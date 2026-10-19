@@ -1,0 +1,61 @@
+// Display formatting for the HUD, cards and toasts.
+
+import type { BuildStage, CableMethod, ParcelKind, StreetClass } from '../sim/types';
+
+/** 12400 -> "12,400" */
+export function formatNumber(n: number): string {
+  return Math.round(n).toLocaleString('en-US');
+}
+
+/** Whole dollars: 12400 -> "$12,400", -3000 -> "-$3,000". */
+export function formatMoney(amount: number): string {
+  const rounded = Math.round(amount);
+  return `${rounded < 0 ? '-' : ''}$${formatNumber(Math.abs(rounded))}`;
+}
+
+/** Signed dollars with an explicit plus: "+$1,200" / "-$300" / "$0". */
+export function formatSignedMoney(amount: number): string {
+  const rounded = Math.round(amount);
+  return rounded > 0 ? `+${formatMoney(rounded)}` : formatMoney(rounded);
+}
+
+export function plural(n: number, one: string, many = `${one}s`): string {
+  return `${formatNumber(n)} ${n === 1 ? one : many}`;
+}
+
+export function formatFeet(ft: number): string {
+  return `${formatNumber(ft)} ft`;
+}
+
+/** "14-45 days", or "10 days" when the range is a single value. */
+export function formatDayRange(min: number, max: number): string {
+  return min === max ? plural(min, 'day') : `${formatNumber(min)}–${plural(max, 'day')}`;
+}
+
+export const METHOD_LABEL: Record<CableMethod, string> = {
+  aerial: 'Aerial',
+  underground: 'Underground',
+};
+
+export const CLASS_LABEL: Record<StreetClass, string> = {
+  arterial: 'Arterial',
+  collector: 'Collector',
+  local: 'Local street',
+};
+
+export const KIND_LABEL: Record<ParcelKind, string> = {
+  home: 'Home',
+  mdu: 'Apartment building',
+  smb: 'Small business',
+};
+
+const STAGE_LABEL: Record<BuildStage, string> = {
+  permitting: 'Permitting',
+  constructing: 'Under construction',
+  live: 'Live',
+};
+
+/** "Permitting, 12 days left" / "Live" */
+export function formatStage(stage: BuildStage, daysLeft: number): string {
+  return stage === 'live' ? STAGE_LABEL.live : `${STAGE_LABEL[stage]}, ${plural(daysLeft, 'day')} left`;
+}
