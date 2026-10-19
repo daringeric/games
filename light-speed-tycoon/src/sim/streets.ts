@@ -124,11 +124,20 @@ function heapPop(heap: HeapItem[]): HeapItem | undefined {
 }
 
 /**
- * Shortest route along streets from one node to another, weighted by lengthFt
- * (Dijkstra). Returns segment ids in travel order, [] when from === to, or null
- * when unreachable. Deterministic: ties break toward the lower segment id.
+ * What travelling along a segment costs a route: a positive number, or
+ * Infinity (any non-finite value) where the route may not go.
  */
-export function shortestPath(city: City, from: NodeId, to: NodeId): SegmentId[] | null {
+export type SegmentCost = (segment: StreetSegment) => number;
+
+const byLength: SegmentCost = (segment) => segment.lengthFt;
+
+/**
+ * Cheapest route along streets from one node to another (Dijkstra), weighted by
+ * `cost` (default: lengthFt, i.e. the shortest route). Returns segment ids in
+ * travel order, [] when from === to, or null when unreachable. Deterministic:
+ * ties break toward the lower segment id.
+ */
+export function shortestPath(city: City, from: NodeId, to: NodeId, cost: SegmentCost = byLength): SegmentId[] | null {
   if (!isNodeId(city, from) || !isNodeId(city, to)) return null;
   if (from === to) return [];
   const { adjacency } = graphIndex(city);
@@ -150,9 +159,11 @@ export function shortestPath(city: City, from: NodeId, to: NodeId): SegmentId[] 
       const seg = city.segments[segId] as StreetSegment;
       const v = otherEnd(seg, u);
       if (done[v]) continue;
-      const d = item.dist + seg.lengthFt;
+      const step = cost(seg);
+      if (!Number.isFinite(step)) continue;
+      const d = item.dist + step;
       const best = dist[v] as number;
-      // Lengths are positive, so every equal-length predecessor of v is settled
+      // Costs are positive, so every equal-cost predecessor of v is settled
       // before v is: keeping the lowest entering segment id is order-independent.
       if (d < best || (d === best && segId < (via[v] as number))) {
         dist[v] = d;

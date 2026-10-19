@@ -138,10 +138,31 @@ describe('shortestPath', () => {
     expect(shortestPath(city, 5, 0)).toEqual([V(1, 0), H(0, 0)]);
   });
 
+  it('breaks ties toward the lower segment id even when the higher one is found first', () => {
+    // Square 2x2-cell blocks: nodes 1 (2, 0) and 4 (0, 2) are both 120 ft from
+    // node 0, and node 1 settles first by node id, so node 5 is first reached by
+    // V(1,0)=10. The tie-break must swap that for H(0,1)=3 when node 4 settles.
+    expect(shortestPath(makeGridCity({ blockW: 2, blockH: 2 }), 0, 5)).toEqual([V(0, 0), H(0, 1)]);
+  });
+
   it('weighs by length, not hop count', () => {
     const detour = makeGridCity();
     detour.segments[H(0, 0)] = { ...seg(detour, H(0, 0)), lengthFt: 10_000 };
     expect(shortestPath(detour, 0, 1)).toEqual([V(0, 0), H(0, 1), V(1, 0)]);
+  });
+
+  it('weighs by a custom cost and never crosses a segment costing Infinity', () => {
+    // H(0,1) is closed: 0 -> 5 has to take the other 360 ft route.
+    const closed = (s: StreetSegment) => (s.id === H(0, 1) ? Infinity : s.lengthFt);
+    expect(shortestPath(city, 0, 5, closed)).toEqual([H(0, 0), V(1, 0)]);
+    // Hop count instead of feet: straight along 1st St beats the shorter dog-leg.
+    const detour = makeGridCity();
+    detour.segments[H(0, 0)] = { ...seg(detour, H(0, 0)), lengthFt: 10_000 };
+    expect(shortestPath(detour, 0, 1, () => 1)).toEqual([H(0, 0)]);
+    // Every way into node 0 closed: unreachable.
+    const fenced = (s: StreetSegment) => (s.a === 0 || s.b === 0 ? Infinity : s.lengthFt);
+    expect(shortestPath(city, 5, 0, fenced)).toBeNull();
+    expect(shortestPath(city, 0, 0, fenced)).toEqual([]);
   });
 
   it('returns null when unreachable or for invalid nodes', () => {

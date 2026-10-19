@@ -57,6 +57,27 @@ describe('cable tools', () => {
     expect(state.network.spans).toEqual([]);
   });
 
+  it('routes aerial runs along poles when the shortest route crosses a street without them', () => {
+    // 0 -> 5 is 360 ft either way; the plain shortest route takes 2nd St (H(0,1)=3), which has no poles here.
+    const state = game();
+    state.city.segments[3] = { ...state.city.segments[3]!, hasPoles: false };
+    const tools = new ToolController();
+    tools.setTool('aerial');
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(4.1, 2.1);
+    const view = tools.view(state);
+    expect(view.overlay.path).toEqual({ segments: [0, 10], fresh: [0, 10], method: 'aerial', ok: true });
+    expect(view.card?.blockers).toEqual([]);
+    expect(tools.click(state, dispatcher(state), 4.1, 2.1)?.ok).toBe(true);
+    expect(state.network.spans.map((s) => s.segment)).toEqual([0, 10]);
+
+    // Underground keeps the plain shortest route.
+    tools.setTool('underground');
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(4.1, 2.1);
+    expect(tools.view(state).overlay.path?.segments).toEqual([9, 3]);
+  });
+
   it('ends the run on cancel', () => {
     const state = game();
     const tools = new ToolController();
@@ -172,6 +193,49 @@ describe('inspect tool', () => {
     expect(tools.view(state)).toBe(first);
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
     expect(tools.view(state)).not.toBe(first);
+  });
+
+  it('recomputes the view when only the day changes', () => {
+    const state = game();
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    const cable = () => tools.view(state).card?.rows.find((r) => r.label === 'Cable')?.value;
+    const before = cable();
+    expect(before).toMatch(/permitting, \d+ days left/);
+    const version = state.network.version;
+    const cash = state.finance.cash;
+    runDays(state, 3);
+    // Still permitting: nothing but the day moved.
+    expect(state.network.version).toBe(version);
+    expect(state.finance.cash).toBe(cash);
+    expect(cable()).not.toBe(before);
+  });
+
+  it('recomputes the view when only the network changes', () => {
+    const state = game();
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    runDays(state, 120);
+    const tools = new ToolController();
+    tools.setTool('remove');
+    tools.hoverAt(2, 0.1);
+    expect(tools.view(state).card?.title).toBe('Remove cable on 1st St');
+    // Removing live cable refunds nothing, so cash and day stay put.
+    const cash = state.finance.cash;
+    expect(tools.click(state, dispatcher(state), 2, 0.1)?.ok).toBe(true);
+    expect(state.finance.cash).toBe(cash);
+    tools.hoverAt(2, 0.1);
+    expect(tools.view(state).card).toBeNull();
+  });
+
+  it('recomputes the view when only cash changes', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(4.1, 2.1);
+    expect(tools.view(state).card?.blockers).toEqual([]);
+    state.finance.cash = 100;
+    expect(tools.view(state).card?.blockers).toEqual(['Not enough cash: need $16,200, have $100']);
   });
 });
 

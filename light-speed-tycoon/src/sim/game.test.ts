@@ -343,10 +343,11 @@ describe('tick and runDays', () => {
     const liveDay = aerial.liveDay!;
     // 240 ft at one pole per 150 ft = 2 poles.
     const rent = -2 * POLE_RENT_PER_POLE_PER_MONTH;
-    const rented = state.finance.reports.filter((r) => closedOn(r) >= liveDay);
+    // A month pays rent when the span was live by its last day.
+    const rented = state.finance.reports.filter((r) => closedOn(r) > liveDay);
     expect(rented.length).toBeGreaterThan(0);
     for (const report of state.finance.reports) {
-      expect(report.totals.poleRent).toBe(closedOn(report) >= liveDay ? rent : undefined);
+      expect(report.totals.poleRent).toBe(closedOn(report) > liveDay ? rent : undefined);
     }
   });
 
@@ -363,8 +364,50 @@ describe('tick and runDays', () => {
     );
     expect(state.finance.reports).toHaveLength(4); // day 120 is May 1
     for (const report of state.finance.reports) {
-      expect(report.passings).toBe(closedOn(report) >= lit ? 8 : 0);
+      expect(report.passings).toBe(closedOn(report) > lit ? 8 : 0);
     }
     expect(getService(state).passings).toBe(8);
+  });
+
+  it('bills no pole rent and counts no passings for the month before a span goes live on the 1st', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'aerial' });
+    // Make-ready ends on Jan 31 and the one-day build finishes on Feb 1 (day 31).
+    const span = state.network.spans[0]!;
+    span.stageDaysLeft = 30;
+    span.constructDays = 1;
+    runDays(state, 30);
+    expect(span.stage).toBe('constructing');
+    expect(getService(state).passings).toBe(0);
+
+    tick(state);
+    expect(span).toMatchObject({ stage: 'live', liveDay: 31 });
+    const january = state.finance.reports[0]!;
+    expect(january).toMatchObject({ year: 2027, month: 1, passings: 0 });
+    expect(january.totals.poleRent).toBeUndefined();
+    // The ledger has no rent dated Jan 31 either.
+    expect(state.finance.monthToDate).toEqual([]);
+    expect(getService(state).passings).toBe(4);
+
+    runDays(state, 28);
+    expect(state.finance.reports[1]).toMatchObject({ year: 2027, month: 2, passings: 4 });
+    expect(state.finance.reports[1]!.totals.poleRent).toBe(-2 * POLE_RENT_PER_POLE_PER_MONTH);
+  });
+
+  it('counts homes that appear on the 1st in the new month, not the one that ended', () => {
+    const city = makeGridCity();
+    // One of the four homes fronting segment 0 is built on Feb 1 (day 31).
+    const late = city.parcels.find((p) => p.segment === 0)!;
+    late.appearsDay = 31;
+    const state = game(city);
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    runDays(state, 30);
+    expect(getService(state).passings).toBe(3);
+
+    tick(state);
+    expect(state.finance.reports[0]).toMatchObject({ year: 2027, month: 1, passings: 3 });
+    expect(getService(state).passings).toBe(4);
   });
 });

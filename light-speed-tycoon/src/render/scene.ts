@@ -66,11 +66,15 @@ export class Scene {
     return townBounds(city, this.theme);
   }
 
-  /** Bring every layer up to date with the state; cheap when nothing changed. */
+  /**
+   * Bring every layer up to date with the state; cheap when nothing changed.
+   * Throws if the city can't be built; syncing a good state afterwards rebuilds
+   * the map from scratch.
+   */
   sync(state: GameState): void {
-    if (state.city !== this.city) this.setCity(state.city);
-    if (state !== this.state) {
-      // A loaded game can reuse version numbers; redraw everything.
+    if (state.city !== this.city || state !== this.state) {
+      // A new city, or a loaded game that can reuse version numbers: redraw everything.
+      if (state.city !== this.city) this.setCity(state.city);
       this.state = state;
       this.service = null;
       this.networkVersion = -1;
@@ -114,6 +118,11 @@ export class Scene {
     if (this.city && this.overlay.draw(this.city, spec)) this.dirty = true;
   }
 
+  /** What the map currently shows, for debugging and tests: lots drawn as passed, live spans drawn, live cable redraws. */
+  stats(): { passedLots: number; liveSpans: number; liveRedraws: number } {
+    return { passedLots: this.parcels.passedLots, liveSpans: this.network.liveSpans, liveRedraws: this.network.liveRedraws };
+  }
+
   /** Whether the frame needs drawing; clears the flag. An idle map costs no GPU time. */
   takeDirty(): boolean {
     const dirty = this.dirty;
@@ -122,7 +131,9 @@ export class Scene {
   }
 
   private setCity(city: City): void {
-    this.city = city;
+    // Set only once the city is fully built, so one that fails midway is rebuilt
+    // from scratch rather than left half drawn.
+    this.city = null;
     this.dirty = true;
     for (const child of this.ground.removeChildren()) child.destroy();
     const board = new Graphics();
@@ -137,10 +148,16 @@ export class Scene {
     drawPoleOverlay(this.poles, city, this.theme);
     this.parcels.setCity(city);
 
-    if (this.co) this.co.destroy({ children: true });
+    // Graphics.destroy given options keeps its context (and the GPU buffers
+    // behind it) unless asked: say so, or every new town leaks the old building.
+    if (this.co) {
+      this.co.destroy({ children: true, context: true });
+      this.co = null;
+    }
     this.co = buildCentralOffice(city, this.theme);
     // Over cables and previews so they run in under the building; under cabinets and tool marks.
     this.world.addChildAt(this.co, this.world.getChildIndex(this.network.above));
     this.overlay.draw(city, {});
+    this.city = city;
   }
 }

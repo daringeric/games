@@ -32,7 +32,8 @@ export class Toasts {
 
 /** Card that follows the cursor with a quote or details for whatever is under it. */
 export class FloatingCard {
-  readonly root = el('div', { class: 'float-card pill-card', attrs: { 'aria-live': 'polite' } });
+  // Hidden until the first frame has something to show (and for good if boot fails).
+  readonly root = el('div', { class: 'float-card pill-card', attrs: { 'aria-live': 'polite', hidden: '' } });
   private key = '';
 
   render(card: CardModel | null, x: number, y: number, viewW: number, viewH: number): void {

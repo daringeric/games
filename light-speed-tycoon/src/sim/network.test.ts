@@ -14,9 +14,11 @@ import {
   SPLITTER_COST,
   START_CASH,
 } from './balance';
+import { newGame } from './game';
 import {
   advanceNetwork,
   cableCost,
+  cableRoute,
   computeService,
   getService,
   layCable,
@@ -27,6 +29,7 @@ import {
   spanOnSegment,
 } from './network';
 import { Rng } from './rng';
+import { shortestPath } from './streets';
 import { makeGridCity } from './testing/fixtures';
 import type { BuildStage, City, CommandResult, GameState, SegmentId } from './types';
 
@@ -343,14 +346,27 @@ describe('advanceNetwork', () => {
     state.day = 3;
     placeCabinet(state, 0);
     const cabinet = state.network.cabinets[0]!;
-    for (let d = 1; d < CABINET_PERMIT_DAYS; d++) tick(state);
+    // The cabinet is the only thing in the network, so every version bump below is
+    // its own: the renderer redraws cabinets only when the version changes.
+    let version = state.network.version;
+    for (let d = 1; d < CABINET_PERMIT_DAYS; d++) {
+      tick(state);
+      expect(state.network.version).toBe(version);
+    }
     expect(cabinet.stage).toBe('permitting');
     tick(state);
     expect(cabinet).toMatchObject({ stage: 'constructing', stageDaysLeft: CABINET_CONSTRUCT_DAYS });
-    for (let d = 1; d < CABINET_CONSTRUCT_DAYS; d++) tick(state);
+    expect(state.network.version).toBe(++version);
+    for (let d = 1; d < CABINET_CONSTRUCT_DAYS; d++) {
+      tick(state);
+      expect(state.network.version).toBe(version);
+    }
     expect(cabinet.stage).toBe('constructing');
     tick(state);
     expect(cabinet).toMatchObject({ stage: 'live', liveDay: 3 + CABINET_PERMIT_DAYS + CABINET_CONSTRUCT_DAYS });
+    expect(state.network.version).toBe(++version);
+    for (let d = 0; d < 5; d++) tick(state);
+    expect(state.network.version).toBe(version);
   });
 
   it('bumps the version once per day however many stages change', () => {
@@ -600,5 +616,60 @@ describe('spanOnSegment', () => {
     lay(state, [H(0, 0), V(0, 0)], 'aerial');
     expect(spanOnSegment(state, V(0, 0))?.id).toBe(2);
     expect(spanOnSegment(state, H(1, 0))).toBeUndefined();
+  });
+});
+
+describe('cableRoute', () => {
+  // 0 -> 5 is 360 ft either way: [V(0,0), H(0,1)] by the shortest-path tie-break, or [H(0,0), V(1,0)].
+  function unpoled(...ids: SegmentId[]): City {
+    const city = makeGridCity();
+    for (const id of ids) city.segments[id] = { ...city.segments[id]!, hasPoles: false };
+    return city;
+  }
+
+  it('routes aerial runs along poles when an equally short route has them', () => {
+    const state = makeState(unpoled(H(0, 1)));
+    expect(shortestPath(state.city, 0, 5)).toEqual([V(0, 0), H(0, 1)]);
+    const route = cableRoute(state, 0, 5, 'aerial');
+    expect(route).toEqual([H(0, 0), V(1, 0)]);
+    expect(quoteCable(state, route!, 'aerial')).toMatchObject({ ok: true, lengthFt: 360 });
+  });
+
+  it('takes a longer poled detour over a shorter street without poles', () => {
+    const state = makeState(unpoled(H(0, 0)));
+    expect(cableRoute(state, 0, 1, 'aerial')).toEqual([V(0, 0), H(0, 1), V(1, 0)]);
+  });
+
+  it('crosses a street without poles that already has cable, since the order skips it', () => {
+    const state = makeState(unpoled(H(0, 0)));
+    expect(lay(state, [H(0, 0)], 'underground').ok).toBe(true);
+    const route = cableRoute(state, 0, 2, 'aerial');
+    expect(route).toEqual([H(0, 0), H(1, 0)]);
+    expect(quoteCable(state, route!, 'aerial')).toMatchObject({ ok: true, newSegments: [H(1, 0)] });
+  });
+
+  it('falls back to the plain shortest route, whose quote names the blocking street', () => {
+    // Node 0 has no poled street at all.
+    const state = makeState(unpoled(H(0, 0), V(0, 0)));
+    const route = cableRoute(state, 0, 5, 'aerial');
+    expect(route).toEqual(shortestPath(state.city, 0, 5));
+    expect(quoteCable(state, route!, 'aerial').reasons).toEqual(['No poles on A Ave - lay underground instead']);
+  });
+
+  it('routes underground runs along the plain shortest route', () => {
+    const state = makeState(unpoled(H(0, 1)));
+    expect(cableRoute(state, 0, 5, 'underground')).toEqual([V(0, 0), H(0, 1)]);
+    expect(cableRoute(state, 0, 0, 'underground')).toEqual([]);
+    expect(cableRoute(state, 0, 99, 'aerial')).toBeNull();
+  });
+
+  it('finds the poled route on a generated town', () => {
+    // Seed 1: the plain shortest 68 -> 97 route crosses Water St, which has no
+    // poles; an all-poled route of the same 1,500 ft exists.
+    const state = newGame(1);
+    const plain = shortestPath(state.city, 68, 97)!;
+    expect(quoteCable(state, plain, 'aerial').reasons).toEqual(['No poles on Water St - lay underground instead']);
+    const route = cableRoute(state, 68, 97, 'aerial')!;
+    expect(quoteCable(state, route, 'aerial')).toMatchObject({ ok: true, reasons: [], lengthFt: 1_500 });
   });
 });
