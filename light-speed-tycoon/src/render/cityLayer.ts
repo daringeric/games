@@ -6,8 +6,9 @@ import { polesOnSegment } from '../sim/streets';
 import type { City } from '../sim/types';
 import type { Tree } from './decor';
 import type { Bounds } from './camera';
-import { streetLattice } from './geometry';
+import { mapExit, straightRuns, streetLattice } from './geometry';
 import { addCenteredDashes, disc, pointsAlong, segmentLine } from './shapes';
+import type { Line } from './shapes';
 import type { Theme } from './theme';
 
 /** World rect of the board: the map plus a grass margin. */
@@ -47,11 +48,14 @@ export function drawBoard(g: Graphics, city: City, theme: Theme): void {
  * Roads as plain rectangles (segments are axis-aligned) plus a disc at every
  * node, which gives the same rounded junctions as round caps for a fraction of
  * the triangles. Curbs go under every road first so fills merge at junctions.
+ * Streets that run off the map carry on to the board edge instead of ending in
+ * a turnaround bulb.
  */
 export function drawRoads(g: Graphics, city: City, theme: Theme): void {
   const { road } = theme;
   const c = theme.cell;
   const lattice = streetLattice(city);
+  const margin = theme.board.margin * c;
   // Widest road meeting each node sizes its junction disc and stops centre dashes short of it.
   const nodeHalf = new Float32Array(city.nodes.length);
   for (const seg of city.segments) {
@@ -59,20 +63,28 @@ export function drawRoads(g: Graphics, city: City, theme: Theme): void {
     nodeHalf[seg.a] = Math.max(nodeHalf[seg.a] ?? 0, half);
     nodeHalf[seg.b] = Math.max(nodeHalf[seg.b] ?? 0, half);
   }
-  // Dead ends widen into a turnaround bulb.
-  const junction = (id: number) => (nodeHalf[id] ?? 0) * (lattice.degree[id] === 1 ? road.culDeSac : 1);
+  const exits = city.nodes.map((n) => mapExit(city, lattice, n.id));
+  // Dead ends widen into a turnaround bulb; map exits have no junction at all.
+  const junction = (id: number) => (exits[id] ? 0 : (nodeHalf[id] ?? 0) * (lattice.degree[id] === 1 ? road.culDeSac : 1));
 
   const pave = (grow: number, color: string) => {
-    for (const seg of city.segments) {
-      const l = segmentLine(city, seg, theme);
-      const half = road.width[seg.streetClass] / 2 + grow;
+    const rect = (l: Line, half: number) => {
       const x = Math.min(l.ax, l.bx);
       const y = Math.min(l.ay, l.by);
       if (l.ay === l.by) g.rect(x, y - half, Math.abs(l.bx - l.ax), 2 * half);
       else g.rect(x - half, y, 2 * half, Math.abs(l.by - l.ay));
+    };
+    for (const seg of city.segments) {
+      const half = road.width[seg.streetClass] / 2 + grow;
+      rect(segmentLine(city, seg, theme), half);
+      for (const id of [seg.a, seg.b]) {
+        const out = exits[id];
+        const n = city.nodes[id];
+        if (out && n) rect({ ax: n.x * c, ay: n.y * c, bx: n.x * c + out.dx * margin, by: n.y * c + out.dy * margin }, half);
+      }
     }
     for (const n of city.nodes) {
-      if ((nodeHalf[n.id] ?? 0) === 0) continue;
+      if ((nodeHalf[n.id] ?? 0) === 0 || exits[n.id]) continue;
       // Big turnaround bulbs get a true circle; junction discs stay low-poly.
       if (lattice.degree[n.id] === 1) g.circle(n.x * c, n.y * c, junction(n.id) + grow);
       else disc(g, n.x * c, n.y * c, junction(n.id) + grow);
@@ -82,10 +94,22 @@ export function drawRoads(g: Graphics, city: City, theme: Theme): void {
   pave(road.edgeWidth, road.edge);
   pave(0, road.fill);
 
+  // Centre dashes follow whole straight runs so they don't break where citygen
+  // splits a long street, and stop short of junctions and bulbs.
   let dashes = 0;
-  for (const seg of city.segments) {
-    const inset = Math.max(junction(seg.a), junction(seg.b)) + road.gap / 2;
-    dashes += addCenteredDashes(g, segmentLine(city, seg, theme), road.dash, road.gap, inset);
+  for (const run of straightRuns(city, lattice)) {
+    const a = city.nodes[run.a];
+    const b = city.nodes[run.b];
+    if (!a || !b) continue;
+    const len = Math.hypot(b.x - a.x, b.y - a.y) * c;
+    const ux = ((b.x - a.x) * c) / len;
+    const uy = ((b.y - a.y) * c) / len;
+    // Positive trims pull an end in from its junction; a map exit instead extends to the board edge.
+    const trim = (id: number) => (exits[id] ? -margin : junction(id) + road.gap / 2);
+    const ta = trim(run.a);
+    const tb = trim(run.b);
+    const line: Line = { ax: a.x * c + ux * ta, ay: a.y * c + uy * ta, bx: b.x * c - ux * tb, by: b.y * c - uy * tb };
+    dashes += addCenteredDashes(g, line, road.dash, road.gap, 0);
   }
   if (dashes > 0) g.stroke({ width: road.centerLineWidth, color: road.centerLine, cap: 'butt' });
 }

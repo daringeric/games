@@ -34,6 +34,8 @@ interface DebugHook {
   setSpeed(speed: Speed): void;
   worldToScreen(x: number, y: number): { x: number; y: number };
   screenToWorld(x: number, y: number): { x: number; y: number };
+  /** Frame-loop counters: animation frames run, and how many of them drew the map. */
+  stats(): { frames: number; renders: number };
 }
 
 declare global {
@@ -173,15 +175,18 @@ async function boot(): Promise<void> {
 
   const pointer = { x: 0, y: 0, onMap: false };
   new Input(app.canvas, camera, theme.cell, {
-    hover(grid, screen) {
+    hover(grid, screen, touch) {
+      if (touch !== undefined) tools.touch = touch;
       pointer.x = screen.x;
       pointer.y = screen.y;
       pointer.onMap = grid !== null;
       if (grid) tools.hoverAt(grid.x, grid.y);
       else tools.clearHover();
     },
-    click(grid) {
-      const outcome = tools.click(session.state, (cmd) => session.dispatch(cmd), grid.x, grid.y);
+    click(grid, touch) {
+      const dispatch = (cmd: Command) => session.dispatch(cmd);
+      tools.touch = touch;
+      const outcome = touch ? tools.tap(session.state, dispatch, grid.x, grid.y) : tools.click(session.state, dispatch, grid.x, grid.y);
       if (!outcome) return;
       toasts.show(outcome.message, outcome.ok);
       if (outcome.ok) hint.hide();
@@ -207,6 +212,7 @@ async function boot(): Promise<void> {
     if (document.visibilityState === 'hidden') autosave();
   });
 
+  const counters = { frames: 0, renders: 0 };
   window.__lst = {
     getState: () => session.state,
     dispatch: (cmd) => session.dispatch(cmd),
@@ -222,6 +228,7 @@ async function boot(): Promise<void> {
       const p = camera.screenToWorld(x - r.left, y - r.top);
       return { x: p.x / theme.cell, y: p.y / theme.cell };
     },
+    stats: () => ({ ...counters }),
   };
 
   scene.sync(session.state);
@@ -241,7 +248,11 @@ async function boot(): Promise<void> {
     panel.update(state);
     scene.applyCamera(camera);
     scene.animate(now);
-    if (scene.takeDirty()) app.render();
+    counters.frames++;
+    if (scene.takeDirty()) {
+      counters.renders++;
+      app.render();
+    }
     window.requestAnimationFrame(frame);
   };
   window.requestAnimationFrame(frame);

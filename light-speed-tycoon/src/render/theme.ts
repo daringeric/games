@@ -153,7 +153,7 @@ export interface Theme {
     shadowOffset: number;
     text: string;
     textSecondary: string;
-    /** Brand coral for decoration (dots, icons). */
+    /** Brand coral for small decorations. */
     accent: string;
     /**
      * Active button fill. A shade deeper than accent so white label text keeps
@@ -168,13 +168,11 @@ export interface Theme {
     dangerBg: string;
     success: string;
     successBg: string;
-    warning: string;
     focus: string;
     radius: number;
     pillRadius: number;
     /** Minimum touch target. */
     touch: number;
-    gap: number;
     fontSize: number;
     numberSize: number;
   };
@@ -318,18 +316,11 @@ export const toyTown: Theme = {
     dangerBg: '#FFE4E8',
     success: '#0E7A6D',
     successBg: '#DDF6F1',
-    warning: '#9A5B00',
     focus: '#0E7A6D',
     radius: 16,
     pillRadius: 999,
     touch: 44,
-    gap: 12,
     fontSize: 15,
     numberSize: 17,
   },
 };
-
-/** Pixi wants numbers in a few places (tint math); CSS strings everywhere else. */
-export function hexToNumber(hex: string): number {
-  return Number.parseInt(hex.slice(1), 16);
-}

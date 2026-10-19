@@ -2,7 +2,8 @@
 // run on the cell lattice, which side of a lot faces its street, and the inset
 // rectangles lots and buildings are drawn in. No Pixi here, so it unit-tests in node.
 
-import type { City, Parcel, StreetClass, StreetSegment } from '../sim/types';
+import { otherEnd, segmentsAtNode } from '../sim/streets';
+import type { City, NodeId, Parcel, SegmentId, StreetClass, StreetSegment } from '../sim/types';
 import type { Theme } from './theme';
 
 export interface Rect {
@@ -186,4 +187,79 @@ export function parcelGrid(city: City): Int32Array {
   }
   parcelGridCache.set(city, grid);
   return grid;
+}
+
+/**
+ * Where a street runs off the map: a dead end on the map border whose street
+ * points outward. Returns the unit direction out of the map, or null for any
+ * other node (an ordinary dead end gets a turnaround bulb instead).
+ */
+export function mapExit(city: City, lattice: StreetLattice, node: NodeId): { dx: number; dy: number } | null {
+  if (lattice.degree[node] !== 1) return null;
+  const n = city.nodes[node];
+  const seg = city.segments[segmentsAtNode(city, node)[0] ?? -1];
+  if (!n || !seg) return null;
+  const o = city.nodes[otherEnd(seg, node)];
+  if (!o) return null;
+  const dx = Math.sign(n.x - o.x);
+  const dy = Math.sign(n.y - o.y);
+  const out = (n.x === 0 && dx < 0) || (n.x === city.width && dx > 0) || (n.y === 0 && dy < 0) || (n.y === city.height && dy > 0);
+  return out ? { dx, dy } : null;
+}
+
+/** A straight stretch of one street class, possibly several segments long. */
+export interface StreetRun {
+  /** End nodes; the run is axis-aligned from a to b. */
+  a: NodeId;
+  b: NodeId;
+  streetClass: StreetClass;
+  segments: SegmentId[];
+}
+
+function isHorizontal(city: City, seg: StreetSegment): boolean {
+  return city.nodes[seg.a]?.y === city.nodes[seg.b]?.y;
+}
+
+/**
+ * Streets as straight runs: segments joined through plain joints (degree-2 nodes
+ * where the same class of street carries straight on, which citygen adds to
+ * split long runs). Centre-line dashes follow runs so they don't break at joints.
+ */
+export function straightRuns(city: City, lattice: StreetLattice): StreetRun[] {
+  const visited = new Uint8Array(city.segments.length);
+  // The segment that continues `seg` straight through `node`, if node is a plain joint.
+  const carryOn = (seg: StreetSegment, node: NodeId): StreetSegment | null => {
+    if (lattice.degree[node] !== 2) return null;
+    for (const id of segmentsAtNode(city, node)) {
+      const next = city.segments[id];
+      if (next && next.id !== seg.id && next.streetClass === seg.streetClass && isHorizontal(city, next) === isHorizontal(city, seg)) {
+        return next;
+      }
+    }
+    return null;
+  };
+  const runs: StreetRun[] = [];
+  for (const seg of city.segments) {
+    if (visited[seg.id]) continue;
+    visited[seg.id] = 1;
+    const ends: NodeId[] = [];
+    const before: SegmentId[] = [];
+    const after: SegmentId[] = [];
+    for (const [start, list] of [
+      [seg.a, before],
+      [seg.b, after],
+    ] as const) {
+      let cur: StreetSegment = seg;
+      let node: NodeId = start;
+      for (let next = carryOn(cur, node); next && !visited[next.id]; next = carryOn(cur, node)) {
+        visited[next.id] = 1;
+        list.push(next.id);
+        node = otherEnd(next, node);
+        cur = next;
+      }
+      ends.push(node);
+    }
+    runs.push({ a: ends[0] as NodeId, b: ends[1] as NodeId, streetClass: seg.streetClass, segments: [...before.reverse(), seg.id, ...after] });
+  }
+  return runs;
 }

@@ -16,6 +16,7 @@ export class ReportPanel {
   private readonly lastRow: HTMLElement;
   private readonly empty: HTMLElement;
   private key = '';
+  private state: GameState | null = null;
 
   constructor() {
     const stat = (label: string, value: HTMLElement) => el('div', { class: 'stat' }, [el('dt', { text: label }), el('dd', {}, [value])]);
@@ -42,8 +43,10 @@ export class ReportPanel {
   update(state: GameState): void {
     const { finance } = state;
     const key = `${finance.reports.length}|${finance.monthToDate.length}|${state.day}`;
-    if (key === this.key) return;
+    // A loaded game can match the old one's counts, so the state is part of the key.
+    if (key === this.key && state === this.state) return;
     this.key = key;
+    this.state = state;
 
     const last = finance.reports[finance.reports.length - 1];
     this.lastRow.hidden = !last;

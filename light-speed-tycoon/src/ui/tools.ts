@@ -61,11 +61,16 @@ export class ToolController {
   /** Corner the current cable run continues from. */
   private origin: NodeId | null = null;
   private hover: { x: number; y: number } | null = null;
-  private cached: { key: string; view: ToolView } | null = null;
+  private cached: { state: GameState; key: string; view: ToolView } | null = null;
+  /** The last input was a touch: cards say "tap", and orders take a confirming tap. */
+  touch = false;
+  /** Touch has no hover: the target a first tap previewed, which a second tap on it confirms. */
+  private armed: string | null = null;
 
   setTool(tool: ToolId): void {
     this.tool = tool;
     this.origin = null;
+    this.armed = null;
   }
 
   get drawing(): boolean {
@@ -76,6 +81,7 @@ export class ToolController {
   cancel(): boolean {
     const was = this.origin !== null;
     this.origin = null;
+    this.armed = null;
     return was;
   }
 
@@ -93,15 +99,55 @@ export class ToolController {
     const key = [
       this.tool,
       this.origin,
+      this.touch,
       h ? `${h.x.toFixed(2)},${h.y.toFixed(2)}` : '-',
       state.network.version,
       state.finance.cash,
       state.day,
     ].join('|');
-    if (this.cached?.key === key && this.cached.view) return this.cached.view;
+    // A new or loaded game can share every key field with the old one (a fresh
+    // town is day 0, version 0, start cash), so the state itself is part of the key.
+    if (this.cached?.state === state && this.cached.key === key) return this.cached.view;
     const view = this.compute(state);
-    this.cached = { key, view };
+    this.cached = { state, key, view };
     return view;
+  }
+
+  /**
+   * Act on a touch tap at (x, y). With no hover on touch screens, the first tap
+   * on a new target only previews it (the card shows the quote) and a second tap
+   * on the same target acts. Picking a run's start corner needs no confirming.
+   */
+  tap(state: GameState, dispatch: Dispatch, x: number, y: number): ToolOutcome | null {
+    this.touch = true;
+    this.hoverAt(x, y);
+    const target = this.tapTarget(state, x, y);
+    if (target !== null && target !== this.armed) {
+      this.armed = target;
+      return null;
+    }
+    this.armed = null;
+    return this.click(state, dispatch, x, y);
+  }
+
+  /** What a tap at (x, y) would act on, for tools whose taps cost money; null acts at once. */
+  private tapTarget(state: GameState, x: number, y: number): string | null {
+    switch (this.tool) {
+      case 'aerial':
+      case 'underground': {
+        if (this.origin === null) return null;
+        const node = nearestNode(state.city, x, y);
+        return node === this.origin ? null : `node:${node}`;
+      }
+      case 'cabinet':
+        return `node:${nearestNode(state.city, x, y)}`;
+      case 'remove': {
+        const seg = removableSegment(state, x, y);
+        return seg === null ? null : `segment:${seg}`;
+      }
+      case 'inspect':
+        return null;
+    }
   }
 
   /** Act on a click at grid point (x, y). Returns a message to toast, or null for nothing to report. */
@@ -164,9 +210,9 @@ export class ToolController {
       case 'underground':
         return this.cableView(state, this.tool, h.x, h.y);
       case 'cabinet':
-        return cabinetView(state, nearestNode(state.city, h.x, h.y));
+        return cabinetView(state, nearestNode(state.city, h.x, h.y), this.touch);
       case 'remove':
-        return removeView(state, h.x, h.y);
+        return removeView(state, h.x, h.y, this.touch);
       case 'inspect':
         return inspectView(state, h.x, h.y);
     }
@@ -184,7 +230,7 @@ export class ToolController {
           tone: method,
           rows: [{ label: 'Start at', value: cornerLabel(state, snap) }],
           blockers: [],
-          hint: 'Click a corner to start the run. Fiber must reach back to the CO.',
+          hint: `${this.touch ? 'Tap' : 'Click'} a corner to start the run. Fiber must reach back to the CO.`,
         },
       };
     }
@@ -192,7 +238,13 @@ export class ToolController {
     if (snap === origin) {
       return {
         overlay: { origin, snap },
-        card: { title, tone: method, rows: [], blockers: [], hint: 'Point at another corner to plan a run. Esc to stop.' },
+        card: {
+          title,
+          tone: method,
+          rows: [],
+          blockers: [],
+          hint: this.touch ? 'Tap another corner to plan a run. Pick another tool to stop.' : 'Point at another corner to plan a run. Esc to stop.',
+        },
       };
     }
     const path = shortestPath(city, origin, snap);
@@ -216,13 +268,19 @@ export class ToolController {
         tone: method,
         rows,
         blockers: quote.reasons,
-        hint: quote.ok ? 'Click to order · Esc to stop' : 'Esc to stop',
+        hint: this.touch
+          ? quote.ok
+            ? 'Tap this corner again to order'
+            : 'Tap another corner, or pick another tool to stop'
+          : quote.ok
+            ? 'Click to order · Esc to stop'
+            : 'Esc to stop',
       },
     };
   }
 }
 
-function cabinetView(state: GameState, node: NodeId): ToolView {
+function cabinetView(state: GameState, node: NodeId, touch: boolean): ToolView {
   const quote = quoteCabinet(state, node);
   return {
     overlay: { snap: node, cabinet: { node, ok: quote.ok } },
@@ -237,7 +295,7 @@ function cabinetView(state: GameState, node: NodeId): ToolView {
         { label: 'Splitter', value: `1:${SPLIT_RATIO}, uses 1 PON port` },
       ],
       blockers: quote.reasons,
-      hint: quote.ok ? 'Click to place. It lights streets once cable joins it to the CO.' : undefined,
+      hint: quote.ok ? `${touch ? 'Tap again' : 'Click'} to place. It lights streets once cable joins it to the CO.` : undefined,
     },
   };
 }
@@ -247,7 +305,7 @@ function removableSegment(state: GameState, x: number, y: number): SegmentId | n
   return seg !== null && spanOnSegment(state, seg) ? seg : null;
 }
 
-function removeView(state: GameState, x: number, y: number): ToolView {
+function removeView(state: GameState, x: number, y: number, touch: boolean): ToolView {
   const seg = removableSegment(state, x, y);
   const span = seg === null ? undefined : spanOnSegment(state, seg);
   if (seg === null || !span) return { overlay: {}, card: null };
@@ -263,7 +321,9 @@ function removeView(state: GameState, x: number, y: number): ToolView {
         { label: 'Refund', value: refund ? formatMoney(span.cost) : 'No refund' },
       ],
       blockers: [],
-      hint: refund ? 'Still permitting: cancelling refunds it in full.' : 'Crews have started, so removing it refunds nothing.',
+      hint:
+        (refund ? 'Still permitting: cancelling refunds it in full.' : 'Crews have started, so removing it refunds nothing.') +
+        (touch ? ' Tap again to remove.' : ''),
     },
   };
 }

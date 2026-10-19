@@ -13,9 +13,10 @@ const DRAG_SLOP = 6;
 const KEY_ZOOM = 1.25;
 
 export interface InputHandlers {
-  /** Cursor moved over the map (grid units), or left it (null). */
-  hover(grid: { x: number; y: number } | null, screen: { x: number; y: number }): void;
-  click(grid: { x: number; y: number }): void;
+  /** Cursor moved over the map (grid units), or left it (null); `touch` when a finger moved. */
+  hover(grid: { x: number; y: number } | null, screen: { x: number; y: number }, touch?: boolean): void;
+  /** A click or tap on the map; `touch` for a finger, which has no hover to preview with. */
+  click(grid: { x: number; y: number }, touch: boolean): void;
   /** Esc / right-click: end the current action. Returns true if something was cancelled. */
   cancel(): boolean;
   pickTool(tool: ToolId): void;
@@ -136,7 +137,7 @@ export class Input {
       press.lastX = p.x;
       press.lastY = p.y;
     }
-    this.handlers.hover(this.toGrid(p), p);
+    this.handlers.hover(this.toGrid(p), p, e.pointerType === 'touch');
     this.updateCursor();
   };
 
@@ -150,7 +151,7 @@ export class Input {
       if (press.button === 2) {
         this.handlers.cancel();
       } else if (press.button === 0 && !this.spaceHeld) {
-        this.handlers.click(this.toGrid(p));
+        this.handlers.click(this.toGrid(p), press.touch);
         this.handlers.hover(this.toGrid(p), p);
       }
     }
@@ -164,6 +165,8 @@ export class Input {
   };
 
   private readonly onLeave = (e: PointerEvent) => {
+    // A lifted finger "leaves" too; keep its tap's card up, since touch has no hover to bring it back.
+    if (e.pointerType === 'touch') return;
     if (!this.press) this.handlers.hover(null, this.local(e));
   };
 

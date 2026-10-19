@@ -42,7 +42,8 @@ export class Hud {
     this.cash = el('span', { class: 'hud-cash num', attrs: { 'data-testid': 'hud-cash' } });
     this.passings = el('span', { class: 'num', attrs: { 'data-testid': 'hud-passings' } });
     this.building = el('span', { class: 'num', attrs: { 'data-testid': 'hud-building' } });
-    this.buildingChip = el('span', { class: 'chip chip-building' }, [icon(ICONS.crew), this.building, ' under construction']);
+    // Counts every order not yet live: permitting as well as crews on site (the tooltip splits them).
+    this.buildingChip = el('span', { class: 'chip chip-building' }, [icon(ICONS.crew), this.building, ' in progress']);
     this.menuButton = el('button', {
       class: 'btn icon-btn menu-button',
       attrs: { type: 'button', 'aria-label': 'Menu', 'aria-haspopup': 'true', 'aria-expanded': 'false' },

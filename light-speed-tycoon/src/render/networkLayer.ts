@@ -1,7 +1,9 @@
 // Player-built plant: cable spans in their build stages, poles, cabinets and
 // stage markers. Redrawn only when network.version changes; the marching
 // construction stripes and cabinet glow live in small render groups of their
-// own so animating them never re-batches the rest of the map.
+// own so animating them never re-batches the rest of the map. A cabinet's glow
+// pulses for a few seconds when it lights up and then holds steady, so a
+// finished network costs no frames while the map sits idle.
 //
 // Two containers: `below` (cables and markers) sits under the central office
 // so cables run in beneath it; `above` (cabinets) sits over it so a cabinet at
@@ -23,6 +25,10 @@ export function cabinetCenter(city: City, node: NodeId, theme: Theme): { x: numb
   return { x: x + theme.co.width / 2 - 3, y: y + theme.co.height / 2 - 1 };
 }
 
+/** How long a newly active cabinet's glow pulses before it settles. */
+export const GLOW_PULSE_MS = 4000;
+const GLOW_STEADY_ALPHA = 0.5;
+
 export class NetworkLayer {
   readonly below = new Container({ isRenderGroup: true });
   readonly above = new Container({ isRenderGroup: true });
@@ -34,7 +40,12 @@ export class NetworkLayer {
   private readonly markers = new Graphics();
   private readonly cabinets = new Graphics();
   private constructing: { line: Line; method: CableMethod }[] = [];
-  private glowing = false;
+  /** When each active cabinet was first seen active (performance.now ms), for this game. */
+  private activeSince = new Map<number, number>();
+  private game: GameState | null = null;
+  /** The glow pulses until this time; afterwards it is drawn steady once and left alone. */
+  private pulseUntil = -Infinity;
+  private glowSettled = true;
 
   constructor(private readonly theme: Theme) {
     this.stripeGroup.addChild(this.stripes);
@@ -43,8 +54,13 @@ export class NetworkLayer {
     this.above.addChild(this.glowGroup, this.cabinets);
   }
 
-  sync(state: GameState, service: ServiceSnapshot): void {
+  sync(state: GameState, service: ServiceSnapshot, now = performance.now()): void {
     const { city, network } = state;
+    if (state !== this.game) {
+      // Cabinet ids restart in another game.
+      this.game = state;
+      this.activeSince.clear();
+    }
     const theme = this.theme;
     const { cable } = theme;
     for (const g of [this.cables, this.markers, this.cabinets, this.glow]) g.clear();
@@ -91,15 +107,17 @@ export class NetworkLayer {
     for (const span of byStage.permitting) this.drawPermitBadge(midpoint(lineOf(span)), span.method);
     for (const span of byStage.constructing) this.drawCrewTruck(lineOf(span));
 
-    this.drawCabinets(city, state, service);
+    this.drawCabinets(city, state, service, now);
+    // Stripes for the new set of crews (or none, clearing finished ones).
+    this.animate(now);
   }
 
-  /** True while something on the map moves (construction stripes, cabinet glow). */
+  /** True while something on the map moves (construction stripes, a cabinet that just lit up). */
   get animating(): boolean {
-    return this.constructing.length > 0 || this.glowing;
+    return this.constructing.length > 0 || !this.glowSettled;
   }
 
-  /** Per-frame: march the construction stripes and pulse cabinet glows. */
+  /** Per-frame: march the construction stripes and pulse newly lit cabinet glows. */
   animate(ms: number): void {
     const { cable } = this.theme;
     const style = cable.constructing;
@@ -113,7 +131,14 @@ export class NetworkLayer {
       // Narrower than the tube so an orange rim frames each white stripe.
       if (dashes > 0) this.stripes.stroke({ width: cable[method].width - 2, color: style.stripe, cap: 'butt' });
     }
-    this.glow.alpha = 0.35 + 0.25 * Math.sin(ms / 420);
+    if (ms < this.pulseUntil) {
+      // Starts and ends at the steady alpha, so settling doesn't jump.
+      const t = (this.pulseUntil - ms) / GLOW_PULSE_MS;
+      this.glow.alpha = GLOW_STEADY_ALPHA + 0.3 * Math.sin(t * Math.PI * 3) * t;
+    } else {
+      this.glow.alpha = GLOW_STEADY_ALPHA;
+      this.glowSettled = true;
+    }
   }
 
   private drawPoles(points: { x: number; y: number }[]): void {
@@ -145,38 +170,41 @@ export class NetworkLayer {
     }
   }
 
-  /** Little orange crew truck parked mid-span, nose pointing along the street. */
+  /** Little orange crew truck parked beside the trench mid-span, nose along the street. */
   private drawCrewTruck(l: Line): void {
     const g = this.markers;
     const { constructing } = this.theme.cable;
-    const p = midpoint(l);
+    const mid = midpoint(l);
     const horizontal = Math.abs(l.bx - l.ax) >= Math.abs(l.by - l.ay);
-    const len = 15;
-    const wid = 8.5;
+    const len = 20;
+    const wid = 11;
+    // Parked alongside rather than on the orange tube, where it would vanish.
+    const off = this.theme.cable.underground.width / 2 + wid / 2 + 1;
+    const p = horizontal ? { x: mid.x, y: mid.y + off } : { x: mid.x + off, y: mid.y };
     const w = horizontal ? len : wid;
     const h = horizontal ? wid : len;
     const x = p.x - w / 2;
     const y = p.y - h / 2;
-    g.roundRect(x + 1, y + 2, w, h, 2.5).fill(this.theme.house.shadow);
+    g.roundRect(x + 1, y + 2.5, w, h, 3).fill(this.theme.house.shadow);
     // Wheels peek out at the corners.
     const wheels: [number, number][] = horizontal
-      ? [[x + 2, y - 1], [x + w - 5, y - 1], [x + 2, y + h - 2], [x + w - 5, y + h - 2]]
-      : [[x - 1, y + 2], [x + w - 2, y + 2], [x - 1, y + h - 5], [x + w - 2, y + h - 5]];
-    for (const [wx, wy] of wheels) g.rect(wx, wy, 3, 3);
+      ? [[x + 2.5, y - 1.5], [x + w - 6.5, y - 1.5], [x + 2.5, y + h - 2.5], [x + w - 6.5, y + h - 2.5]]
+      : [[x - 1.5, y + 2.5], [x + w - 2.5, y + 2.5], [x - 1.5, y + h - 6.5], [x + w - 2.5, y + h - 6.5]];
+    for (const [wx, wy] of wheels) g.rect(wx, wy, 4, 4);
     g.fill(constructing.crewWheel);
-    g.roundRect(x, y, w, h, 2.5).fill(constructing.crew);
-    const cab = horizontal ? { x: x + w - 5.5, y: y + 1.5, w: 4, h: h - 3 } : { x: x + 1.5, y: y + 1.5, w: w - 3, h: 4 };
-    g.roundRect(cab.x, cab.y, cab.w, cab.h, 1.2).fill(constructing.crewCab);
+    g.roundRect(x, y, w, h, 3).fill(constructing.crew).stroke({ width: 1.2, color: constructing.crewWheel, alignment: 1 });
+    const cab = horizontal ? { x: x + w - 7, y: y + 2, w: 5, h: h - 4 } : { x: x + 2, y: y + 2, w: w - 4, h: 5 };
+    g.roundRect(cab.x, cab.y, cab.w, cab.h, 1.5).fill(constructing.crewCab);
     // Cable drum on the bed.
     const drum = horizontal ? { x: x + w * 0.36, y: p.y } : { x: p.x, y: y + h * 0.64 };
-    g.circle(drum.x, drum.y, 2.3).fill(constructing.crewCab).stroke({ width: 1, color: constructing.crewWheel });
+    g.circle(drum.x, drum.y, 3).fill(constructing.crewCab).stroke({ width: 1.2, color: constructing.crewWheel });
   }
 
-  private drawCabinets(city: City, state: GameState, service: ServiceSnapshot): void {
+  private drawCabinets(city: City, state: GameState, service: ServiceSnapshot, now: number): void {
     const { cabinet } = this.theme;
     const g = this.cabinets;
     const s = cabinet.size;
-    this.glowing = false;
+    for (const id of [...this.activeSince.keys()]) if (!service.activeCabinets.has(id)) this.activeSince.delete(id);
     for (const cab of state.network.cabinets) {
       const { x: cx, y: cy } = cabinetCenter(city, cab.node, this.theme);
       const x = cx - s / 2;
@@ -189,7 +217,11 @@ export class NetworkLayer {
       g.circle(cx, cy, 3.4).fill(active ? cabinet.light : cabinet.dimLight);
       if (active) {
         this.glow.circle(cx, cy, s * 0.85).fill(cabinet.glow);
-        this.glowing = true;
+        if (!this.activeSince.has(cab.id)) {
+          this.activeSince.set(cab.id, now);
+          this.pulseUntil = now + GLOW_PULSE_MS;
+          this.glowSettled = false;
+        }
       }
     }
   }

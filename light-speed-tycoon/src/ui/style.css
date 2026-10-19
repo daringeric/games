@@ -230,11 +230,22 @@ body {
 }
 
 .hud-town {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   color: var(--text-2);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.02em;
   white-space: nowrap;
+}
+
+.hud-town::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .hud-date {
@@ -274,7 +285,7 @@ body {
 }
 
 .chip-building {
-  min-width: 206px;
+  min-width: 156px;
 }
 
 .chip-passings .icon {
