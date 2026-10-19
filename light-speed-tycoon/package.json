@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "description": "A fun-first city-builder/tycoon about building and running a fiber ISP.",
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
