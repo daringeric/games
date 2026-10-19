@@ -30,7 +30,7 @@ A fun-first city-builder/tycoon where you are a fiber builder and provider. The 
 | Goal | Sandbox with optional milestones; lose on bankruptcy or covenant breach |
 | Pacing | Real-time, 1 tick = 1 day, pause/1x/2x/4x, monthly close with P&L |
 | Platform | Browser, TypeScript + PixiJS |
-| Look | Clean top-down vector map (Mini Metro meets OSP/GIS), heat-map overlays |
+| Look | **Toy Town**: chunky, sunny top-down vector map with candy-tube fiber, heat-map overlays (chosen over the Lightwave and Field Print directions) |
 
 ## Network model
 
