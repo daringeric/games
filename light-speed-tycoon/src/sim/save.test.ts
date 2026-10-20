@@ -10,6 +10,7 @@ import {
   TIER_DEFAULTS,
   TIER_PRICE_MAX,
 } from './balance';
+import { newDebt } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
 import { deserialize, fnv1a, hashState, SaveError, serialize } from './save';
@@ -126,7 +127,9 @@ describe('serialize / deserialize', () => {
   it('upgrades a round-2 save from before installs had their own notices', () => {
     const state = playedGame();
     const save: Save = JSON.parse(serialize(state));
-    // The early round-2 shape: no flag, and install notices posted as cash warnings.
+    // The early round-2 shape: a v2 save (no debt) with no flag, and install notices posted as cash warnings.
+    save.schemaVersion = 2;
+    delete save.debt;
     delete save.sales.installsPaused;
     const at = save.nextNoticeId;
     save.notices.push(
@@ -145,6 +148,8 @@ describe('serialize / deserialize', () => {
 
     // With no install notices left in the log, installs are taken as running.
     const quiet: Save = JSON.parse(serialize(state));
+    quiet.schemaVersion = 2;
+    delete quiet.debt;
     delete quiet.sales.installsPaused;
     expect(deserialize(JSON.stringify(quiet)).sales).toEqual(state.sales);
   });
@@ -224,7 +229,7 @@ describe('deserialize errors', () => {
 
   it('rejects a missing or unsupported schemaVersion', () => {
     expectSaveError(corrupted((s) => delete s.schemaVersion), /no schemaVersion/);
-    expectSaveError(corrupted((s) => (s.schemaVersion = 3)), /Unsupported save version 3 /);
+    expectSaveError(corrupted((s) => (s.schemaVersion = 4)), /Unsupported save version 4 \(this build reads version 3\)/);
     expectSaveError(corrupted((s) => (s.schemaVersion = 0)), /Unsupported save version 0 /);
     expectSaveError(corrupted((s) => (s.schemaVersion = '1')), /Unsupported save version "1" /);
     expectSaveError(corrupted((s) => (s.schemaVersion = null)), /Unsupported save version null /);
@@ -426,13 +431,96 @@ describe('deserialize errors', () => {
     ['a missing notice milestone ref', (s) => delete s.notices[0].milestone, /notices\[0\]\.milestone should be one of/],
     ['zero nextNoticeId', (s) => (s.nextNoticeId = 0), /nextNoticeId should be an integer >= 1, got 0/],
     ['missing gameOver', (s) => delete s.gameOver, /gameOver should be an object, got nothing/],
-    ['gameOver for an unknown reason', (s) => (s.gameOver = { day: 1, reason: 'bored', message: 'x' }), /gameOver\.reason should be one of "insolvent", got "bored"/],
+    ['gameOver for an unknown reason', (s) => (s.gameOver = { day: 1, reason: 'bored', message: 'x' }), /gameOver\.reason should be one of "insolvent", "default", got "bored"/],
     ['gameOver in the future', (s) => (s.gameOver = { day: s.day + 1, reason: 'insolvent', message: 'x' }), /gameOver\.day should be an integer in 0\.\.\d+/],
     ['gameOver without a message', (s) => (s.gameOver = { day: 1, reason: 'insolvent' }), /gameOver\.message should be a string, got nothing/],
+    // Debt (schemaVersion 3)
+    ['missing debt', (s) => delete s.debt, /debt should be an object, got nothing/],
+    ['missing credit line', (s) => delete s.debt.credit, /debt\.credit should be an object, got nothing/],
+    ['negative credit balance', (s) => (s.debt.credit.balance = -1), /debt\.credit\.balance should be an integer in 0\.\.\d+, got -1/],
+    ['an absurd credit balance', (s) => (s.debt.credit.balance = 1e15), /debt\.credit\.balance should be an integer in 0\.\.1000000000000, got 1000000000000000/],
+    ['fractional base rate', (s) => (s.debt.credit.rate.baseBps = 5.5), /debt\.credit\.rate\.baseBps should be an integer in 0\.\.100000, got 5\.5/],
+    ['missing CPP spread', (s) => delete s.debt.credit.rate.cppBps, /debt\.credit\.rate\.cppBps should be an integer/],
+    ['negative dollar-days', (s) => (s.debt.credit.balanceDollarDays = -5), /debt\.credit\.balanceDollarDays should be an integer in 0\.\./],
+    ['zero nextLoanId', (s) => (s.debt.nextLoanId = 0), /debt\.nextLoanId should be an integer >= 1, got 0/],
+    ['loans not a list', (s) => (s.debt.loans = {}), /debt\.loans should be an array, got an object/],
+    ['an unknown covenant stage', (s) => (s.debt.covenant.stage = 'doomed'), /debt\.covenant\.stage should be one of "compliant", "warning", "penalty", "frozen", got "doomed"/],
+    ['negative compliant closes', (s) => (s.debt.covenant.compliantCloses = -1), /debt\.covenant\.compliantCloses should be an integer in 0\.\.1000, got -1/],
+    ['an unknown notice kind (round-3 kinds listed)', (s) => (s.notices[0].kind = 'loanShark'), /notices\[0\]\.kind should be one of .*"paymentMissed".*got "loanShark"/],
   ];
 
   it.each(cases)('rejects %s', (_name, mutate, message) => {
     expectSaveError(corrupted(mutate), message);
+  });
+
+  describe('term loans and report debt stats', () => {
+    /** The good save with two term loans and a closed month carrying debt stats. */
+    const withLoans = (mutate: (save: Save) => void = () => {}): string =>
+      corrupted((s) => {
+        s.debt.credit.balance = 12_000;
+        s.debt.credit.balanceDollarDays = 12_000 * 3;
+        s.debt.loans = [
+          { id: 1, principal: 50_000, balance: 41_200, rateBps: 725, termMonths: 60, payment: 996, monthsLeft: 50, originatedDay: 0 },
+          { id: 3, principal: 20_000, balance: 20_000, rateBps: 800, termMonths: 84, payment: 312, monthsLeft: 84, originatedDay: s.day },
+        ];
+        s.debt.nextLoanId = 4;
+        s.debt.covenant = { stage: 'penalty', compliantCloses: 1 };
+        s.finance.reports[0].debt = {
+          creditBalance: 12_000,
+          termBalance: 61_200,
+          creditLimit: 20_000,
+          arr: 40_000,
+          annualOperatingCashFlow: -15_000,
+          annualDebtService: 16_000,
+          leverageX100: 732,
+          coverageX100: -94,
+          stage: 'penalty',
+          averageRateBps: 1_060,
+          missedPayment: false,
+        };
+        s.finance.monthToDate.push(
+          { day: s.day, category: 'loanProceeds', amount: 20_000, memo: 'Term loan #3' },
+          { day: s.day, category: 'principal', amount: -1_000, memo: 'Credit line repayment' },
+        );
+        s.finance.cash += 19_000;
+        mutate(s);
+      });
+
+    it('loads and round-trips loans, a drawn line, a covenant stage and report debt stats', () => {
+      const state = deserialize(withLoans());
+      expect(state.debt.loans.map((l) => l.id)).toEqual([1, 3]);
+      expect(state.debt.covenant.stage).toBe('penalty');
+      expect(state.finance.reports[0]?.debt?.leverageX100).toBe(732);
+      expect(deserialize(serialize(state))).toEqual(state);
+      // Unmeasurable leverage and no scheduled debt service are nulls, not missing.
+      const nulls = deserialize(
+        withLoans((s) => Object.assign(s.finance.reports[0].debt, { leverageX100: null, coverageX100: null, averageRateBps: null })),
+      );
+      expect(nulls.finance.reports[0]?.debt?.coverageX100).toBeNull();
+    });
+
+    const loanCases: Array<[string, (save: Save) => void, RegExp]> = [
+      ['a loan id not below nextLoanId', (s) => (s.debt.loans[1].id = 4), /debt\.loans\[1\]\.id should be an integer in 1\.\.3, got 4/],
+      ['loans out of order', (s) => (s.debt.loans[1].id = 1), /debt\.loans \(by id\)\[1\] should be greater than the entry before it \(1\), got 1/],
+      ['a paid-off loan left in the list', (s) => (s.debt.loans[0].balance = 0), /debt\.loans\[0\]\.balance should be an integer in 1\.\./],
+      ['a zero principal', (s) => (s.debt.loans[0].principal = 0), /debt\.loans\[0\]\.principal should be an integer in 1\.\./],
+      ['an absurd rate', (s) => (s.debt.loans[0].rateBps = 1e6), /debt\.loans\[0\]\.rateBps should be an integer in 0\.\.100000/],
+      ['a zero payment', (s) => (s.debt.loans[0].payment = 0), /debt\.loans\[0\]\.payment should be an integer in 1\.\./],
+      ['more months left than the term', (s) => (s.debt.loans[0].monthsLeft = 61), /debt\.loans\[0\]\.monthsLeft should be an integer in 1\.\.60, got 61/],
+      ['no months left', (s) => (s.debt.loans[0].monthsLeft = 0), /debt\.loans\[0\]\.monthsLeft should be an integer in 1\.\.60, got 0/],
+      ['a century-long term', (s) => (s.debt.loans[0].termMonths = 5_000), /debt\.loans\[0\]\.termMonths should be an integer in 1\.\.1200/],
+      ['a loan from the future', (s) => (s.debt.loans[1].originatedDay = s.day + 1), /debt\.loans\[1\]\.originatedDay should be an integer in 0\.\.\d+/],
+      ['report debt with a fractional leverage', (s) => (s.finance.reports[0].debt.leverageX100 = 7.3), /finance\.reports\[0\]\.debt\.leverageX100 should be an integer >= 0, got 7\.3/],
+      ['report debt missing its coverage', (s) => delete s.finance.reports[0].debt.coverageX100, /finance\.reports\[0\]\.debt\.coverageX100 should be an integer, got nothing/],
+      ['report debt with an unknown stage', (s) => (s.finance.reports[0].debt.stage = 'broke'), /finance\.reports\[0\]\.debt\.stage should be one of/],
+      ['report debt with a string missed flag', (s) => (s.finance.reports[0].debt.missedPayment = 'no'), /finance\.reports\[0\]\.debt\.missedPayment should be true or false, got "no"/],
+      ['report debt with negative debt', (s) => (s.finance.reports[0].debt.termBalance = -1), /finance\.reports\[0\]\.debt\.termBalance should be an integer >= 0, got -1/],
+      ['an unknown ledger category', (s) => (s.finance.monthToDate.at(-1).category = 'bailout'), /finance\.monthToDate\[\d+\]\.category should be one of .*"loanProceeds".*got "bailout"/],
+    ];
+
+    it.each(loanCases)('rejects %s', (_name, mutate, message) => {
+      expectSaveError(withLoans(mutate), message);
+    });
   });
 
   it('covers a save with every round-2 record present', () => {
@@ -527,7 +615,7 @@ describe('schemaVersion 1 saves', () => {
     const v1: Save = JSON.parse(text);
     expect(v1.schemaVersion).toBe(1);
     const state = deserialize(text);
-    expect(state.schemaVersion).toBe(2);
+    expect(state.schemaVersion).toBe(3);
 
     // The town, plant, money and history are the player's own.
     expect(state.city).toEqual(v1.city);
@@ -558,8 +646,10 @@ describe('schemaVersion 1 saves', () => {
     expect(state.notices).toEqual([]);
     expect(state.nextNoticeId).toBe(1);
     expect(state.gameOver).toBeNull();
+    // ...and on through v2 to v3: nothing borrowed.
+    expect(state.debt).toEqual(newDebt());
 
-    // Service is unchanged by the migration, and the migrated game saves as v2.
+    // Service is unchanged by the migration, and the migrated game saves as v3.
     const again = deserialize(serialize(state));
     expect(again).toEqual(state);
     expect(getService(again).passings).toBe(getService(state).passings);
@@ -618,5 +708,85 @@ describe('schemaVersion 1 saves under the round-2 cabinet reach', () => {
 
   it.each(['v1-grid', 'v1-town'] as const)('says nothing when the frozen %s save keeps all its passings', (name) => {
     expect(deserialize(v1Fixture(name)).notices).toEqual([]);
+  });
+});
+
+/**
+ * Saves written by the round-2 (schemaVersion 2) build, frozen before round 3
+ * changed GameState: v2-grid is a hand-played Gridville (seed 7, mixed lots,
+ * day 357: live and permitting cable, two cabinets, a splitter, subscribers
+ * on homes, businesses and apartment buildings); v2-town is the SMART bot on
+ * the seed-2027 town for 20 months plus 11 days (mid-month, ~200 subscribers,
+ * four milestones).
+ */
+function v2Fixture(name: 'v2-grid' | 'v2-town'): string {
+  return readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8');
+}
+
+describe('schemaVersion 2 saves', () => {
+  it.each(['v2-grid', 'v2-town'] as const)('migrates the frozen %s save with no debt and keeps everything else', (name) => {
+    const text = v2Fixture(name);
+    const v2: Save = JSON.parse(text);
+    expect(v2.schemaVersion).toBe(2);
+    expect(v2.debt).toBeUndefined();
+    // A real mid-game save: subscribers, closed months with stats, an open month.
+    expect(v2.sales.accounts.length).toBeGreaterThan(0);
+    expect(v2.finance.reports.length).toBeGreaterThan(6);
+    expect(v2.finance.reports.every((r: Save) => r.stats !== undefined)).toBe(true);
+    expect(v2.finance.monthToDate.length).toBeGreaterThan(0);
+
+    const state = deserialize(text);
+    expect(state.schemaVersion).toBe(3);
+    expect(state.debt).toEqual(newDebt());
+    const { schemaVersion: _from, ...kept } = v2;
+    const { schemaVersion: _to, debt: _debt, ...rest } = state;
+    expect(rest).toEqual(kept);
+    expect(state.finance.reports.every((r) => r.debt === undefined)).toBe(true);
+    // Nothing to explain: the rules that changed in round 3 do not take anything away.
+    expect(state.notices).toEqual(v2.notices);
+
+    // Same key order as a fresh game, so a migrated game hashes like a fresh one.
+    expect(Object.keys(state)).toEqual(Object.keys(newGame(state.seed, { city: state.city })));
+    expect(deserialize(serialize(state))).toEqual(state);
+  });
+
+  it.each(['v2-grid', 'v2-town'] as const)('keeps playing the frozen %s save through month closes', (name) => {
+    const state = deserialize(v2Fixture(name));
+    const passings = getService(state).passings;
+    const reports = state.finance.reports.length;
+    const subscribers = subscriberUnits(state);
+    expect(passings).toBeGreaterThan(0);
+    expect(subscribers).toBeGreaterThan(0);
+    runDays(state, 62);
+    expect(state.gameOver).toBeNull();
+    expect(state.finance.reports.length).toBe(reports + 2);
+    expect(state.finance.reports.at(-1)?.stats?.subscribers).toBeGreaterThan(0);
+    expect(getService(state).passings).toBeGreaterThanOrEqual(passings);
+    expect(deserialize(serialize(state))).toEqual(state);
+  });
+
+  it('plays a migrated v2 game exactly like the same game loaded twice', () => {
+    const a = deserialize(v2Fixture('v2-grid'));
+    const b = deserialize(v2Fixture('v2-grid'));
+    for (const state of [a, b]) {
+      applyCommand(state, { type: 'layCable', segments: [6, 7], method: 'aerial' });
+      runDays(state, 45);
+    }
+    expect(hashState(a)).toBe(hashState(b));
+  });
+
+  it('validates a v2 save as v2 before migrating it, naming the bad field', () => {
+    const bad = (mutate: (save: Save) => void): string => {
+      const save: Save = JSON.parse(v2Fixture('v2-grid'));
+      mutate(save);
+      return JSON.stringify(save);
+    };
+    expectSaveError(bad((s) => (s.network.spans[0].segment = 999)), /network\.spans\[0\]\.segment should be an integer in 0\.\.16, got 999/);
+    // Round-3 records cannot appear in a round-2 save.
+    expectSaveError(bad((s) => (s.notices[0].kind = 'paymentMissed')), /notices\[0\]\.kind should be one of .*got "paymentMissed"/);
+    expectSaveError(bad((s) => (s.finance.monthToDate[0].category = 'loanProceeds')), /finance\.monthToDate\[0\]\.category should be one of .*got "loanProceeds"/);
+    expectSaveError(bad((s) => (s.gameOver = { day: 1, reason: 'default', message: 'x' })), /gameOver\.reason should be one of "insolvent", got "default"/);
+    // A stray debt object in a v2 save is replaced by the migration, not trusted.
+    expect(deserialize(bad((s) => (s.debt = { junk: true }))).debt).toEqual(newDebt());
   });
 });

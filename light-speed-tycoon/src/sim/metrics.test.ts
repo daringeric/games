@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CPP_AMBER_MULTIPLIER, CPP_TARGET } from './balance';
-import { CAPEX_CATEGORIES, cppBand, operatingCashFlow, reportKpis } from './metrics';
+import { CAPEX_CATEGORIES, cppBand, FINANCING_CATEGORIES, operatingCashFlow, reportKpis } from './metrics';
 import type { MonthlyReport, MonthlyStats } from './types';
 
 function stats(overrides: Partial<MonthlyStats> = {}): MonthlyStats {
@@ -64,6 +64,16 @@ describe('operatingCashFlow', () => {
 
   it('covers exactly construction, equipment, install and refund', () => {
     expect([...CAPEX_CATEGORIES].sort()).toEqual(['construction', 'equipment', 'install', 'refund']);
+  });
+
+  it('leaves out financing too: interest, principal and money borrowed (round 3)', () => {
+    expect([...FINANCING_CATEGORIES].sort()).toEqual(['interest', 'loanProceeds', 'principal']);
+    const plain = report();
+    const totals = { ...plain.totals, interest: -1_200, principal: -3_000, loanProceeds: 50_000 };
+    const net = Object.values(totals).reduce((a, b) => a + (b ?? 0), 0);
+    const levered = report({ totals, net });
+    expect(levered.net).toBe(plain.net - 1_200 - 3_000 + 50_000);
+    expect(operatingCashFlow(levered)).toBe(operatingCashFlow(plain));
   });
 
   it('works on reports without stats (migrated from v1) and empty months', () => {

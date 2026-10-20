@@ -22,8 +22,12 @@ export function noticeTone(notice: Notice): ToastTone {
   switch (notice.kind) {
     case 'milestone':
     case 'installsResumed':
+    case 'covenantCured':
+    case 'loanPaidOff':
       return 'ok';
     case 'gameOver':
+    case 'paymentMissed':
+    case 'creditFrozen':
       return 'err';
     case 'insolvencyWarning':
     case 'installsPaused':
@@ -31,6 +35,9 @@ export function noticeTone(notice: Notice): ToastTone {
     case 'serviceLost':
     case 'oltFull':
     case 'rulesUpdated':
+    case 'paymentDue':
+    case 'covenantWarning':
+    case 'covenantPenalty':
       return 'warn';
   }
 }

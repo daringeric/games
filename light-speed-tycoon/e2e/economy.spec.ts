@@ -268,7 +268,7 @@ test('a schemaVersion 1 save imports and migrates', async ({ page }) => {
   await (await chooser).setFiles(file);
   await page.getByRole('dialog').getByRole('button', { name: 'Open imported game' }).click();
   await expect.poll(toasts).toContainEqual(toast('ok', `Imported ${v1.city.name}`));
-  expect(await page.evaluate(() => window.__lst!.getState().schemaVersion)).toBe(2);
+  expect(await page.evaluate(() => window.__lst!.getState().schemaVersion)).toBe(3);
   await expect(page.locator('.hud-town')).toHaveText(v1.city.name);
   // Its reports predate subscribers: their KPIs read "–".
   const panel = page.getByRole('region', { name: 'Monthly report' });

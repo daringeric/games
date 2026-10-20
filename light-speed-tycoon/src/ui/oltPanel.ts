@@ -1,7 +1,8 @@
 // The OLT panel, opened by clicking the central office with the inspect tool:
 // PON ports in use, line cards, splitters per cabinet, and the button that
-// buys another line card (addOltCard). A non-modal dialog: the map keeps
-// running behind it, Esc (routed by MapControls) or the close button shuts it.
+// buys another line card (addOltCard), with the cash it would leave (and the
+// credit line when cash is short). A non-modal dialog: the map keeps running
+// behind it, Esc (routed by MapControls) or the close button shuts it.
 
 import { OLT_MAX_CARDS, OLT_PORTS_PER_CARD, SPLIT_RATIO } from '../sim/balance';
 import { ponPortsUsed, quoteOltCard } from '../sim/network';
@@ -9,7 +10,7 @@ import type { Command, CommandResult, GameState } from '../sim/types';
 import { el, icon, setText } from './dom';
 import { formatMoney, formatNumber, formatStage, plural } from './format';
 import { ICONS } from './icons';
-import { cornerLabel } from './tools';
+import { cashAfterRow, cornerLabel, creditHint, fundsOf } from './tools';
 
 export interface OltPanelDeps {
   /** The game in play when the button is pressed. */
@@ -33,6 +34,8 @@ export class OltPanel {
   private readonly button: HTMLButtonElement;
   private readonly buttonDetail: HTMLElement;
   private readonly blockers: HTMLUListElement;
+  private readonly cashAfter: HTMLElement;
+  private readonly credit: HTMLElement;
   private key = '';
   private listKey = '';
   private blockersKey = '';
@@ -78,7 +81,10 @@ export class OltPanel {
       [el('span', { class: 'olt-add-label', text: 'Add line card' }), this.buttonDetail],
     );
     this.blockers = el('ul', { class: 'blockers' });
-    const body = el('div', { class: 'olt-body' }, [this.meter, summary, this.sub, this.empty, this.list, this.button, this.blockers]);
+    this.cashAfter = el('span', { class: 'num', attrs: { 'data-testid': 'olt-cash-after' } });
+    const cashAfter = el('p', { class: 'olt-cash-after' }, [el('span', { text: 'Cash after ' }), this.cashAfter]);
+    this.credit = el('p', { class: 'card-credit', attrs: { 'data-testid': 'olt-credit', hidden: '' } });
+    const body = el('div', { class: 'olt-body' }, [this.meter, summary, this.sub, this.empty, this.list, this.button, cashAfter, this.credit, this.blockers]);
     this.root = el(
       'section',
       {
@@ -115,7 +121,16 @@ export class OltPanel {
     if (!this.isOpen) return;
     const { olt } = state.network;
     // The day too: cabinet stages count down their days.
-    const key = [state.network.version, state.day, olt.ponPorts, olt.cards, state.finance.cash, state.gameOver ? 1 : 0].join('|');
+    const key = [
+      state.network.version,
+      state.day,
+      olt.ponPorts,
+      olt.cards,
+      state.finance.cash,
+      state.debt.credit.balance,
+      state.debt.covenant.stage,
+      state.gameOver ? 1 : 0,
+    ].join('|');
     if (!force && state === this.game && key === this.key) return;
     this.game = state;
     this.key = key;
@@ -158,6 +173,13 @@ export class OltPanel {
     }
 
     setText(this.buttonDetail, `${formatMoney(quote.cost)} · ${plural(quote.ponPortsAfter, 'PON port')} after`);
+    const funds = fundsOf(state);
+    const after = cashAfterRow(funds, quote.cost);
+    setText(this.cashAfter, after.value);
+    this.cashAfter.classList.toggle('negative', after.tone === 'negative');
+    const credit = creditHint(funds, quote.cost) ?? '';
+    setText(this.credit, credit);
+    this.credit.hidden = credit === '';
     if (this.button.disabled !== !quote.ok) this.button.disabled = !quote.ok;
     this.blockers.hidden = quote.ok;
     const blockersKey = quote.reasons.join('\n');

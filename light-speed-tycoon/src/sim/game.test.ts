@@ -19,6 +19,7 @@ import {
 } from './balance';
 import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
+import { newDebt } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng, withRng } from './rng';
@@ -46,7 +47,7 @@ describe('newGame', () => {
     const city = makeGridCity();
     const state = newGame(42, { city });
     expect(state).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       seed: 42,
       day: 0,
       rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales') },
@@ -60,6 +61,7 @@ describe('newGame', () => {
         version: 0,
       },
       finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
+      debt: newDebt(),
       sales: newSales(),
       milestones: [],
       notices: [],

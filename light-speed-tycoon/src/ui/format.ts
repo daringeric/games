@@ -74,3 +74,26 @@ export function formatPercent(fraction: number): string {
 export function formatMaybeMoney(amount: number | null): string {
   return amount === null ? '–' : formatMoney(amount);
 }
+
+/** An annual rate in basis points: 725 -> "7.25%". */
+export function formatRate(bps: number): string {
+  const rounded = Math.round(bps);
+  const sign = rounded < 0 ? '-' : '';
+  const abs = Math.abs(rounded);
+  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}%`;
+}
+
+/** A spread in basis points with an explicit sign: 150 -> "+1.50%", -25 -> "-0.25%", 0 -> "+0.00%". */
+export function formatBpsDelta(bps: number): string {
+  const text = formatRate(bps);
+  return text.startsWith('-') ? text : `+${text}`;
+}
+
+/** A multiple such as leverage or coverage: 4.123 -> "4.12×"; null (not measurable) -> "–". */
+export function formatRatio(x: number | null): string {
+  if (x === null || !Number.isFinite(x)) return '–';
+  const hundredths = Math.round(x * 100);
+  const sign = hundredths < 0 ? '-' : '';
+  const abs = Math.abs(hundredths);
+  return `${sign}${formatNumber(Math.floor(abs / 100))}.${String(abs % 100).padStart(2, '0')}×`;
+}

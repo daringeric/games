@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { formatDayRange, formatMaybeMoney, formatMoney, formatPercent, formatPerFt, formatSignedMoney, formatStage, plural } from './format';
+import {
+  formatBpsDelta,
+  formatDayRange,
+  formatMaybeMoney,
+  formatMoney,
+  formatPercent,
+  formatPerFt,
+  formatRate,
+  formatRatio,
+  formatSignedMoney,
+  formatStage,
+  plural,
+} from './format';
 
 describe('format', () => {
   it('formats whole dollars with separators and a leading minus', () => {
@@ -32,5 +44,27 @@ describe('format', () => {
     expect(formatPercent(0)).toBe('0%');
     expect(formatMaybeMoney(520.4)).toBe('$520');
     expect(formatMaybeMoney(null)).toBe('–');
+  });
+
+  it('formats interest rates and spreads from basis points', () => {
+    expect(formatRate(725)).toBe('7.25%');
+    expect(formatRate(500)).toBe('5.00%');
+    expect(formatRate(5)).toBe('0.05%');
+    expect(formatRate(0)).toBe('0.00%');
+    expect(formatRate(1250)).toBe('12.50%');
+    expect(formatBpsDelta(150)).toBe('+1.50%');
+    expect(formatBpsDelta(0)).toBe('+0.00%');
+    expect(formatBpsDelta(-25)).toBe('-0.25%');
+  });
+
+  it('formats leverage and coverage multiples, with an en dash when not measurable', () => {
+    expect(formatRatio(4.123)).toBe('4.12×');
+    expect(formatRatio(5)).toBe('5.00×');
+    expect(formatRatio(1.2)).toBe('1.20×');
+    expect(formatRatio(0)).toBe('0.00×');
+    expect(formatRatio(-0.456)).toBe('-0.46×');
+    expect(formatRatio(1234.5)).toBe('1,234.50×');
+    expect(formatRatio(null)).toBe('–');
+    expect(formatRatio(Number.POSITIVE_INFINITY)).toBe('–');
   });
 });

@@ -33,6 +33,14 @@ export function costPerPassing(capexOsp: number, passings: number): number | nul
 /** Ledger categories that are capital spend (or its refunds) rather than operating cash flow. */
 export const CAPEX_CATEGORIES: readonly LedgerCategory[] = ['construction', 'equipment', 'install', 'refund'];
 
+/**
+ * Ledger categories that are financing rather than operating cash flow:
+ * interest (and late fees), principal repaid, and money borrowed. Operating
+ * cash flow excludes them (it is what the lender measures leverage and
+ * coverage against); net cash flow (report.net) includes them.
+ */
+export const FINANCING_CATEGORIES: readonly LedgerCategory[] = ['interest', 'principal', 'loanProceeds'];
+
 /** KPIs derived from one closed month. Ratios are plain fractions; money is unrounded dollars. */
 export interface ReportKpis {
   /** totals.revenue ?? 0. */
@@ -57,15 +65,18 @@ export interface ReportKpis {
 }
 
 /**
- * Net cash flow excluding capital spend: report.net minus the totals of
- * CAPEX_CATEGORIES (i.e. revenue - overhead - pole rent - marketing - payroll
- * - interest - other). This is the "cash-flow positive" of the milestone and
- * the tuning targets. Works on v1-migrated reports too (they have totals).
+ * Net cash flow excluding capital spend and financing: report.net minus the
+ * totals of CAPEX_CATEGORIES and FINANCING_CATEGORIES (i.e. revenue -
+ * overhead - pole rent - marketing - payroll - other; before interest, like
+ * EBITDA). This is the "cash-flow positive" of the milestone and the tuning
+ * targets, and the cash flow covenants are measured on. Works on v1-migrated
+ * reports too (they have totals).
  */
 export function operatingCashFlow(report: MonthlyReport): number {
-  let capex = 0;
-  for (const category of CAPEX_CATEGORIES) capex += report.totals[category] ?? 0;
-  return report.net - capex;
+  let excluded = 0;
+  for (const category of CAPEX_CATEGORIES) excluded += report.totals[category] ?? 0;
+  for (const category of FINANCING_CATEGORIES) excluded += report.totals[category] ?? 0;
+  return report.net - excluded;
 }
 
 /**

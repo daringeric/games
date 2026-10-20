@@ -1,15 +1,17 @@
-// Report panel: the last closed month (net, revenue, subscribers and the
-// scorecard KPIs) and this month's spending so far. On phones and short
-// screens it starts collapsed to three headline figures; "Details" opens the rest.
+// Report panel: the last closed month (net, revenue, subscribers, the
+// scorecard KPIs and, from round 3, financing: interest, principal, money
+// borrowed, debt, leverage and coverage) and this month's spending so far. On
+// phones and short screens it starts collapsed to three headline figures;
+// "Details" opens the rest.
 //
-// Owner: ui-economy workstream.
+// Owner: ui-economy workstream; financing rows: ui-bank workstream.
 
-import { CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
+import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatMonth } from '../sim/calendar';
 import { operatingCashFlow, reportKpis } from '../sim/metrics';
 import type { CppBand, GameState, MonthlyReport } from '../sim/types';
 import { el, setText } from './dom';
-import { formatMaybeMoney, formatMoney, formatNumber, formatPercent, formatSignedMoney, plural } from './format';
+import { formatMaybeMoney, formatMoney, formatNumber, formatPercent, formatRatio, formatSignedMoney, plural } from './format';
 
 export type ReportRowKey =
   | 'net'
@@ -22,15 +24,21 @@ export type ReportRowKey =
   | 'costPerConnection'
   | 'operatingCashFlow'
   | 'poleRent'
-  | 'passings';
+  | 'passings'
+  | 'interest'
+  | 'principal'
+  | 'proceeds'
+  | 'debt'
+  | 'leverage'
+  | 'coverage';
 
 export interface ReportRow {
   key: ReportRowKey;
   label: string;
-  /** Display value; '–' when the KPI is undefined (no subscribers, no passings, a report from a v1 save). */
+  /** Display value; '–' when the KPI is undefined (no subscribers, no passings, a report from a v1 or v2 save). */
   value: string;
-  /** Coloring: a negative amount, or the cost-per-passing band. */
-  tone: 'negative' | CppBand | null;
+  /** Coloring: a negative amount, the cost-per-passing band, or a covenant breach. */
+  tone: 'negative' | CppBand | 'breach' | null;
   /** Secondary line, e.g. the subscriber movements of the month. */
   detail: string | null;
   /** Longer explanation for a tooltip. */
@@ -65,7 +73,7 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       value: formatSignedMoney(report.net),
       tone: report.net < 0 ? 'negative' : null,
       detail: null,
-      hint: 'Net cash flow: everything in and out this month, building and installs included',
+      hint: 'Net cash flow: everything in and out this month, building, installs and financing included',
     },
     {
       key: 'revenue',
@@ -129,7 +137,7 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       value: formatSignedMoney(flow),
       tone: flow < 0 ? 'negative' : null,
       detail: null,
-      hint: 'Revenue minus running costs, before building and installs',
+      hint: 'Revenue minus running costs, before building, installs and financing',
     },
     {
       key: 'poleRent',
@@ -147,14 +155,84 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       detail: null,
       hint: 'Homes and businesses your lit network passes',
     },
+    ...financingRows(report),
   ];
 }
 
-/** "Mar 2027 closed: net +$1,200, 412 subs, 1,034 passings" (no subscriber count for a report without stats). */
+/**
+ * The month's financing: interest, principal repaid and money borrowed (from
+ * totals), and debt, leverage and coverage at month end (report.debt). A
+ * report from before round 3 (no `debt`) reads '–' throughout.
+ */
+export function financingRows(report: MonthlyReport): ReportRow[] {
+  const debt = report.debt ?? null;
+  const spent = (amount: number | undefined) => (debt ? formatMoney(0 - (amount ?? 0)) : DASH);
+  const leverage = debt?.leverageX100;
+  const coverage = debt?.coverageX100;
+  const leverageBreach = debt !== null && (leverage === null ? debt.creditBalance + debt.termBalance > 0 : (leverage ?? 0) > COVENANT_MAX_LEVERAGE * 100);
+  const coverageBreach = debt !== null && coverage != null && coverage < COVENANT_MIN_COVERAGE * 100;
+  return [
+    {
+      key: 'interest',
+      label: 'Interest',
+      value: spent(report.totals.interest),
+      tone: null,
+      detail: null,
+      hint: 'Interest on the credit line and term loans, accrued interest on prepayments, and any late fee',
+    },
+    {
+      key: 'principal',
+      label: 'Principal repaid',
+      value: spent(report.totals.principal),
+      tone: null,
+      detail: null,
+      hint: 'Credit-line repayments, scheduled term-loan principal and prepayments',
+    },
+    {
+      key: 'proceeds',
+      label: 'Borrowed',
+      value: debt ? formatMoney(report.totals.loanProceeds ?? 0) : DASH,
+      tone: null,
+      detail: null,
+      hint: 'Credit-line draws and new term loans this month',
+    },
+    {
+      key: 'debt',
+      label: 'Debt at month end',
+      value: debt ? formatMoney(debt.creditBalance + debt.termBalance) : DASH,
+      tone: null,
+      detail: null,
+      hint: 'Credit-line balance plus every term loan still owed, after this close’s payments',
+    },
+    {
+      key: 'leverage',
+      label: 'Leverage',
+      value: !debt || leverage === undefined ? DASH : leverage === null ? 'not measurable' : formatRatio(leverage / 100),
+      tone: leverageBreach ? 'breach' : null,
+      detail: debt ? `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}` : null,
+      hint: `Debt over the cash flow the bank counts (yearly operating cash flow, or a share of recurring revenue if that is more). The covenant allows at most ${formatRatio(COVENANT_MAX_LEVERAGE)}`,
+    },
+    {
+      key: 'coverage',
+      label: 'Coverage',
+      value: !debt || coverage == null ? DASH : formatRatio(coverage / 100),
+      tone: coverageBreach ? 'breach' : null,
+      detail: debt ? `min ${formatRatio(COVENANT_MIN_COVERAGE)}` : null,
+      hint: `The cash flow the bank counts over the next 12 months of debt service. The covenant asks for at least ${formatRatio(COVENANT_MIN_COVERAGE)}`,
+    },
+  ];
+}
+
+/**
+ * "Mar 2027 closed: net +$1,200, 412 subs, 1,034 passings" (no subscriber
+ * count for a report without stats; ", payment missed" when the close could
+ * not pay its debt service).
+ */
 export function monthClosedMessage(report: MonthlyReport): string {
   const parts = [`net ${formatSignedMoney(report.net)}`];
   if (report.stats) parts.push(plural(report.stats.subscribers, 'sub'));
   parts.push(plural(report.passings, 'passing'));
+  if (report.debt?.missedPayment) parts.push('payment missed');
   return `${formatMonth(report.year, report.month)} closed: ${parts.join(', ')}`;
 }
 
@@ -176,7 +254,7 @@ interface RowView {
 }
 
 /** Rows whose secondary line sits right after the value rather than on a row of its own. */
-const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp'];
+const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage'];
 
 export class ReportPanel {
   readonly root: HTMLElement;
@@ -273,6 +351,7 @@ export class ReportPanel {
         if (!view) continue;
         setText(view.value, row.value);
         view.value.classList.toggle('negative', row.tone === 'negative');
+        view.value.classList.toggle('breach', row.tone === 'breach');
         for (const band of ['green', 'amber', 'red'] as const) view.value.classList.toggle(`cpp-${band}`, row.tone === band);
         if (view.detail) setText(view.detail, row.detail ?? '–');
         if (view.inline) {

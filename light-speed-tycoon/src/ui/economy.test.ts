@@ -1,6 +1,7 @@
-// Pure models behind the economy UI: report rows, the month-close toast, the
-// pricing preview, milestone progress, the rate card, HUD chips, notice tones
-// and the debug-hook gate. Money is checked against balance.ts constants and
+// Pure models behind the economy UI: report rows (financing included), the
+// month-close toast, the pricing preview, milestone progress, the rate card,
+// HUD chips (debt and covenant included), notice tones, the game-over
+// subtitle and the debug-hook gate. Money is checked against balance.ts constants and
 // sim results, never literal dollar amounts.
 
 import { describe, expect, it } from 'vitest';
@@ -34,6 +35,17 @@ import {
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
   AERIAL_COST_PER_FT,
   CABINET_REACH_FT,
+  BASE_RATE_BPS,
+  COVENANT_CURE_CLOSES,
+  COVENANT_MAX_LEVERAGE,
+  COVENANT_MIN_COVERAGE,
+  CPP_SPREAD_BPS,
+  CREDIT_LINE_EXTRA_BPS,
+  LEVERAGE_SPREAD_BANDS,
+  LEVERAGE_SPREAD_MAX_BPS,
+  PENALTY_STEP_UP_BPS,
+  TERM_EXTRA_BPS,
+  TERM_LOAN_YEARS,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { applyCommand, newGame, runDays } from '../sim/game';
@@ -42,13 +54,14 @@ import { getService } from '../sim/network';
 import { MILESTONES } from '../sim/milestones';
 import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, defaultPricing, marketingBoost, targetTakeRate, tierMix, unitPrice } from '../sim/sales';
 import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
-import type { GameState, MonthlyReport, Notice, NoticeKind, TierSetting } from '../sim/types';
+import type { DebtStats, GameState, MonthlyReport, Notice, NoticeKind, TermLoan, TierSetting } from '../sim/types';
 import { debugHookEnabled, searchWithoutSeed } from './debugHook';
-import { formatFeet, formatMoney, formatPerFt, formatPercent, formatSignedMoney, plural } from './format';
-import { cppStatus, overdraftStatus, ponStatus, runwayHint } from './hud';
+import { formatBpsDelta, formatFeet, formatMoney, formatPerFt, formatPercent, formatRate, formatRatio, formatSignedMoney, plural } from './format';
+import { gameOverSubtitle } from './gameOverDialog';
+import { covenantStatus, cppStatus, debtStatus, overdraftStatus, ponStatus, runwayHint } from './hud';
 import { milestoneRows } from './milestonesPanel';
 import { noticeTone, toastLayout } from './overlays';
-import { monthClosedMessage, reportRows, subscriberMovements } from './panel';
+import { financingRows, monthClosedMessage, reportRows, subscriberMovements } from './panel';
 import type { ReportRow } from './panel';
 import { boostHint, draftFrom, incumbentOffer, parseNumberField, pricingPreview } from './pricingPanel';
 import type { PricingDraft } from './pricingPanel';
@@ -87,6 +100,12 @@ describe('report rows', () => {
       'operatingCashFlow',
       'poleRent',
       'passings',
+      'interest',
+      'principal',
+      'proceeds',
+      'debt',
+      'leverage',
+      'coverage',
     ]);
     expect(row(rows, 'net').value).toBe(formatSignedMoney(report.net));
     expect(row(rows, 'revenue').value).toBe(formatMoney(kpis.revenue));
@@ -161,6 +180,67 @@ describe('report rows', () => {
     expect(row(rows, 'operatingCashFlow').value).toBe(formatSignedMoney(operatingCashFlow(v1)));
     expect(row(rows, 'poleRent').value).toBe(formatMoney(20));
     expect(row(rows, 'passings').value).toBe('12');
+    for (const key of ['interest', 'principal', 'proceeds', 'debt', 'leverage', 'coverage'] as const) expect(row(rows, key).value).toBe('–');
+  });
+});
+
+describe('financing report rows', () => {
+  const debt = (over: Partial<DebtStats> = {}): DebtStats => ({
+    creditBalance: 12_000,
+    termBalance: 400_000,
+    creditLimit: 50_000,
+    arr: 100_000,
+    annualOperatingCashFlow: 90_000,
+    annualDebtService: 60_000,
+    leverageX100: 458,
+    coverageX100: 150,
+    stage: 'compliant',
+    averageRateBps: 725,
+    missedPayment: false,
+    ...over,
+  });
+  const report = (d: DebtStats | undefined, totals: MonthlyReport['totals'] = {}): MonthlyReport => ({
+    year: 2028,
+    month: 2,
+    totals,
+    net: 0,
+    cashEnd: 0,
+    passings: 10,
+    debt: d,
+  });
+
+  it('shows the month’s interest, principal and borrowing, and debt, leverage and coverage at month end', () => {
+    const rows = financingRows(report(debt(), { interest: -2_345, principal: -6_100, loanProceeds: 50_000 }));
+    expect(row(rows, 'interest')).toMatchObject({ value: formatMoney(2_345), tone: null });
+    expect(row(rows, 'principal').value).toBe(formatMoney(6_100));
+    expect(row(rows, 'proceeds').value).toBe(formatMoney(50_000));
+    expect(row(rows, 'debt').value).toBe(formatMoney(412_000));
+    expect(row(rows, 'leverage')).toMatchObject({ value: '4.58×', tone: null, detail: `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}` });
+    expect(row(rows, 'coverage')).toMatchObject({ value: '1.50×', tone: null, detail: `min ${formatRatio(COVENANT_MIN_COVERAGE)}` });
+  });
+
+  it('reads $0 for money that did not move in a round-3 month, and – for nothing scheduled', () => {
+    const rows = financingRows(report(debt({ creditBalance: 0, termBalance: 0, leverageX100: 0, coverageX100: null })));
+    for (const key of ['interest', 'principal', 'proceeds', 'debt'] as const) expect(row(rows, key).value).toBe('$0');
+    expect(row(rows, 'leverage').value).toBe('0.00×');
+    expect(row(rows, 'coverage').value).toBe('–');
+  });
+
+  it('marks a covenant breach, and debt with no cash flow as not measurable', () => {
+    const over = financingRows(report(debt({ leverageX100: COVENANT_MAX_LEVERAGE * 100 + 1, coverageX100: COVENANT_MIN_COVERAGE * 100 - 1 })));
+    expect(row(over, 'leverage').tone).toBe('breach');
+    expect(row(over, 'coverage').tone).toBe('breach');
+    const atLimit = financingRows(report(debt({ leverageX100: COVENANT_MAX_LEVERAGE * 100, coverageX100: COVENANT_MIN_COVERAGE * 100 })));
+    expect(row(atLimit, 'leverage').tone).toBeNull();
+    expect(row(atLimit, 'coverage').tone).toBeNull();
+    const unmeasurable = financingRows(report(debt({ leverageX100: null })));
+    expect(row(unmeasurable, 'leverage')).toMatchObject({ value: 'not measurable', tone: 'breach' });
+  });
+
+  it('keeps net as the full cash flow and says operating cash flow is before financing', () => {
+    const rows = reportRows(report(debt(), { revenue: 9_000, overhead: -4_000, interest: -1_000, loanProceeds: 20_000 }));
+    expect(row(rows, 'operatingCashFlow').hint).toContain('financing');
+    expect(row(rows, 'net').hint).toContain('financing included');
   });
 });
 
@@ -197,6 +277,27 @@ describe('month-close toast', () => {
 
   it('leaves out subscribers for a report without stats', () => {
     expect(monthClosedMessage(report(null, 7, 0))).toBe('Mar 2027 closed: net $0, 7 passings');
+  });
+
+  it('says when the close missed its debt payment', () => {
+    const missed: MonthlyReport = {
+      ...report(null, 7, 0),
+      debt: {
+        creditBalance: 1,
+        termBalance: 0,
+        creditLimit: 0,
+        arr: 0,
+        annualOperatingCashFlow: 0,
+        annualDebtService: 0,
+        leverageX100: null,
+        coverageX100: null,
+        stage: 'frozen',
+        averageRateBps: null,
+        missedPayment: true,
+      },
+    };
+    expect(monthClosedMessage(missed)).toBe('Mar 2027 closed: net $0, 7 passings, payment missed');
+    expect(monthClosedMessage({ ...missed, debt: { ...missed.debt!, missedPayment: false } })).toBe('Mar 2027 closed: net $0, 7 passings');
   });
 });
 
@@ -375,6 +476,24 @@ describe('rate card', () => {
     expect(splitter?.value).toBe(formatMoney(SPLITTER_COST));
   });
 
+  it('lists what borrowing costs, from balance.ts', () => {
+    const financing = sections.find((s) => s.title === 'Financing')!;
+    const rate = (label: string) => financing.rows.find((r) => r.label === label)?.value;
+    expect(rate('Base rate')).toBe(`${formatRate(BASE_RATE_BPS)} a year`);
+    expect(rate('Credit line premium')).toBe(formatBpsDelta(CREDIT_LINE_EXTRA_BPS));
+    for (const years of TERM_LOAN_YEARS) expect(rate(`${years}-year term premium`)).toBe(formatBpsDelta(TERM_EXTRA_BPS[years]));
+    expect(rate(`Leverage up to ${formatRatio(LEVERAGE_SPREAD_BANDS[0]!.maxLeverage)}`)).toBe(formatBpsDelta(LEVERAGE_SPREAD_BANDS[0]!.spreadBps));
+    expect(rate(`Leverage above ${formatRatio(LEVERAGE_SPREAD_BANDS.at(-1)!.maxLeverage)}`)).toBe(formatBpsDelta(LEVERAGE_SPREAD_MAX_BPS));
+    expect(rate('Cost per passing: amber')).toBe(formatBpsDelta(CPP_SPREAD_BPS.amber));
+    expect(rate('Cost per passing: red')).toBe(formatBpsDelta(CPP_SPREAD_BPS.red));
+    expect(rate('Penalty rate')).toBe(formatBpsDelta(PENALTY_STEP_UP_BPS));
+    expect(rate('Leverage covenant')).toBe(`max ${formatRatio(COVENANT_MAX_LEVERAGE)}`);
+    expect(rate('Coverage covenant')).toBe(`min ${formatRatio(COVENANT_MIN_COVERAGE)}`);
+    expect(rate('Cure')).toBe(plural(COVENANT_CURE_CLOSES, 'close'));
+    // One leverage row per band, plus the one above them.
+    expect(financing.rows.filter((r) => r.label.startsWith('Leverage ') && !r.label.includes('covenant')).length).toBe(LEVERAGE_SPREAD_BANDS.length + 1);
+  });
+
   it('has no empty or broken values', () => {
     for (const s of sections) {
       expect(s.rows.length).toBeGreaterThan(0);
@@ -411,6 +530,50 @@ describe('HUD chips', () => {
     expect(overdraftStatus(state)).toMatchObject({ text: `Recovering: ${plural(1, 'close')} left`, tone: 'warn' });
     state.gameOver = { day: 31, reason: 'insolvent', message: 'Out of cash.' };
     expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: out of cash', tone: 'danger', tip: 'Out of cash.' });
+    state.gameOver = { day: 31, reason: 'default', message: 'Defaulted.' };
+    expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: loan default', tone: 'danger', tip: 'Defaulted.' });
+  });
+
+  const loan = (id: number, balance: number): TermLoan => ({
+    id,
+    principal: balance,
+    balance,
+    rateBps: BASE_RATE_BPS,
+    termMonths: 84,
+    payment: 1,
+    monthsLeft: 84,
+    originatedDay: 0,
+  });
+
+  it('shows total debt only while something is owed, splitting line and loans in the tooltip', () => {
+    const state = makeTestState();
+    expect(debtStatus(state)).toBeNull();
+    state.debt.credit.balance = 12_000;
+    expect(debtStatus(state)).toMatchObject({ text: `Debt ${formatMoney(12_000)}`, total: 12_000 });
+    state.debt.loans = [loan(1, 150_000), loan(2, 250_000)];
+    const status = debtStatus(state)!;
+    expect(status.text).toBe(`Debt ${formatMoney(412_000)}`);
+    expect(status.tip).toContain(`Credit line ${formatMoney(12_000)}`);
+    expect(status.tip).toContain(`term loans ${formatMoney(400_000)} (2 loans)`);
+    state.debt.credit.balance = 0;
+    expect(debtStatus(state)!.tip).toContain(`Credit line ${formatMoney(0)}`);
+  });
+
+  it('shows the covenant stage only when not compliant, warn then danger, with what it means and how to cure', () => {
+    const state = makeTestState();
+    expect(covenantStatus(state)).toBeNull();
+    state.debt.covenant = { stage: 'warning', compliantCloses: 0 };
+    expect(covenantStatus(state)).toMatchObject({ text: 'Covenant warning', tone: 'warn' });
+    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MAX_LEVERAGE));
+    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MIN_COVERAGE));
+    expect(covenantStatus(state)!.tip).toContain(plural(COVENANT_CURE_CLOSES, 'compliant month close'));
+    state.debt.covenant = { stage: 'penalty', compliantCloses: 1 };
+    expect(covenantStatus(state)).toMatchObject({ text: 'Penalty rate', tone: 'warn' });
+    expect(covenantStatus(state)!.tip).toContain(formatBpsDelta(PENALTY_STEP_UP_BPS));
+    expect(covenantStatus(state)!.tip).toContain(`1 of ${COVENANT_CURE_CLOSES} so far`);
+    state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+    expect(covenantStatus(state)).toMatchObject({ text: 'Credit frozen', tone: 'danger' });
+    expect(covenantStatus(state)!.tip).toContain('default');
   });
 
   it('shows the live cost per passing by the same formula as the report, banded against the target', () => {
@@ -452,12 +615,25 @@ describe('notice tones', () => {
     expect(noticeTone(notice('gameOver'))).toBe('err');
   });
 
+  it('tones the bank’s notices: cures and payoffs are good news, missed payments and a freeze are errors', () => {
+    for (const kind of ['covenantCured', 'loanPaidOff'] as const) expect(noticeTone(notice(kind))).toBe('ok');
+    for (const kind of ['paymentMissed', 'creditFrozen', 'gameOver'] as const) expect(noticeTone(notice(kind))).toBe('err');
+    for (const kind of ['paymentDue', 'covenantWarning', 'covenantPenalty'] as const) expect(noticeTone(notice(kind))).toBe('warn');
+  });
+
   it('tells install pauses (trouble) from resumes (good news) by kind, not by wording', () => {
     expect(noticeTone(notice('installsPaused', `${INSTALLS_PAUSED_PREFIX}: cash is short`))).toBe('warn');
     expect(noticeTone(notice('installsResumed', `${INSTALLS_RESUMED_PREFIX}: cash is back`))).toBe('ok');
     expect(noticeTone(notice('installsResumed', 'Back in business'))).toBe('ok');
     // A cash warning is a warning whatever it says.
     expect(noticeTone(notice('insolvencyWarning', `${INSTALLS_RESUMED_PREFIX}: cash is back`))).toBe('warn');
+  });
+});
+
+describe('game over subtitle', () => {
+  it('says how the company ended', () => {
+    expect(gameOverSubtitle('insolvent', 'Elmwood')).toBe('Elmwood has gone bankrupt.');
+    expect(gameOverSubtitle('default', 'Elmwood')).toBe('Elmwood has defaulted on its loans.');
   });
 });
 

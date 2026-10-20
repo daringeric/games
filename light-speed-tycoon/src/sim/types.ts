@@ -17,12 +17,19 @@
 // Saved state (GameState and everything under it) is plain JSON: no classes,
 // Maps, Sets, undefined or NaN. Every number in saved state is a safe integer
 // unless its doc says otherwise (Pricing.smbMultiplier is the one float).
+// Interest rates are saved as whole basis points (bps: 725 = 7.25% a year) and
+// saved ratios as hundredths (412 = 4.12x), so they stay integers too.
 //
 // schemaVersion history:
 //   1 - round 1: city, network (spans, cabinets, OLT ports), ledger, reports.
 //   2 - round 2: cabinet reach, splitter/OLT capacity, itemized costs and CPP,
 //       subscribers and pricing, insolvency, milestones, notices. v1 saves are
 //       migrated on load (save.ts migrateV1toV2).
+//   3 - round 3: financing (GameState.debt: a revolving credit line, term
+//       loans, covenant stage), ledger categories 'principal' and
+//       'loanProceeds', MonthlyReport.debt, debt notices and the 'default'
+//       game over. v2 saves migrate with no debt (save.ts migrateV2toV3); v1
+//       saves migrate v1 -> v2 -> v3.
 
 export type NodeId = number;
 export type SegmentId = number;
@@ -226,7 +233,9 @@ export type LedgerCategory =
   | 'overhead' // fixed monthly overhead plus per-subscriber support cost
   | 'payroll'
   | 'marketing'
-  | 'interest'
+  | 'interest' // financing: credit-line and term-loan interest, accrued interest on a prepayment, late fees (negative)
+  | 'principal' // financing: credit-line repayments, scheduled term-loan principal, prepayments (negative)
+  | 'loanProceeds' // financing: credit-line draws and term-loan proceeds (positive)
   | 'other';
 
 export interface LedgerEntry {
@@ -288,6 +297,42 @@ export interface MonthlyReport {
    * metrics.ts reportKpis(), never stored.
    */
   stats?: MonthlyStats;
+  /**
+   * Financing figures at month end (after this close's debt service and
+   * covenant review). Absent on reports migrated from schemaVersion 1 and 2
+   * saves; present on every report a round-3 close writes, debt or not.
+   * Interest, principal and proceeds of the month are in `totals`.
+   */
+  debt?: DebtStats;
+}
+
+/**
+ * Financing figures captured at a month close (debt.reviewDebt writes them,
+ * after payments, the covenant review and the credit line's re-pricing).
+ */
+export interface DebtStats {
+  /** Credit-line balance at month end (>= 0; missed interest capitalized into it). */
+  creditBalance: number;
+  /** Sum of every term loan's balance at month end (>= 0). Total debt = creditBalance + termBalance. */
+  termBalance: number;
+  /** Credit-line limit for the coming month (debt.creditLimit at this close, >= 0). */
+  creditLimit: number;
+  /** Annualized trailing recurring revenue at this close (debt.trailingArr), the base of borrowing capacity (>= 0). */
+  arr: number;
+  /** Annualized trailing operating cash flow at this close (debt.annualOperatingCashFlow); may be negative. */
+  annualOperatingCashFlow: number;
+  /** Scheduled debt service over the next 12 months at this close (debt.annualDebtService, >= 0). */
+  annualDebtService: number;
+  /** Leverage x 100, rounded (412 = 4.12x): 0 with no debt; null when unmeasurable (debt but no cash flow to measure it against). */
+  leverageX100: number | null;
+  /** Debt-service coverage x 100, rounded (may be <= 0); null when nothing is scheduled (no debt). */
+  coverageX100: number | null;
+  /** Covenant stage after this close's review. */
+  stage: CovenantStage;
+  /** Debt-weighted average effective annual rate (penalty included) on month-end balances, bps; null with no debt. */
+  averageRateBps: number | null;
+  /** This close's debt service could not be paid (see DebtClose.missed). */
+  missedPayment: boolean;
 }
 
 /**
@@ -322,6 +367,120 @@ export interface Finance {
    * ends with cash >= 0). Reaching INSOLVENCY_GRACE_MONTHS ends the game.
    */
   negativeMonths: number;
+}
+
+// ---------------------------------------------------------------------------
+// Financing (round 3): a revolving credit line, term loans, covenants.
+//
+// Borrowing capacity is a multiple of ARR: annualized recurring revenue of
+// the trailing closed months (debt.trailingArr). Rates are base + a leverage
+// spread + a cost-per-passing spread + a product adjustment, in whole basis
+// points; while the covenant stage is 'penalty' or 'frozen' every balance pays
+// PENALTY_STEP_UP_BPS on top (never fixed into a loan). Term-loan rates are
+// fixed at origination; the credit line floats (re-priced at each close).
+// See debt.ts for every formula.
+// ---------------------------------------------------------------------------
+
+export type LoanId = number;
+
+/** Allowed term-loan terms in years (balance.TERM_LOAN_YEARS lists them). */
+export type TermYears = 5 | 7;
+
+/**
+ * Where the company stands with its lender. Each month close that breaches a
+ * covenant steps it up one stage (compliant -> warning -> penalty -> frozen;
+ * frozen stays frozen); COVENANT_CURE_CLOSES compliant closes in a row step
+ * it down one stage. A missed payment jumps straight to 'frozen' (with a late
+ * fee); a missed payment while 'frozen' is a default (game over). A close
+ * with no debt at all resets it to 'compliant'.
+ *   warning - nothing changes yet but the notice
+ *   penalty - every balance pays PENALTY_STEP_UP_BPS more
+ *   frozen  - penalty, and no credit-line draws or new term loans (repaying and prepaying still work)
+ */
+export type CovenantStage = 'compliant' | 'warning' | 'penalty' | 'frozen';
+
+/**
+ * An interest rate's parts, whole basis points, each >= 0. The rate is their
+ * sum; the penalty surcharge is never one of them (it follows the stage).
+ */
+export interface RateParts {
+  /** BASE_RATE_BPS when priced. */
+  baseBps: number;
+  /** Leverage spread (LEVERAGE_SPREAD_BANDS; LEVERAGE_SPREAD_MAX_BPS above them or when unmeasurable). */
+  leverageBps: number;
+  /** Cost-per-passing spread: CPP_SPREAD_BPS[band of lifetime CPP]; 0 while nothing is passed. */
+  cppBps: number;
+  /** Product adjustment: CREDIT_LINE_EXTRA_BPS for the line, TERM_EXTRA_BPS[termYears] for a term loan. */
+  productBps: number;
+}
+
+export interface CreditLine {
+  /** Drawn balance, whole dollars, 0..SANE max (may exceed the limit after the limit shrinks or missed interest is capitalized). */
+  balance: number;
+  /**
+   * The line's floating rate until the next close, without the penalty
+   * surcharge. newGame and migrations price it with no leverage and no CPP
+   * spread (base + product); every close re-prices it (debt.reviewDebt).
+   */
+  rate: RateParts;
+  /**
+   * Sum over the open month's days of the end-of-day balance (debt.endDebtDay
+   * adds the balance once per day, before the day advances). Interest at the
+   * close = round(balanceDollarDays x effective bps / (10,000 x 365)); reset to
+   * 0 by the close. >= 0.
+   */
+  balanceDollarDays: number;
+}
+
+/**
+ * A fixed-rate term loan, repaid in level monthly payments (principal +
+ * interest) at month closes. The month it is taken it pays only stub interest
+ * for the days it was held; the regular payments start at the next close.
+ */
+export interface TermLoan {
+  /** From Debt.nextLoanId; loans are listed by ascending id. */
+  id: LoanId;
+  /** Amount borrowed, whole dollars >= 1. */
+  principal: number;
+  /**
+   * Still owed, whole dollars >= 1 (a loan is removed the moment it reaches
+   * 0). Normally <= principal; a missed payment capitalizes interest into it.
+   */
+  balance: number;
+  /** Fixed annual rate, bps (the RateParts sum at origination; no penalty surcharge). */
+  rateBps: number;
+  /** Term in months: termYears x 12. */
+  termMonths: number;
+  /**
+   * Level monthly payment, whole dollars >= 1 (debt.levelPayment of the
+   * balance over monthsLeft; re-amortized by a partial prepayment). Each
+   * regular payment's interest is round(balance x effective bps / 120,000)
+   * and its principal is payment - interest (never below 0); the last one
+   * (monthsLeft === 1) pays the whole remaining balance plus its interest.
+   */
+  payment: number;
+  /** Regular payments still due, 1..termMonths. A missed payment leaves it unchanged (the schedule slips a month). */
+  monthsLeft: number;
+  /** Day the loan was taken, 0..state.day. */
+  originatedDay: number;
+}
+
+export interface CovenantState {
+  stage: CovenantStage;
+  /**
+   * Consecutive compliant closes toward the next cure step, 0..COVENANT_CURE_CLOSES - 1
+   * (0 whenever stage is 'compliant'; reset by any breach or missed payment).
+   */
+  compliantCloses: number;
+}
+
+export interface Debt {
+  credit: CreditLine;
+  /** Open term loans (balance >= 1), ascending id. */
+  loans: TermLoan[];
+  /** Id the next term loan gets (>= 1, greater than every id in loans). */
+  nextLoanId: number;
+  covenant: CovenantState;
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +613,14 @@ export type NoticeKind =
   | 'installsPaused' // cash could not cover the next install; new customers wait (Sales.installsPaused set)
   | 'installsResumed' // an install connected again after a pause (Sales.installsPaused cleared)
   | 'rulesUpdated' // an older save loaded under rules that changed what it gets (e.g. cabinet reach)
-  | 'gameOver'
+  | 'paymentDue' // PAYMENT_REMINDER_DAYS before a close, cash is below the debt service that close will charge
+  | 'paymentMissed' // a close could not pay its debt service: late fee, credit frozen (not yet frozen before)
+  | 'covenantWarning' // a covenant breach stepped the stage up to 'warning'
+  | 'covenantPenalty' // a covenant breach stepped the stage up to 'penalty' (rate step-up)
+  | 'creditFrozen' // a covenant breach stepped the stage up to 'frozen' (no draws, no new term loans)
+  | 'covenantCured' // compliant closes (or no debt left) stepped the stage down
+  | 'loanPaidOff' // a term loan's last scheduled payment was made at a close
+  | 'gameOver' // insolvency or default ended the game
   | 'milestone';
 
 /**
@@ -476,10 +642,18 @@ export interface Notice {
   milestone: MilestoneId | null;
 }
 
+/**
+ * Why the game ended: 'insolvent' - INSOLVENCY_GRACE_MONTHS month closes in a
+ * row ended with cash < 0 (finance.checkInsolvency); 'default' - a close could
+ * not pay its debt service while the credit line was already frozen
+ * (debt.reviewDebt).
+ */
+export type GameOverReason = 'insolvent' | 'default';
+
 export interface GameOver {
   /** Day the game ended (a month-close day). */
   day: number;
-  reason: 'insolvent';
+  reason: GameOverReason;
   /** Player-facing explanation. */
   message: string;
 }
@@ -496,7 +670,7 @@ export interface RngStreams {
 }
 
 export interface GameState {
-  schemaVersion: 2;
+  schemaVersion: 3;
   seed: number;
   day: number;
   rng: RngStreams;
@@ -505,6 +679,8 @@ export interface GameState {
   city: City;
   network: Network;
   finance: Finance;
+  /** Credit line, term loans and covenant stage (debt.newDebt() for a new game: nothing borrowed). */
+  debt: Debt;
   sales: Sales;
   /** Achieved milestones, in the order achieved; each id at most once. */
   milestones: MilestoneRecord[];
@@ -544,9 +720,21 @@ export type Command =
   /** Replace every tier's price and offered flag (each TierId exactly once) and the SMB multiplier. Free. */
   | { type: 'setPricing'; tiers: TierSetting[]; smbMultiplier: number }
   /** Set the monthly marketing budget (whole dollars). Free; spend accrues daily. */
-  | { type: 'setMarketing'; perMonth: number };
+  | { type: 'setMarketing'; perMonth: number }
+  /** Draw whole dollars (>= 1, <= available) from the credit line. Cost = -amount (cash in). */
+  | { type: 'drawCredit'; amount: number }
+  /** Repay whole dollars (>= 1, <= balance, <= cash) of the credit line. Cost = amount. */
+  | { type: 'repayCredit'; amount: number }
+  /** Borrow a fixed-rate term loan of whole dollars (TERM_LOAN_MIN..capacity). Cost = -amount (cash in). */
+  | { type: 'takeTermLoan'; amount: number; termYears: TermYears }
+  /** Prepay whole dollars (>= 1, <= balance) of a term loan plus the interest accrued on them. Cost = amount + accrued interest. */
+  | { type: 'prepayLoan'; loan: LoanId; amount: number };
 
-/** On success `cost` is the net spend now (negative for a refund, 0 for free commands). */
+/**
+ * On success `cost` is the net cash spent now: negative for a refund or money
+ * borrowed, 0 for free commands. A command's cost is exactly the change in cash
+ * it caused (negated).
+ */
 export type CommandResult = { ok: true; cost: number } | { ok: false; reason: string };
 
 // ---------------------------------------------------------------------------
@@ -745,6 +933,130 @@ export interface CoveragePreview {
   projectedCppBand: CppBand | null;
   /** Subscriber ports a new cabinet starts with (CABINET_START_SPLITTERS x SPLIT_RATIO). */
   ports: number;
+}
+
+// ---------------------------------------------------------------------------
+// Financing quotes (pure functions of state, debt.ts; never saved)
+// ---------------------------------------------------------------------------
+
+/** A rate with its parts, for a quote or offer. All bps. */
+export interface RateBreakdown extends RateParts {
+  /** PENALTY_STEP_UP_BPS while the covenant stage is 'penalty' or 'frozen', else 0. Charged on every balance; never fixed into a loan. */
+  penaltyBps: number;
+  /** baseBps + leverageBps + cppBps + productBps: what a term loan fixes, or the line's rate until the next close. */
+  rateBps: number;
+  /** rateBps + penaltyBps: what is charged today. */
+  effectiveRateBps: number;
+  /** Leverage the leverage spread was priced on (x, unrounded): 0 with no debt, null when unmeasurable. */
+  leverage: number | null;
+  /** Lifetime cost per passing the CPP spread was priced on (dollars, unrounded); null while nothing is passed (no CPP spread). */
+  cpp: number | null;
+  cppBand: CppBand | null;
+}
+
+/**
+ * The covenant tests and the figures behind them (debt.covenantMetrics).
+ * Cash flows are annualized from the trailing closed months; debt is today's.
+ */
+export interface CovenantMetrics {
+  /** Credit-line balance + term-loan balances (pro forma: plus the quoted amount). */
+  totalDebt: number;
+  /** Annualized trailing recurring revenue (debt.trailingArr). */
+  arr: number;
+  /** Annualized trailing operating cash flow (financing and capex excluded); may be negative. */
+  annualOperatingCashFlow: number;
+  /**
+   * Cash flow the lender counts: max(annualOperatingCashFlow, arr x
+   * UNDERWRITING_MIN_MARGIN), so a young network is judged on its recurring
+   * revenue while its operating cash flow is <= 0 or small. May be <= 0
+   * (no revenue yet and burning cash).
+   */
+  underwritingCashFlow: number;
+  /** Scheduled debt service over the next 12 months: each loan's payment x min(12, monthsLeft) + the line's balance x effective rate for a year. */
+  annualDebtService: number;
+  /** totalDebt / underwritingCashFlow (x, unrounded); 0 with no debt; null when debt > 0 and underwritingCashFlow <= 0 (unmeasurable: a breach). */
+  leverage: number | null;
+  /** underwritingCashFlow / annualDebtService (x, unrounded, may be <= 0); null when annualDebtService is 0. */
+  coverage: number | null;
+  /** No debt, or leverage measurable and <= COVENANT_MAX_LEVERAGE. */
+  leverageOk: boolean;
+  /** Nothing scheduled, or coverage >= COVENANT_MIN_COVERAGE. */
+  coverageOk: boolean;
+  /** leverageOk && coverageOk. */
+  compliant: boolean;
+}
+
+/** The credit line as the bank offers it today (debt.creditOffer). */
+export interface CreditOffer {
+  /** Limit: floor to LOAN_ROUNDING of trailingArr x CREDIT_LIMIT_ARR_MULTIPLE (stable within a month: closed months only). */
+  limit: number;
+  balance: number;
+  /** What a draw may take now: max(0, limit - balance), 0 while frozen. */
+  available: number;
+  /** Most a repayment may be now: min(balance, max(0, cash)). */
+  maxRepay: number;
+  frozen: boolean;
+  /** The line's rate (stored parts, priced at the last close) plus today's penalty surcharge. leverage/cpp are those of the last close (0 / null before the first). */
+  rate: RateBreakdown;
+  /** Interest accrued so far this month at the effective rate (what the next close charges for days already past). */
+  accruedInterest: number;
+  /** trailingArr: the base of the limit. */
+  arr: number;
+  /** Why a draw is impossible now (frozen, no limit yet, limit used up); empty when available > 0. */
+  reasons: string[];
+}
+
+/** A term loan as the bank would write it today (debt.quoteTermLoan). */
+export interface TermLoanQuote {
+  /**
+   * takeTermLoan would accept it: the game is not over, termYears is one of
+   * TERM_LOAN_YEARS, amount is a whole number >= TERM_LOAN_MIN and <=
+   * maxAmount, and the stage is not 'frozen'. A covenant breach does not
+   * block it (see breachesCovenant).
+   */
+  ok: boolean;
+  /** Player-facing blockers; empty when ok. */
+  reasons: string[];
+  /** Requested amount (as given). */
+  amount: number;
+  termYears: TermYears;
+  termMonths: number;
+  /** Most a new term loan may be now: floor to LOAN_ROUNDING of trailingArr x TERM_CAPACITY_ARR_MULTIPLE - term balances (0 while frozen or below TERM_LOAN_MIN). */
+  maxAmount: number;
+  /** Priced on pro forma leverage (debt + amount) and today's lifetime CPP. */
+  rate: RateBreakdown;
+  /** Level monthly payment at rate.rateBps (debt.levelPayment); 0 when the amount is invalid. */
+  payment: number;
+  /** The final regular payment (absorbs rounding), from the exact schedule. */
+  lastPayment: number;
+  /** Interest-only charge at this month's close for the days from today to month end (debt.stubDays), at the effective rate. */
+  stubInterest: number;
+  /** stubInterest + every regular payment's interest at rate.rateBps (no penalty), from the exact schedule. */
+  totalInterest: number;
+  /** Covenant figures today and pro forma with this loan (today's cash flows: the build it funds is not counted). */
+  before: CovenantMetrics;
+  after: CovenantMetrics;
+  /** !after.compliant: taking it would breach a covenant at the next close unless cash flow improves. */
+  breachesCovenant: boolean;
+  /** Cash after the proceeds arrive. */
+  cashAfter: number;
+}
+
+/** What prepaying a term loan would take (debt.quotePrepay). */
+export interface PrepayQuote {
+  ok: boolean;
+  reasons: string[];
+  loan: LoanId;
+  /** Principal prepaid (as given). */
+  amount: number;
+  /** Interest accrued on `amount` since the later of the loan's origination and the 1st of this month, at the effective rate. */
+  accruedInterest: number;
+  /** amount + accruedInterest: the cash it takes. */
+  total: number;
+  /** Repays the whole balance (the loan closes). */
+  paysOff: boolean;
+  /** Re-amortized level payment over the same months left (0 when it pays off). */
+  paymentAfter: number;
 }
 
 // ---------------------------------------------------------------------------

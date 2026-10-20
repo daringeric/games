@@ -2,6 +2,7 @@
 
 import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH } from './balance';
 import { dateOf, formatMonth, MONTH_LENGTHS } from './calendar';
+import { closeDebtMonth, reviewDebt } from './debt';
 import { operatingCashFlow } from './metrics';
 import { checkMilestones } from './milestones';
 import { ponPortsUsed } from './network';
@@ -24,7 +25,9 @@ const CATEGORY_ORDER: Record<LedgerCategory, number> = {
   payroll: 7,
   marketing: 8,
   interest: 9,
-  other: 10,
+  principal: 10,
+  loanProceeds: 11,
+  other: 12,
 };
 
 /** Whole number with thousands separators: 12400 -> "12,400". */
@@ -91,14 +94,20 @@ export function monthlyPoleRent(state: GameState): number {
  *   1. pole rent for live aerial spans;
  *   2. 'overhead' -OVERHEAD_PER_MONTH ("Overhead for Mar 2027");
  *   3. sales.closeSalesMonth: revenue, marketing, support, churn, accrual reset;
- *   4. totals, net and the MonthlyReport (labelled with the ended month), with
+ *   4. debt.closeDebtMonth: the month's debt service (credit-line interest,
+ *      term-loan payments) out of the cash left after 1-3, or a missed
+ *      payment (interest capitalized, a late fee);
+ *   5. totals, net and the MonthlyReport (labelled with the ended month), with
  *      `stats` from the month-end state: subscribers/accounts after churn, the
  *      SalesClose counts, sales.connectsTotal, finance.capex, PON ports in use
  *      / olt.ponPorts, sales.fullCabinets.length; append it to finance.reports
  *      and clear monthToDate;
- *   5. milestones.checkMilestones(state, report);
- *   6. checkInsolvency(state).
- * Returns the report. Every report it writes has `stats`.
+ *   6. milestones.checkMilestones(state, report);
+ *   7. debt.reviewDebt: default (game over) / missed payment / covenant
+ *      review and its notices, the credit line's re-pricing, report.debt;
+ *   8. checkInsolvency(state) (nothing once a default has ended the game).
+ * Returns the report. Every report it writes has `stats` and `debt` (zeros
+ * with no debt).
  */
 export function closeMonth(state: GameState, passings: number, rng: Rng): MonthlyReport {
   const lastDay = state.day - 1;
@@ -120,6 +129,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
   }
 
   const sales = closeSalesMonth(state, rng, MONTH_LENGTHS[ended.month - 1] as number, lastDay);
+  const debtClose = closeDebtMonth(state, lastDay);
 
   const sums = new Map<LedgerCategory, number>();
   let net = 0;
@@ -161,6 +171,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
   state.finance.monthToDate = [];
 
   checkMilestones(state, report);
+  reviewDebt(state, report, debtClose);
   checkInsolvency(state);
   return report;
 }
@@ -211,15 +222,17 @@ export function checkInsolvency(state: GameState): void {
 }
 
 /**
- * Months of runway at the current burn, for the HUD warning: null when there is
- * no closed month yet or the last closed month's operating cash flow
- * (metrics.operatingCashFlow) was >= 0; otherwise
- * floor(max(0, cash) / -operatingCashFlow(last)). Pure read.
+ * Months of runway at the current burn, for the HUD warning. The burn is the
+ * last closed month's operating cash flow (metrics.operatingCashFlow) plus its
+ * debt service (totals.interest and totals.principal, both <= 0; money
+ * borrowed is not income, so loanProceeds is left out). Null when there is no
+ * closed month yet or that flow was >= 0; otherwise
+ * floor(max(0, cash) / -flow). Pure read.
  */
 export function runwayMonths(state: GameState): number | null {
   const last = state.finance.reports.at(-1);
   if (!last) return null;
-  const flow = operatingCashFlow(last);
+  const flow = operatingCashFlow(last) + (last.totals.interest ?? 0) + (last.totals.principal ?? 0);
   if (flow >= 0) return null;
   return Math.floor(Math.max(0, state.finance.cash) / -flow);
 }

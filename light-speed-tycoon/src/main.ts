@@ -15,6 +15,7 @@ import type { Insets } from './render/camera';
 import { Scene } from './render/scene';
 import { toyTown } from './render/theme';
 import type { Theme } from './render/theme';
+import { BankPanel } from './ui/bankPanel';
 import { confirmDialog } from './ui/confirm';
 import { installDebugHook, searchWithoutSeed } from './ui/debugHook';
 import { el } from './ui/dom';
@@ -126,10 +127,11 @@ async function boot(): Promise<void> {
   const toasts = new Toasts();
   const hint = new HintCard(HINT);
   const pricing = new PricingPanel(session, toasts);
+  const bank = new BankPanel(session, toasts);
   const milestones = new MilestonesPanel(() => session.state);
   const rateCard = new RateCard();
   const gameOver = new GameOverDialog();
-  const hud = new Hud(session, { pricing: () => pricing.open(), milestones: () => milestones.open() });
+  const hud = new Hud(session, { pricing: () => pricing.open(), milestones: () => milestones.open(), bank: () => bank.open() });
   const panel = new ReportPanel();
   const controls = new MapControls({ canvas: app.canvas, camera, theme, scene, session, toasts, hint });
   const toolbar = controls.toolbar;
@@ -238,6 +240,7 @@ async function boot(): Promise<void> {
     }
     controls.reset();
     pricing.close();
+    bank.close();
     milestones.close();
     rateCard.close();
     if (menu.isOpen) menu.close();
@@ -282,6 +285,7 @@ async function boot(): Promise<void> {
   session.onReplaced(() => {
     controls.reset();
     pricing.close();
+    bank.close();
     milestones.close();
     scene.sync(session.state);
     fitCamera();
@@ -332,6 +336,7 @@ async function boot(): Promise<void> {
     controls.update(state);
     hud.update(session);
     panel.update(state);
+    bank.update(session);
     scene.applyCamera(camera);
     scene.animate(now);
     counters.frames++;
