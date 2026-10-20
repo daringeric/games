@@ -39,7 +39,7 @@ import {
 } from './balance';
 import { canAfford, formatMoney, groupThousands, postEntry } from './finance';
 import type { Rng } from './rng';
-import { cornerName, isNodeId, isSegmentId, otherEnd, segmentsAtNode } from './streets';
+import { cornerName, isNodeId, isSegmentId, otherEnd, segmentsAtNode, shortestPath } from './streets';
 import type {
   CabinetId,
   CabinetQuote,
@@ -107,6 +107,24 @@ function streetNames(state: GameState, segments: readonly SegmentId[]): string[]
 
 function notEnoughCash(state: GameState, cost: number): string {
   return `Not enough cash: need ${formatMoney(cost)}, have ${formatMoney(state.finance.cash)}`;
+}
+
+/**
+ * The street route a cable run between two corners takes, for quoting and
+ * ordering. Aerial runs keep to segments they can go on (poled, or already
+ * cabled, which an order skips) whenever such a route exists, even when a
+ * shorter one crosses a street without poles. With no such route they take the
+ * plain shortest route, whose quote then names the street that blocks it.
+ * Underground runs take the shortest route. Null when unreachable.
+ */
+export function cableRoute(state: GameState, from: NodeId, to: NodeId, method: CableMethod): SegmentId[] | null {
+  const { city } = state;
+  if (method === 'aerial') {
+    const cabled = new Set<SegmentId>(state.network.spans.map((s) => s.segment));
+    const route = shortestPath(city, from, to, (seg) => (seg.hasPoles || cabled.has(seg.id) ? seg.lengthFt : Infinity));
+    if (route) return route;
+  }
+  return shortestPath(city, from, to);
 }
 
 /** Estimate a cable order without changing state. */

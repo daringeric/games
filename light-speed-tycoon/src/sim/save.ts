@@ -14,6 +14,11 @@ import type {
 
 const SCHEMA_VERSION = 1;
 const UINT32_MAX = 0xffffffff;
+/**
+ * Largest map edge in cells a save may have: several times a generated town
+ * (96 x 64), and small enough for the per-cell buffers the map is drawn from.
+ */
+const MAX_MAP_CELLS = 512;
 
 export class SaveError extends Error {
   override name = 'SaveError';
@@ -185,17 +190,19 @@ function checkState(save: Json): void {
 function checkCity(city: Json): CityShape {
   int(city.seed, 'city.seed');
   str(city.name, 'city.name');
-  int(city.width, 'city.width', 1);
-  int(city.height, 'city.height', 1);
+  // Map geometry sizes the spatial index and the renderer's buffers, so it is
+  // held to what the generator makes: nodes on the map's lattice, axis-aligned
+  // segments with a < b, and parcels inside the map.
+  const width = int(city.width, 'city.width', 1, MAX_MAP_CELLS);
+  const height = int(city.height, 'city.height', 1, MAX_MAP_CELLS);
   positive(city.tileFt, 'city.tileFt');
 
   const nodes = list(city.nodes, 'city.nodes');
-  nodes.forEach((value, i) => {
+  const points = nodes.map((value, i) => {
     const path = `city.nodes[${i}]`;
     const node = obj(value, path);
     indexId(node.id, `${path}.id`, i);
-    int(node.x, `${path}.x`);
-    int(node.y, `${path}.y`);
+    return { x: int(node.x, `${path}.x`, 0, width), y: int(node.y, `${path}.y`, 0, height) };
   });
 
   const segments = list(city.segments, 'city.segments');
@@ -203,8 +210,15 @@ function checkCity(city: Json): CityShape {
     const path = `city.segments[${i}]`;
     const seg = obj(value, path);
     indexId(seg.id, `${path}.id`, i);
-    ref(seg.a, `${path}.a`, nodes.length, 'node');
-    ref(seg.b, `${path}.b`, nodes.length, 'node');
+    const a = ref(seg.a, `${path}.a`, nodes.length, 'node');
+    const b = ref(seg.b, `${path}.b`, nodes.length, 'node');
+    if (b <= a) expected(`${path}.b`, `greater than a (${a})`, b);
+    const pa = points[a] as { x: number; y: number };
+    const pb = points[b] as { x: number; y: number };
+    if (pa.x !== pb.x && pa.y !== pb.y) {
+      corrupt(path, `should run along one grid line, but joins (${pa.x}, ${pa.y}) to (${pb.x}, ${pb.y})`);
+    }
+    if (pa.x === pb.x && pa.y === pb.y) corrupt(path, `joins two nodes at the same point (${pa.x}, ${pa.y})`);
     oneOf(seg.streetClass, `${path}.streetClass`, STREET_CLASSES);
     str(seg.name, `${path}.name`);
     positive(seg.lengthFt, `${path}.lengthFt`);
@@ -219,10 +233,13 @@ function checkCity(city: Json): CityShape {
     indexId(parcel.id, `${path}.id`, i);
     oneOf(parcel.kind, `${path}.kind`, PARCEL_KINDS);
     ref(parcel.segment, `${path}.segment`, segments.length, 'segment');
-    int(parcel.x, `${path}.x`);
-    int(parcel.y, `${path}.y`);
-    int(parcel.w, `${path}.w`, 1);
-    int(parcel.h, `${path}.h`, 1);
+    const x = int(parcel.x, `${path}.x`, 0, width - 1);
+    const y = int(parcel.y, `${path}.y`, 0, height - 1);
+    const w = int(parcel.w, `${path}.w`, 1);
+    const h = int(parcel.h, `${path}.h`, 1);
+    if (x + w > width || y + h > height) {
+      corrupt(path, `runs off the ${width} x ${height} map (cells ${x}..${x + w - 1} x ${y}..${y + h - 1})`);
+    }
     int(parcel.units, `${path}.units`, 0);
     int(parcel.appearsDay, `${path}.appearsDay`, 0);
     oneOf(parcel.zone, `${path}.zone`, ZONES);

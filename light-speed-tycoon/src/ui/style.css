@@ -71,11 +71,35 @@ body {
 }
 
 .boot-error {
-  max-width: 480px;
+  position: relative;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: min(480px, calc(100vw - 32px));
   margin: 20vh auto 0;
-  padding: 0 16px;
+  padding: 18px 20px;
   font-weight: 700;
   text-align: center;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.boot-error p {
+  margin: 0;
+}
+
+.boot-error-detail {
+  color: var(--text-2);
+}
+
+/* .btn comes later in this file, so these need its specificity plus one. */
+.btn.boot-error-reset,
+.btn.boot-error-reset:hover {
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
 }
 
 /* Buttons ---------------------------------------------------------------- */
@@ -646,9 +670,28 @@ body {
   }
 }
 
-/* Phone ---------------------------------------------------------------------- */
+/* Short screens ------------------------------------------------------------------ */
 
-@media (max-width: 720px) {
+/* Centred on a short screen (a large phone in landscape), the toolbar would reach
+   up over the HUD's speed controls: hang it below the HUD instead, with slightly
+   smaller buttons. Narrower screens get the phone layout below. */
+@media (max-height: 500px) {
+  .toolbar {
+    top: 86px;
+    transform: none;
+  }
+
+  .tool {
+    width: 46px;
+    height: 46px;
+  }
+}
+
+/* Phones and narrow tablets ----------------------------------------------------- */
+
+/* The one-row HUD needs about 860px (its items' minimum widths plus margins);
+   below that it stacks into two rows and the toolbar moves to the bottom. */
+@media (max-width: 880px) {
   .hud {
     top: 8px;
     right: 8px;
@@ -772,4 +815,48 @@ body {
   .chip-building {
     font-size: 12px;
   }
+}
+
+/* Confirmation dialog ---------------------------------------------------- */
+
+.confirm {
+  width: min(420px, calc(100vw - 32px));
+  padding: 22px 22px 18px;
+  color: var(--text);
+}
+
+.confirm::backdrop {
+  background: rgb(35 48 58 / 35%);
+}
+
+.confirm-title {
+  margin: 0 0 8px;
+  font: 600 22px / 1.15 var(--font-display);
+}
+
+.confirm-detail {
+  margin: 0 0 18px;
+  color: var(--text-2);
+  font: 600 15px / 1.4 var(--font-ui);
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.confirm-cancel {
+  background: var(--hover);
+}
+
+.confirm-ok {
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+}
+
+.confirm-ok:hover {
+  background: var(--active);
 }

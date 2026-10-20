@@ -3,8 +3,14 @@
 // Panning: left-drag with the inspect tool, middle- or right-drag in any tool,
 // Space+drag in any tool, and one-finger drag on touch screens (a tap still
 // clicks). Wheel and pinch zoom around the cursor; +/- zoom around the centre.
+//
+// Space toggles pause on a plain tap. A press made while it is held is a pan
+// (never a tool click) and cancels the pause toggle. Space still presses a
+// button the keyboard focused, as on any page, but not one the mouse left
+// focused, which would otherwise swallow every pause.
 
 import type { Camera } from '../render/camera';
+import { isDialogOpen } from './confirm';
 import type { Speed } from './session';
 import type { ToolId } from './tools';
 
@@ -37,7 +43,12 @@ interface Press {
   pan: boolean;
   moved: boolean;
   touch: boolean;
+  /** Space was held when the press began: it pans and never clicks. */
+  space: boolean;
 }
+
+/** Controls the browser presses with Space when they have keyboard focus. */
+const SPACE_CONTROLS = 'button, [role="menuitem"], a[href], summary, select';
 
 const TOOL_KEYS: Record<string, ToolId> = { i: 'inspect', a: 'aerial', u: 'underground', c: 'cabinet', x: 'remove' };
 const SPEED_KEYS: Record<string, Speed> = { '1': 1, '2': 2, '3': 4 };
@@ -47,7 +58,12 @@ export class Input {
   private readonly touches = new Map<number, { x: number; y: number }>();
   private pinchDist = 0;
   private spaceHeld = false;
+  /** Space has been a pan modifier during this hold (a press began or was under way), so releasing it doesn't toggle pause. */
   private spaceUsedForPan = false;
+  /** The last input was a pointer press rather than a key; read when focus moves. */
+  private pointerInput = false;
+  /** The element that last took focus from the keyboard (Tab, or a script after a key press), if any. */
+  private keyboardFocused: EventTarget | null = null;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -67,6 +83,11 @@ export class Input {
     window.addEventListener('blur', () => {
       this.spaceHeld = false;
     });
+    // Focus modality, tracked first (capture on window) so nothing can hide it.
+    // :focus-visible can't tell: a key press turns it on before keydown handlers run.
+    window.addEventListener('pointerdown', () => (this.pointerInput = true), true);
+    window.addEventListener('keydown', () => (this.pointerInput = false), true);
+    window.addEventListener('focusin', (e) => (this.keyboardFocused = this.pointerInput ? null : e.target), true);
   }
 
   private local(e: PointerEvent | WheelEvent): { x: number; y: number } {
@@ -98,6 +119,7 @@ export class Input {
     }
     if (this.press) return;
     this.canvas.setPointerCapture(e.pointerId);
+    if (this.spaceHeld) this.spaceUsedForPan = true;
     const inspect = this.handlers.currentTool() === 'inspect';
     this.press = {
       id: e.pointerId,
@@ -110,6 +132,7 @@ export class Input {
       pan: e.button === 1 || e.button === 2 || this.spaceHeld || (e.button === 0 && inspect),
       moved: false,
       touch: e.pointerType === 'touch',
+      space: this.spaceHeld,
     };
     if (e.button === 1) e.preventDefault();
   };
@@ -150,7 +173,7 @@ export class Input {
     if (!press.moved) {
       if (press.button === 2) {
         this.handlers.cancel();
-      } else if (press.button === 0 && !this.spaceHeld) {
+      } else if (press.button === 0 && !press.space && !this.spaceHeld) {
         this.handlers.click(this.toGrid(p), press.touch);
         this.handlers.hover(this.toGrid(p), p);
       }
@@ -198,16 +221,21 @@ export class Input {
   }
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // A modal confirmation owns the keyboard: Space and Enter press its buttons, Esc cancels it.
+    if (e.ctrlKey || e.metaKey || e.altKey || isDialogOpen()) return;
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
     const key = e.key.toLowerCase();
     if (e.key === ' ') {
-      // Space pans while held and toggles pause on a plain tap; keep it from clicking focused buttons.
+      // A keyboard-focused control gets Space as usual (the browser presses it).
+      if (this.keyboardFocusedControl(target)) return;
+      // Otherwise Space pans while held and toggles pause on a plain tap; keep it
+      // from pressing a button the mouse left focused.
       e.preventDefault();
       if (!e.repeat) {
         this.spaceHeld = true;
-        this.spaceUsedForPan = false;
+        // Held down over a press already under way: a modifier, not a pause tap.
+        this.spaceUsedForPan = this.press !== null;
         this.updateCursor();
       }
       return;
@@ -226,10 +254,15 @@ export class Input {
   };
 
   private readonly onKeyUp = (e: KeyboardEvent) => {
-    if (e.key !== ' ') return;
+    // Only a Space whose keydown was taken for pan and pause; one that went to a control is left to it.
+    if (e.key !== ' ' || !this.spaceHeld) return;
     e.preventDefault();
-    if (this.spaceHeld && !this.spaceUsedForPan) this.handlers.togglePause();
+    if (!this.spaceUsedForPan) this.handlers.togglePause();
     this.spaceHeld = false;
     this.updateCursor();
   };
+
+  private keyboardFocusedControl(target: HTMLElement | null): boolean {
+    return target !== null && target === this.keyboardFocused && target.matches(SPACE_CONTROLS);
+  }
 }

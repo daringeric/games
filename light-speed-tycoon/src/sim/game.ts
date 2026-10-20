@@ -74,13 +74,18 @@ function describeType(type: unknown): string {
 }
 
 /**
- * Advance one day: state.day += 1, advanceNetwork, then if the new day is the
- * 1st of a month, closeMonth with the current passings.
+ * Advance one day: state.day += 1; if the new day is the 1st of a month,
+ * closeMonth with the passings and live cable as they stood at the end of the
+ * ended month; then advanceNetwork. A span that goes live on the 1st, or a lot
+ * that appears that day, belongs to the new month.
  */
 export function tick(state: GameState): void {
+  const closing = isFirstOfMonth(state.day + 1);
+  // Parcels appear by day, so take passings before the day moves on.
+  const passings = closing ? getService(state).passings : 0;
   state.day += 1;
+  if (closing) closeMonth(state, passings);
   advanceNetwork(state);
-  if (isFirstOfMonth(state.day)) closeMonth(state, getService(state).passings);
 }
 
 export function runDays(state: GameState, days: number): void {

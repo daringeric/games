@@ -119,6 +119,7 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
       const reportsBefore = state.finance.reports.length;
       const versionBefore = state.network.version;
       const passingsBefore = getService(state).passings;
+      const rentBefore = monthlyPoleRent(state);
       tick(state);
 
       // getService is memoized on network version and day; parcels appear by day,
@@ -142,9 +143,10 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
       expect(report.cashEnd).toBe(state.finance.cash);
       expect(report.cashEnd - prevCash).toBe(report.net);
       expect(Object.values(report.totals).reduce((a, b) => a + (b ?? 0), 0)).toBe(report.net);
-      // Passings and pole rent are taken after the day's network progress.
-      expect(report.passings).toBe(fresh.passings);
-      expect((report.totals.poleRent ?? 0) + monthlyPoleRent(state)).toBe(0);
+      // Passings and pole rent are taken as the month ended: before the new day's
+      // network progress and town growth.
+      expect(report.passings).toBe(passingsBefore);
+      expect((report.totals.poleRent ?? 0) + rentBefore).toBe(0);
       expect(state.finance.monthToDate).toEqual([]);
 
       // Every month-end save must load back to the identical game.

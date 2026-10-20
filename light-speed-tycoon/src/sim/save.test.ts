@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { applyCommand, newGame, runDays } from './game';
 import { getService } from './network';
 import { deserialize, fnv1a, hashState, SaveError, serialize } from './save';
+import { nearestNode, nearestSegment } from './streets';
 import { makeGridCity } from './testing/fixtures';
 import type { GridCityOptions } from './testing/fixtures';
 import type { GameState } from './types';
@@ -152,14 +153,23 @@ describe('deserialize errors', () => {
     ['zero nextId', (s) => (s.nextId = 0), /nextId should be an integer >= 1, got 0/],
     // City
     ['numeric city name', (s) => (s.city.name = 5), /city\.name should be a string, got 5/],
-    ['zero city width', (s) => (s.city.width = 0), /city\.width should be an integer >= 1/],
+    ['zero city width', (s) => (s.city.width = 0), /city\.width should be an integer in 1\.\.512/],
+    ['city too wide to draw', (s) => (s.city.width = 2e9), /city\.width should be an integer in 1\.\.512, got 2000000000/],
+    ['city too tall to draw', (s) => (s.city.height = 100_000), /city\.height should be an integer in 1\.\.512, got 100000/],
     ['missing tileFt', (s) => delete s.city.tileFt, /city\.tileFt should be a number > 0, got nothing/],
     ['nodes not an array', (s) => (s.city.nodes = {}), /city\.nodes should be an array, got an object/],
     ['null node', (s) => (s.city.nodes[0] = null), /city\.nodes\[0\] should be an object, got null/],
     ['node id off its index', (s) => (s.city.nodes[2].id = 5), /city\.nodes\[2\]\.id should be 2 \(its position/],
     ['string node coordinate', (s) => (s.city.nodes[1].x = '4'), /city\.nodes\[1\]\.x should be an integer/],
+    ['node far off the map', (s) => (s.city.nodes[3].x = 4_000_000_000_000), /city\.nodes\[3\]\.x should be an integer in 0\.\.12, got 4000000000000/],
+    ['node above the map', (s) => (s.city.nodes[3].y = -1), /city\.nodes\[3\]\.y should be an integer in 0\.\.4, got -1/],
+    ['node past the map edge', (s) => (s.city.width = 11), /city\.nodes\[3\]\.x should be an integer in 0\.\.11, got 12/],
     ['segment id off its index', (s) => (s.city.segments[3].id = 4), /city\.segments\[3\]\.id should be 3/],
     ['segment endpoint out of range', (s) => (s.city.segments[0].b = 99), /city\.segments\[0\]\.b should be an integer in 0\.\.11, got 99/],
+    ['segment from a node to itself', (s) => (s.city.segments[0].b = s.city.segments[0].a), /city\.segments\[0\]\.b should be greater than a \(0\), got 0/],
+    ['segment endpoints reversed', (s) => ([s.city.segments[0].a, s.city.segments[0].b] = [1, 0]), /city\.segments\[0\]\.b should be greater than a \(1\), got 0/],
+    ['diagonal segment', (s) => (s.city.segments[0].b = 5), /city\.segments\[0\] should run along one grid line, but joins \(0, 0\) to \(4, 2\)/],
+    ['segment with both ends at one point', (s) => (s.city.nodes[1].x = 0), /city\.segments\[0\] joins two nodes at the same point \(0, 0\)/],
     ['unknown street class', (s) => (s.city.segments[0].streetClass = 'highway'), /streetClass should be one of "arterial", "collector", "local", got "highway"/],
     ['zero-length segment', (s) => (s.city.segments[1].lengthFt = 0), /city\.segments\[1\]\.lengthFt should be a number > 0, got 0/],
     ['string hasPoles', (s) => (s.city.segments[1].hasPoles = 'yes'), /city\.segments\[1\]\.hasPoles should be true or false/],
@@ -168,6 +178,9 @@ describe('deserialize errors', () => {
     ['parcel segment out of range', (s) => (s.city.parcels[0].segment = 17), /city\.parcels\[0\]\.segment should be an integer in 0\.\.16, got 17/],
     ['unknown parcel kind', (s) => (s.city.parcels[0].kind = 'castle'), /city\.parcels\[0\]\.kind should be one of/],
     ['zero-width parcel', (s) => (s.city.parcels[0].w = 0), /city\.parcels\[0\]\.w should be an integer >= 1/],
+    ['parcel left of the map', (s) => (s.city.parcels[0].x = -1), /city\.parcels\[0\]\.x should be an integer in 0\.\.11, got -1/],
+    ['parcel below the map', (s) => (s.city.parcels[0].y = 4), /city\.parcels\[0\]\.y should be an integer in 0\.\.3, got 4/],
+    ['parcel running off the map', (s) => (s.city.parcels[0].w = 13), /city\.parcels\[0\] runs off the 12 x 4 map \(cells 0\.\.12 x 0\.\.0\)/],
     ['fractional units', (s) => (s.city.parcels[0].units = 1.5), /city\.parcels\[0\]\.units/],
     ['unknown zone', (s) => (s.city.parcels[0].zone = 'moon'), /city\.parcels\[0\]\.zone should be one of/],
     ['coNode out of range', (s) => (s.city.coNode = 12), /city\.coNode should be an integer in 0\.\.11, got 12/],
@@ -221,6 +234,15 @@ describe('deserialize errors', () => {
     expectSaveError(corrupted(mutate), message);
   });
 
+  it('rejects map geometry that would crash street picking on a generated town', () => {
+    const town: Save = JSON.parse(serialize(newGame(9)));
+    town.city.nodes[3].x = 4_000_000_000_000;
+    expectSaveError(JSON.stringify(town), /city\.nodes\[3\]\.x should be an integer in 0\.\.\d+, got 4000000000000/);
+    // The untouched town loads and picks.
+    const loaded = deserialize(serialize(newGame(9)));
+    expect(nearestNode(loaded.city, 10, 10)).toBeGreaterThanOrEqual(0);
+  });
+
   it('either rejects or loads a playable game for any single-field corruption', () => {
     // A tiny town keeps this exhaustive sweep fast: every path in the save,
     // every kind of wrong value.
@@ -262,6 +284,9 @@ describe('deserialize errors', () => {
           applyCommand(state, { type: 'removeSpan', span: 2 });
           runDays(state, 62);
           getService(state);
+          // Hovering and clicking the map picks streets through the spatial index.
+          nearestNode(state.city, 1, 1);
+          nearestSegment(state.city, 1, 1, 0.5);
           deserialize(serialize(state));
         } catch (err) {
           failures.push(`${label}: loaded, then ${String(err)}`);

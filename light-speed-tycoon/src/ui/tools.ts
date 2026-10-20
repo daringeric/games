@@ -3,8 +3,8 @@
 // Pixi so it unit-tests against hand-built states.
 
 import { formatDate } from '../sim/calendar';
-import { getService, quoteCabinet, quoteCable, spanOnSegment } from '../sim/network';
-import { nearestNode, nearestSegment, polesOnSegment, segmentsAtNode, shortestPath } from '../sim/streets';
+import { cableRoute, getService, quoteCabinet, quoteCable, spanOnSegment } from '../sim/network';
+import { nearestNode, nearestSegment, polesOnSegment, segmentsAtNode } from '../sim/streets';
 import { SPLIT_RATIO } from '../sim/balance';
 import type { Cabinet, CableMethod, Command, CommandResult, GameState, NodeId, SegmentId, ServiceSnapshot } from '../sim/types';
 import type { OverlaySpec } from '../render/overlay';
@@ -162,9 +162,9 @@ export class ToolController {
           return null;
         }
         if (target === this.origin) return null;
-        const path = shortestPath(city, this.origin, target);
-        if (!path) return { ok: false, message: 'No street route to that corner' };
         const method: CableMethod = this.tool;
+        const path = cableRoute(state, this.origin, target, method);
+        if (!path) return { ok: false, message: 'No street route to that corner' };
         const quote = quoteCable(state, path, method);
         const result = dispatch({ type: 'layCable', segments: path, method });
         if (!result.ok) return { ok: false, message: result.reason };
@@ -247,7 +247,7 @@ export class ToolController {
         },
       };
     }
-    const path = shortestPath(city, origin, snap);
+    const path = cableRoute(state, origin, snap, method);
     if (!path) {
       return { overlay: { origin, snap }, card: { title, tone: method, rows: [], blockers: ['No street route to that corner'] } };
     }

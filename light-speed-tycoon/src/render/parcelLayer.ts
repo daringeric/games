@@ -18,6 +18,8 @@ interface Chunk {
   g: Graphics;
   parcels: Parcel[];
   key: string;
+  /** Lots drawn in the 'passed' look at the last redraw. */
+  passed: number;
 }
 
 export class ParcelLayer {
@@ -44,7 +46,7 @@ export class ParcelLayer {
       if (parcels.length === 0) continue;
       const g = new Graphics();
       this.container.addChild(g);
-      this.chunks.push({ g, parcels, key: '' });
+      this.chunks.push({ g, parcels, key: '', passed: 0 });
     }
   }
 
@@ -66,22 +68,32 @@ export class ParcelLayer {
       chunk.key = key;
       changed = true;
       chunk.g.clear();
+      chunk.passed = 0;
       for (const p of chunk.parcels) {
-        if (p.appearsDay <= day) drawParcel(chunk.g, city, lattice, p, passed.has(p.id) ? 'passed' : 'unserved', this.theme);
+        if (p.appearsDay > day) continue;
+        const look: ParcelLook = passed.has(p.id) ? 'passed' : 'unserved';
+        if (drawParcel(chunk.g, city, lattice, p, look, this.theme) && look === 'passed') chunk.passed++;
       }
     }
     return changed;
   }
+
+  /** How many lots are drawn in the 'passed' look (a debug and test read-out of what the map shows). */
+  get passedLots(): number {
+    return this.chunks.reduce((sum, chunk) => sum + chunk.passed, 0);
+  }
 }
 
-export function drawParcel(g: Graphics, city: City, lattice: StreetLattice, p: Parcel, look: ParcelLook, theme: Theme): void {
+/** Draw one lot and its building; false when the lot is too small to show. */
+export function drawParcel(g: Graphics, city: City, lattice: StreetLattice, p: Parcel, look: ParcelLook, theme: Theme): boolean {
   const lot = lotRect(lattice, p, theme);
-  if (lot.w <= 2 || lot.h <= 2) return;
+  if (lot.w <= 2 || lot.h <= 2) return false;
   const frame = lotFrame(lot, frontageSide(city, p));
   const h = hashInt(p.id);
   if (p.kind === 'home') drawHome(g, lot, frame, h, look, theme);
   else if (p.kind === 'smb') drawShop(g, lot, frame, h, look, theme);
   else drawApartments(g, lot, p.units, look, theme);
+  return true;
 }
 
 /** 0..1 from a slice of a hash, for deterministic per-lot variety. */

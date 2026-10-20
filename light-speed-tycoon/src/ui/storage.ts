@@ -6,6 +6,8 @@ import { deserialize, serialize } from '../sim/save';
 import type { GameState } from '../sim/types';
 
 export const AUTOSAVE_KEY = 'lst:autosave';
+/** Autosave for a town opened from a ?seed= link, kept apart so a link never overwrites the main game. */
+export const SEED_AUTOSAVE_KEY = 'lst:autosave:seed';
 export const SAVE_KEY = 'lst:save';
 
 export function readSave(key: string): GameState | null {
@@ -26,6 +28,15 @@ export function readSave(key: string): GameState | null {
 export function writeSave(key: string, state: GameState): boolean {
   try {
     window.localStorage.setItem(key, serialize(state));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function removeSave(key: string): boolean {
+  try {
+    window.localStorage.removeItem(key);
     return true;
   } catch {
     return false;

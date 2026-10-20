@@ -5,6 +5,11 @@
 // pulses for a few seconds when it lights up and then holds steady, so a
 // finished network costs no frames while the map sits idle.
 //
+// Live cable (tubes, highlights and their poles) is most of the geometry in a
+// built-out town and the costliest to tessellate, so it has a Graphics of its
+// own, redrawn only when the set of live spans changes: an order, a permit or
+// a cabinet coming through leaves it alone.
+//
 // Two containers: `below` (cables and markers) sits under the central office
 // so cables run in beneath it; `above` (cabinets) sits over it so a cabinet at
 // the CO stays visible.
@@ -32,6 +37,7 @@ const GLOW_STEADY_ALPHA = 0.5;
 export class NetworkLayer {
   readonly below = new Container({ isRenderGroup: true });
   readonly above = new Container({ isRenderGroup: true });
+  private readonly live = new Graphics();
   private readonly cables = new Graphics();
   private readonly stripeGroup = new Container({ isRenderGroup: true });
   private readonly stripes = new Graphics();
@@ -46,20 +52,26 @@ export class NetworkLayer {
   /** The glow pulses until this time; afterwards it is drawn steady once and left alone. */
   private pulseUntil = -Infinity;
   private glowSettled = true;
+  /** Ids of the live spans `live` shows, or null when it must be redrawn. */
+  private liveKey: string | null = null;
+  /** Live spans drawn, and how many times the live cable has been redrawn (debug and test read-outs). */
+  liveSpans = 0;
+  liveRedraws = 0;
 
   constructor(private readonly theme: Theme) {
     this.stripeGroup.addChild(this.stripes);
     this.glowGroup.addChild(this.glow);
-    this.below.addChild(this.cables, this.stripeGroup, this.markers);
+    this.below.addChild(this.live, this.cables, this.stripeGroup, this.markers);
     this.above.addChild(this.glowGroup, this.cabinets);
   }
 
   sync(state: GameState, service: ServiceSnapshot, now = performance.now()): void {
     const { city, network } = state;
     if (state !== this.game) {
-      // Cabinet ids restart in another game.
+      // Cabinet and span ids restart in another game.
       this.game = state;
       this.activeSince.clear();
+      this.liveKey = null;
     }
     const theme = this.theme;
     const { cable } = theme;
@@ -87,22 +99,27 @@ export class NetworkLayer {
       strokeLines(this.cables, lines, { width: cable[method].width, color: cable.constructing.tube, cap: 'round', join: 'round' });
     }
 
-    // Live: candy tubes with a highlight stripe.
-    for (const method of ['underground', 'aerial'] as const) {
-      const style = cable[method];
-      const lines = ofMethod(byStage.live, method);
-      strokeLines(this.cables, lines, { width: style.width, color: style.tube, cap: 'round', join: 'round' });
-      const shine = lines.map((l) => highlightLine(l, style.width * 0.18, style.width * 0.6));
-      strokeLines(this.cables, shine, { width: Math.max(1.2, style.width * 0.3), color: style.highlight, cap: 'round' });
+    // Live: candy tubes with a highlight stripe, redrawn only when the live set changes.
+    // A span's segment and method never change, so its id stands for its drawing.
+    const liveKey = byStage.live.map((s) => s.id).join(',');
+    if (liveKey !== this.liveKey) {
+      this.liveKey = liveKey;
+      this.liveRedraws++;
+      this.live.clear();
+      this.liveSpans = 0;
+      for (const method of ['underground', 'aerial'] as const) {
+        const style = cable[method];
+        const lines = ofMethod(byStage.live, method);
+        this.liveSpans += lines.length;
+        strokeLines(this.live, lines, { width: style.width, color: style.tube, cap: 'round', join: 'round' });
+        const shine = lines.map((l) => highlightLine(l, style.width * 0.18, style.width * 0.6));
+        strokeLines(this.live, shine, { width: Math.max(1.2, style.width * 0.3), color: style.highlight, cap: 'round' });
+      }
+      this.drawPoles(this.live, this.polesOf(city, byStage.live));
     }
 
-    // Peg poles carry every aerial span that is being built or live.
-    const poles: { x: number; y: number }[] = [];
-    for (const span of [...byStage.constructing, ...byStage.live]) {
-      const seg = city.segments[span.segment];
-      if (span.method === 'aerial' && seg) poles.push(...pointsAlong(lineOf(span), polesOnSegment(seg)));
-    }
-    this.drawPoles(poles);
+    // Peg poles carry every aerial span that is being built (live ones are drawn with the live cable).
+    this.drawPoles(this.cables, this.polesOf(city, byStage.constructing));
 
     for (const span of byStage.permitting) this.drawPermitBadge(midpoint(lineOf(span)), span.method);
     for (const span of byStage.constructing) this.drawCrewTruck(lineOf(span));
@@ -141,13 +158,23 @@ export class NetworkLayer {
     }
   }
 
-  private drawPoles(points: { x: number; y: number }[]): void {
+  /** Pole positions along the aerial spans among `spans`. */
+  private polesOf(city: City, spans: readonly CableSpan[]): { x: number; y: number }[] {
+    const poles: { x: number; y: number }[] = [];
+    for (const span of spans) {
+      const seg = city.segments[span.segment];
+      if (span.method === 'aerial' && seg) poles.push(...pointsAlong(segmentLine(city, seg, this.theme), polesOnSegment(seg)));
+    }
+    return poles;
+  }
+
+  private drawPoles(g: Graphics, points: { x: number; y: number }[]): void {
     const { aerial } = this.theme.cable;
     if (points.length === 0) return;
-    for (const p of points) this.cables.circle(p.x, p.y, aerial.poleRadius);
-    this.cables.fill(aerial.poleRim);
-    for (const p of points) this.cables.circle(p.x, p.y, aerial.poleRadius - 1.3);
-    this.cables.fill(aerial.pole);
+    for (const p of points) g.circle(p.x, p.y, aerial.poleRadius);
+    g.fill(aerial.poleRim);
+    for (const p of points) g.circle(p.x, p.y, aerial.poleRadius - 1.3);
+    g.fill(aerial.pole);
   }
 
   /** White badge: an hourglass for aerial make-ready, a clipboard for an underground permit. */

@@ -67,8 +67,9 @@ export function monthlyPoleRent(state: GameState): number {
 
 /**
  * Close the month that just ended. Called by tick() when the new day is the 1st
- * of a month (never for day 0). Posts that month's recurring charges (pole rent)
- * dated the last day of the ended month, totals monthToDate into a MonthlyReport
+ * of a month (never for day 0), before that day's network progress, so the
+ * network is as it stood on the ended month's last day. Posts that month's
+ * recurring charges (pole rent) dated the last day of the ended month, totals monthToDate into a MonthlyReport
  * labelled with the ended month's year/month, appends it to finance.reports,
  * clears monthToDate and returns the report.
  */

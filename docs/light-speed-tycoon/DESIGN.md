@@ -59,7 +59,11 @@ Home · MDU demarc + building router · SMB
 
 - **Revenue:** residential/SMB MRC, MDU bulk, dedicated MRC + NRC, (later) wholesale.
 - **Costs:** construction (per ft by method), drops/ONTs, equipment, payroll, pole rent, transport leases, IX ports, marketing, interest, SLA credits.
-- **Monthly report:** subs, gross adds, churn, ARPU by product, CPGA, take rate by area, EBITDA, cash, debt covenants.
+- **Monthly report:** subs, gross adds, churn, ARPU by product, CPGA, take rate by area, cost per passing vs target, cost per connection, EBITDA, cash, debt covenants.
+- **Cost per passing (CPP):** outside-plant build cost (cable, cabinets, splitters) ÷ homes passed; drops/ONTs/install are cost per connection, tracked separately. A tunable target (~$1,000) colors every cable quote and cabinet preview (green ≤ target, amber ≤ 1.5×, red above) and anchors milestones. Scorecard first; lenders price debt off CPP performance once loans land.
+- **CO capacity:** each 1:32 splitter consumes one OLT PON port (start: 16 ports = 512 subs). Upgrades at the CO add OLT line cards (+16 ports) and later a second chassis, each with a cost.
+- **Cost pressure:** per-pole make-ready on aerial, engineering/permit fees per order, fixed monthly overhead, and a lean starting purse so the starting cash covers only ~25–33% of the town; tuned by headless simulation.
+- **Cabinet coverage:** a cabinet serves homes within a street-distance reach (~1,500 ft, tunable); splitter ports (32 each) cap subscribers. Placement preview shades the reach and counts homes covered.
 - **Competitor response:** incumbents run promos in neighborhoods you enter (ARPU compression); rival overbuilder races for unbuilt areas and RFQs.
 
 ## Milestones
