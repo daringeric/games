@@ -10,10 +10,10 @@
 // only uses the public members below.
 
 import type { Camera } from '../render/camera';
+import { costOverlayThresholds } from '../render/cityLayer';
 import type { CostOverlayMode } from '../render/cityLayer';
 import type { Scene } from '../render/scene';
 import type { Theme } from '../render/theme';
-import { CPP_AMBER_MULTIPLIER, CPP_TARGET, TILE_FT } from '../sim/balance';
 import type { Command, GameState } from '../sim/types';
 import { el } from './dom';
 import { FloatingCard } from './floatingCard';
@@ -242,22 +242,21 @@ function legendItem(color: string, text: string): HTMLElement {
 }
 
 /**
- * The cost overlay's legend: what each band means in dollars per foot (a
- * street is banded by its cost per lot frontage, $/ft x TILE_FT, against the
- * cost-per-passing target).
+ * The cost overlay's legend: what each band means in dollars per foot (all-in
+ * cable cost before per-order fees; see costOverlayThresholds: aerial reads
+ * green, soil bores amber, rock red).
  */
 function buildLegend(theme: Theme, mode: HTMLElement, none: HTMLElement): HTMLElement {
-  const green = CPP_TARGET / TILE_FT;
-  const amber = (CPP_TARGET * CPP_AMBER_MULTIPLIER) / TILE_FT;
+  const { green, amber } = costOverlayThresholds();
   return el(
     'aside',
     { class: 'cost-legend pill-card', attrs: { 'aria-label': 'Cost overlay legend', 'data-testid': 'cost-legend', hidden: '' } },
     [
       el('p', { class: 'cost-legend-title' }, ['Cable $/ft · ', mode]),
       el('ul', {}, [
-        legendItem(theme.cpp.green, `≤ ${formatPerFt(green)}`),
-        legendItem(theme.cpp.amber, `≤ ${formatPerFt(amber)}`),
-        legendItem(theme.cpp.red, 'more'),
+        legendItem(theme.cpp.green, `≤ ${formatPerFt(green)} · aerial`),
+        legendItem(theme.cpp.amber, `≤ ${formatPerFt(amber)} · bore`),
+        legendItem(theme.cpp.red, 'more · rock'),
         none,
       ]),
     ],

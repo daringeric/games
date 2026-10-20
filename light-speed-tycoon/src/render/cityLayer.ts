@@ -3,8 +3,13 @@
 // texture shown while planning underground runs, and the $/ft cost overlay.
 
 import type { Graphics } from 'pixi.js';
-import { TILE_FT } from '../sim/balance';
-import { cppBand } from '../sim/metrics';
+import {
+  AERIAL_COST_PER_FT,
+  MAKE_READY_COST_PER_POLE,
+  POLE_SPACING_FT,
+  UNDERGROUND_COST_PER_FT,
+  UNDERGROUND_ROCK_SURCHARGE_PER_FT,
+} from '../sim/balance';
 import { segmentCostPerFt } from '../sim/network';
 import { polesOnSegment } from '../sim/streets';
 import type { CableMethod, City, CppBand, StreetSegment } from '../sim/types';
@@ -198,10 +203,27 @@ export function overlayCostPerFt(seg: StreetSegment, mode: CostOverlayMode): num
   return Math.min(aerial, under);
 }
 
-/** The overlay's color band for a street: cost per lot frontage ($/ft x TILE_FT) against the CPP target. */
+/**
+ * Where the overlay's colors change, in $/ft, from the build rates: green up
+ * to halfway between typical aerial (strand plus make-ready at the usual pole
+ * spacing) and an underground bore in soil, amber up to halfway between soil
+ * and rock, red above. So aerial streets read green, soil bores amber and rock
+ * red, in every mode, whatever the tuned rates are. (A single cost-per-passing
+ * threshold would paint every underground street the same red.)
+ */
+export function costOverlayThresholds(): { green: number; amber: number } {
+  const aerial = AERIAL_COST_PER_FT + MAKE_READY_COST_PER_POLE / POLE_SPACING_FT;
+  const soil = UNDERGROUND_COST_PER_FT;
+  const rock = UNDERGROUND_COST_PER_FT + UNDERGROUND_ROCK_SURCHARGE_PER_FT;
+  return { green: (aerial + soil) / 2, amber: (soil + rock) / 2 };
+}
+
+/** The overlay's color band for a street's all-in $/ft (see costOverlayThresholds); null where it can't be built. */
 export function overlayBand(seg: StreetSegment, mode: CostOverlayMode): CppBand | null {
   const perFt = overlayCostPerFt(seg, mode);
-  return perFt === null ? null : cppBand(perFt * TILE_FT);
+  if (perFt === null) return null;
+  const { green, amber } = costOverlayThresholds();
+  return perFt <= green ? 'green' : perFt <= amber ? 'amber' : 'red';
 }
 
 /** Every street colored by its $/ft band (theme.cpp), or the "can't build" color. */

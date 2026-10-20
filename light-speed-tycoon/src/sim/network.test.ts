@@ -50,6 +50,7 @@ import {
   quoteCable,
   quoteOltCard,
   quoteRemoveCabinet,
+  quoteRemoveSpan,
   quoteSplitter,
   rememberedPermitDays,
   removeCabinet,
@@ -891,7 +892,8 @@ describe('cabinets', () => {
       },
     ]);
     expect(state.nextNoticeId).toBe(2);
-    expectRejected(state, (s) => placeCabinet(s, 2), 'No free PON ports on the OLT: 2 of 2 in use');
+    // Same blocker as a splitter: it says how to get more ports.
+    expectRejected(state, (s) => placeCabinet(s, 2), 'No free PON ports on the OLT: 2 of 2 in use - add a line card at the CO');
     expect(state.network.cabinets).toHaveLength(2);
   });
 
@@ -1226,6 +1228,81 @@ describe('removeSpan', () => {
     lay(state, [H(0, 0)], 'aerial');
     removeSpan(state, 1);
     expect(quoteCable(state, [H(0, 0)], 'underground').newSegments).toEqual([H(0, 0)]);
+  });
+});
+
+describe('quoteRemoveSpan', () => {
+  /** Live cable along 1st St (H(0,0) -> H(1,0) -> H(2,0)) from the CO cabinet, one subscriber per lot on it. */
+  function litStreet(): { state: GameState; spans: number[]; cabinet: number } {
+    const state = makeState();
+    const spans = [H(0, 0), H(1, 0), H(2, 0)].map((s) => addSpan(state, s));
+    const cabinet = addCabinet(state, state.city.coNode);
+    const on = new Set([H(0, 0), H(1, 0), H(2, 0)]);
+    state.sales.accounts = state.city.parcels
+      .filter((p) => on.has(p.segment))
+      .map((p) => ({ parcel: p.id, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }));
+    return { state, spans, cabinet };
+  }
+
+  /** Units that the next daily sales step would drop as lost service (street dark or cabinet inactive). */
+  function wouldLoseService(state: GameState): number {
+    const service = computeService(state);
+    return state.sales.accounts
+      .filter((a) => !service.litSegments.has(state.city.parcels[a.parcel]!.segment) || !service.activeCabinets.has(a.cabinet))
+      .length;
+  }
+
+  it('counts everyone cut off beyond a feeder span, not just its own street', () => {
+    const { state, spans } = litStreet();
+    const unitsOn = (seg: SegmentId) => state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === seg).length;
+    expect(unitsOn(H(0, 0))).toBeGreaterThan(0);
+    expect(unitsOn(H(2, 0))).toBeGreaterThan(0);
+    const before = structuredClone(state);
+    const passings = computeService(state).passings;
+
+    const feeder = quoteRemoveSpan(state, spans[0]!);
+    expect(feeder).toEqual({ ok: true, reasons: [], refund: 0, subscribersAffected: state.sales.accounts.length, passingsLost: passings });
+    const tail = quoteRemoveSpan(state, spans[2]!);
+    expect(tail.subscribersAffected).toBe(unitsOn(H(2, 0)));
+    // A quote changes nothing.
+    expect(state).toEqual(before);
+
+    // And it matches what removing it really does.
+    for (const [span, quote] of [[spans[0]!, feeder], [spans[2]!, tail]] as const) {
+      const copy = structuredClone(before);
+      removeSpan(copy, span);
+      expect(wouldLoseService(copy)).toBe(quote.subscribersAffected);
+      expect(passings - computeService(copy).passings).toBe(quote.passingsLost);
+    }
+  });
+
+  it('counts subscribers whose cabinet goes dark with the cable feeding it', () => {
+    const state = makeState();
+    addSpan(state, H(0, 0));
+    const feeder = addSpan(state, H(1, 0));
+    addSpan(state, H(2, 0));
+    // The cabinet stands at the far end of 2nd span: cut that and the cabinet loses the CO.
+    const cabinet = addCabinet(state, 2);
+    const parcel = state.city.parcels.find((p) => p.segment === H(0, 0))!;
+    state.sales.accounts = [{ parcel: parcel.id, cabinet, tierUnits: { fiber500: 0, fiber1g: 2, fiber2g: 0 }, since: 0 }];
+    expect(computeService(state).litSegments.has(H(0, 0))).toBe(true);
+    expect(quoteRemoveSpan(state, feeder).subscribersAffected).toBe(2);
+  });
+
+  it('quotes the permitting refund removeSpan pays, and no service loss for cable not yet live', () => {
+    const state = makeState();
+    lay(state, [H(0, 0), H(1, 0)], 'underground');
+    const span = state.network.spans[0]!;
+    const quote = quoteRemoveSpan(state, span.id);
+    expect(quote).toEqual({ ok: true, reasons: [], refund: Math.round(span.refundable * PERMITTING_CANCEL_REFUND), subscribersAffected: 0, passingsLost: 0 });
+    expect(removeSpan(state, span.id)).toEqual({ ok: true, cost: -quote.refund });
+    state.network.spans[0]!.stage = 'constructing';
+    expect(quoteRemoveSpan(state, state.network.spans[0]!.id).refund).toBe(0);
+  });
+
+  it('names an unknown span', () => {
+    const state = makeState();
+    expect(quoteRemoveSpan(state, 99)).toEqual({ ok: false, reasons: ['Unknown cable span: 99'], refund: 0, subscribersAffected: 0, passingsLost: 0 });
   });
 });
 

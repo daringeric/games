@@ -6,7 +6,7 @@
 
 import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, SPLITTER_COST } from './balance';
 import { cppBand } from './metrics';
-import { getService, spanCharges } from './network';
+import { getService, plannedService, spanCharges } from './network';
 import { isNodeId, parcelsServedBy, segmentsWithin } from './streets';
 import type { SegmentReach } from './streets';
 import type { City, CoveragePreview, CoverageSegment, GameState, Network, NodeId, StreetSegment } from './types';
@@ -66,8 +66,11 @@ const previewCache = new WeakMap<GameState, PreviewCacheEntry>();
 /**
  * What a cabinet at `node` could cover, measured along streets with
  * CABINET_REACH_FT (cable not required). See CoveragePreview for every field.
- * Uses getService(state) for `connected` / `servedBy` (a cabinet already at
- * `node` never counts as "elsewhere"), the cabinet's list price for
+ * Uses getService(state) for `connected` (live cable today) and
+ * plannedService(state) for `servedBy`: the cabinet that will serve the
+ * segment once everything already ordered is built, so a cabinet still
+ * permitting or under construction counts too (a cabinet already at `node`
+ * never counts as "elsewhere"). The cabinet's list price for
  * cabinetCost (CABINET_COST + CABINET_START_SPLITTERS x SPLITTER_COST, or 0
  * when a cabinet already stands at `node`; cash and PON ports are not checked
  * here), and per-segment cheapest cable charges (network.spanCharges) for
@@ -90,6 +93,7 @@ export function coveragePreview(state: GameState, node: NodeId): CoveragePreview
   }
 
   const service = getService(state);
+  const planned = plannedService(state);
   const here = network.cabinets.find((c) => c.node === node);
   const cabled = new Set(network.spans.map((s) => s.segment));
   const preview = emptyPreview(node);
@@ -98,7 +102,7 @@ export function coveragePreview(state: GameState, node: NodeId): CoveragePreview
 
   for (const { segment, distanceFt } of segmentsWithin(city, node, CABINET_REACH_FT)) {
     const connected = service.connectedSegments.has(segment);
-    const server = service.servingCabinet.get(segment);
+    const server = planned.servingCabinet.get(segment);
     const servedBy = server === undefined || server === here?.id ? null : server;
     const entry: CoverageSegment = { segment, distanceFt, connected, servedBy };
     preview.segments.push(entry);

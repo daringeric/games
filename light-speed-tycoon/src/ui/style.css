@@ -354,6 +354,29 @@ body {
   min-width: 112px;
 }
 
+/* Cost per passing: the value and its dot take the band color (green / amber / red). */
+.chip-cpp .cpp-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.chip-cpp.band-green .cpp-dot,
+.chip-cpp.band-green .num {
+  color: var(--cpp-green);
+}
+
+.chip-cpp.band-amber .cpp-dot,
+.chip-cpp.band-amber .num {
+  color: var(--cpp-amber);
+}
+
+.chip-cpp.band-red .cpp-dot,
+.chip-cpp.band-red .num {
+  color: var(--cpp-red);
+}
+
 .chip-building {
   min-width: 156px;
 }
@@ -612,6 +635,15 @@ body {
   text-align: right;
 }
 
+/* Small print after a value: the cost-per-passing target. */
+.report-details .row-sub {
+  margin-left: 6px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .row-movements .num {
   font-family: var(--font-ui);
   font-size: 13px;
@@ -866,6 +898,37 @@ body {
    so the toolbar still fits down the side, centred beside the two-row HUD
    (which stays narrow enough to clear it: see below). Narrower screens get the
    phone layout further down. */
+/* Mid-width screens (small laptops, tablets in landscape, landscape phones
+   wider than 880px): the full chip row would reach the toolbar, so chips size
+   to their content, the cost-per-passing chip drops its label (the colored
+   dot, the value and its tooltip stay) and the overdraft warning gets a row of
+   its own. */
+@media (max-width: 1100px) {
+  .chip {
+    padding: 0 10px;
+  }
+
+  .chip-passings,
+  .chip-subs,
+  .chip-mrr,
+  .chip-pon,
+  .chip-building {
+    min-width: 0;
+  }
+
+  .chip-cpp .chip-label {
+    display: none;
+  }
+
+  .hud.alerting {
+    grid-template-columns: repeat(5, auto);
+    grid-template-areas:
+      'speeds when cash actions menu'
+      'stats stats stats stats stats'
+      'alert alert alert alert alert';
+  }
+}
+
 @media (max-height: 500px) {
   .tool {
     width: 46px;
@@ -1025,27 +1088,47 @@ body {
 /* Phone portrait: the clock and menu on top, money and the pricing and
    milestones buttons next, then the chips (labels dropped, numbers kept). */
 @media (max-width: 600px) {
+  /* The pricing and milestones buttons span the date and menu columns, so the
+     menu column is only as wide as the menu button and the date keeps room. */
   .hud,
   .hud.alerting {
     grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-areas:
       'speeds when menu'
-      'cash cash actions'
+      'cash actions actions'
       'stats stats stats';
   }
 
   .hud.alerting {
     grid-template-areas:
       'speeds when menu'
-      'cash cash actions'
+      'cash actions actions'
       'stats stats stats'
       'alert alert alert';
+  }
+
+  .hud-actions {
+    justify-self: end;
   }
 
   .hud-cash {
     justify-self: start;
     padding-left: 8px;
     font-size: 20px;
+  }
+
+  /* The date column takes what the speed buttons and menu leave, never more. */
+  .hud-when {
+    min-width: 0;
+    padding: 0 2px 0 4px;
+  }
+
+  .hud-date {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .chip-label {
@@ -1101,6 +1184,13 @@ body {
   }
 }
 
+@media (max-width: 400px) {
+  .speed {
+    min-width: 42px;
+    padding: 0 8px;
+  }
+}
+
 @media (max-width: 360px) {
   .chip {
     padding: 0 5px;
@@ -1108,7 +1198,8 @@ body {
   }
 
   .speed {
-    min-width: 40px;
+    min-width: 38px;
+    padding: 0 6px;
   }
 }
 

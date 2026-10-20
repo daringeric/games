@@ -1,15 +1,17 @@
 // Top bar: speed controls, date, cash (with an overdraft warning), the
 // pricing and milestones buttons, the menu, and a row of chips: passings,
-// subscribers, monthly recurring revenue, OLT PON ports and the build queue.
+// cost per passing, subscribers, monthly recurring revenue, OLT PON ports and
+// the build queue.
 //
 // Owner: ui-economy workstream.
 
-import { INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
+import { CPP_AMBER_MULTIPLIER, CPP_TARGET, INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { runwayMonths } from '../sim/finance';
+import { costPerPassing, cppBand } from '../sim/metrics';
 import { getService, ponPortsUsed } from '../sim/network';
 import { monthlyRecurringRevenue, subscriberUnits } from '../sim/sales';
-import type { GameState } from '../sim/types';
+import type { CppBand, GameState } from '../sim/types';
 import { el, icon, setText } from './dom';
 import { formatMoney, formatNumber, plural } from './format';
 import { ICONS } from './icons';
@@ -41,6 +43,32 @@ export function ponStatus(state: GameState): PonStatus {
     text: `PON ${formatNumber(used)}/${formatNumber(ports)}`,
     level,
     tip: `OLT PON ports in use: ${formatNumber(used)} of ${formatNumber(ports)}. Every splitter uses one.${advice}`,
+  };
+}
+
+export interface CppStatus {
+  /** "$812" */
+  text: string;
+  band: CppBand;
+  tip: string;
+}
+
+/**
+ * The HUD's cost-per-passing chip: lifetime outside-plant spend over today's
+ * passings (the same formula as the monthly report's KPI, live), or null
+ * while nothing is passed.
+ */
+export function cppStatus(state: GameState): CppStatus | null {
+  const passings = getService(state).passings;
+  const cpp = costPerPassing(state.finance.capex.osp, passings);
+  if (cpp === null) return null;
+  return {
+    text: formatMoney(cpp),
+    band: cppBand(cpp),
+    tip:
+      `Cost per passing: ${formatMoney(cpp)} of cable, cabinets and splitters per home passed ` +
+      `(${formatMoney(state.finance.capex.osp)} over ${plural(passings, 'passing')}). ` +
+      `Target ${formatMoney(CPP_TARGET)}: green at or under it, amber up to ${formatMoney(CPP_TARGET * CPP_AMBER_MULTIPLIER)}, red above.`,
   };
 }
 
@@ -106,6 +134,8 @@ export class Hud {
   private readonly ponChip: HTMLElement;
   private readonly building: HTMLElement;
   private readonly buildingChip: HTMLElement;
+  private readonly cpp: HTMLElement;
+  private readonly cppChip: HTMLElement;
   /** Session revision and state the subscriber figures were last computed for. */
   private seen: { revision: number; state: GameState | null } = { revision: -1, state: null };
 
@@ -157,6 +187,12 @@ export class Hud {
     this.mrr = el('span', { class: 'num', attrs: { 'data-testid': 'hud-mrr' } });
     this.pon = el('span', { class: 'num', attrs: { 'data-testid': 'hud-pon' } });
     this.building = el('span', { class: 'num', attrs: { 'data-testid': 'hud-building' } });
+    this.cpp = el('span', { class: 'num', attrs: { 'data-testid': 'hud-cpp' } });
+    this.cppChip = el('span', { class: 'chip chip-cpp', attrs: { hidden: '' } }, [
+      el('span', { class: 'cpp-dot', attrs: { 'aria-hidden': 'true' } }),
+      this.cpp,
+      label(' per passing'),
+    ]);
     this.ponChip = el('span', { class: 'chip chip-pon' }, [icon(ICONS.chip), this.pon]);
     // Counts every order not yet live: permitting as well as crews on site (the tooltip splits them).
     this.buildingChip = el('span', { class: 'chip chip-building' }, [icon(ICONS.crew), this.building, label(' in progress')]);
@@ -166,6 +202,7 @@ export class Hud {
         this.passings,
         label(' passings'),
       ]),
+      this.cppChip,
       el('span', { class: 'chip chip-subs', attrs: { title: 'Subscribers: homes, businesses and apartments with service' } }, [
         icon(ICONS.users),
         this.subs,
@@ -227,6 +264,13 @@ export class Hud {
       if (this.ponChip.title !== pon.tip) this.ponChip.title = pon.tip;
       const tip = runwayHint(state);
       if (this.cash.title !== tip) this.cash.title = tip;
+      const cpp = cppStatus(state);
+      this.cppChip.hidden = cpp === null;
+      if (cpp) {
+        setText(this.cpp, cpp.text);
+        for (const band of ['green', 'amber', 'red'] as const) this.cppChip.classList.toggle(`band-${band}`, cpp.band === band);
+        if (this.cppChip.title !== cpp.tip) this.cppChip.title = cpp.tip;
+      }
     }
 
     let permitting = 0;

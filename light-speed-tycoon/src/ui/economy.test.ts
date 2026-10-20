@@ -36,14 +36,15 @@ import {
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { applyCommand, newGame, runDays } from '../sim/game';
-import { operatingCashFlow, reportKpis } from '../sim/metrics';
+import { cppBand, operatingCashFlow, reportKpis } from '../sim/metrics';
+import { getService } from '../sim/network';
 import { MILESTONES } from '../sim/milestones';
 import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, defaultPricing, marketingBoost, targetTakeRate, tierMix, unitPrice } from '../sim/sales';
 import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
 import type { GameState, MonthlyReport, Notice, NoticeKind, TierSetting } from '../sim/types';
 import { debugHookEnabled, searchWithoutSeed } from './debugHook';
 import { formatFeet, formatMoney, formatPerFt, formatPercent, formatSignedMoney, plural } from './format';
-import { overdraftStatus, ponStatus, runwayHint } from './hud';
+import { cppStatus, overdraftStatus, ponStatus, runwayHint } from './hud';
 import { milestoneRows } from './milestonesPanel';
 import { noticeTone } from './overlays';
 import { monthClosedMessage, reportRows, subscriberMovements } from './panel';
@@ -400,6 +401,27 @@ describe('HUD chips', () => {
     expect(overdraftStatus(state)).toMatchObject({ text: `Recovering: ${plural(1, 'close')} left`, tone: 'warn' });
     state.gameOver = { day: 31, reason: 'insolvent', message: 'Out of cash.' };
     expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: out of cash', tone: 'danger', tip: 'Out of cash.' });
+  });
+
+  it('shows the live cost per passing by the same formula as the report, banded against the target', () => {
+    const state = makeTestState();
+    expect(cppStatus(state)).toBeNull();
+    const lit = litGame(31);
+    lit.finance.capex.osp = CPP_TARGET * getService(lit).passings;
+    expect(cppStatus(lit)).toMatchObject({ text: formatMoney(CPP_TARGET), band: 'green' });
+    // Right after a month close the chip and the report's KPI agree.
+    const closing = makeTestState(makeGridCity({ cols: 3, rows: 2 }));
+    addLivePlant(closing, { splitters: 4 });
+    closing.finance.capex.osp = 123_457;
+    runDays(closing, 31);
+    const kpis = reportKpis(closing.finance.reports.at(-1)!)!;
+    expect(kpis.cpp).toBeGreaterThan(0);
+    expect(cppStatus(closing)!.text).toBe(formatMoney(kpis.cpp!));
+    expect(cppStatus(closing)!.band).toBe(kpis.cppBand);
+    lit.finance.capex.osp = CPP_TARGET * CPP_AMBER_MULTIPLIER * getService(lit).passings + getService(lit).passings;
+    expect(cppStatus(lit)!.band).toBe(cppBand(lit.finance.capex.osp / getService(lit).passings));
+    expect(cppStatus(lit)!.band).toBe('red');
+    expect(cppStatus(lit)!.tip).toContain(`Target ${formatMoney(CPP_TARGET)}`);
   });
 
   it('gives the runway at last month’s burn in the cash tooltip', () => {

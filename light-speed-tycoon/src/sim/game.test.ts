@@ -394,6 +394,7 @@ describe('tick and runDays', () => {
         stats: {
           subscribers: 0,
           accounts: 0,
+          subscriberDays: 0,
           grossAdds: 0,
           churned: 0,
           lostService: 0,

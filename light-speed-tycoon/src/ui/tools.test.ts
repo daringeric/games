@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CABINET_REACH_FT, SPLIT_RATIO } from '../sim/balance';
+import { CABINET_REACH_FT, CPP_TARGET, SPLIT_RATIO } from '../sim/balance';
 import { coveragePreview } from '../sim/coverage';
 import { applyCommand, newGame, runDays } from '../sim/game';
 import {
@@ -8,6 +8,7 @@ import {
   quoteCabinet,
   quoteCable,
   quoteRemoveCabinet,
+  quoteRemoveSpan,
   quoteSplitter,
   segmentCostPerFt,
   spanOnSegment,
@@ -98,6 +99,7 @@ describe('cable tools', () => {
     const cpp = card?.rows.find((r) => r.label === 'Cost per passing');
     expect(cpp?.value).toBe(formatMoney(quote.cpp!));
     expect(cpp?.tone).toBe(quote.cppBand);
+    expect(cpp?.sub).toBe(`target ${formatMoney(CPP_TARGET)}`);
     expect(row(card, 'Permit')).toBe(`${quote.permitDaysMin}–${quote.permitDaysMax} days`);
     expect(card?.note).toBe(`Cancel while permitting: ${formatMoney(cancelRefund(quote.refundable))} back`);
     // No cabinet yet, so the homes along it are not in reach.
@@ -300,7 +302,8 @@ describe('cabinet tool', () => {
     expect(row(view.card, 'Already served')).toBe(formatNumber(preview.passingsServedElsewhere));
     expect(row(view.card, 'Passable today')).toBe(formatNumber(preview.passingsPassableToday));
     const cpp = view.card?.rows.find((r) => r.label === 'Cost per passing');
-    expect(cpp?.value).toBe(`${formatMoney(preview.projectedCpp!)} projected`);
+    expect(cpp?.value).toBe(formatMoney(preview.projectedCpp!));
+    expect(cpp?.sub).toBe(`projected, target ${formatMoney(CPP_TARGET)}`);
     expect(cpp?.tone).toBe(preview.projectedCppBand);
     expect(row(view.card, 'Ports')).toMatch(new RegExp(`^${preview.ports} `));
     expect(row(view.card, 'Cost')).toBe(formatMoney(quote.cost));
@@ -402,6 +405,28 @@ describe('remove tool', () => {
     tools.hoverAt(2, 0);
     expect(row(tools.view(state).card, 'Refund')).toBe('No refund');
     expect(tools.click(state, dispatcher(state), 2, 0)?.message).toMatch(/no refund/);
+  });
+
+  it('warns about subscribers cut off beyond a live feeder, not only those on its street', () => {
+    const state = game();
+    // Live cable east along 1st St (segments 0, 1, 2) from the CO cabinet; subscribers on 3rd-segment lots only.
+    applyCommand(state, { type: 'layCable', segments: [0, 1, 2], method: 'underground' });
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    runDays(state, 80);
+    const cabinet = state.network.cabinets[0]!.id;
+    const far = state.city.parcels.filter((p) => p.segment === 2).map((p) => p.id);
+    expect(far.length).toBeGreaterThan(1);
+    state.sales.accounts = far.map((parcel) => ({ parcel, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }));
+    const feeder = spanOnSegment(state, 0)!;
+    const quote = quoteRemoveSpan(state, feeder.id);
+    expect(quote.subscribersAffected).toBe(far.length);
+    const tools = new ToolController();
+    tools.setTool('remove');
+    tools.hoverAt(2, 0.2);
+    const card = tools.view(state).card;
+    expect(card?.title).toBe('Remove cable on 1st St');
+    expect(row(card, 'Passings lost')).toBe(formatNumber(quote.passingsLost));
+    expect(card?.warnings).toEqual([`${far.length} subscribers (some beyond this street) lose service`]);
   });
 
   it('ignores streets without cable', () => {

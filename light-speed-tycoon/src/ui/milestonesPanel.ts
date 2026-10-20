@@ -6,7 +6,14 @@
 import { CPP_TARGET } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { operatingCashFlow } from '../sim/metrics';
-import { MILESTONES } from '../sim/milestones';
+import {
+  EFFICIENT_PASSINGS,
+  FAVORITE_PASSINGS,
+  FAVORITE_TAKE_RATE,
+  FIRST_SUBSCRIBERS,
+  MANY_SUBSCRIBERS,
+  MILESTONES,
+} from '../sim/milestones';
 import { getService } from '../sim/network';
 import { subscriberUnits } from '../sim/sales';
 import type { GameState, MilestoneId } from '../sim/types';
@@ -15,14 +22,6 @@ import type { Sheet } from './confirm';
 import { el, icon } from './dom';
 import { formatMoney, formatNumber, formatPercent, formatSignedMoney } from './format';
 import { ICONS } from './icons';
-
-// The thresholds milestones.ts judges by (its titles and descriptions quote
-// them; they are part of each milestone's definition, not balance knobs).
-const EFFICIENT_PASSINGS = 1_000;
-const FIRST_SUBSCRIBERS = 100;
-const MANY_SUBSCRIBERS = 1_000;
-const FAVORITE_TAKE_RATE = 0.3;
-const FAVORITE_PASSINGS = 500;
 
 export interface MilestoneRow {
   id: MilestoneId;

@@ -670,7 +670,11 @@ export interface CoverageSegment {
   distanceFt: number;
   /** Has live cable connected to the CO today (lit the moment a cabinet here is live). */
   connected: boolean;
-  /** Active cabinet (other than one at the preview node) already serving it today, else null. */
+  /**
+   * Cabinet (other than one at the preview node) that serves it once
+   * everything already ordered is built (live cabinets today included, and
+   * ones still permitting or under construction), else null.
+   */
   servedBy: CabinetId | null;
 }
 
@@ -687,7 +691,7 @@ export interface CoveragePreview {
   passingsNow: number;
   /** Units on parcels served by those segments that appear later. */
   passingsFuture: number;
-  /** Of passingsNow: already passed today by another active cabinet. */
+  /** Of passingsNow: on segments another cabinet serves, or will once what is already ordered is built (servedBy). */
   passingsServedElsewhere: number;
   /** Of passingsNow, not served elsewhere: on connected segments, so passed as soon as this cabinet is live and CO-connected. */
   passingsPassableToday: number;

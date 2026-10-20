@@ -2,7 +2,7 @@
 // day, each id at most once, in the order achieved); definitions live here.
 //
 // Owner: sim-economy workstream. MILESTONES (ids, titles, descriptions) is
-// part of the contract so the UI can list them; checkMilestones is a stub.
+// part of the contract so the UI can list them.
 
 import { CPP_TARGET } from './balance';
 import { operatingCashFlow, reportKpis } from './metrics';
@@ -11,12 +11,13 @@ import { postNotice } from './notices';
 import type { GameState, MilestoneId, MilestoneRecord, MonthlyReport } from './types';
 
 // Thresholds are part of each milestone's definition (its title and
-// description quote them), not balance knobs.
-const EFFICIENT_PASSINGS = 1_000;
-const FIRST_SUBSCRIBERS = 100;
-const MANY_SUBSCRIBERS = 1_000;
-const FAVORITE_TAKE_RATE = 0.3;
-const FAVORITE_PASSINGS = 500;
+// description quote them), not balance knobs. Exported for the milestones
+// panel's progress hints.
+export const EFFICIENT_PASSINGS = 1_000;
+export const FIRST_SUBSCRIBERS = 100;
+export const MANY_SUBSCRIBERS = 1_000;
+export const FAVORITE_TAKE_RATE = 0.3;
+export const FAVORITE_PASSINGS = 500;
 
 export interface MilestoneDef {
   id: MilestoneId;

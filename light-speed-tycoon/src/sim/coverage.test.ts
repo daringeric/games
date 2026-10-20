@@ -167,6 +167,22 @@ describe('coveragePreview', () => {
     expect(at1.projectedCpp).toBe((CABINET_PRICE + at1.buildOutCost) / (at1.passingsNow - 30));
   });
 
+  it('counts streets a cabinet still being built will serve as served elsewhere', () => {
+    // 1,800 ft blocks: cable ordered along 1st St, a cabinet permitting at the CO.
+    const state = makeTestState(makeGridCity({ blockW: 30 }));
+    addSpan(state, H(0, 0), 'permitting');
+    addSpan(state, H(1, 0), 'constructing');
+    const planned = addCabinet(state, 0, 'permitting');
+    expect(getService(state).litSegments.size).toBe(0);
+    const at1 = coveragePreview(state, 1);
+    // Once built, the CO cabinet serves 1st St's first segment; the second is beyond its reach.
+    expect(at1.segments.find((s) => s.segment === H(0, 0))).toEqual({ segment: H(0, 0), distanceFt: 0, connected: false, servedBy: planned });
+    expect(at1.segments.find((s) => s.segment === H(1, 0))).toMatchObject({ connected: false, servedBy: null });
+    expect(at1.passingsServedElsewhere).toBe(30);
+    expect(at1.passingsPassableToday).toBe(0);
+    expect(at1.projectedCpp).toBe((CABINET_PRICE + at1.buildOutCost) / (at1.passingsNow - 30));
+  });
+
   it('never counts a cabinet at the preview node as serving elsewhere', () => {
     const state = makeTestState();
     addSpan(state, H(0, 0));

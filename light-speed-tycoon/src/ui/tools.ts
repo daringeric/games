@@ -613,9 +613,9 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
           ? { label: 'Cost per passing', value: 'Nothing new to pass', tone: 'muted' }
           : {
               label: 'Cost per passing',
-              value: `${formatMoney(preview.projectedCpp)} projected`,
+              value: formatMoney(preview.projectedCpp),
               tone: preview.projectedCppBand ?? undefined,
-              sub: CPP_TARGET_NOTE,
+              sub: `projected, ${CPP_TARGET_NOTE}`,
             },
         { label: 'Ports', value: `${formatNumber(preview.ports)} (1:${SPLIT_RATIO}, 1 PON port)` },
         { label: 'Cost', value: formatMoney(quote.cost) },

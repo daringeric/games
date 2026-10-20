@@ -15,6 +15,7 @@ import {
   INSTALL_COST_MDU_UNIT,
   INSTALL_COST_SMB,
   MAKE_READY_COST_PER_POLE,
+  MDU_PORTS_PER_BUILDING,
   MDU_ROUTER_COST,
   OLT_CARD_COST,
   OLT_PORTS_PER_CARD,
@@ -93,7 +94,11 @@ export function rateCardSections(): RateSection[] {
         { label: 'Home install', value: formatMoney(INSTALL_COST_HOME), note: 'Drop, ONT and install' },
         { label: 'Business install', value: formatMoney(INSTALL_COST_SMB), note: 'Drop, ONT and install for a shop or office' },
         { label: 'Apartment unit', value: formatMoney(INSTALL_COST_MDU_UNIT), note: 'Each subscribing apartment' },
-        { label: 'Building router', value: formatMoney(MDU_ROUTER_COST), note: 'Once per apartment building, on one splitter port' },
+        {
+          label: 'Building router',
+          value: formatMoney(MDU_ROUTER_COST),
+          note: `Once per apartment building; the whole building rides on ${plural(MDU_PORTS_PER_BUILDING, 'splitter port')}`,
+        },
       ],
     },
     {

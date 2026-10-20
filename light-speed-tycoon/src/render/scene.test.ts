@@ -9,6 +9,7 @@ import { applyCommand, newGame, runDays } from '../sim/game';
 import { getService } from '../sim/network';
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { GameState, ParcelId } from '../sim/types';
+import { costOverlayThresholds, overlayBand } from './cityLayer';
 import { OverlayLayer } from './overlay';
 import type { OverlaySpec } from './overlay';
 import { ParcelLayer } from './parcelLayer';
@@ -279,5 +280,25 @@ describe('OverlayLayer', () => {
     const city = makeGridCity();
     const layer = new OverlayLayer(toyTown);
     expect(layer.draw(city, { served: [0, 2, 999], wrongSide: [1, 999], serving: 0, ring: { node: 5, tone: 'remove' } })).toBe(true);
+  });
+});
+
+describe('cost overlay bands', () => {
+  // One 600 ft street, re-dressed per case: poles, rock.
+  const base = makeGridCity({ blockW: 10 }).segments[0]!;
+  const street = (hasPoles: boolean, rock: boolean) => ({ ...base, hasPoles, rock });
+
+  it('tells aerial, soil bores and rock apart in every mode', () => {
+    const { green, amber } = costOverlayThresholds();
+    expect(green).toBeLessThan(amber);
+    expect(overlayBand(street(true, false), 'aerial')).toBe('green');
+    expect(overlayBand(street(true, true), 'aerial')).toBe('green');
+    expect(overlayBand(street(false, false), 'aerial')).toBeNull();
+    expect(overlayBand(street(true, false), 'underground')).toBe('amber');
+    expect(overlayBand(street(true, true), 'underground')).toBe('red');
+    // The cheaper buildable method: aerial where poled, else the bore.
+    expect(overlayBand(street(true, true), 'cheapest')).toBe('green');
+    expect(overlayBand(street(false, false), 'cheapest')).toBe('amber');
+    expect(overlayBand(street(false, true), 'cheapest')).toBe('red');
   });
 });

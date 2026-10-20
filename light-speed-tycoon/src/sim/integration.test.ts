@@ -6,9 +6,9 @@ import { MARKETING_MAX_PER_MONTH, START_CASH, TIER_PRICE_MAX, TIER_PRICE_MIN } f
 import { isFirstOfMonth } from './calendar';
 import { monthlyPoleRent } from './finance';
 import { applyCommand, newGame, tick } from './game';
-import { computeService, getService } from './network';
+import { computeService, getService, ponPortsUsed } from './network';
 import { Rng } from './rng';
-import { TIER_IDS } from './sales';
+import { cabinetPortCapacity, cabinetPortsUsed, TIER_IDS } from './sales';
 import { deserialize, hashState, serialize } from './save';
 import { otherEnd, segmentsAtNode, shortestPath } from './streets';
 import type { CableMethod, Command, GameState, NodeId, StreetSegment } from './types';
@@ -54,6 +54,23 @@ function installCapex(state: GameState): number {
   const closed = state.finance.reports.reduce((sum, r) => sum + (r.totals.install ?? 0), 0);
   const open = state.finance.monthToDate.filter((e) => e.category === 'install').reduce((sum, e) => sum + e.amount, 0);
   return 0 - (closed + open);
+}
+
+/** Plant capex implied by every construction, equipment and refund amount ever posted. */
+function plantCapex(state: GameState): number {
+  const categories = ['construction', 'equipment', 'refund'] as const;
+  const closed = state.finance.reports.reduce((sum, r) => sum + categories.reduce((t, c) => t + (r.totals[c] ?? 0), 0), 0);
+  const open = state.finance.monthToDate.filter((e) => (categories as readonly string[]).includes(e.category)).reduce((sum, e) => sum + e.amount, 0);
+  return 0 - (closed + open);
+}
+
+/** Port accounting: accounts within each cabinet's splitter ports, splitters within the OLT's PON ports. */
+function expectPortsWithinCapacity(state: GameState): void {
+  const used = cabinetPortsUsed(state);
+  for (const cabinet of state.network.cabinets) {
+    expect(used.get(cabinet.id) ?? 0).toBeLessThanOrEqual(cabinetPortCapacity(cabinet));
+  }
+  expect(ponPortsUsed(state)).toBeLessThanOrEqual(state.network.olt.ponPorts);
 }
 
 /** Corners the player's plant already reaches (plus the CO). */
@@ -145,6 +162,9 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
       if (target) tally.removedByStage[target.stage] = (tally.removedByStage[target.stage] ?? 0) + 1;
       // `cost` is the net spend: what left the bank (negative for a refund).
       expect(cash - state.finance.cash).toBe(result.cost);
+      // Capex moves with its ledger entry: plant (osp + co) and connections.
+      expect(state.finance.capex.osp + state.finance.capex.co).toBe(plantCapex(state));
+      expect(ponPortsUsed(state)).toBeLessThanOrEqual(state.network.olt.ponPorts);
       // Spending needs the cash up front; a refund can leave an overdraft negative.
       if (result.cost > 0) expect(state.finance.cash).toBeGreaterThanOrEqual(0);
     }
@@ -173,6 +193,8 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
         expect(memo.activeCabinets.has(account.cabinet)).toBe(true);
         expect(memo.litSegments.has(state.city.parcels[account.parcel]!.segment)).toBe(true);
       }
+      expectPortsWithinCapacity(state);
+      expect(state.finance.capex.osp + state.finance.capex.co).toBe(plantCapex(state));
       if (state.gameOver) {
         // Only a month close ends the game, and it stops that day cold.
         expect(isFirstOfMonth(state.day)).toBe(true);

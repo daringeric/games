@@ -687,6 +687,7 @@ describe('closeSalesMonth', () => {
       revenue: Math.round(month.revenueDollarDays / 31),
       marketing: Math.round(month.marketingDollarDays / 31),
       support: Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * month.subscriberUnitDays) / 31),
+      subscriberDays: month.subscriberUnitDays,
       grossAdds: month.grossAdds,
       churned: subs - subscriberUnits(state),
       lostService: month.lostService,
@@ -705,7 +706,7 @@ describe('closeSalesMonth', () => {
     state.sales.marketingPerMonth = 0;
     state.day = 31;
     const close = withRng(state, 'sales', (rng) => closeSalesMonth(state, rng, 31, 30));
-    expect(close).toEqual({ revenue: 0, marketing: 0, support: 0, grossAdds: 0, churned: 0, lostService: 0 });
+    expect(close).toEqual({ revenue: 0, marketing: 0, support: 0, subscriberDays: 0, grossAdds: 0, churned: 0, lostService: 0 });
     expect(state.finance.monthToDate).toEqual([]);
   });
 

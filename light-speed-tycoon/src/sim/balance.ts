@@ -1,18 +1,18 @@
 // Tunable game-balance values. Rough starting points; see docs/light-speed-tycoon/DESIGN.md.
 // Money in whole dollars, distance in feet, time in days.
 //
-// Round 2: constants marked "R2 guess" keep their round-1 value for now so the
-// tree stays behavior-identical until the round-2 rules are implemented; the
-// balance-tuning workstream switches them to the guessed value (or better) and
-// tunes everything by headless simulation. New round-2 constants already hold
-// their initial guess. Implementation workstreams must not edit this file:
-// tests reference these constants symbolically, never as literal dollar amounts.
+// Round 2: tuned by headless bots (src/sim/tuning/): targets.test.ts holds the
+// targets (start cash vs. town build-out, cost per passing by area, smart play
+// cash-flow positive in months 12-18, careless overbuild goes bankrupt, idle
+// survives) across several seeds; TUNE_REPORT=1 npx vitest run
+// src/sim/tuning/report.test.ts prints the per-seed numbers. Tests reference
+// these constants symbolically, never as literal dollar amounts.
 
 import type { ParcelKind, TierId } from './types';
 
 export const START_YEAR = 2027;
-/** R2 guess: 750_000 (start cash should cover only ~25-33% of the town's build-out). */
-export const START_CASH = 1_500_000;
+/** Start cash covers only ~25-33% of the town's build-out (tuning target). */
+export const START_CASH = 750_000;
 
 /** Feet per map cell. A typical residential lot frontage. */
 export const TILE_FT = 60;
@@ -21,22 +21,12 @@ export const TILE_FT = 60;
 // Construction cost
 // ---------------------------------------------------------------------------
 
-/** Aerial strand + lash, dollars per ft (excludes make-ready). R2 guess: 11. */
-export const AERIAL_COST_PER_FT = 10;
-/** Underground directional bore + conduit, dollars per ft (soil). R2 guess: 28. */
-export const UNDERGROUND_COST_PER_FT = 30;
-/**
- * Round-1 rule: underground on rock cost ROCK_MULTIPLIER x the bore rate.
- * Superseded in round 2 by UNDERGROUND_ROCK_SURCHARGE_PER_FT (an itemized
- * surcharge line); the tuning workstream deletes this once nothing imports it.
- */
-export const ROCK_MULTIPLIER = 2;
-/**
- * Extra dollars per ft for underground on rock, shown as its own quote line.
- * Equal to UNDERGROUND_COST_PER_FT x (ROCK_MULTIPLIER - 1) for now so totals are
- * unchanged. R2 guess: 22 (rock bore ~ $50/ft all-in).
- */
-export const UNDERGROUND_ROCK_SURCHARGE_PER_FT = 30;
+/** Aerial strand + lash, dollars per ft (excludes make-ready). */
+export const AERIAL_COST_PER_FT = 11;
+/** Underground directional bore + conduit, dollars per ft (soil). */
+export const UNDERGROUND_COST_PER_FT = 28;
+/** Extra dollars per ft for underground on rock, shown as its own quote line (rock bore ~ $50/ft all-in). */
+export const UNDERGROUND_ROCK_SURCHARGE_PER_FT = 22;
 /** Aerial make-ready: utility work per pole on each new aerial segment (polesOnSegment), non-refundable. */
 export const MAKE_READY_COST_PER_POLE = 450;
 /** Engineering and design, per cable order (one layCable command), any method. Non-refundable. */
@@ -79,7 +69,7 @@ export const MAKE_READY_MEMORY_DAYS = 365;
 
 // Refunds: cancelling a span still in permitting refunds this fraction of its
 // refundable part (construction + rock; fees and make-ready never come back).
-// R2 guess: 1 (the non-refundable fees already act as a cancellation fee).
+// 1: the non-refundable fees already act as a cancellation fee.
 export const PERMITTING_CANCEL_REFUND = 1;
 
 // ---------------------------------------------------------------------------
@@ -93,10 +83,10 @@ export const POLE_RENT_PER_POLE_PER_MONTH = 2;
 // Cabinets (fiber distribution hubs), splitters and coverage
 // ---------------------------------------------------------------------------
 
-/** Cabinet shell, pad and install. R2 guess: 28_000. */
-export const CABINET_COST = 15_000;
-/** One 1:SPLIT_RATIO splitter, installed. R2 guess: 1_800. */
-export const SPLITTER_COST = 1_200;
+/** Cabinet shell, pad and install. */
+export const CABINET_COST = 28_000;
+/** One 1:SPLIT_RATIO splitter, installed. */
+export const SPLITTER_COST = 1_800;
 export const CABINET_START_SPLITTERS = 1;
 export const SPLIT_RATIO = 32;
 /** Splitter slots per cabinet (8 x 32 = 256 subscriber ports). */
@@ -109,17 +99,17 @@ export const CABINET_CANCEL_REFUND = 1;
  * A cabinet passes homes on connected cable whose nearer endpoint is strictly
  * less than this far from the cabinet's node, measured along that cable.
  */
-export const CABINET_REACH_FT = 1_500;
+export const CABINET_REACH_FT = 800;
 
 // ---------------------------------------------------------------------------
 // OLT at the CO
 // ---------------------------------------------------------------------------
 
-export const OLT_PORTS_PER_CARD = 16;
+export const OLT_PORTS_PER_CARD = 8;
 export const OLT_START_CARDS = 1;
 /** Line-card slots in the one chassis (a second chassis comes later). */
 export const OLT_MAX_CARDS = 8;
-export const OLT_CARD_COST = 18_000;
+export const OLT_CARD_COST = 12_000;
 export const OLT_START_PON_PORTS = OLT_START_CARDS * OLT_PORTS_PER_CARD;
 
 // ---------------------------------------------------------------------------
@@ -180,7 +170,7 @@ export const TAKE_SPEED_RATIO_CAP = 4;
 export const TAKE_UPLOAD_WEIGHT = 0.02;
 export const TAKE_UPLOAD_RATIO_CAP = 10;
 export const TAKE_PRICE_WEIGHT = 1;
-export const TAKE_RATE_BASE = 0.22;
+export const TAKE_RATE_BASE = 0.33;
 export const TAKE_RATE_PER_ADVANTAGE = 0.25;
 export const TAKE_RATE_MIN = 0.03;
 export const TAKE_RATE_MAX = 0.6;
@@ -191,7 +181,7 @@ export const TAKE_RATE_KIND_FACTOR: Readonly<Record<ParcelKind, number>> = { hom
  * Signup ramp: each day a lit segment gains about
  * (target units - subscribed units) x SIGNUP_RAMP_PER_DAY x (1 + marketing boost).
  */
-export const SIGNUP_RAMP_PER_DAY = 1 / 120;
+export const SIGNUP_RAMP_PER_DAY = 1 / 650;
 
 // ---------------------------------------------------------------------------
 // Marketing
@@ -223,11 +213,11 @@ export const CHURN_MONTHLY_MAX = 0.2;
 // ---------------------------------------------------------------------------
 
 /** Drop + ONT + install for a single-family home. */
-export const INSTALL_COST_HOME = 850;
+export const INSTALL_COST_HOME = 700;
 /** Drop + ONT + install for a small business. */
-export const INSTALL_COST_SMB = 1_400;
+export const INSTALL_COST_SMB = 1_100;
 /** One-time fiber-to-demarc + building router, paid with an MDU's first subscribing unit. */
-export const MDU_ROUTER_COST = 7_500;
+export const MDU_ROUTER_COST = 5_000;
 /** Per subscribing MDU apartment (in-building wiring + ONT/port). */
 export const INSTALL_COST_MDU_UNIT = 250;
 /**
@@ -242,7 +232,7 @@ export const MDU_PORTS_PER_BUILDING = 1;
 // ---------------------------------------------------------------------------
 
 /** Fixed monthly overhead (NOC, billing, office, staff), posted at every month close. */
-export const OVERHEAD_PER_MONTH = 15_000;
+export const OVERHEAD_PER_MONTH = 8_000;
 /** Customer support per subscribed unit per month, accrued daily, posted at close. */
 export const SUPPORT_COST_PER_SUB_PER_MONTH = 4;
 

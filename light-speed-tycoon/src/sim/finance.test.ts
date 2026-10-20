@@ -137,6 +137,7 @@ function close(state: GameState, passings = 0, seed = 1): MonthlyReport {
 const ZERO_STATS = {
   subscribers: 0,
   accounts: 0,
+  subscriberDays: 0,
   grossAdds: 0,
   churned: 0,
   lostService: 0,
@@ -260,6 +261,8 @@ describe('closeMonth', () => {
     expect(report.stats).toEqual({
       subscribers,
       accounts: state.sales.accounts.length,
+      // The month's subscriber-days (the ARPU denominator), from the accrual.
+      subscriberDays: 31 * 2,
       grossAdds: 5,
       churned: 2 - subscribers,
       lostService: 3,

@@ -21,6 +21,15 @@ export function cppBand(cpp: number): CppBand {
   return 'red';
 }
 
+/**
+ * Cost per passing: lifetime outside-plant capex (Finance.capex.osp: cable incl.
+ * fees and make-ready, cabinets, splitters) over units passed; null with
+ * nothing passed. The one formula behind the report KPI and the HUD.
+ */
+export function costPerPassing(capexOsp: number, passings: number): number | null {
+  return passings > 0 ? capexOsp / passings : null;
+}
+
 /** Ledger categories that are capital spend (or its refunds) rather than operating cash flow. */
 export const CAPEX_CATEGORIES: readonly LedgerCategory[] = ['construction', 'equipment', 'install', 'refund'];
 
@@ -67,7 +76,7 @@ export function reportKpis(report: MonthlyReport): ReportKpis | null {
   const stats = report.stats;
   if (!stats) return null;
   const revenue = report.totals.revenue ?? 0;
-  const cpp = report.passings > 0 ? stats.capexOsp / report.passings : null;
+  const cpp = costPerPassing(stats.capexOsp, report.passings);
   return {
     revenue,
     arpu: stats.subscriberDays > 0 ? (revenue * (MONTH_LENGTHS[report.month - 1] ?? 30)) / stats.subscriberDays : null,

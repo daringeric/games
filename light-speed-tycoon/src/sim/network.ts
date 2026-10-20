@@ -1071,6 +1071,35 @@ function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
   };
 }
 
+/** Who serves what once everything already ordered is built. */
+export interface PlannedService {
+  /** Segments that will connect to the CO once every span (any stage) is live. */
+  connectedSegments: ReadonlySet<SegmentId>;
+  /** For each segment that will be lit, its nearest cabinet (any stage) along that cable (ties -> lower id). */
+  servingCabinet: ReadonlyMap<SegmentId, CabinetId>;
+}
+
+const plannedCache = new WeakMap<GameState, { network: Network; version: number; planned: PlannedService }>();
+
+/**
+ * The coverage rule applied as if every span and cabinet already ordered (any
+ * stage) were live: the network the player has committed to. The cabinet
+ * placement preview uses it, so a cabinet still permitting counts as covering
+ * its streets. Memoized on (state, network.version).
+ */
+export function plannedService(state: GameState): PlannedService {
+  const { network } = state;
+  const cached = plannedCache.get(state);
+  if (cached && cached.network === network && cached.version === network.version) return cached.planned;
+  const live = new Set<SegmentId>(network.spans.map((s) => s.segment));
+  const reach = computeReach(state.city, live, network.cabinets);
+  const servingCabinet = new Map<SegmentId, CabinetId>();
+  for (const [segment, { cabinet }] of reach.serving) servingCabinet.set(segment, cabinet);
+  const planned: PlannedService = { connectedSegments: reach.connected, servingCabinet };
+  plannedCache.set(state, { network, version: network.version, planned });
+  return planned;
+}
+
 const serviceCache = new WeakMap<GameState, { network: Network; reach: Reach; snapshot: ServiceSnapshot }>();
 
 /**
