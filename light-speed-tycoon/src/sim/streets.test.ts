@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { generateCity } from './citygen';
 import { Rng } from './rng';
 import {
   cornerName,
@@ -7,13 +8,16 @@ import {
   nearestNode,
   nearestSegment,
   otherEnd,
+  parcelsServedBy,
+  parcelsTouchingSegment,
   polesOnSegment,
   segmentBetween,
   segmentsAtNode,
+  segmentsWithin,
   shortestPath,
 } from './streets';
 import { makeGridCity } from './testing/fixtures';
-import type { City, SegmentId, StreetSegment } from './types';
+import type { City, Parcel, SegmentId, StreetSegment } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i at (4i, 2j).
 // Horizontal segment (i, j) = j * 3 + i (240 ft); vertical (i, j) = 9 + j * 4 + i (120 ft).
@@ -304,5 +308,154 @@ describe('polesOnSegment', () => {
 
   it('is zero without poles', () => {
     expect(polesOnSegment({ ...base, hasPoles: false })).toBe(0);
+  });
+});
+
+describe('segmentsWithin', () => {
+  const city = makeGridCity();
+
+  it('measures street distance to each segment\'s nearer endpoint, ascending by id', () => {
+    // Node 1 is 240 ft east of the CO corner, node 4 120 ft south, node 8 240 ft south;
+    // node 5 is 360 ft away by either route, so nothing beyond it is reached.
+    expect(segmentsWithin(city, 0, 300)).toEqual([
+      { segment: H(0, 0), distanceFt: 0 },
+      { segment: H(1, 0), distanceFt: 240 },
+      { segment: H(0, 1), distanceFt: 120 },
+      { segment: H(0, 2), distanceFt: 240 },
+      { segment: V(0, 0), distanceFt: 0 },
+      { segment: V(1, 0), distanceFt: 240 },
+      { segment: V(0, 1), distanceFt: 120 },
+    ]);
+  });
+
+  it('is strict at the limit', () => {
+    // Nodes 1 and 8 are exactly 240 ft away, so their onward segments drop out.
+    expect(segmentsWithin(city, 0, 240).map((r) => r.segment)).toEqual([H(0, 0), H(0, 1), V(0, 0), V(0, 1)]);
+    expect(segmentsWithin(city, 0, 241).map((r) => r.segment)).toEqual([
+      H(0, 0),
+      H(1, 0),
+      H(0, 1),
+      H(0, 2),
+      V(0, 0),
+      V(1, 0),
+      V(0, 1),
+    ]);
+  });
+
+  it('gives a touching segment distance 0 however long it is', () => {
+    const wide = makeGridCity({ blockW: 30 });
+    expect(segmentsWithin(wide, 0, 100)).toEqual([
+      { segment: H(0, 0), distanceFt: 0 },
+      { segment: V(0, 0), distanceFt: 0 },
+    ]);
+  });
+
+  it('travels and reports only allowed segments', () => {
+    const horizontal = (s: StreetSegment) => s.id < 9;
+    expect(segmentsWithin(city, 0, 1_000, horizontal)).toEqual([
+      { segment: H(0, 0), distanceFt: 0 },
+      { segment: H(1, 0), distanceFt: 240 },
+      { segment: H(2, 0), distanceFt: 480 },
+    ]);
+  });
+
+  it('returns [] for an invalid node or a non-positive limit', () => {
+    expect(segmentsWithin(city, -1, 1_000)).toEqual([]);
+    expect(segmentsWithin(city, 12, 1_000)).toEqual([]);
+    expect(segmentsWithin(city, 0.5, 1_000)).toEqual([]);
+    expect(segmentsWithin(city, 0, 0)).toEqual([]);
+    expect(segmentsWithin(city, 0, Number.NaN)).toEqual([]);
+  });
+
+  it('matches shortest-path distances on a generated town', () => {
+    const town = generateCity(7);
+    const rng = new Rng(3);
+    for (let k = 0; k < 20; k++) {
+      const from = rng.int(0, town.nodes.length - 1);
+      const limit = rng.int(200, 2_500);
+      const reach = segmentsWithin(town, from, limit);
+      const dist = town.nodes.map((n) => {
+        const path = shortestPath(town, from, n.id);
+        return path ? pathLength(town, path) : Infinity;
+      });
+      const nodeDist = (to: number) => dist[to]!;
+      const expected = town.segments
+        .map((s) => ({ segment: s.id, distanceFt: Math.min(nodeDist(s.a), nodeDist(s.b)) }))
+        .filter((r) => r.distanceFt < limit);
+      expect(reach).toEqual(expected);
+    }
+  });
+});
+
+describe('parcelsServedBy', () => {
+  const city = makeGridCity();
+
+  it('lists the parcels a segment serves (Parcel.segment), ascending', () => {
+    // Default grid lots alternate top row / bottom row per column: ids 0, 2, 4, 6 front 1st St.
+    expect(parcelsServedBy(city, H(0, 0))).toEqual([0, 2, 4, 6]);
+    expect(parcelsServedBy(city, H(0, 1))).toEqual([1, 3, 5, 7, 24, 26, 28, 30]);
+    // Avenues serve nobody in the grid fixture.
+    expect(parcelsServedBy(city, V(0, 0))).toEqual([]);
+  });
+
+  it('agrees with a scan of every parcel and rejects invalid ids', () => {
+    const town = generateCity(11);
+    for (const s of town.segments) {
+      expect(parcelsServedBy(town, s.id)).toEqual(town.parcels.filter((p) => p.segment === s.id).map((p) => p.id));
+    }
+    expect(parcelsServedBy(city, -1)).toEqual([]);
+    expect(parcelsServedBy(city, 17)).toEqual([]);
+    expect(parcelsServedBy(city, 0.5)).toEqual([]);
+  });
+});
+
+describe('parcelsTouchingSegment', () => {
+  const city = makeGridCity();
+
+  /** Brute force: a side of the footprint overlaps the segment's line for a positive length. */
+  function bruteTouching(c: City, segment: StreetSegment): number[] {
+    const a = c.nodes[segment.a]!;
+    const b = c.nodes[segment.b]!;
+    const touches = (p: Parcel) => {
+      if (a.y === b.y) {
+        const overlap = Math.min(Math.max(a.x, b.x), p.x + p.w) - Math.max(Math.min(a.x, b.x), p.x);
+        return (a.y === p.y || a.y === p.y + p.h) && overlap > 0;
+      }
+      const overlap = Math.min(Math.max(a.y, b.y), p.y + p.h) - Math.max(Math.min(a.y, b.y), p.y);
+      return (a.x === p.x || a.x === p.x + p.w) && overlap > 0;
+    };
+    return c.parcels.filter(touches).map((p) => p.id);
+  }
+
+  it('finds lots on both sides of a street and corner lots on side streets', () => {
+    expect(parcelsTouchingSegment(city, H(0, 0))).toEqual([0, 2, 4, 6]);
+    expect(parcelsTouchingSegment(city, H(0, 1))).toEqual([1, 3, 5, 7, 24, 26, 28, 30]);
+    // A Ave runs down the left edge of the first block: its two corner lots touch it
+    // although 1st St and 2nd St serve them.
+    expect(parcelsTouchingSegment(city, V(0, 0))).toEqual([0, 1]);
+    // B Ave separates the first and second blocks.
+    expect(parcelsTouchingSegment(city, V(1, 0))).toEqual([6, 7, 8, 9]);
+    expect(parcelsTouchingSegment(city, -1)).toEqual([]);
+    expect(parcelsTouchingSegment(city, 17)).toEqual([]);
+  });
+
+  it('handles footprints larger than one cell', () => {
+    const c = makeGridCity();
+    // One 4x2 building filling the first block touches all four streets around it.
+    c.parcels = [{ ...c.parcels[0]!, kind: 'mdu', w: 4, h: 2, units: 24 }];
+    expect(parcelsTouchingSegment(c, H(0, 0))).toEqual([0]);
+    expect(parcelsTouchingSegment(c, H(0, 1))).toEqual([0]);
+    expect(parcelsTouchingSegment(c, V(0, 0))).toEqual([0]);
+    expect(parcelsTouchingSegment(c, V(1, 0))).toEqual([0]);
+    expect(parcelsTouchingSegment(c, H(1, 0))).toEqual([]);
+    expect(parcelsTouchingSegment(c, V(2, 0))).toEqual([]);
+  });
+
+  it('matches a brute-force scan on generated towns, and every parcel touches its serving street', () => {
+    for (const seed of [1, 2027]) {
+      const town = generateCity(seed);
+      for (const s of town.segments) expect(parcelsTouchingSegment(town, s.id)).toEqual(bruteTouching(town, s));
+      for (const p of town.parcels) expect(parcelsTouchingSegment(town, p.segment)).toContain(p.id);
+    }
   });
 });

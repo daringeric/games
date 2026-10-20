@@ -1,4 +1,7 @@
-// Game menu: new game, save/load to browser storage, export/import JSON files.
+// Game menu: new game, save/load to browser storage, export/import JSON files,
+// and the rate card.
+//
+// Owner: ui-economy workstream.
 
 import { el } from './dom';
 
@@ -8,6 +11,7 @@ export interface MenuActions {
   load(): void;
   exportFile(): void;
   importFile(file: File): void;
+  rateCard(): void;
 }
 
 export class Menu {
@@ -48,6 +52,7 @@ export class Menu {
       item('Load', 'Go back to your last save', actions.load),
       item('Export', 'Download the game as a file', actions.exportFile),
       item('Import', 'Open a downloaded game file', () => this.fileInput.click()),
+      item('Rate card', 'What cable, gear and installs cost', actions.rateCard),
       this.fileInput,
     ]);
     this.root.hidden = true;

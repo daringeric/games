@@ -8,7 +8,13 @@ import type { Application } from 'pixi.js';
 import { applyCommand, newGame, runDays } from '../sim/game';
 import { getService } from '../sim/network';
 import { makeGridCity } from '../sim/testing/fixtures';
-import type { GameState } from '../sim/types';
+import type { GameState, ParcelId } from '../sim/types';
+import { costOverlayThresholds, overlayBand } from './cityLayer';
+import { OverlayLayer } from './overlay';
+import type { OverlaySpec } from './overlay';
+import { drawParcel, ParcelLayer } from './parcelLayer';
+import type { ParcelLook } from './parcelLayer';
+import { streetLattice } from './geometry';
 import { Scene } from './scene';
 import { toyTown } from './theme';
 
@@ -31,6 +37,103 @@ function coGraphics(s: Scene): Graphics {
   if (!(g instanceof Graphics)) throw new Error('No central office in the scene');
   return g;
 }
+
+/** A Graphics that remembers the colour of every fill. */
+class FillRecorder extends Graphics {
+  readonly colors: string[] = [];
+  override fill(...args: Parameters<Graphics['fill']>): this {
+    const style = args[0] as unknown;
+    const color = typeof style === 'object' && style !== null && 'color' in style ? (style as { color: unknown }).color : style;
+    if (typeof color === 'string') this.colors.push(color.toUpperCase());
+    return super.fill(...args);
+  }
+}
+
+/** sRGB hex -> [r, g, b] in 0..255. */
+function rgb(hex: string): [number, number, number] {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function hue([r, g, b]: [number, number, number]): number {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max === min) return 0;
+  const d = max - min;
+  const h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+
+function luminance([r, g, b]: [number, number, number]): number {
+  const lin = (c: number) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** WCAG contrast of `color` laid at `alpha` over `under`, against `under`. */
+function washContrast(color: string, alpha: number, under: string): number {
+  const c = rgb(color);
+  const u = rgb(under);
+  const mixed = c.map((v, i) => alpha * v + (1 - alpha) * (u[i] as number)) as [number, number, number];
+  const [hi, lo] = [luminance(u), luminance(mixed)].sort((a, b) => b - a) as [number, number];
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+describe('cabinet coverage colours', () => {
+  const { coverage, road, lot } = toyTown;
+
+  it('belong to the Toy Town teal family of the CO and cabinets, not a saturated blue', () => {
+    for (const color of [coverage.reach, coverage.litToday, coverage.litGlow, toyTown.cabinet.body]) {
+      const h = hue(rgb(color));
+      expect(h, color).toBeGreaterThanOrEqual(160);
+      expect(h, color).toBeLessThanOrEqual(185);
+    }
+  });
+
+  it('read over the cream roads and the pale lawns, even at the faintest reach band', () => {
+    for (const under of [road.fill, lot.lawn]) {
+      expect(washContrast(coverage.reach, coverage.reachAlphaFar, under), under).toBeGreaterThanOrEqual(1.2);
+      expect(washContrast(coverage.reach, coverage.reachAlphaNear, under), under).toBeGreaterThanOrEqual(2);
+      // Streets a cabinet would light today stand out from the reach shading.
+      expect(washContrast(coverage.litToday, coverage.litTodayAlpha, under), under).toBeGreaterThan(washContrast(coverage.reach, coverage.reachAlphaNear, under));
+    }
+  });
+});
+
+describe('drawParcel', () => {
+  // Lot 0 an apartment building, lot 1 a shop, the rest homes.
+  const city = makeGridCity({
+    parcelKinds: (p) => (p.id === 0 ? { kind: 'mdu', units: 12 } : p.id === 1 ? { kind: 'smb', units: 1 } : undefined),
+  });
+  const lattice = streetLattice(city);
+  const fills = (id: ParcelId, look: ParcelLook, units = 0): string[] => {
+    const g = new FillRecorder();
+    expect(drawParcel(g, city, lattice, city.parcels[id]!, look, toyTown, units)).toBe(true);
+    return g.colors;
+  };
+  const up = (c: string) => c.toUpperCase();
+
+  it('roofs a subscribing home in the subscriber colours, and a passed one in the passed colours', () => {
+    const home = city.parcels.findIndex((p) => p.kind === 'home');
+    expect(fills(home, 'subscribed')).toContain(up(toyTown.house.subscriber.roof));
+    expect(fills(home, 'subscribed')).not.toContain(up(toyTown.house.passed.roof));
+    expect(fills(home, 'passed')).toContain(up(toyTown.house.passed.roof));
+    expect(fills(home, 'passed')).not.toContain(up(toyTown.house.subscriber.roof));
+  });
+
+  it('lights an apartment building unit pip per subscribing unit, and none for a passed one', () => {
+    expect(fills(0, 'subscribed', 5)).toContain(up(toyTown.mdu.pipLit));
+    expect(fills(0, 'passed')).not.toContain(up(toyTown.mdu.pipLit));
+  });
+
+  it('gives a subscribing shop the served awning, and a passed one the passed awning', () => {
+    expect(fills(1, 'subscribed')).toContain(up(toyTown.smb.awningServed.stripe));
+    expect(fills(1, 'subscribed')).not.toContain(up(toyTown.smb.awningPassed.stripe));
+    expect(fills(1, 'passed')).toContain(up(toyTown.smb.awningPassed.stripe));
+  });
+});
 
 describe('Scene', () => {
   it('draws lit homes as passed and live cable once the network lights a street', () => {
@@ -116,7 +219,201 @@ describe('Scene', () => {
     s.sync(state);
     expect(s.stats()).toMatchObject({ passedLots: before.passedLots, liveSpans: before.liveSpans });
     expect(coGraphics(s).destroyed).toBe(false);
-    // The ground layer (first in the world) holds the board, roads and trees again.
-    expect((s.world.children[0] as Container).children).toHaveLength(3);
+    // The ground layer (first in the world) holds the board, roads, rock stipple and trees again.
+    expect((s.world.children[0] as Container).children).toHaveLength(4);
+  });
+
+  it('draws subscribers, counting their lots as passed too', () => {
+    const state = litGame();
+    state.sales.marketingPerMonth = 20_000;
+    runDays(state, 120);
+    for (let i = 0; i < 40 && state.sales.accounts.length === 0; i++) runDays(state, 10);
+    expect(state.sales.accounts.length).toBeGreaterThan(0);
+    const s = scene();
+    s.sync(state);
+    const passed = getService(state).passedParcels;
+    const subscribed = state.sales.accounts.map((a) => a.parcel);
+    expect(s.stats().subscribedLots).toBe(subscribed.length);
+    // Every subscriber's lot is lit, so passedLots still counts each passed lot exactly once.
+    expect(subscribed.every((p) => passed.includes(p))).toBe(true);
+    expect(s.stats().passedLots).toBe(passed.length);
+  });
+
+  it('keeps subscriber looks current while one game state plays on (the app mutates it in place)', () => {
+    const state = litGame();
+    state.sales.marketingPerMonth = 20_000;
+    const s = scene();
+    s.sync(state);
+    expect(s.stats().subscribedLots).toBe(0);
+    let subscribed = 0;
+    for (let day = 0; day < 900 && subscribed < 2; day++) {
+      runDays(state, 1);
+      s.sync(state);
+      subscribed = new Set(state.sales.accounts.map((a) => a.parcel)).size;
+      expect(s.stats().subscribedLots, `day ${state.day}`).toBe(subscribed);
+    }
+    expect(subscribed).toBeGreaterThan(0);
+  });
+
+  it('rings full cabinets, redrawing when the full list changes even if the network did not', () => {
+    const state = litGame();
+    const s = scene();
+    s.sync(state);
+    s.takeDirty();
+    expect(s.stats().fullCabinets).toBe(0);
+    state.sales.fullCabinets = [state.network.cabinets[0]!.id];
+    s.sync(state);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().fullCabinets).toBe(1);
+    s.sync(state);
+    expect(s.takeDirty()).toBe(false);
+    state.sales.fullCabinets = [];
+    s.sync(state);
+    expect(s.stats().fullCabinets).toBe(0);
+  });
+
+  it('washes out live cable that reaches the CO but no cabinet', () => {
+    // 1st St runs eight blocks of 240 ft east of the CO: the last block starts beyond the reach.
+    const state = newGame(7, { city: makeGridCity({ cols: 8 }) });
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    applyCommand(state, { type: 'layCable', segments: [0, 1, 2, 3, 4, 5, 6, 7], method: 'underground' });
+    runDays(state, 150);
+    const service = getService(state);
+    expect(service.connectedSegments.size).toBe(8);
+    expect(service.litSegments.has(7)).toBe(false);
+    const s = scene();
+    s.sync(state);
+    expect(s.stats()).toMatchObject({ liveSpans: 8, dimSpans: 8 - service.litSegments.size });
+    expect(s.stats().dimSpans).toBeGreaterThan(0);
+  });
+
+  it('toggles the rock texture and the cost overlay, drawing a frame only on a change', () => {
+    const state = newGame(7, { city: makeGridCity({ rock: true }) });
+    const s = scene();
+    s.sync(state);
+    s.takeDirty();
+    s.setRockEmphasis(true);
+    expect(s.takeDirty()).toBe(true);
+    s.setRockEmphasis(true);
+    expect(s.takeDirty()).toBe(false);
+    expect(s.stats().rockEmphasis).toBe(true);
+
+    expect(s.stats().costOverlay).toBeNull();
+    s.setCostOverlay('aerial');
+    expect(s.takeDirty()).toBe(true);
+    s.setCostOverlay('aerial');
+    expect(s.takeDirty()).toBe(false);
+    s.setCostOverlay('cheapest');
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().costOverlay).toBe('cheapest');
+    s.setCostOverlay(null);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats()).toMatchObject({ costOverlay: null });
+    // A new city keeps the overlay choice.
+    s.setCostOverlay('underground');
+    s.sync(newGame(8, { city: makeGridCity({ cols: 4 }) }));
+    expect(s.stats().costOverlay).toBe('underground');
+  });
+
+  it('skips an unchanged overlay spec without comparing it', () => {
+    const state = litGame();
+    const s = scene();
+    s.sync(state);
+    const spec: OverlaySpec = { snap: 1, path: { segments: [0], fresh: [0], method: 'underground', ok: true } };
+    s.setOverlay(spec);
+    expect(s.takeDirty()).toBe(true);
+    s.setOverlay(spec);
+    expect(s.takeDirty()).toBe(false);
+    // An equal spec in a new object draws nothing new either.
+    s.setOverlay({ ...spec });
+    expect(s.takeDirty()).toBe(false);
+    s.setOverlay({ ...spec, snap: 2 });
+    expect(s.takeDirty()).toBe(true);
+  });
+});
+
+describe('ParcelLayer', () => {
+  // 36 x 4 cells: three chunks side by side.
+  const city = makeGridCity({ cols: 6, blockW: 6 });
+  const westHome = city.parcels.find((p) => p.x === 1 && p.y === 0)!.id;
+  const eastHome = city.parcels.find((p) => p.x === 34 && p.y === 0)!.id;
+  const eastMdu = (() => {
+    const p = city.parcels.find((q) => q.x === 33 && q.y === 0)!;
+    p.kind = 'mdu';
+    p.units = 12;
+    return p.id;
+  })();
+
+  it('redraws only the chunk whose subscriptions changed, and when an apartment building gains units', () => {
+    const layer = new ParcelLayer(toyTown);
+    layer.setCity(city);
+    const passed = new Set<ParcelId>([westHome, eastHome, eastMdu]);
+    expect(layer.sync(0, passed)).toBe(true);
+    const base = layer.chunkRedraws;
+    expect(layer.passedLots).toBe(3);
+    expect(layer.subscribedLots).toBe(0);
+
+    expect(layer.sync(0, passed, new Map([[westHome, 1]]))).toBe(true);
+    expect(layer.chunkRedraws).toBe(base + 1);
+    expect(layer.subscribedLots).toBe(1);
+    expect(layer.passedLots).toBe(3);
+
+    // Same subscriptions: nothing to redraw.
+    expect(layer.sync(0, passed, new Map([[westHome, 1]]))).toBe(false);
+
+    // An apartment building gaining a unit redraws its chunk alone.
+    expect(layer.sync(0, passed, new Map([[westHome, 1], [eastMdu, 3]]))).toBe(true);
+    expect(layer.chunkRedraws).toBe(base + 2);
+    expect(layer.sync(0, passed, new Map([[westHome, 1], [eastMdu, 4]]))).toBe(true);
+    expect(layer.chunkRedraws).toBe(base + 3);
+    expect(layer.subscribedLots).toBe(2);
+
+    // A subscriber whose street went dark this very day still draws (and counts) as one.
+    expect(layer.sync(0, new Set([eastHome]), new Map([[westHome, 1]]))).toBe(true);
+    expect(layer.subscribedLots).toBe(1);
+    expect(layer.passedLots).toBe(2);
+  });
+});
+
+describe('OverlayLayer', () => {
+  it('redraws the cabinet coverage context only when the coverage changes', () => {
+    const city = makeGridCity();
+    const layer = new OverlayLayer(toyTown);
+    const coverage = [{ cabinet: 1, lit: [0], reach: [0, 1, 9] }];
+    expect(layer.draw(city, { coverage, snap: 1 })).toBe(true);
+    const redraws = layer.contextRedraws;
+    // The pointer moves: the hover marks redraw, the coverage doesn't.
+    expect(layer.draw(city, { coverage, snap: 2, reach: [{ id: 3, t: 0.2, elsewhere: false, lit: false }] })).toBe(true);
+    expect(layer.contextRedraws).toBe(redraws);
+    expect(layer.draw(city, { coverage: [{ cabinet: 1, lit: [0, 1], reach: [0, 1, 9] }], snap: 2 })).toBe(true);
+    expect(layer.contextRedraws).toBe(redraws + 1);
+    expect(layer.draw(city, { snap: 2 })).toBe(true);
+    expect(layer.contextRedraws).toBe(redraws + 2);
+  });
+
+  it('draws building tells for a planned route without throwing on unknown ids', () => {
+    const city = makeGridCity();
+    const layer = new OverlayLayer(toyTown);
+    expect(layer.draw(city, { served: [0, 2, 999], wrongSide: [1, 999], serving: 0, ring: { node: 5, tone: 'remove' } })).toBe(true);
+  });
+});
+
+describe('cost overlay bands', () => {
+  // One 600 ft street, re-dressed per case: poles, rock.
+  const base = makeGridCity({ blockW: 10 }).segments[0]!;
+  const street = (hasPoles: boolean, rock: boolean) => ({ ...base, hasPoles, rock });
+
+  it('tells aerial, soil bores and rock apart in every mode', () => {
+    const { green, amber } = costOverlayThresholds();
+    expect(green).toBeLessThan(amber);
+    expect(overlayBand(street(true, false), 'aerial')).toBe('green');
+    expect(overlayBand(street(true, true), 'aerial')).toBe('green');
+    expect(overlayBand(street(false, false), 'aerial')).toBeNull();
+    expect(overlayBand(street(true, false), 'underground')).toBe('amber');
+    expect(overlayBand(street(true, true), 'underground')).toBe('red');
+    // The cheaper buildable method: aerial where poled, else the bore.
+    expect(overlayBand(street(true, true), 'cheapest')).toBe('green');
+    expect(overlayBand(street(false, false), 'cheapest')).toBe('amber');
+    expect(overlayBand(street(false, true), 'cheapest')).toBe('red');
   });
 });

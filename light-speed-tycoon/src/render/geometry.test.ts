@@ -2,11 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { City, StreetClass } from '../sim/types';
 import {
+  MDU_ROOF_PAD,
+  dropPoint,
   frontageSide,
+  hashInt,
+  homePlan,
   horizontalStreet,
   lotFrame,
   lotRect,
   mapExit,
+  mduDemarc,
   parcelGrid,
   straightRuns,
   streetAlongSide,
@@ -79,6 +84,14 @@ describe('lots', () => {
     expect(lotFrame(lot, 'left').toWorld(5, 2, 10, 8)).toEqual({ x: 102, y: 205, w: 8, h: 10 });
     expect(lotFrame(lot, 'right').toWorld(5, 2, 10, 8)).toEqual({ x: 130, y: 205, w: 8, h: 10 });
     expect(lotFrame(lot, 'left').front).toBe(30);
+  });
+
+  it('maps lot-local points, with negative depth toward the street', () => {
+    const lot = { x: 100, y: 200, w: 40, h: 30 };
+    expect(lotFrame(lot, 'top').point(5, -3)).toEqual({ x: 105, y: 197 });
+    expect(lotFrame(lot, 'bottom').point(5, -3)).toEqual({ x: 105, y: 233 });
+    expect(lotFrame(lot, 'left').point(5, -3)).toEqual({ x: 97, y: 205 });
+    expect(lotFrame(lot, 'right').point(5, -3)).toEqual({ x: 143, y: 205 });
   });
 
   it('indexes parcels by cell', () => {
@@ -169,5 +182,72 @@ describe('straightRuns', () => {
     }
     // Citygen splits long streets, so some runs span several segments.
     expect(runs.length).toBeLessThan(city.segments.length);
+  });
+});
+
+describe('building tells', () => {
+  const s = toyTown.demarc.size;
+  const gap = toyTown.lot.curbGap;
+  const center = (r: { x: number; y: number; w: number; h: number }) => ({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+
+  /** Grid town whose lots are apartment buildings. */
+  function mduCity(): City {
+    return makeGridCity({ parcelKinds: () => ({ kind: 'mdu', units: 12 }) });
+  }
+
+  it('puts an apartment building’s demarc on the middle of its serving wall, with the entry running to the curb', () => {
+    const city = mduCity();
+    const lattice = streetLattice(city);
+    // Fronts 1st St above it.
+    const north = city.parcels.find((p) => p.x === 1 && p.y === 0)!;
+    const lot = lotRect(lattice, north, toyTown);
+    const tell = mduDemarc(lot, frontageSide(city, north), toyTown);
+    expect(tell.side).toBe('top');
+    expect(center(tell.box).x).toBeCloseTo(lot.x + lot.w / 2);
+    expect(center(tell.box).y).toBeCloseTo(lot.y + MDU_ROOF_PAD);
+    expect(tell.box.w).toBe(s);
+    expect(tell.entry).toEqual({ ax: lot.x + lot.w / 2, ay: lot.y + MDU_ROOF_PAD - s / 2, bx: lot.x + lot.w / 2, by: lot.y - gap });
+    expect(tell.curb).toEqual({ x: lot.x + lot.w / 2, y: lot.y - gap });
+    // The curb point sits on the edge of the serving street's pavement.
+    const street = toyTown.road.width.local / 2;
+    expect(tell.curb.y).toBeCloseTo(north.y * toyTown.cell + street);
+
+    // Its neighbor behind it fronts 2nd St below: the demarc moves to the bottom wall.
+    const south = city.parcels.find((p) => p.x === 1 && p.y === 1)!;
+    const southLot = lotRect(lattice, south, toyTown);
+    const southTell = mduDemarc(southLot, frontageSide(city, south), toyTown);
+    expect(southTell.side).toBe('bottom');
+    expect(center(southTell.box).y).toBeCloseTo(southLot.y + southLot.h - MDU_ROOF_PAD);
+    expect(southTell.curb.y).toBeCloseTo(southLot.y + southLot.h + gap);
+  });
+
+  it('follows the serving street round a corner lot, never just the nearest street', () => {
+    const city = mduCity();
+    // The corner lot at (0, 0) touches 1st St (top) and A Ave (left); serve it from A Ave.
+    const corner = city.parcels.find((p) => p.x === 0 && p.y === 0)!;
+    corner.segment = 9;
+    const lattice = streetLattice(city);
+    const lot = lotRect(lattice, corner, toyTown);
+    const tell = mduDemarc(lot, frontageSide(city, corner), toyTown);
+    expect(tell.side).toBe('left');
+    expect(center(tell.box).x).toBeCloseTo(lot.x + MDU_ROOF_PAD);
+    expect(center(tell.box).y).toBeCloseTo(lot.y + lot.h / 2);
+    expect(tell.curb).toEqual({ x: lot.x - gap, y: lot.y + lot.h / 2 });
+    expect(dropPoint(city, lattice, corner, toyTown)).toEqual(tell.curb);
+  });
+
+  it('drops homes at the end of their front walk and shops mid-front, on the serving side', () => {
+    const city = makeGridCity({ parcelKinds: (p) => (p.x === 2 ? { kind: 'smb', units: 1 } : undefined) });
+    const lattice = streetLattice(city);
+    const home = city.parcels.find((p) => p.x === 1 && p.y === 1)!;
+    const lot = lotRect(lattice, home, toyTown);
+    const plan = homePlan(lotFrame(lot, 'bottom'), hashInt(home.id));
+    expect(dropPoint(city, lattice, home, toyTown)).toEqual({ x: lot.x + plan.walkU, y: lot.y + lot.h + gap });
+    // The walk runs from the house's middle.
+    expect(plan.walkU).toBeCloseTo(plan.u + plan.along / 2);
+
+    const shop = city.parcels.find((p) => p.x === 2 && p.y === 0)!;
+    const shopLot = lotRect(lattice, shop, toyTown);
+    expect(dropPoint(city, lattice, shop, toyTown)).toEqual({ x: shopLot.x + shopLot.w / 2, y: shopLot.y - gap });
   });
 });

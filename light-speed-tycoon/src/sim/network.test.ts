@@ -1,76 +1,124 @@
 import { describe, expect, it } from 'vitest';
 import {
+  AERIAL_COST_PER_FT,
+  AERIAL_DETOUR_MAX_RATIO,
+  CABINET_CANCEL_REFUND,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
   CABINET_PERMIT_DAYS,
+  CABINET_REACH_FT,
+  CABINET_START_SPLITTERS,
+  ENGINEERING_FEE,
+  MAKE_READY_COST_PER_POLE,
   MAKE_READY_DAYS_MAX,
   MAKE_READY_DAYS_MIN,
   MAKE_READY_LONG_CHANCE,
   MAKE_READY_LONG_DAYS_MAX,
   MAKE_READY_LONG_DAYS_MIN,
-  OLT_START_PON_PORTS,
+  MAKE_READY_MEMORY_DAYS,
+  MAX_SPLITTERS_PER_CABINET,
+  OLT_CARD_COST,
+  OLT_MAX_CARDS,
+  OLT_PORTS_PER_CARD,
   PERMIT_DAYS_MAX,
   PERMIT_DAYS_MIN,
+  PERMIT_FEE_AERIAL,
+  PERMIT_FEE_UNDERGROUND,
+  PERMITTING_CANCEL_REFUND,
+  SPLIT_RATIO,
   SPLITTER_COST,
   START_CASH,
+  TILE_FT,
+  UNDERGROUND_COST_PER_FT,
+  UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from './balance';
-import { newGame } from './game';
+import { formatMoney } from './finance';
+import { applyCommand, newGame } from './game';
+import { cppBand } from './metrics';
 import {
+  addOltCard,
+  addSplitter,
   advanceNetwork,
   cableCost,
   cableRoute,
   computeService,
   getService,
   layCable,
+  orderFees,
   placeCabinet,
+  ponPortsUsed,
   quoteCabinet,
   quoteCable,
+  quoteOltCard,
+  quoteRemoveCabinet,
+  quoteRemoveSpan,
+  quoteSplitter,
+  rememberedPermitDays,
+  removeCabinet,
   removeSpan,
+  segmentCostPerFt,
+  spanCharges,
   spanOnSegment,
 } from './network';
 import { Rng } from './rng';
-import { shortestPath } from './streets';
-import { makeGridCity } from './testing/fixtures';
-import type { BuildStage, City, CommandResult, GameState, SegmentId } from './types';
+import { polesOnSegment, shortestPath } from './streets';
+import { makeGridCity, makeTestState } from './testing/fixtures';
+import type { BuildStage, CableMethod, City, CommandResult, GameState, SegmentId, StreetSegment } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
 // Horizontal segment (i, j) = j * 3 + i (240 ft, "1st St".."3rd St");
 // vertical (i, j) = 9 + j * 4 + i (120 ft, "A Ave".."D Ave").
+// Lots: ids 0, 2, 4, 6 front H(0, 0); 1, 3, 5, 7 front H(0, 1) from above, 24, 26, 28, 30 from below.
 const H = (i: number, j: number) => j * 3 + i;
 const V = (i: number, j: number) => 9 + j * 4 + i;
-const CABINET_PRICE = CABINET_COST + SPLITTER_COST;
+const CABINET_PRICE = CABINET_COST + CABINET_START_SPLITTERS * SPLITTER_COST;
 
 function makeState(city: City = makeGridCity()): GameState {
-  return {
-    schemaVersion: 1,
-    seed: 1,
-    day: 0,
-    rng: { events: 12345 },
-    nextId: 1,
-    city,
-    network: { spans: [], cabinets: [], olt: { ponPorts: OLT_START_PON_PORTS, tech: 'gpon' }, version: 0 },
-    finance: { cash: START_CASH, monthToDate: [], reports: [] },
-  };
+  return makeTestState(city);
 }
 
-function lay(state: GameState, segments: SegmentId[], method: 'aerial' | 'underground', seed = 1): CommandResult {
+function lay(state: GameState, segments: SegmentId[], method: CableMethod, seed = 1): CommandResult {
   return layCable(state, segments, method, new Rng(seed));
 }
 
+function seg(state: GameState, id: SegmentId): StreetSegment {
+  return state.city.segments[id]!;
+}
+
+function charges(state: GameState, id: SegmentId, method: CableMethod) {
+  return spanCharges(seg(state, id), method);
+}
+
+/** What an order of these (all new) segments costs: per-span charges plus the per-order fees once. */
+function orderCost(state: GameState, ids: SegmentId[], method: CableMethod): number {
+  return ids.reduce((sum, id) => sum + charges(state, id, method).total, 0) + orderFees(method);
+}
+
+/** The permitting draw layCable makes, replayed on a reference Rng. */
+function refDraw(rng: Rng, method: CableMethod): number {
+  if (method === 'underground') return rng.int(PERMIT_DAYS_MIN, PERMIT_DAYS_MAX);
+  return rng.chance(MAKE_READY_LONG_CHANCE)
+    ? rng.int(MAKE_READY_LONG_DAYS_MIN, MAKE_READY_LONG_DAYS_MAX)
+    : rng.int(MAKE_READY_DAYS_MIN, MAKE_READY_DAYS_MAX);
+}
+
 /** Put a span straight into the network at a given stage (service tests). */
-function addSpan(state: GameState, segment: SegmentId, stage: BuildStage = 'live'): void {
+function addSpan(state: GameState, segment: SegmentId, stage: BuildStage = 'live'): number {
+  const id = state.nextId++;
   state.network.spans.push({
-    id: state.nextId++,
+    id,
     segment,
     method: 'aerial',
     stage,
     stageDaysLeft: stage === 'live' ? 0 : 3,
     constructDays: 1,
     cost: 0,
+    refundable: 0,
     orderedDay: 0,
     liveDay: stage === 'live' ? 0 : null,
   });
   state.network.version++;
+  return id;
 }
 
 function addCabinet(state: GameState, node: number, stage: BuildStage = 'live'): number {
@@ -98,50 +146,189 @@ function reasonOf(result: CommandResult): string {
   return result.ok ? '' : result.reason;
 }
 
-describe('quoteCable', () => {
-  it('prices aerial and underground per foot', () => {
+function sorted(ids: Iterable<number>): number[] {
+  return [...ids].sort((a, b) => a - b);
+}
+
+/** A rejected command must leave every part of the game exactly as it was. */
+function expectRejected(state: GameState, run: (s: GameState) => CommandResult, reason: string | RegExp): void {
+  const before = structuredClone(state);
+  const result = run(state);
+  expect(result.ok).toBe(false);
+  if (typeof reason === 'string') expect(reasonOf(result)).toBe(reason);
+  else expect(reasonOf(result)).toMatch(reason);
+  expect(state).toEqual(before);
+}
+
+describe('spanCharges and segmentCostPerFt', () => {
+  it('prices aerial strand plus make-ready per pole', () => {
     const state = makeState();
-    const aerial = quoteCable(state, [H(0, 0), V(0, 0)], 'aerial');
-    expect(aerial).toMatchObject({ ok: true, reasons: [], newSegments: [H(0, 0), V(0, 0)], lengthFt: 360, cost: 3_600 });
-    const underground = quoteCable(state, [H(0, 0), V(0, 0)], 'underground');
-    expect(underground).toMatchObject({ ok: true, lengthFt: 360, cost: 10_800 });
+    const segment = seg(state, H(0, 0));
+    const poles = polesOnSegment(segment);
+    expect(poles).toBeGreaterThan(0);
+    const construction = Math.round(segment.lengthFt * AERIAL_COST_PER_FT);
+    expect(spanCharges(segment, 'aerial')).toEqual({
+      construction,
+      rock: 0,
+      poles,
+      makeReady: poles * MAKE_READY_COST_PER_POLE,
+      total: construction + poles * MAKE_READY_COST_PER_POLE,
+      refundable: construction,
+    });
+    expect(cableCost(segment, 'aerial')).toBe(construction + poles * MAKE_READY_COST_PER_POLE);
   });
 
-  it('doubles underground on rock but not aerial', () => {
+  it('adds the rock surcharge to underground only', () => {
     const state = makeState(makeGridCity({ rock: true }));
-    expect(quoteCable(state, [H(0, 0), V(0, 0)], 'underground').cost).toBe(21_600);
-    expect(quoteCable(state, [H(0, 0), V(0, 0)], 'aerial').cost).toBe(3_600);
+    const segment = seg(state, H(0, 0));
+    const construction = Math.round(segment.lengthFt * UNDERGROUND_COST_PER_FT);
+    const rock = Math.round(segment.lengthFt * UNDERGROUND_ROCK_SURCHARGE_PER_FT);
+    expect(spanCharges(segment, 'underground')).toEqual({
+      construction,
+      rock,
+      poles: 0,
+      makeReady: 0,
+      total: construction + rock,
+      refundable: construction + rock,
+    });
+    expect(spanCharges(segment, 'aerial').rock).toBe(0);
+    expect(spanCharges(seg(makeState(), H(0, 0)), 'underground').rock).toBe(0);
   });
 
-  it('rounds to whole dollars per span', () => {
+  it('rounds each charge to whole dollars', () => {
+    const city = makeGridCity({ rock: true });
+    city.segments[0] = { ...city.segments[0]!, lengthFt: 33.33 };
+    const segment = city.segments[0];
+    expect(spanCharges(segment, 'aerial').construction).toBe(Math.round(33.33 * AERIAL_COST_PER_FT));
+    expect(spanCharges(segment, 'underground').rock).toBe(Math.round(33.33 * UNDERGROUND_ROCK_SURCHARGE_PER_FT));
+    for (const method of ['aerial', 'underground'] as const) {
+      const c = spanCharges(segment, method);
+      expect(Number.isInteger(c.construction) && Number.isInteger(c.rock) && Number.isInteger(c.total)).toBe(true);
+    }
+  });
+
+  it('charges no make-ready on a street without poles', () => {
+    const state = makeState(makeGridCity({ hasPoles: false }));
+    expect(charges(state, H(0, 0), 'aerial')).toMatchObject({ poles: 0, makeReady: 0 });
+  });
+
+  it('gives all-in dollars per foot, null for aerial without poles', () => {
+    const state = makeState();
+    const segment = seg(state, H(0, 0));
+    expect(segmentCostPerFt(segment, 'aerial')).toBe(spanCharges(segment, 'aerial').total / segment.lengthFt);
+    expect(segmentCostPerFt(segment, 'underground')).toBe(UNDERGROUND_COST_PER_FT);
+    const bare = { ...segment, hasPoles: false };
+    expect(segmentCostPerFt(bare, 'aerial')).toBeNull();
+    expect(segmentCostPerFt(bare, 'underground')).toBe(UNDERGROUND_COST_PER_FT);
+  });
+});
+
+describe('quoteCable', () => {
+  it('itemizes an aerial order: strand, make-ready and the two fees', () => {
+    const state = makeState();
+    const ids = [H(0, 0), V(0, 0)];
+    const quote = quoteCable(state, ids, 'aerial');
+    const poles = polesOnSegment(seg(state, H(0, 0))) + polesOnSegment(seg(state, V(0, 0)));
+    const strand = charges(state, H(0, 0), 'aerial').construction + charges(state, V(0, 0), 'aerial').construction;
+    expect(quote).toMatchObject({ ok: true, reasons: [], newSegments: ids, lengthFt: 360 });
+    expect(quote.lines).toEqual([
+      { kind: 'cable', label: 'Aerial strand', quantity: 360, unit: 'ft', rate: AERIAL_COST_PER_FT, amount: strand, refundable: true },
+      {
+        kind: 'makeReady',
+        label: `Make-ready (${poles} poles)`,
+        quantity: poles,
+        unit: 'pole',
+        rate: MAKE_READY_COST_PER_POLE,
+        amount: poles * MAKE_READY_COST_PER_POLE,
+        refundable: false,
+      },
+      { kind: 'engineering', label: 'Engineering', quantity: 1, unit: 'order', rate: ENGINEERING_FEE, amount: ENGINEERING_FEE, refundable: false },
+      {
+        kind: 'permit',
+        label: 'Pole attachment application',
+        quantity: 1,
+        unit: 'order',
+        rate: PERMIT_FEE_AERIAL,
+        amount: PERMIT_FEE_AERIAL,
+        refundable: false,
+      },
+    ]);
+    expect(quote.cost).toBe(quote.lines.reduce((sum, line) => sum + line.amount, 0));
+    expect(quote.cost).toBe(orderCost(state, ids, 'aerial'));
+    expect(quote.refundable).toBe(strand);
+    expect(quote.costPerFt).toBe(quote.cost / 360);
+  });
+
+  it('itemizes an underground order with a city permit and no make-ready', () => {
+    const state = makeState();
+    const quote = quoteCable(state, [H(0, 0), V(0, 0)], 'underground');
+    expect(quote.lines.map((l) => [l.kind, l.label])).toEqual([
+      ['cable', 'Underground bore'],
+      ['engineering', 'Engineering'],
+      ['permit', 'City permit'],
+    ]);
+    expect(quote.lines[0]).toMatchObject({ quantity: 360, rate: UNDERGROUND_COST_PER_FT, amount: 360 * UNDERGROUND_COST_PER_FT });
+    expect(quote.lines[2]).toMatchObject({ rate: PERMIT_FEE_UNDERGROUND, amount: PERMIT_FEE_UNDERGROUND });
+    expect(quote.cost).toBe(360 * UNDERGROUND_COST_PER_FT + ENGINEERING_FEE + PERMIT_FEE_UNDERGROUND);
+    expect(quote.refundable).toBe(360 * UNDERGROUND_COST_PER_FT);
+  });
+
+  it('adds a rock line for underground on rock only, over the rock segments only', () => {
+    const city = makeGridCity();
+    city.segments[H(0, 0)] = { ...city.segments[H(0, 0)]!, rock: true };
+    const state = makeState(city);
+    const underground = quoteCable(state, [H(0, 0), V(0, 0)], 'underground');
+    const rock = underground.lines.find((l) => l.kind === 'rock');
+    expect(rock).toEqual({
+      kind: 'rock',
+      label: 'Rock surcharge',
+      quantity: 240,
+      unit: 'ft',
+      rate: UNDERGROUND_ROCK_SURCHARGE_PER_FT,
+      amount: Math.round(240 * UNDERGROUND_ROCK_SURCHARGE_PER_FT),
+      refundable: true,
+    });
+    expect(underground.lines.map((l) => l.kind)).toEqual(['cable', 'rock', 'engineering', 'permit']);
+    expect(underground.refundable).toBe(underground.lines[0]!.amount + rock!.amount);
+    expect(underground.cost).toBe(orderCost(state, [H(0, 0), V(0, 0)], 'underground'));
+    expect(quoteCable(state, [H(0, 0), V(0, 0)], 'aerial').lines.some((l) => l.kind === 'rock')).toBe(false);
+    expect(quoteCable(state, [V(0, 0)], 'underground').lines.some((l) => l.kind === 'rock')).toBe(false);
+  });
+
+  it('sums per-span rounded amounts, so lines add up exactly', () => {
     const city = makeGridCity();
     city.segments[0] = { ...city.segments[0]!, lengthFt: 33.33 };
     city.segments[1] = { ...city.segments[1]!, lengthFt: 33.33 };
-    expect(cableCost(city.segments[0], 'aerial')).toBe(333);
-    // 2 x 333, not round(666.6).
-    expect(quoteCable(makeState(city), [0, 1], 'aerial').cost).toBe(666);
+    const state = makeState(city);
+    const quote = quoteCable(state, [0, 1], 'underground');
+    // 2 x round(33.33 x rate), not round(66.66 x rate).
+    expect(quote.lines[0]!.amount).toBe(2 * Math.round(33.33 * UNDERGROUND_COST_PER_FT));
+    expect(quote.cost).toBe(quote.lines.reduce((sum, line) => sum + line.amount, 0));
   });
 
-  it('skips already-cabled segments and duplicate ids', () => {
+  it('skips already-cabled segments and duplicate ids, charging the fees once', () => {
     const state = makeState();
     expect(lay(state, [H(0, 0)], 'aerial').ok).toBe(true);
     const quote = quoteCable(state, [H(0, 0), H(1, 0), H(1, 0), H(0, 0), H(1, 0)], 'aerial');
-    expect(quote).toMatchObject({ ok: true, newSegments: [H(1, 0)], lengthFt: 240, cost: 2_400 });
+    expect(quote).toMatchObject({ ok: true, newSegments: [H(1, 0)], lengthFt: 240 });
+    expect(quote.cost).toBe(charges(state, H(1, 0), 'aerial').total + ENGINEERING_FEE + PERMIT_FEE_AERIAL);
+    expect(quote.lines.filter((l) => l.kind === 'engineering' || l.kind === 'permit').map((l) => l.quantity)).toEqual([1, 1]);
   });
 
-  it('rejects an order with nothing new to build', () => {
+  it('rejects an order with nothing new to build and charges nothing, not even fees', () => {
     const state = makeState();
     lay(state, [H(0, 0)], 'aerial');
     const quote = quoteCable(state, [H(0, 0), H(0, 0)], 'underground');
     expect(quote.ok).toBe(false);
     expect(quote.reasons).toEqual(['Every selected street already has cable']);
-    expect(quote.cost).toBe(0);
+    expect(quote).toMatchObject({ cost: 0, lines: [], refundable: 0, costPerFt: 0, lengthFt: 0 });
   });
 
   it('rejects an empty order', () => {
     const quote = quoteCable(makeState(), [], 'aerial');
     expect(quote.ok).toBe(false);
     expect(quote.reasons).toEqual(['No street segments selected']);
+    expect(quote.lines).toEqual([]);
   });
 
   it('rejects aerial on streets without poles, naming them', () => {
@@ -149,6 +336,8 @@ describe('quoteCable', () => {
     const quote = quoteCable(state, [H(0, 0), H(1, 0), V(0, 0)], 'aerial');
     expect(quote.ok).toBe(false);
     expect(quote.reasons).toEqual(['No poles on 1st St, A Ave - lay underground instead']);
+    // No poles, no make-ready line.
+    expect(quote.lines.map((l) => l.kind)).toEqual(['cable', 'engineering', 'permit']);
     expect(quoteCable(state, [H(0, 0), V(0, 0)], 'underground').ok).toBe(true);
   });
 
@@ -175,13 +364,16 @@ describe('quoteCable', () => {
     expect(quoteCable(state, null as unknown as SegmentId[], 'aerial').ok).toBe(false);
   });
 
-  it('flags insufficient cash with both amounts', () => {
+  it('checks cash against the full cost including fees and make-ready', () => {
     const state = makeState();
-    state.finance.cash = 9_000;
-    const quote = quoteCable(state, [H(0, 0), H(1, 0)], 'underground');
+    const cost = orderCost(state, [H(0, 0), H(1, 0)], 'aerial');
+    state.finance.cash = cost - 1;
+    const quote = quoteCable(state, [H(0, 0), H(1, 0)], 'aerial');
     expect(quote.ok).toBe(false);
-    expect(quote.cost).toBe(14_400);
-    expect(quote.reasons).toEqual(['Not enough cash: need $14,400, have $9,000']);
+    expect(quote.cost).toBe(cost);
+    expect(quote.reasons).toEqual([`Not enough cash: need ${formatMoney(cost)}, have ${formatMoney(cost - 1)}`]);
+    state.finance.cash = cost;
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'aerial').ok).toBe(true);
   });
 
   it('quotes the full permitting range and the longest construction', () => {
@@ -192,6 +384,7 @@ describe('quoteCable', () => {
       permitDaysMin: MAKE_READY_DAYS_MIN,
       permitDaysMax: MAKE_READY_LONG_DAYS_MAX,
       constructDays: 2,
+      rememberedPermitDays: null,
     });
     const underground = quoteCable(state, [V(0, 0), H(0, 0)], 'underground');
     expect(underground).toMatchObject({ permitDaysMin: PERMIT_DAYS_MIN, permitDaysMax: PERMIT_DAYS_MAX, constructDays: 4 });
@@ -200,30 +393,127 @@ describe('quoteCable', () => {
 
   it('does not change state', () => {
     const state = makeState();
+    addCabinet(state, 0, 'permitting');
+    lay(state, [H(0, 0)], 'aerial');
     const before = JSON.stringify(state);
-    quoteCable(state, [H(0, 0), V(0, 0)], 'aerial');
+    quoteCable(state, [H(0, 0), H(1, 0), V(1, 0)], 'aerial');
     expect(JSON.stringify(state)).toBe(before);
   });
 });
 
+describe('quoteCable passings, CPP and wrong-side buildings', () => {
+  it('counts units along the new cable today and in the future, by serving segment', () => {
+    const city = makeGridCity();
+    city.parcels[0] = { ...city.parcels[0]!, appearsDay: 10 };
+    city.parcels[2] = { ...city.parcels[2]!, kind: 'mdu', units: 24 };
+    const state = makeState(city);
+    // Lots 0, 2, 4, 6 front 1st St; A Ave serves nobody (lots 0 and 1 only touch it).
+    const quote = quoteCable(state, [H(0, 0), V(0, 0)], 'underground');
+    expect(quote).toMatchObject({ passingsAlong: 26, passingsFuture: 1 });
+    state.day = 10;
+    expect(quoteCable(state, [H(0, 0), V(0, 0)], 'underground')).toMatchObject({ passingsAlong: 27, passingsFuture: 0 });
+  });
+
+  it('gives cost per passing and its band, or null with no passings', () => {
+    const state = makeState();
+    const quote = quoteCable(state, [H(0, 0), H(1, 0)], 'aerial');
+    expect(quote.passingsAlong).toBe(8);
+    expect(quote.cpp).toBe(quote.cost / 8);
+    expect(quote.cppBand).toBe(cppBand(quote.cost / 8));
+    const avenue = quoteCable(state, [V(0, 0)], 'aerial');
+    expect(avenue).toMatchObject({ passingsAlong: 0, cpp: null, cppBand: null });
+  });
+
+  it('counts passings in reach only with a cabinet ordered on CO-connected cable', () => {
+    const state = makeState();
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'aerial').passingsInReach).toBe(0);
+    // A cabinet still in permitting counts: the quote assumes everything ordered goes live.
+    addCabinet(state, 0, 'permitting');
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'aerial').passingsInReach).toBe(8);
+  });
+
+  it('routes the hypothetical network through spans already ordered', () => {
+    const state = makeState();
+    addCabinet(state, 1, 'permitting');
+    // Without 1st St from the CO, 2nd block's 1st St is an island.
+    expect(quoteCable(state, [H(1, 0)], 'aerial').passingsInReach).toBe(0);
+    addSpan(state, H(0, 0), 'permitting');
+    expect(quoteCable(state, [H(1, 0)], 'aerial')).toMatchObject({ passingsAlong: 4, passingsInReach: 4 });
+  });
+
+  it('leaves out passings beyond cabinet reach', () => {
+    // 1,800 ft blocks: 1st St's second segment starts 1,800 ft from the CO cabinet.
+    const state = makeState(makeGridCity({ blockW: 30 }));
+    addCabinet(state, 0, 'constructing');
+    const quote = quoteCable(state, [H(0, 0), H(1, 0)], 'underground');
+    expect(quote).toMatchObject({ passingsAlong: 60, passingsInReach: 30 });
+  });
+
+  it('lists existing buildings along the route that face an uncabled street', () => {
+    const state = makeState();
+    // Lots 0 and 1 sit on A Ave's corners but front 1st St and 2nd St.
+    expect(quoteCable(state, [V(0, 0)], 'aerial').wrongSideParcels).toEqual([0, 1]);
+    // Cabling 1st St in the same order takes care of lot 0.
+    expect(quoteCable(state, [V(0, 0), H(0, 0)], 'aerial').wrongSideParcels).toEqual([1]);
+    // So does 2nd St already having cable (any stage).
+    addSpan(state, H(0, 1), 'permitting');
+    expect(quoteCable(state, [V(0, 0), H(0, 0)], 'aerial').wrongSideParcels).toEqual([]);
+    // Buildings that do not exist yet are not counted.
+    const city = makeGridCity();
+    city.parcels[1] = { ...city.parcels[1]!, appearsDay: 10 };
+    expect(quoteCable(makeState(city), [V(0, 0)], 'aerial').wrongSideParcels).toEqual([0]);
+    // Streets lined by the lots they serve have none.
+    expect(quoteCable(state, [H(1, 0), H(2, 0)], 'aerial').wrongSideParcels).toEqual([]);
+  });
+});
+
 describe('layCable', () => {
-  it('creates permitting spans, charges cash and posts a construction entry', () => {
+  it('creates permitting spans, charges cash and capex and posts one construction entry', () => {
     const state = makeState(makeGridCity({ blockW: 20 }));
     state.day = 7;
+    const quote = quoteCable(state, [H(0, 0), V(0, 0)], 'aerial');
     const result = lay(state, [H(0, 0), V(0, 0)], 'aerial');
-    expect(result).toEqual({ ok: true, cost: 13_200 });
-    expect(state.finance.cash).toBe(START_CASH - 13_200);
+    expect(result).toEqual({ ok: true, cost: quote.cost });
+    expect(state.finance.cash).toBe(START_CASH - quote.cost);
+    expect(state.finance.capex).toEqual({ osp: quote.cost, connect: 0, co: 0 });
     expect(state.nextId).toBe(3);
     expect(state.network.version).toBe(1);
 
     const [first, second] = state.network.spans;
-    expect(first).toMatchObject({ id: 1, segment: H(0, 0), method: 'aerial', stage: 'permitting', constructDays: 2, cost: 12_000, orderedDay: 7, liveDay: null });
-    expect(second).toMatchObject({ id: 2, segment: V(0, 0), constructDays: 1, cost: 1_200 });
+    expect(first).toMatchObject({ id: 1, segment: H(0, 0), method: 'aerial', stage: 'permitting', constructDays: 2, orderedDay: 7, liveDay: null });
+    expect(second).toMatchObject({ id: 2, segment: V(0, 0), constructDays: 1 });
     expect(first!.stageDaysLeft).toBe(second!.stageDaysLeft);
 
     expect(state.finance.monthToDate).toEqual([
-      { day: 7, category: 'construction', amount: -13_200, memo: 'Aerial cable on 1st St, A Ave (1,320 ft)' },
+      { day: 7, category: 'construction', amount: -quote.cost, memo: 'Aerial cable on 1st St, A Ave (1,320 ft)' },
     ]);
+  });
+
+  it('splits the order fees over the spans by length, remainder on the last span', () => {
+    const state = makeState(makeGridCity({ blockW: 20 }));
+    const ids = [H(0, 0), V(0, 0), H(0, 1)];
+    const quote = quoteCable(state, ids, 'underground');
+    lay(state, ids, 'underground');
+    const fees = orderFees('underground');
+    const total = 1_200 + 120 + 1_200;
+    const share = (ft: number) => Math.floor((fees * ft) / total);
+    const spans = state.network.spans;
+    expect(spans[0]!.cost).toBe(charges(state, H(0, 0), 'underground').total + share(1_200));
+    expect(spans[1]!.cost).toBe(charges(state, V(0, 0), 'underground').total + share(120));
+    expect(spans[2]!.cost).toBe(charges(state, H(0, 1), 'underground').total + fees - share(1_200) - share(120));
+    expect(spans.reduce((sum, s) => sum + s.cost, 0)).toBe(quote.cost);
+    for (const span of spans) expect(span.refundable).toBe(charges(state, span.segment, 'underground').refundable);
+  });
+
+  it('keeps refundable to construction plus rock', () => {
+    const state = makeState(makeGridCity({ rock: true }));
+    lay(state, [H(0, 0)], 'underground');
+    lay(state, [H(1, 0)], 'aerial');
+    const [bore, strand] = state.network.spans;
+    const c = charges(state, H(0, 0), 'underground');
+    expect(bore!.refundable).toBe(c.construction + c.rock);
+    expect(strand!.refundable).toBe(charges(state, H(1, 0), 'aerial').construction);
+    for (const span of state.network.spans) expect(span.refundable).toBeLessThanOrEqual(span.cost);
   });
 
   it('summarises long street lists in the memo', () => {
@@ -236,10 +526,11 @@ describe('layCable', () => {
   it('leaves state and rng untouched when rejected', () => {
     const state = makeState();
     state.finance.cash = 100;
+    const cost = quoteCable(state, [H(0, 0)], 'aerial').cost;
     const rng = new Rng(5);
     const before = JSON.stringify(state);
     const result = layCable(state, [H(0, 0)], 'aerial', rng);
-    expect(result).toEqual({ ok: false, reason: 'Not enough cash: need $2,400, have $100' });
+    expect(result).toEqual({ ok: false, reason: `Not enough cash: need ${formatMoney(cost)}, have $100` });
     expect(JSON.stringify(state)).toBe(before);
     expect(rng.state).toBe(new Rng(5).state);
   });
@@ -247,8 +538,9 @@ describe('layCable', () => {
   it('joins multiple reasons', () => {
     const state = makeState(makeGridCity({ hasPoles: false }));
     state.finance.cash = 0;
+    const cost = quoteCable(state, [H(0, 0)], 'aerial').cost;
     expect(reasonOf(lay(state, [H(0, 0)], 'aerial'))).toBe(
-      'No poles on 1st St - lay underground instead; Not enough cash: need $2,400, have $0',
+      `No poles on 1st St - lay underground instead; Not enough cash: need ${formatMoney(cost)}, have $0`,
     );
   });
 
@@ -299,15 +591,165 @@ describe('layCable', () => {
 
         // The rng advanced by exactly one draw.
         const ref = new Rng(seed);
-        if (method === 'aerial') {
-          if (ref.chance(MAKE_READY_LONG_CHANCE)) ref.int(MAKE_READY_LONG_DAYS_MIN, MAKE_READY_LONG_DAYS_MAX);
-          else ref.int(MAKE_READY_DAYS_MIN, MAKE_READY_DAYS_MAX);
-        } else {
-          ref.int(PERMIT_DAYS_MIN, PERMIT_DAYS_MAX);
-        }
+        expect([...days][0]).toBe(refDraw(ref, method));
         expect(rng.state).toBe(ref.state);
       }
     }
+  });
+});
+
+describe('make-ready memory', () => {
+  it('remembers each fresh draw, sorted by segment then method', () => {
+    const state = makeState();
+    state.day = 4;
+    lay(state, [H(2, 0), H(0, 0)], 'aerial', 3);
+    const days = state.network.spans[0]!.stageDaysLeft;
+    lay(state, [V(0, 0), H(1, 1)], 'underground', 4);
+    const ugDays = state.network.spans[2]!.stageDaysLeft;
+    expect(state.network.makeReady).toEqual([
+      { segment: H(0, 0), method: 'aerial', days, drawnDay: 4 },
+      { segment: H(2, 0), method: 'aerial', days, drawnDay: 4 },
+      { segment: H(1, 1), method: 'underground', days: ugDays, drawnDay: 4 },
+      { segment: V(0, 0), method: 'underground', days: ugDays, drawnDay: 4 },
+    ]);
+    expect(rememberedPermitDays(state, H(0, 0), 'aerial')).toBe(days);
+    expect(rememberedPermitDays(state, H(0, 0), 'underground')).toBeNull();
+  });
+
+  it('reuses the remembered days after cancel and reorder, consuming no RNG', () => {
+    const state = makeState();
+    expect(applyCommand(state, { type: 'layCable', segments: [H(0, 0)], method: 'aerial' }).ok).toBe(true);
+    const days = state.network.spans[0]!.stageDaysLeft;
+    const memos = structuredClone(state.network.makeReady);
+    expect(applyCommand(state, { type: 'removeSpan', span: state.network.spans[0]!.id }).ok).toBe(true);
+    // Memos survive the cancellation.
+    expect(state.network.makeReady).toEqual(memos);
+
+    state.day = MAKE_READY_MEMORY_DAYS - 1;
+    const quote = quoteCable(state, [H(0, 0)], 'aerial');
+    expect(quote).toMatchObject({ rememberedPermitDays: days, permitDaysMin: days, permitDaysMax: days });
+    const events = state.rng.events;
+    expect(applyCommand(state, { type: 'layCable', segments: [H(0, 0)], method: 'aerial' }).ok).toBe(true);
+    expect(state.rng.events).toBe(events);
+    expect(state.network.spans[0]!.stageDaysLeft).toBe(days);
+    // Reuse never moves drawnDay, so the memo still expires on schedule.
+    expect(state.network.makeReady).toEqual(memos);
+  });
+
+  it('draws fresh once the memory has expired, and replaces the memo', () => {
+    const state = makeState();
+    lay(state, [H(0, 0)], 'underground', 1);
+    removeSpan(state, state.network.spans[0]!.id);
+    state.day = MAKE_READY_MEMORY_DAYS;
+    expect(quoteCable(state, [H(0, 0)], 'underground')).toMatchObject({
+      rememberedPermitDays: null,
+      permitDaysMin: PERMIT_DAYS_MIN,
+      permitDaysMax: PERMIT_DAYS_MAX,
+    });
+    const rng = new Rng(99);
+    layCable(state, [H(0, 0)], 'underground', rng);
+    const ref = new Rng(99);
+    const fresh = refDraw(ref, 'underground');
+    expect(rng.state).toBe(ref.state);
+    expect(state.network.spans[0]!.stageDaysLeft).toBe(fresh);
+    expect(state.network.makeReady).toEqual([
+      { segment: H(0, 0), method: 'underground', days: fresh, drawnDay: MAKE_READY_MEMORY_DAYS },
+    ]);
+  });
+
+  it('draws fresh for the other method', () => {
+    const state = makeState();
+    lay(state, [H(0, 0)], 'underground', 1);
+    const ugDays = state.network.spans[0]!.stageDaysLeft;
+    removeSpan(state, state.network.spans[0]!.id);
+    expect(quoteCable(state, [H(0, 0)], 'aerial').rememberedPermitDays).toBeNull();
+    const rng = new Rng(8);
+    layCable(state, [H(0, 0)], 'aerial', rng);
+    const ref = new Rng(8);
+    const fresh = refDraw(ref, 'aerial');
+    expect(rng.state).toBe(ref.state);
+    expect(state.network.spans[0]!.stageDaysLeft).toBe(fresh);
+    expect(state.network.makeReady).toEqual([
+      { segment: H(0, 0), method: 'aerial', days: fresh, drawnDay: 0 },
+      { segment: H(0, 0), method: 'underground', days: ugDays, drawnDay: 0 },
+    ]);
+  });
+
+  it('keeps remembered spans on their days while the rest share one fresh draw', () => {
+    const state = makeState();
+    lay(state, [H(1, 0)], 'aerial', 21);
+    const remembered = state.network.spans[0]!.stageDaysLeft;
+    removeSpan(state, state.network.spans[0]!.id);
+    state.day = 30;
+
+    const quote = quoteCable(state, [H(0, 0), H(1, 0), H(2, 0)], 'aerial');
+    expect(quote.rememberedPermitDays).toBe(remembered);
+    expect(quote.permitDaysMin).toBe(Math.max(remembered, MAKE_READY_DAYS_MIN));
+    expect(quote.permitDaysMax).toBe(Math.max(remembered, MAKE_READY_LONG_DAYS_MAX));
+
+    const rng = new Rng(22);
+    layCable(state, [H(0, 0), H(1, 0), H(2, 0)], 'aerial', rng);
+    const ref = new Rng(22);
+    const fresh = refDraw(ref, 'aerial');
+    expect(rng.state).toBe(ref.state);
+    expect(state.network.spans.map((s) => [s.segment, s.stageDaysLeft])).toEqual([
+      [H(0, 0), fresh],
+      [H(1, 0), remembered],
+      [H(2, 0), fresh],
+    ]);
+    expect(state.network.makeReady).toEqual([
+      { segment: H(0, 0), method: 'aerial', days: fresh, drawnDay: 30 },
+      { segment: H(1, 0), method: 'aerial', days: remembered, drawnDay: 0 },
+      { segment: H(2, 0), method: 'aerial', days: fresh, drawnDay: 30 },
+    ]);
+  });
+
+  it('quotes a remembered long draw as the floor of the permitting range', () => {
+    const state = makeState();
+    state.network.makeReady = [{ segment: H(0, 0), method: 'underground', days: PERMIT_DAYS_MAX + 100, drawnDay: 0 }];
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'underground')).toMatchObject({
+      rememberedPermitDays: PERMIT_DAYS_MAX + 100,
+      permitDaysMin: PERMIT_DAYS_MAX + 100,
+      permitDaysMax: PERMIT_DAYS_MAX + 100,
+    });
+    state.network.makeReady = [{ segment: H(0, 0), method: 'underground', days: PERMIT_DAYS_MIN + 1, drawnDay: 0 }];
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'underground')).toMatchObject({
+      rememberedPermitDays: PERMIT_DAYS_MIN + 1,
+      permitDaysMin: PERMIT_DAYS_MIN + 1,
+      permitDaysMax: PERMIT_DAYS_MAX,
+    });
+    // A memo on a segment that is skipped (already cabled) does not count.
+    addSpan(state, H(0, 0), 'permitting');
+    expect(quoteCable(state, [H(0, 0), H(1, 0)], 'underground').rememberedPermitDays).toBeNull();
+  });
+
+  it('prunes expired memos on the next successful order, not on a rejected one', () => {
+    const state = makeState();
+    lay(state, [H(0, 0), V(0, 0)], 'aerial');
+    lay(state, [H(2, 2)], 'underground');
+    state.day = MAKE_READY_MEMORY_DAYS + 5;
+
+    // Rejected: nothing changes, expired memos linger.
+    const cash = state.finance.cash;
+    state.finance.cash = 0;
+    expectRejected(state, (s) => lay(s, [H(1, 0)], 'aerial'), /Not enough cash/);
+    expect(state.network.makeReady).toHaveLength(3);
+    state.finance.cash = cash;
+
+    expect(lay(state, [H(1, 0)], 'aerial', 5).ok).toBe(true);
+    expect(state.network.makeReady).toEqual([
+      { segment: H(1, 0), method: 'aerial', days: state.network.spans.at(-1)!.stageDaysLeft, drawnDay: MAKE_READY_MEMORY_DAYS + 5 },
+    ]);
+  });
+
+  it('leaves memos and RNG untouched when an order with remembered segments is rejected', () => {
+    const state = makeState();
+    lay(state, [H(0, 0)], 'aerial');
+    removeSpan(state, state.network.spans[0]!.id);
+    state.finance.cash = 0;
+    const rng = new Rng(3);
+    expectRejected(state, (s) => layCable(s, [H(0, 0), H(1, 0)], 'aerial', rng), /Not enough cash/);
+    expect(rng.state).toBe(new Rng(3).state);
   });
 });
 
@@ -389,74 +831,375 @@ describe('cabinets', () => {
       cost: CABINET_PRICE,
       permitDays: CABINET_PERMIT_DAYS,
       constructDays: CABINET_CONSTRUCT_DAYS,
+      splitters: CABINET_START_SPLITTERS,
+      ports: CABINET_START_SPLITTERS * SPLIT_RATIO,
     });
   });
 
-  it('places a cabinet, charges equipment and bumps the version', () => {
+  it('places a cabinet, charges equipment and capex and bumps the version', () => {
     const state = makeState();
     state.nextId = 40;
     expect(placeCabinet(state, 5)).toEqual({ ok: true, cost: CABINET_PRICE });
     expect(state.network.cabinets).toEqual([
-      { id: 40, node: 5, splitters: 1, stage: 'permitting', stageDaysLeft: CABINET_PERMIT_DAYS, cost: CABINET_PRICE, orderedDay: 0, liveDay: null },
+      {
+        id: 40,
+        node: 5,
+        splitters: CABINET_START_SPLITTERS,
+        stage: 'permitting',
+        stageDaysLeft: CABINET_PERMIT_DAYS,
+        cost: CABINET_PRICE,
+        orderedDay: 0,
+        liveDay: null,
+      },
     ]);
     expect(state.nextId).toBe(41);
     expect(state.network.version).toBe(1);
     expect(state.finance.cash).toBe(START_CASH - CABINET_PRICE);
+    expect(state.finance.capex).toEqual({ osp: CABINET_PRICE, connect: 0, co: 0 });
     expect(state.finance.monthToDate).toEqual([
       { day: 0, category: 'equipment', amount: -CABINET_PRICE, memo: 'Cabinet at 2nd St & B Ave (1 splitter)' },
     ]);
+    expect(state.notices).toEqual([]);
   });
 
   it('rejects bad nodes', () => {
     const state = makeState();
     for (const bad of [-1, 12, 2.5, Number.NaN]) {
-      expect(reasonOf(placeCabinet(state, bad))).toBe(`Unknown street corner: ${bad}`);
+      expectRejected(state, (s) => placeCabinet(s, bad), `Unknown street corner: ${bad}`);
     }
-    expect(state.network.cabinets).toHaveLength(0);
   });
 
   it('allows one cabinet per node', () => {
     const state = makeState();
     expect(placeCabinet(state, 0).ok).toBe(true);
-    expect(reasonOf(placeCabinet(state, 0))).toBe('There is already a cabinet at 1st St & A Ave');
+    expectRejected(state, (s) => placeCabinet(s, 0), 'There is already a cabinet at 1st St & A Ave');
     expect(placeCabinet(state, 1).ok).toBe(true);
   });
 
-  it('caps total splitters at the OLT port count', () => {
+  it('caps total splitters at the OLT port count and says when the last port is used', () => {
     const state = makeState();
     state.network.olt.ponPorts = 2;
     expect(placeCabinet(state, 0).ok).toBe(true);
+    expect(state.notices).toEqual([]);
     expect(placeCabinet(state, 1).ok).toBe(true);
-    expect(reasonOf(placeCabinet(state, 2))).toBe('No free PON ports on the OLT: 2 of 2 in use');
+    expect(state.notices).toEqual([
+      {
+        id: 1,
+        day: 0,
+        kind: 'oltFull',
+        message: 'All 2 PON ports at the CO are in use: add an OLT line card before the next cabinet or splitter',
+        cabinet: null,
+        milestone: null,
+      },
+    ]);
+    expect(state.nextNoticeId).toBe(2);
+    // Same blocker as a splitter: it says how to get more ports.
+    expectRejected(state, (s) => placeCabinet(s, 2), 'No free PON ports on the OLT: 2 of 2 in use - add a line card at the CO');
     expect(state.network.cabinets).toHaveLength(2);
   });
 
   it('rejects when cash is short', () => {
     const state = makeState();
-    state.finance.cash = 16_199;
-    expect(reasonOf(placeCabinet(state, 0))).toBe('Not enough cash: need $16,200, have $16,199');
-    state.finance.cash = 16_200;
+    state.finance.cash = CABINET_PRICE - 1;
+    expectRejected(
+      state,
+      (s) => placeCabinet(s, 0),
+      `Not enough cash: need ${formatMoney(CABINET_PRICE)}, have ${formatMoney(CABINET_PRICE - 1)}`,
+    );
+    state.finance.cash = CABINET_PRICE;
     expect(placeCabinet(state, 0).ok).toBe(true);
     expect(state.finance.cash).toBe(0);
   });
 });
 
+describe('splitters', () => {
+  it('quotes one more splitter', () => {
+    const state = makeState();
+    placeCabinet(state, 0);
+    const id = state.network.cabinets[0]!.id;
+    expect(quoteSplitter(state, id)).toEqual({
+      ok: true,
+      reasons: [],
+      cost: SPLITTER_COST,
+      splittersAfter: CABINET_START_SPLITTERS + 1,
+      portsAfter: (CABINET_START_SPLITTERS + 1) * SPLIT_RATIO,
+      ponPortsUsedAfter: CABINET_START_SPLITTERS + 1,
+      ponPorts: state.network.olt.ponPorts,
+    });
+  });
+
+  it('adds a splitter in any stage, charging equipment and capex', () => {
+    for (const stage of ['permitting', 'constructing', 'live'] as const) {
+      const state = makeState();
+      const id = addCabinet(state, 0, stage);
+      const version = state.network.version;
+      expect(addSplitter(state, id)).toEqual({ ok: true, cost: SPLITTER_COST });
+      expect(state.network.cabinets[0]).toMatchObject({ splitters: 2, cost: SPLITTER_COST, stage });
+      expect(state.network.version).toBe(version + 1);
+      expect(ponPortsUsed(state)).toBe(2);
+      expect(state.finance.cash).toBe(START_CASH - SPLITTER_COST);
+      expect(state.finance.capex).toEqual({ osp: SPLITTER_COST, connect: 0, co: 0 });
+      expect(state.finance.monthToDate).toEqual([
+        { day: 0, category: 'equipment', amount: -SPLITTER_COST, memo: `Splitter added at 1st St & A Ave (2 x 1:${SPLIT_RATIO})` },
+      ]);
+      expect(state.notices).toEqual([]);
+    }
+  });
+
+  it('posts oltFull when a splitter takes the last PON port', () => {
+    const state = makeState();
+    state.network.olt.ponPorts = 3;
+    const id = addCabinet(state, 0);
+    expect(addSplitter(state, id).ok).toBe(true);
+    expect(state.notices).toEqual([]);
+    expect(addSplitter(state, id).ok).toBe(true);
+    expect(state.notices.map((n) => [n.kind, n.message])).toEqual([
+      ['oltFull', 'All 3 PON ports at the CO are in use: add an OLT line card before the next cabinet or splitter'],
+    ]);
+  });
+
+  it('rejects every blocker without changing anything', () => {
+    const state = makeState();
+    const id = addCabinet(state, 0);
+    expectRejected(state, (s) => addSplitter(s, 99), 'Unknown cabinet: 99');
+    expect(quoteSplitter(state, 99)).toMatchObject({ ok: false, reasons: ['Unknown cabinet: 99'] });
+
+    state.network.cabinets[0]!.splitters = MAX_SPLITTERS_PER_CABINET;
+    // Room on the OLT, so the full cabinet is the only blocker.
+    state.network.olt.ponPorts = MAX_SPLITTERS_PER_CABINET + 1;
+    expectRejected(
+      state,
+      (s) => addSplitter(s, id),
+      `Cabinet at 1st St & A Ave already has ${MAX_SPLITTERS_PER_CABINET} splitters, the most it holds`,
+    );
+
+    state.network.cabinets[0]!.splitters = 2;
+    state.network.olt.ponPorts = 2;
+    expectRejected(state, (s) => addSplitter(s, id), 'No free PON ports on the OLT: 2 of 2 in use - add a line card at the CO');
+    state.network.olt.cards = OLT_MAX_CARDS;
+    expectRejected(state, (s) => addSplitter(s, id), 'No free PON ports on the OLT: 2 of 2 in use - the OLT chassis is full');
+
+    state.network.olt.ponPorts = 16;
+    state.finance.cash = SPLITTER_COST - 1;
+    expectRejected(
+      state,
+      (s) => addSplitter(s, id),
+      `Not enough cash: need ${formatMoney(SPLITTER_COST)}, have ${formatMoney(SPLITTER_COST - 1)}`,
+    );
+    state.finance.cash = SPLITTER_COST;
+    expect(addSplitter(state, id).ok).toBe(true);
+  });
+
+  it('lists several blockers together', () => {
+    const state = makeState();
+    const id = addCabinet(state, 0);
+    state.network.olt.ponPorts = 1;
+    state.finance.cash = 0;
+    expect(quoteSplitter(state, id).reasons).toEqual([
+      'No free PON ports on the OLT: 1 of 1 in use - add a line card at the CO',
+      `Not enough cash: need ${formatMoney(SPLITTER_COST)}, have $0`,
+    ]);
+  });
+});
+
+describe('removeCabinet', () => {
+  function withAccounts(state: GameState, cabinet: number): void {
+    state.sales.accounts = [
+      { parcel: 0, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 },
+      { parcel: 2, cabinet: cabinet + 100, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0 },
+      { parcel: 4, cabinet, tierUnits: { fiber500: 3, fiber1g: 2, fiber2g: 1 }, since: 0 },
+    ];
+  }
+
+  it('quotes the refund, freed ports and affected subscribers', () => {
+    const state = makeState();
+    placeCabinet(state, 0);
+    const cabinet = state.network.cabinets[0]!;
+    addSplitter(state, cabinet.id);
+    withAccounts(state, cabinet.id);
+    expect(quoteRemoveCabinet(state, cabinet.id)).toEqual({
+      ok: true,
+      reasons: [],
+      refund: Math.round(cabinet.cost * CABINET_CANCEL_REFUND),
+      ponPortsFreed: 2,
+      subscribersAffected: 7,
+    });
+    cabinet.stage = 'constructing';
+    expect(quoteRemoveCabinet(state, cabinet.id)).toMatchObject({ refund: 0, ponPortsFreed: 2 });
+    expect(quoteRemoveCabinet(state, 99)).toEqual({
+      ok: false,
+      reasons: ['Unknown cabinet: 99'],
+      refund: 0,
+      ponPortsFreed: 0,
+      subscribersAffected: 0,
+    });
+  });
+
+  it('refunds a cabinet cancelled in permitting, splitters included, and frees its ports', () => {
+    const state = makeState();
+    placeCabinet(state, 0);
+    const id = state.network.cabinets[0]!.id;
+    addSplitter(state, id);
+    const paid = CABINET_PRICE + SPLITTER_COST;
+    expect(state.network.cabinets[0]!.cost).toBe(paid);
+    const refund = Math.round(paid * CABINET_CANCEL_REFUND);
+    const version = state.network.version;
+    withAccounts(state, id);
+    const accounts = structuredClone(state.sales.accounts);
+
+    expect(removeCabinet(state, id)).toEqual({ ok: true, cost: -refund });
+    expect(state.network.cabinets).toEqual([]);
+    expect(ponPortsUsed(state)).toBe(0);
+    expect(state.network.version).toBe(version + 1);
+    expect(state.finance.cash).toBe(START_CASH - paid + refund);
+    expect(state.finance.capex.osp).toBe(paid - refund);
+    expect(state.finance.monthToDate.at(-1)).toEqual({
+      day: 0,
+      category: 'refund',
+      amount: refund,
+      memo: 'Refund: cancelled cabinet at 1st St & A Ave',
+    });
+    // Subscribers are dropped by the next daily sales step, not here.
+    expect(state.sales.accounts).toEqual(accounts);
+  });
+
+  it('removes a cabinet under construction or live without a refund', () => {
+    for (const stage of ['constructing', 'live'] as const) {
+      const state = makeState();
+      placeCabinet(state, 5);
+      const cabinet = state.network.cabinets[0]!;
+      cabinet.stage = stage;
+      const cash = state.finance.cash;
+      const capex = { ...state.finance.capex };
+      expect(removeCabinet(state, cabinet.id)).toEqual({ ok: true, cost: 0 });
+      expect(state.network.cabinets).toEqual([]);
+      expect(state.finance.cash).toBe(cash);
+      expect(state.finance.capex).toEqual(capex);
+      expect(state.finance.monthToDate.at(-1)).toEqual({
+        day: 0,
+        category: 'refund',
+        amount: 0,
+        memo: 'Removed cabinet at 2nd St & B Ave - no refund once construction starts',
+      });
+    }
+  });
+
+  it('rejects an unknown cabinet without changing anything', () => {
+    const state = makeState();
+    placeCabinet(state, 0);
+    for (const bad of [99, -1, 1.5, Number.NaN]) expectRejected(state, (s) => removeCabinet(s, bad), `Unknown cabinet: ${bad}`);
+  });
+});
+
+describe('OLT line cards', () => {
+  it('quotes and installs a card instantly', () => {
+    const state = makeState();
+    const { cards, ponPorts } = state.network.olt;
+    expect(quoteOltCard(state)).toEqual({
+      ok: true,
+      reasons: [],
+      cost: OLT_CARD_COST,
+      cardsAfter: cards + 1,
+      ponPortsAfter: ponPorts + OLT_PORTS_PER_CARD,
+    });
+    const version = state.network.version;
+    expect(addOltCard(state)).toEqual({ ok: true, cost: OLT_CARD_COST });
+    expect(state.network.olt).toMatchObject({ cards: cards + 1, ponPorts: ponPorts + OLT_PORTS_PER_CARD });
+    expect(state.network.version).toBe(version + 1);
+    expect(state.finance.cash).toBe(START_CASH - OLT_CARD_COST);
+    expect(state.finance.capex).toEqual({ osp: 0, connect: 0, co: OLT_CARD_COST });
+    expect(state.finance.monthToDate).toEqual([
+      {
+        day: 0,
+        category: 'equipment',
+        amount: -OLT_CARD_COST,
+        memo: `OLT line card ${cards + 1} of ${OLT_MAX_CARDS} at the CO (+${OLT_PORTS_PER_CARD} PON ports)`,
+      },
+    ]);
+  });
+
+  it('frees the way for a cabinet that had no PON port', () => {
+    const state = makeState();
+    state.network.olt.ponPorts = 1;
+    placeCabinet(state, 0);
+    expect(reasonOf(placeCabinet(state, 1))).toMatch(/No free PON ports/);
+    addOltCard(state);
+    expect(placeCabinet(state, 1).ok).toBe(true);
+  });
+
+  it('rejects a full chassis or short cash without changing anything', () => {
+    const state = makeState();
+    state.network.olt.cards = OLT_MAX_CARDS;
+    state.network.olt.ponPorts = OLT_MAX_CARDS * OLT_PORTS_PER_CARD;
+    expectRejected(state, addOltCard, `The OLT chassis is full: ${OLT_MAX_CARDS} of ${OLT_MAX_CARDS} line cards`);
+    state.network.olt.cards = 1;
+    state.finance.cash = OLT_CARD_COST - 1;
+    expectRejected(
+      state,
+      addOltCard,
+      `Not enough cash: need ${formatMoney(OLT_CARD_COST)}, have ${formatMoney(OLT_CARD_COST - 1)}`,
+    );
+  });
+
+  it('says the chassis is full when the last port of a full chassis is used', () => {
+    const state = makeState();
+    state.network.olt.cards = OLT_MAX_CARDS;
+    state.network.olt.ponPorts = 1;
+    placeCabinet(state, 0);
+    expect(state.notices.map((n) => n.message)).toEqual([
+      'All 1 PON ports at the CO are in use: the OLT chassis is full, so no more cabinets or splitters fit',
+    ]);
+  });
+});
+
 describe('removeSpan', () => {
-  it('refunds a span still in permitting', () => {
+  it('refunds construction of a span cancelled in permitting and keeps the fees', () => {
     const state = makeState();
     lay(state, [H(0, 0), H(1, 0)], 'underground');
+    const span = state.network.spans[0]!;
+    const refund = Math.round(span.refundable * PERMITTING_CANCEL_REFUND);
+    expect(span.cost).toBeGreaterThan(refund);
+    const cashBefore = state.finance.cash;
     const version = state.network.version;
     const result = removeSpan(state, 1);
-    expect(result).toEqual({ ok: true, cost: -7_200 });
-    expect(state.finance.cash).toBe(START_CASH - 7_200);
+    expect(result).toEqual({ ok: true, cost: -refund });
+    expect(state.finance.cash).toBe(cashBefore + refund);
     expect(state.network.spans.map((s) => s.id)).toEqual([2]);
     expect(state.network.version).toBe(version + 1);
     expect(state.finance.monthToDate.at(-1)).toEqual({
       day: 0,
       category: 'refund',
-      amount: 7_200,
-      memo: 'Refund: cancelled underground cable on 1st St (240 ft)',
+      amount: refund,
+      memo: `Refund: cancelled underground cable on 1st St (240 ft); ${formatMoney(span.cost - refund)} of fees not refundable`,
     });
+  });
+
+  it('keeps make-ready on a cancelled aerial span, and capex nets out to cash spent', () => {
+    const state = makeState();
+    lay(state, [H(0, 0)], 'aerial');
+    const span = state.network.spans[0]!;
+    const refund = Math.round(span.refundable * PERMITTING_CANCEL_REFUND);
+    expect(removeSpan(state, span.id)).toEqual({ ok: true, cost: -refund });
+    expect(state.finance.monthToDate.at(-1)!.memo).toBe(
+      `Refund: cancelled aerial cable on 1st St (240 ft); ${formatMoney(span.cost - refund)} of fees and make-ready not refundable`,
+    );
+    expect(span.cost - refund).toBeGreaterThanOrEqual(
+      charges(state, H(0, 0), 'aerial').makeReady + orderFees('aerial'),
+    );
+    expect(state.finance.capex.osp).toBe(START_CASH - state.finance.cash);
+    expect(state.finance.capex.osp).toBe(span.cost - refund);
+  });
+
+  it('says nothing about fees when everything is refunded (spans migrated from v1)', () => {
+    const state = makeState();
+    lay(state, [H(0, 0)], 'underground');
+    const span = state.network.spans[0]!;
+    span.refundable = span.cost;
+    const refund = Math.round(span.cost * PERMITTING_CANCEL_REFUND);
+    removeSpan(state, span.id);
+    const memo = state.finance.monthToDate.at(-1)!.memo;
+    if (refund === span.cost) expect(memo).toBe('Refund: cancelled underground cable on 1st St (240 ft)');
+    else expect(memo).toContain('cancellation charge not refundable');
   });
 
   it('removes a span under construction or live without a refund', () => {
@@ -465,8 +1208,10 @@ describe('removeSpan', () => {
       lay(state, [H(0, 0)], 'aerial');
       state.network.spans[0]!.stage = stage;
       const cash = state.finance.cash;
+      const capex = { ...state.finance.capex };
       expect(removeSpan(state, 1)).toEqual({ ok: true, cost: 0 });
       expect(state.finance.cash).toBe(cash);
+      expect(state.finance.capex).toEqual(capex);
       expect(state.network.spans).toHaveLength(0);
       expect(state.network.version).toBe(2);
       expect(state.finance.monthToDate.at(-1)).toMatchObject({ category: 'refund', amount: 0 });
@@ -477,9 +1222,8 @@ describe('removeSpan', () => {
   it('rejects unknown spans', () => {
     const state = makeState();
     lay(state, [H(0, 0)], 'aerial');
-    for (const bad of [0, 2, 1.5, -1]) expect(reasonOf(removeSpan(state, bad))).toBe(`Unknown cable span: ${bad}`);
+    for (const bad of [0, 2, 1.5, -1]) expectRejected(state, (s) => removeSpan(s, bad), `Unknown cable span: ${bad}`);
     expect(state.network.spans).toHaveLength(1);
-    expect(state.network.version).toBe(1);
   });
 
   it('lets the segment be cabled again', () => {
@@ -487,6 +1231,81 @@ describe('removeSpan', () => {
     lay(state, [H(0, 0)], 'aerial');
     removeSpan(state, 1);
     expect(quoteCable(state, [H(0, 0)], 'underground').newSegments).toEqual([H(0, 0)]);
+  });
+});
+
+describe('quoteRemoveSpan', () => {
+  /** Live cable along 1st St (H(0,0) -> H(1,0) -> H(2,0)) from the CO cabinet, one subscriber per lot on it. */
+  function litStreet(): { state: GameState; spans: number[]; cabinet: number } {
+    const state = makeState();
+    const spans = [H(0, 0), H(1, 0), H(2, 0)].map((s) => addSpan(state, s));
+    const cabinet = addCabinet(state, state.city.coNode);
+    const on = new Set([H(0, 0), H(1, 0), H(2, 0)]);
+    state.sales.accounts = state.city.parcels
+      .filter((p) => on.has(p.segment))
+      .map((p) => ({ parcel: p.id, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }));
+    return { state, spans, cabinet };
+  }
+
+  /** Units that the next daily sales step would drop as lost service (street dark or cabinet inactive). */
+  function wouldLoseService(state: GameState): number {
+    const service = computeService(state);
+    return state.sales.accounts
+      .filter((a) => !service.litSegments.has(state.city.parcels[a.parcel]!.segment) || !service.activeCabinets.has(a.cabinet))
+      .length;
+  }
+
+  it('counts everyone cut off beyond a feeder span, not just its own street', () => {
+    const { state, spans } = litStreet();
+    const unitsOn = (seg: SegmentId) => state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === seg).length;
+    expect(unitsOn(H(0, 0))).toBeGreaterThan(0);
+    expect(unitsOn(H(2, 0))).toBeGreaterThan(0);
+    const before = structuredClone(state);
+    const passings = computeService(state).passings;
+
+    const feeder = quoteRemoveSpan(state, spans[0]!);
+    expect(feeder).toEqual({ ok: true, reasons: [], refund: 0, subscribersAffected: state.sales.accounts.length, passingsLost: passings });
+    const tail = quoteRemoveSpan(state, spans[2]!);
+    expect(tail.subscribersAffected).toBe(unitsOn(H(2, 0)));
+    // A quote changes nothing.
+    expect(state).toEqual(before);
+
+    // And it matches what removing it really does.
+    for (const [span, quote] of [[spans[0]!, feeder], [spans[2]!, tail]] as const) {
+      const copy = structuredClone(before);
+      removeSpan(copy, span);
+      expect(wouldLoseService(copy)).toBe(quote.subscribersAffected);
+      expect(passings - computeService(copy).passings).toBe(quote.passingsLost);
+    }
+  });
+
+  it('counts subscribers whose cabinet goes dark with the cable feeding it', () => {
+    const state = makeState();
+    addSpan(state, H(0, 0));
+    const feeder = addSpan(state, H(1, 0));
+    addSpan(state, H(2, 0));
+    // The cabinet stands at the far end of 2nd span: cut that and the cabinet loses the CO.
+    const cabinet = addCabinet(state, 2);
+    const parcel = state.city.parcels.find((p) => p.segment === H(0, 0))!;
+    state.sales.accounts = [{ parcel: parcel.id, cabinet, tierUnits: { fiber500: 0, fiber1g: 2, fiber2g: 0 }, since: 0 }];
+    expect(computeService(state).litSegments.has(H(0, 0))).toBe(true);
+    expect(quoteRemoveSpan(state, feeder).subscribersAffected).toBe(2);
+  });
+
+  it('quotes the permitting refund removeSpan pays, and no service loss for cable not yet live', () => {
+    const state = makeState();
+    lay(state, [H(0, 0), H(1, 0)], 'underground');
+    const span = state.network.spans[0]!;
+    const quote = quoteRemoveSpan(state, span.id);
+    expect(quote).toEqual({ ok: true, reasons: [], refund: Math.round(span.refundable * PERMITTING_CANCEL_REFUND), subscribersAffected: 0, passingsLost: 0 });
+    expect(removeSpan(state, span.id)).toEqual({ ok: true, cost: -quote.refund });
+    state.network.spans[0]!.stage = 'constructing';
+    expect(quoteRemoveSpan(state, state.network.spans[0]!.id).refund).toBe(0);
+  });
+
+  it('names an unknown span', () => {
+    const state = makeState();
+    expect(quoteRemoveSpan(state, 99)).toEqual({ ok: false, reasons: ['Unknown cable span: 99'], refund: 0, subscribersAffected: 0, passingsLost: 0 });
   });
 });
 
@@ -500,6 +1319,9 @@ describe('computeService', () => {
     expect(service.activeCabinets.size).toBe(0);
     expect(service.passedParcels).toEqual([]);
     expect(service.passings).toBe(0);
+    expect(service.servingCabinet.size).toBe(0);
+    expect(service.cabinetCoverage.size).toBe(0);
+    expect(sorted(service.connectedSegments)).toEqual([H(0, 0), H(1, 0)]);
 
     addCabinet(state, 1, 'constructing');
     expect(computeService(state).litSegments.size).toBe(0);
@@ -512,18 +1334,26 @@ describe('computeService', () => {
     const cabinet = addCabinet(state, 2);
     const service = computeService(state);
     expect([...service.activeCabinets]).toEqual([cabinet]);
-    expect([...service.litSegments].sort((a, b) => a - b)).toEqual([H(0, 0), H(1, 0)]);
+    expect(sorted(service.litSegments)).toEqual([H(0, 0), H(1, 0)]);
     // 1st St lots: block row 0 top rows, four per segment.
     expect(service.passedParcels).toEqual([0, 2, 4, 6, 8, 10, 12, 14]);
     expect(service.passings).toBe(8);
     expect(service.networkVersion).toBe(state.network.version);
     expect(service.day).toBe(0);
+    expect(service.servingDistanceFt).toEqual(
+      new Map([
+        [H(0, 0), 240],
+        [H(1, 0), 0],
+      ]),
+    );
+    expect(service.cabinetCoverage.get(cabinet)).toEqual({ segments: [H(0, 0), H(1, 0)], parcels: 8, passings: 8 });
   });
 
   it('counts a cabinet standing at the CO node', () => {
     const state = makeState();
     const cabinet = addCabinet(state, state.city.coNode);
     expect([...computeService(state).activeCabinets]).toEqual([cabinet]);
+    expect(computeService(state).cabinetCoverage.get(cabinet)).toEqual({ segments: [], parcels: 0, passings: 0 });
     addSpan(state, V(0, 0));
     expect([...computeService(state).litSegments]).toEqual([V(0, 0)]);
   });
@@ -576,6 +1406,129 @@ describe('computeService', () => {
     addSpan(state, H(0, 1));
     addCabinet(state, 0);
     expect(computeService(state).passings).toBe(8);
+  });
+
+  it('passes a corner lot only from its own serving street', () => {
+    const state = makeState();
+    addSpan(state, V(0, 0));
+    addCabinet(state, 0);
+    const service = computeService(state);
+    // A Ave is lit and lots 0 and 1 touch it, but they front 1st St and 2nd St.
+    expect([...service.litSegments]).toEqual([V(0, 0)]);
+    expect(service.passedParcels).toEqual([]);
+    expect(service.passings).toBe(0);
+  });
+
+  it('leaves connected cable beyond cabinet reach unlit', () => {
+    // 1,800 ft blocks: H(0, 0) touches the cabinet (distance 0 although longer than
+    // the reach), H(1, 0) starts 1,800 ft away.
+    const state = makeState(makeGridCity({ blockW: 30 }));
+    addSpan(state, H(0, 0));
+    addSpan(state, H(1, 0));
+    const cabinet = addCabinet(state, 0);
+    const service = computeService(state);
+    expect(sorted(service.connectedSegments)).toEqual([H(0, 0), H(1, 0)]);
+    expect([...service.litSegments]).toEqual([H(0, 0)]);
+    expect(service.servingDistanceFt.get(H(0, 0))).toBe(0);
+    expect(service.passings).toBe(30);
+    expect(service.cabinetCoverage.get(cabinet)).toEqual({ segments: [H(0, 0)], parcels: 30, passings: 30 });
+  });
+
+  it('is strict at the reach boundary', () => {
+    for (const [lengthFt, lit] of [
+      [CABINET_REACH_FT, false],
+      [CABINET_REACH_FT - 1, true],
+    ] as const) {
+      const city = makeGridCity();
+      city.segments[H(0, 0)] = { ...city.segments[H(0, 0)]!, lengthFt };
+      const state = makeState(city);
+      addSpan(state, H(0, 0));
+      addSpan(state, H(1, 0));
+      addCabinet(state, 0);
+      const service = computeService(state);
+      expect(service.litSegments.has(H(1, 0))).toBe(lit);
+      expect(service.servingDistanceFt.get(H(1, 0))).toBe(lit ? lengthFt : undefined);
+    }
+  });
+
+  it('measures reach along connected cable, not streets', () => {
+    // Blocks sized from the reach: 120 ft tall and just wide enough that the
+    // cable reaching node 1 the long way round (A Ave, 2nd St, B Ave: 2 x 120
+    // ft + wide) is out of reach although 1st St alone (wide) would be in.
+    const blockH = 2;
+    const blockW = Math.ceil((CABINET_REACH_FT - 2 * blockH * TILE_FT) / TILE_FT);
+    const tall = blockH * TILE_FT;
+    const wide = blockW * TILE_FT;
+    expect(2 * tall + wide).toBeGreaterThanOrEqual(CABINET_REACH_FT);
+    expect(tall + wide).toBeLessThan(CABINET_REACH_FT);
+    const state = makeState(makeGridCity({ blockW, blockH }));
+    for (const id of [V(0, 0), H(0, 1), V(1, 0), H(1, 0)]) addSpan(state, id);
+    addCabinet(state, 0);
+    const service = computeService(state);
+    expect(service.servingDistanceFt.get(V(1, 0))).toBe(tall + wide);
+    expect(service.litSegments.has(H(1, 0))).toBe(false);
+    // Cabling 1st St brings node 1 within reach.
+    addSpan(state, H(0, 0));
+    expect(computeService(state).servingDistanceFt.get(H(1, 0))).toBe(wide);
+  });
+
+  it('serves each segment from the nearest cabinet, ties to the lower id', () => {
+    const state = makeState();
+    for (const id of [H(0, 0), H(1, 0), H(2, 0)]) addSpan(state, id);
+    // The east cabinet gets the lower id; 2nd block's 1st St is 240 ft from both.
+    const east = addCabinet(state, 3);
+    const west = addCabinet(state, 0);
+    const service = computeService(state);
+    expect(service.servingCabinet).toEqual(
+      new Map([
+        [H(0, 0), west],
+        [H(1, 0), east],
+        [H(2, 0), east],
+      ]),
+    );
+    expect(service.servingDistanceFt).toEqual(
+      new Map([
+        [H(0, 0), 0],
+        [H(1, 0), 240],
+        [H(2, 0), 0],
+      ]),
+    );
+    expect(service.cabinetCoverage.get(west)).toEqual({ segments: [H(0, 0)], parcels: 4, passings: 4 });
+    expect(service.cabinetCoverage.get(east)).toEqual({ segments: [H(1, 0), H(2, 0)], parcels: 8, passings: 8 });
+    expect([...service.activeCabinets]).toEqual([east, west].sort((a, b) => a - b));
+  });
+
+  it('splits passings across cabinets so coverage sums to the total', () => {
+    const state = makeState(makeGridCity({ cols: 6, rows: 4, blockW: 8 }));
+    // Every street cabled; cabinets at the CO and in the far corner.
+    for (const s of state.city.segments) addSpan(state, s.id);
+    const a = addCabinet(state, 0);
+    const b = addCabinet(state, state.city.nodes.length - 1);
+    const service = computeService(state);
+    const coverage = [...service.cabinetCoverage.values()];
+    expect(coverage.reduce((sum, c) => sum + c.passings, 0)).toBe(service.passings);
+    expect(coverage.reduce((sum, c) => sum + c.parcels, 0)).toBe(service.passedParcels.length);
+    expect(sorted(coverage.flatMap((c) => c.segments))).toEqual(sorted(service.litSegments));
+    expect(service.cabinetCoverage.get(a)!.passings).toBeGreaterThan(0);
+    expect(service.cabinetCoverage.get(b)!.passings).toBeGreaterThan(0);
+    for (const c of coverage) expect(c.segments).toEqual(sorted(c.segments));
+    for (const [segment, distance] of service.servingDistanceFt) {
+      expect(distance).toBeLessThan(CABINET_REACH_FT);
+      expect(service.litSegments.has(segment)).toBe(true);
+    }
+  });
+
+  it('unlights downstream segments when a feeder span is removed', () => {
+    const state = makeState();
+    addCabinet(state, 0);
+    const feeder = addSpan(state, H(0, 0));
+    addSpan(state, H(1, 0));
+    expect(getService(state).passings).toBe(8);
+    expect(removeSpan(state, feeder).ok).toBe(true);
+    const service = getService(state);
+    expect(service.connectedSegments.size).toBe(0);
+    expect(service.litSegments.size).toBe(0);
+    expect(service.passings).toBe(0);
   });
 });
 
@@ -635,9 +1588,29 @@ describe('cableRoute', () => {
     expect(quoteCable(state, route!, 'aerial')).toMatchObject({ ok: true, lengthFt: 360 });
   });
 
-  it('takes a longer poled detour over a shorter street without poles', () => {
-    const state = makeState(unpoled(H(0, 0)));
+  it('takes a poled detour up to AERIAL_DETOUR_MAX_RATIO x the shortest route', () => {
+    // 0 -> 1: 1st St (240 ft, no poles) or round the block via A Ave, 2nd St, B Ave.
+    const city = unpoled(H(0, 0));
+    const atCap = ((AERIAL_DETOUR_MAX_RATIO - 1) * 240) / 2;
+    city.segments[V(0, 0)] = { ...city.segments[V(0, 0)]!, lengthFt: atCap };
+    city.segments[V(1, 0)] = { ...city.segments[V(1, 0)]!, lengthFt: atCap };
+    const state = makeState(city);
     expect(cableRoute(state, 0, 1, 'aerial')).toEqual([V(0, 0), H(0, 1), V(1, 0)]);
+  });
+
+  it('takes the shortest route over a longer detour, and its quote names the street without poles', () => {
+    // The default detour is 480 ft against 240 ft: twice the shortest route.
+    const state = makeState(unpoled(H(0, 0)));
+    expect(480 / 240).toBeGreaterThan(AERIAL_DETOUR_MAX_RATIO);
+    const route = cableRoute(state, 0, 1, 'aerial');
+    expect(route).toEqual([H(0, 0)]);
+    expect(quoteCable(state, route!, 'aerial').reasons).toEqual(['No poles on 1st St - lay underground instead']);
+    // Just over the cap also takes the shortest route.
+    const city = unpoled(H(0, 0));
+    const overCap = ((AERIAL_DETOUR_MAX_RATIO - 1) * 240) / 2 + 1;
+    city.segments[V(0, 0)] = { ...city.segments[V(0, 0)]!, lengthFt: overCap };
+    city.segments[V(1, 0)] = { ...city.segments[V(1, 0)]!, lengthFt: overCap };
+    expect(cableRoute(makeState(city), 0, 1, 'aerial')).toEqual([H(0, 0)]);
   });
 
   it('crosses a street without poles that already has cable, since the order skips it', () => {
@@ -660,6 +1633,7 @@ describe('cableRoute', () => {
     const state = makeState(unpoled(H(0, 1)));
     expect(cableRoute(state, 0, 5, 'underground')).toEqual([V(0, 0), H(0, 1)]);
     expect(cableRoute(state, 0, 0, 'underground')).toEqual([]);
+    expect(cableRoute(state, 0, 0, 'aerial')).toEqual([]);
     expect(cableRoute(state, 0, 99, 'aerial')).toBeNull();
   });
 
