@@ -8,6 +8,8 @@ Small browser games, built in TypeScript.
 
 A city-builder where you're the fiber company. The town grows on its own; you build the network, sell service and try not to go broke doing it.
 
+**[Play it in your browser](https://games-five-mu.vercel.app)**
+
 - **Build fiber street by street.** Drag along streets to lay aerial cable on poles or bore underground. The quote breaks down every dollar: rate per foot, rock surcharges, make-ready per pole, permit and engineering fees.
 - **Place splitter cabinets where they count.** Each cabinet reaches homes within 800 ft along its cable. The placement preview shades its reach and counts the homes it would cover. Each splitter takes a PON port at the central office, and more ports cost a line-card upgrade.
 - **Watch your cost per passing.** Every quote, the HUD and the monthly report grade it against a target, green to red.
