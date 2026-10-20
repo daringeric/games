@@ -3,7 +3,7 @@
 // is `cell` world pixels on a side. Colors are CSS hex strings, which Pixi and
 // CSS both accept.
 
-import type { StreetClass } from '../sim/types';
+import type { CppBand, StreetClass } from '../sim/types';
 
 export interface RoofColors {
   roof: string;
@@ -69,6 +69,8 @@ export interface Theme {
     outline: number;
     /** Front path from door to curb. */
     path: string;
+    /** Doorstep at the front door and the walkway notch at the curb (the home's serving side). */
+    doorstep: string;
     unserved: RoofColors;
     passed: RoofColors;
     subscriber: RoofColors & { sparkle: string };
@@ -81,6 +83,16 @@ export interface Theme {
     pipLit: string;
     passedRing: string;
     radius: number;
+  };
+  /** MDU building tells: the demarc box on the serving wall and the dashed fiber entry to the curb. */
+  demarc: {
+    box: string;
+    edge: string;
+    entry: string;
+    /** Box edge length (world px). */
+    size: number;
+    /** Ring around the drop point of buildings a planned route would serve. */
+    emphasis: string;
   };
   smb: {
     front: string;
@@ -121,6 +133,12 @@ export interface Theme {
     dimLight: string;
     size: number;
     radius: number;
+    /** Splitter-count badge. */
+    badge: string;
+    badgeText: string;
+    badgeRadius: number;
+    /** Ring around a cabinet that is turning signups away (no free splitter port). */
+    full: string;
   };
   cable: {
     underground: { tube: string; highlight: string; width: number };
@@ -138,13 +156,39 @@ export interface Theme {
     };
     /** Fiber cut burst (outages arrive in a later milestone). */
     cut: { burst: string; core: string };
+    /** Wash over live cable that reaches the CO but no cabinet's reach (it lights nothing). */
+    dim: { color: string; alpha: number };
   };
+  /** Rocky ground under a street: a subtle stipple, emphasized while planning underground runs. */
+  rock: { stipple: string; alpha: number; strong: string; strongAlpha: number };
+  /** Cabinet tool shading: placement preview and existing cabinets' coverage. */
+  coverage: {
+    /** In-reach streets of a planned cabinet, strongest near it. */
+    reach: string;
+    reachAlphaNear: number;
+    reachAlphaFar: number;
+    /** Streets another cabinet already serves: a muted hatch. */
+    elsewhere: string;
+    /** Existing cabinets' lit streets, one tint per cabinet (cycled). */
+    tints: string[];
+    tintAlpha: number;
+    /** Faint dashed outline of every existing cabinet's street reach. */
+    outlineAlpha: number;
+  };
+  /** The $/ft cost overlay (band colors come from `cpp`). */
+  costOverlay: { none: string; alpha: number; width: number };
   overlay: {
     snapRing: string;
     snapFill: string;
     remove: string;
     blocked: string;
   };
+  /**
+   * Cost-per-passing band colors (quote card, cabinet preview, $/ft overlay,
+   * report panel). Shared by map and DOM; themeCss publishes them as
+   * --cpp-green / --cpp-amber / --cpp-red.
+   */
+  cpp: Record<CppBand, string>;
   ui: {
     page: string;
     card: string;
@@ -219,6 +263,7 @@ export const toyTown: Theme = {
     ridgeWidth: 2,
     outline: 1.2,
     path: '#F6F0E2',
+    doorstep: '#E2D6BA',
     unserved: { roof: '#E9E4DA', ridge: '#D6D0C3' },
     passed: { roof: '#F6B93B', ridge: '#DD9C1E' },
     subscriber: { roof: '#E8553A', ridge: '#C4402A', sparkle: '#FFFFFF' },
@@ -230,6 +275,13 @@ export const toyTown: Theme = {
     pipLit: '#E8553A',
     passedRing: '#F6B93B',
     radius: 7,
+  },
+  demarc: {
+    box: '#0E7A6D',
+    edge: '#FFFFFF',
+    entry: '#6B8299',
+    size: 6,
+    emphasis: '#E8553A',
   },
   smb: {
     front: '#FBF7EE',
@@ -269,6 +321,10 @@ export const toyTown: Theme = {
     dimLight: '#D3DEDB',
     size: 19,
     radius: 5,
+    badge: '#23303A',
+    badgeText: '#FFFFFF',
+    badgeRadius: 6.5,
+    full: '#E11D48',
   },
   cable: {
     underground: { tube: '#0E7A6D', highlight: '#5FCDBF', width: 8 },
@@ -291,13 +347,26 @@ export const toyTown: Theme = {
       crewWheel: '#23303A',
     },
     cut: { burst: '#E11D48', core: '#FFFFFF' },
+    dim: { color: '#F6F0E2', alpha: 0.62 },
   },
+  rock: { stipple: '#B9A88A', alpha: 0.55, strong: '#7D6A4E', strongAlpha: 0.9 },
+  coverage: {
+    reach: '#2563EB',
+    reachAlphaNear: 0.62,
+    reachAlphaFar: 0.18,
+    elsewhere: '#8C99A8',
+    tints: ['#0EA5A0', '#A855F7', '#F59E0B', '#EC4899', '#65A30D', '#F97316'],
+    tintAlpha: 0.42,
+    outlineAlpha: 0.38,
+  },
+  costOverlay: { none: '#C9C2B4', alpha: 1, width: 8 },
   overlay: {
     snapRing: '#E8553A',
     snapFill: '#FFFFFF',
     remove: '#E11D48',
     blocked: '#E11D48',
   },
+  cpp: { green: '#16A34A', amber: '#D97706', red: '#DC2626' },
   ui: {
     page: '#F4F8EC',
     card: '#FFFFFF',

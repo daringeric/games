@@ -1,7 +1,20 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { applyCommand, newGame, runDays } from './game';
+import {
+  INSOLVENCY_GRACE_MONTHS,
+  MARKETING_MAX_PER_MONTH,
+  MAX_SPLITTERS_PER_CABINET,
+  OLT_MAX_CARDS,
+  OLT_PORTS_PER_CARD,
+  SMB_MULTIPLIER_MAX,
+  TIER_DEFAULTS,
+  TIER_PRICE_MAX,
+} from './balance';
+import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
 import { deserialize, fnv1a, hashState, SaveError, serialize } from './save';
+import { deriveSeed } from './rng';
+import { newSales, subscriberUnits } from './sales';
 import { nearestNode, nearestSegment } from './streets';
 import { makeGridCity } from './testing/fixtures';
 import type { GridCityOptions } from './testing/fixtures';
@@ -10,20 +23,32 @@ import type { GameState } from './types';
 // Parsed saves are untyped JSON; the corruption tests poke at them freely.
 type Save = any;
 
+/** Every fourth lot is a 12-unit apartment building and every other fourth a business. */
+const MIXED_LOTS: GridCityOptions['parcelKinds'] = (p) =>
+  p.id % 4 === 0 ? { kind: 'mdu', units: 12 } : p.id % 4 === 2 ? { kind: 'smb', units: 1 } : undefined;
+
 /**
- * A game mid-flight: live, constructing/permitting and cancelled spans, a live
- * cabinet, a closed month and open month-to-date entries. Default grid:
- * horizontal segments 0..8, vertical 9..16, CO at node 0.
+ * A game mid-flight and mid-month (Mar 25): live and permitting spans, a live
+ * cabinet, closed months, open month-to-date entries, subscribers on homes,
+ * businesses and apartment buildings (with building routers), a half-accrued
+ * month, a milestone and its notice. Default grid: horizontal segments 0..8,
+ * vertical 9..16, CO at node 0.
  */
 function playedGame(cityOpts: GridCityOptions = {}): GameState {
-  const state = newGame(7, { city: makeGridCity(cityOpts) });
+  const state = newGame(7, { city: makeGridCity({ parcelKinds: MIXED_LOTS, ...cityOpts }) });
+  applyCommand(state, { type: 'setMarketing', perMonth: Math.min(20_000, MARKETING_MAX_PER_MONTH) });
   applyCommand(state, { type: 'placeCabinet', node: 0 });
   applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
   applyCommand(state, { type: 'layCable', segments: [2], method: 'aerial' });
-  runDays(state, 50);
+  runDays(state, 80);
   applyCommand(state, { type: 'layCable', segments: [1], method: 'underground' });
   runDays(state, 3);
   return state;
+}
+
+/** The default lineup as setPricing tiers, with optional price overrides. */
+function tierSettings(prices: Record<string, number> = {}): Array<{ id: string; price: number; offered: boolean }> {
+  return TIER_DEFAULTS.map((t) => ({ id: t.id, price: prices[t.id] ?? t.price, offered: true }));
 }
 
 function expectSaveError(json: string, message: RegExp): void {
@@ -46,19 +71,56 @@ describe('serialize / deserialize', () => {
     expect(serialize(loaded)).toBe(serialize(state));
   });
 
-  it('round-trips a game in progress', () => {
+  it('round-trips a game in progress, mid-month, with subscribers', () => {
     const state = playedGame();
     // Make sure the save really covers every kind of record.
     expect(state.network.spans.map((s) => s.stage)).toContain('live');
     expect(state.network.spans.map((s) => s.stage)).toContain('permitting');
     expect(state.network.cabinets[0]?.stage).toBe('live');
-    expect(state.finance.reports).toHaveLength(1);
+    expect(state.finance.reports.length).toBeGreaterThanOrEqual(1);
+    expect(state.finance.reports.every((r) => r.stats !== undefined)).toBe(true);
     expect(state.finance.monthToDate.length).toBeGreaterThan(0);
+    expect(state.sales.accounts.length).toBeGreaterThan(1);
+    expect(state.sales.routerParcels.length).toBeGreaterThan(0);
+    expect(state.sales.month.revenueDollarDays).toBeGreaterThan(0);
+    expect(state.milestones.length).toBeGreaterThan(0);
+    expect(state.notices.length).toBeGreaterThan(0);
+    expect(state.finance.capex.connect).toBeGreaterThan(0);
 
     const loaded = deserialize(serialize(state));
     expect(loaded).toEqual(state);
     expect(loaded).not.toBe(state);
     expect(getService(loaded).passings).toBe(getService(state).passings);
+    expect(subscriberUnits(loaded)).toBe(subscriberUnits(state));
+  });
+
+  it('round-trips a finished game, which stays finished', () => {
+    const state = playedGame();
+    state.finance.cash = -1;
+    state.finance.negativeMonths = INSOLVENCY_GRACE_MONTHS - 1;
+    while (!state.gameOver) tick(state);
+    const loaded = deserialize(serialize(state));
+    expect(loaded).toEqual(state);
+    const frozen = serialize(loaded);
+    tick(loaded);
+    expect(applyCommand(loaded, { type: 'setMarketing', perMonth: 0 }).ok).toBe(false);
+    expect(serialize(loaded)).toBe(frozen);
+  });
+
+  it('loads saves made under other balance rules', () => {
+    // Commands enforce the current rules; a save only has to be playable.
+    const save: Save = JSON.parse(serialize(playedGame()));
+    save.sales.pricing.tiers[0].price = TIER_PRICE_MAX * 3;
+    save.sales.pricing.tiers[1].offered = false;
+    save.sales.pricing.smbMultiplier = SMB_MULTIPLIER_MAX * 2;
+    save.sales.marketingPerMonth = MARKETING_MAX_PER_MONTH * 5;
+    save.network.olt.cards = OLT_MAX_CARDS + 4;
+    save.network.olt.ponPorts = (OLT_MAX_CARDS + 4) * OLT_PORTS_PER_CARD;
+    save.network.cabinets[0].splitters = MAX_SPLITTERS_PER_CABINET + 3;
+    save.finance.negativeMonths = INSOLVENCY_GRACE_MONTHS + 2;
+    const state = deserialize(JSON.stringify(save));
+    runDays(state, 40);
+    expect(state.day).toBeGreaterThan(save.day);
   });
 
   it('writes plain JSON', () => {
@@ -66,18 +128,24 @@ describe('serialize / deserialize', () => {
     expect(JSON.parse(serialize(state))).toEqual(state);
   });
 
-  it('continues a reloaded game exactly like the original', () => {
+  it('continues a reloaded game exactly like the original, through month closes', () => {
     const original = playedGame();
     const reloaded = deserialize(serialize(original));
     for (const state of [original, reloaded]) {
-      // Aerial orders draw make-ready from the saved events stream.
+      // Aerial orders draw make-ready from the saved events stream; signups,
+      // tier picks and churn draw from the saved sales stream.
       applyCommand(state, { type: 'layCable', segments: [3, 9], method: 'aerial' });
       applyCommand(state, { type: 'removeSpan', span: 1 });
       runDays(state, 40);
+      applyCommand(state, { type: 'setPricing', tiers: tierSettings({ fiber1g: 80 }) as never, smbMultiplier: 2 });
       applyCommand(state, { type: 'layCable', segments: [4, 10], method: 'aerial' });
       applyCommand(state, { type: 'placeCabinet', node: 5 });
-      runDays(state, 100);
+      runDays(state, 50);
+      applyCommand(state, { type: 'setMarketing', perMonth: 2_500 });
+      runDays(state, 50);
     }
+    expect(original.finance.reports.length).toBeGreaterThanOrEqual(5);
+    expect(original.sales.connectsTotal).toBeGreaterThan(0);
     expect(hashState(reloaded)).toBe(hashState(original));
     expect(serialize(reloaded)).toBe(serialize(original));
   });
@@ -111,6 +179,8 @@ describe('hashState', () => {
 
 describe('deserialize errors', () => {
   const good = serialize(playedGame());
+  /** A make-ready memo on `segment` drawn on day 0. */
+  const memo = (segment: number) => ({ segment, method: 'aerial', days: 30, drawnDay: 0 });
   /** The good save with one change applied. */
   const corrupted = (mutate: (save: Save) => void): string => {
     const save: Save = JSON.parse(good);
@@ -128,7 +198,7 @@ describe('deserialize errors', () => {
 
   it('rejects a missing or unsupported schemaVersion', () => {
     expectSaveError(corrupted((s) => delete s.schemaVersion), /no schemaVersion/);
-    expectSaveError(corrupted((s) => (s.schemaVersion = 2)), /Unsupported save version 2 /);
+    expectSaveError(corrupted((s) => (s.schemaVersion = 3)), /Unsupported save version 3 /);
     expectSaveError(corrupted((s) => (s.schemaVersion = 0)), /Unsupported save version 0 /);
     expectSaveError(corrupted((s) => (s.schemaVersion = '1')), /Unsupported save version "1" /);
     expectSaveError(corrupted((s) => (s.schemaVersion = null)), /Unsupported save version null /);
@@ -228,10 +298,124 @@ describe('deserialize errors', () => {
     ['unknown report category', (s) => (s.finance.reports[0].totals.bribes = -1), /finance\.reports\[0\]\.totals key should be one of .*, got "bribes"/],
     ['string report total', (s) => (s.finance.reports[0].totals.construction = '-1'), /finance\.reports\[0\]\.totals\.construction should be an integer/],
     ['negative passings', (s) => (s.finance.reports[0].passings = -1), /finance\.reports\[0\]\.passings should be an integer >= 0/],
+    // Round 2: rng, network
+    ['missing sales stream', (s) => delete s.rng.sales, /rng\.sales should be an integer in 0\.\.4294967295, got nothing/],
+    ['sales stream past uint32', (s) => (s.rng.sales = 2 ** 32), /rng\.sales should be an integer in 0\.\.4294967295/],
+    ['refundable above cost', (s) => (s.network.spans[0].refundable = s.network.spans[0].cost + 1), /network\.spans\[0\]\.refundable should be an integer in 0\.\.\d+/],
+    ['negative refundable', (s) => (s.network.spans[0].refundable = -1), /network\.spans\[0\]\.refundable/],
+    ['missing OLT cards', (s) => delete s.network.olt.cards, /network\.olt\.cards should be an integer >= 0, got nothing/],
+    ['fractional OLT cards', (s) => (s.network.olt.cards = 1.5), /network\.olt\.cards should be an integer >= 0, got 1\.5/],
+    ['makeReady not a list', (s) => (s.network.makeReady = {}), /network\.makeReady should be an array/],
+    ['make-ready memo on an unknown segment', (s) => (s.network.makeReady = [memo(99)]), /network\.makeReady\[0\]\.segment should be an integer in 0\.\.16, got 99/],
+    ['make-ready memo with an unknown method', (s) => (s.network.makeReady = [{ ...memo(0), method: 'laser' }]), /network\.makeReady\[0\]\.method should be one of/],
+    ['make-ready memo of zero days', (s) => (s.network.makeReady = [{ ...memo(0), days: 0 }]), /network\.makeReady\[0\]\.days should be an integer >= 1, got 0/],
+    ['make-ready memo drawn in the future', (s) => (s.network.makeReady = [{ ...memo(0), drawnDay: s.day + 1 }]), /network\.makeReady\[0\]\.drawnDay should be an integer in 0\.\.\d+/],
+    ['make-ready memos out of order', (s) => (s.network.makeReady = [memo(3), memo(1)]), /network\.makeReady\[1\] should be greater than the entry before it/],
+    ['duplicate make-ready memos', (s) => (s.network.makeReady = [memo(1), memo(1)]), /network\.makeReady\[1\] should be greater/],
+    ['make-ready methods out of order', (s) => (s.network.makeReady = [{ ...memo(1), method: 'underground' }, memo(1)]), /network\.makeReady\[1\] should be greater/],
+    // Finance
+    ['missing capex', (s) => delete s.finance.capex, /finance\.capex should be an object, got nothing/],
+    ['negative OSP capex', (s) => (s.finance.capex.osp = -1), /finance\.capex\.osp should be an integer >= 0, got -1/],
+    ['fractional connect capex', (s) => (s.finance.capex.connect = 0.5), /finance\.capex\.connect should be an integer >= 0/],
+    ['missing CO capex', (s) => delete s.finance.capex.co, /finance\.capex\.co should be an integer >= 0, got nothing/],
+    ['negative negativeMonths', (s) => (s.finance.negativeMonths = -1), /finance\.negativeMonths should be an integer >= 0, got -1/],
+    ['missing negativeMonths', (s) => delete s.finance.negativeMonths, /finance\.negativeMonths should be an integer >= 0, got nothing/],
+    ['install entry category typo', (s) => (s.finance.monthToDate[0].category = 'instal'), /finance\.monthToDate\[0\]\.category should be one of/],
+    ['stats that are not an object', (s) => (s.finance.reports[0].stats = 7), /finance\.reports\[0\]\.stats should be an object, got 7/],
+    ['null stats', (s) => (s.finance.reports[0].stats = null), /finance\.reports\[0\]\.stats should be an object, got null/],
+    ['string subscriber count', (s) => (s.finance.reports[0].stats.subscribers = '4'), /finance\.reports\[0\]\.stats\.subscribers should be an integer >= 0/],
+    ['negative PON ports in stats', (s) => (s.finance.reports[0].stats.ponPorts = -1), /finance\.reports\[0\]\.stats\.ponPorts should be an integer >= 0/],
+    ['stats missing a field', (s) => delete s.finance.reports[0].stats.fullCabinets, /finance\.reports\[0\]\.stats\.fullCabinets should be an integer >= 0, got nothing/],
+    // Sales: pricing and marketing
+    ['missing sales', (s) => delete s.sales, /sales should be an object, got nothing/],
+    ['two tiers', (s) => s.sales.pricing.tiers.pop(), /sales\.pricing\.tiers should list the 3 tiers fiber500, fiber1g, fiber2g, got 2/],
+    ['four tiers', (s) => s.sales.pricing.tiers.push({ ...s.sales.pricing.tiers[0] }), /sales\.pricing\.tiers should list the 3 tiers/],
+    ['tiers out of order', (s) => s.sales.pricing.tiers.reverse(), /sales\.pricing\.tiers\[0\]\.id should be "fiber500", got "fiber2g"/],
+    ['an unknown tier', (s) => (s.sales.pricing.tiers[1].id = 'fiber10g'), /sales\.pricing\.tiers\[1\]\.id should be "fiber1g", got "fiber10g"/],
+    ['a zero price', (s) => (s.sales.pricing.tiers[0].price = 0), /sales\.pricing\.tiers\[0\]\.price should be an integer in 1\.\.100000, got 0/],
+    ['a fractional price', (s) => (s.sales.pricing.tiers[2].price = 95.5), /sales\.pricing\.tiers\[2\]\.price should be an integer/],
+    ['an absurd price', (s) => (s.sales.pricing.tiers[2].price = 1e9), /sales\.pricing\.tiers\[2\]\.price should be an integer in 1\.\.100000/],
+    ['a string offered flag', (s) => (s.sales.pricing.tiers[0].offered = 'yes'), /sales\.pricing\.tiers\[0\]\.offered should be true or false/],
+    ['no tier offered', (s) => s.sales.pricing.tiers.forEach((t: Save) => (t.offered = false)), /sales\.pricing\.tiers should offer at least one tier/],
+    ['a missing tier name', (s) => delete s.sales.pricing.tiers[0].name, /sales\.pricing\.tiers\[0\]\.name should be a string/],
+    ['zero tier speed', (s) => (s.sales.pricing.tiers[1].downMbps = 0), /sales\.pricing\.tiers\[1\]\.downMbps should be an integer >= 1/],
+    ['a zero business multiplier', (s) => (s.sales.pricing.smbMultiplier = 0), /sales\.pricing\.smbMultiplier should be a number in 0\.01\.\.100, got 0/],
+    ['a string business multiplier', (s) => (s.sales.pricing.smbMultiplier = '1.5'), /sales\.pricing\.smbMultiplier should be a number/],
+    ['an absurd business multiplier', (s) => (s.sales.pricing.smbMultiplier = 1e6), /sales\.pricing\.smbMultiplier should be a number in 0\.01\.\.100/],
+    ['negative marketing', (s) => (s.sales.marketingPerMonth = -1), /sales\.marketingPerMonth should be an integer in 0\.\.1000000000, got -1/],
+    ['fractional marketing', (s) => (s.sales.marketingPerMonth = 10.5), /sales\.marketingPerMonth should be an integer/],
+    ['absurd marketing', (s) => (s.sales.marketingPerMonth = 1e12), /sales\.marketingPerMonth should be an integer in 0\.\.1000000000/],
+    // Sales: accounts and routers
+    ['accounts not a list', (s) => (s.sales.accounts = {}), /sales\.accounts should be an array, got an object/],
+    ['account on an unknown parcel', (s) => (s.sales.accounts[0].parcel = 999), /sales\.accounts\[0\]\.parcel should be an integer in 0\.\.47, got 999/],
+    ['accounts out of order', (s) => s.sales.accounts.reverse(), /sales\.accounts \(by parcel\)\[1\] should be greater than the entry before it/],
+    ['two accounts on one parcel', (s) => s.sales.accounts.splice(1, 0, structuredClone(s.sales.accounts[0])), /sales\.accounts \(by parcel\)\[1\] should be greater/],
+    ['an unknown tier key', (s) => (s.sales.accounts[0].tierUnits.fiber10g = 1), /sales\.accounts\[0\]\.tierUnits key should be one of "fiber500", "fiber1g", "fiber2g", got "fiber10g"/],
+    ['a missing tier key', (s) => delete s.sales.accounts[0].tierUnits.fiber2g, /sales\.accounts\[0\]\.tierUnits\.fiber2g should be an integer >= 0, got nothing/],
+    ['negative tier units', (s) => (s.sales.accounts[0].tierUnits.fiber500 = -1), /sales\.accounts\[0\]\.tierUnits\.fiber500 should be an integer >= 0, got -1/],
+    ['fractional tier units', (s) => (s.sales.accounts[0].tierUnits.fiber1g = 0.5), /sales\.accounts\[0\]\.tierUnits\.fiber1g should be an integer/],
+    ['an account with no units', (s) => (s.sales.accounts[0].tierUnits = { fiber500: 0, fiber1g: 0, fiber2g: 0 }), /sales\.accounts\[0\]\.tierUnits should add up to 1\.\.12 units \(parcel 0 has 12\), got 0/],
+    ['more units than the building has', (s) => (s.sales.accounts[0].tierUnits = { fiber500: 13, fiber1g: 0, fiber2g: 0 }), /sales\.accounts\[0\]\.tierUnits should add up to 1\.\.12 units \(parcel 0 has 12\), got 13/],
+    [
+      'a home with two subscriptions',
+      (s) => {
+        s.city.parcels[0].kind = 'home';
+        s.sales.accounts[0].tierUnits = { fiber500: 1, fiber1g: 1, fiber2g: 0 };
+        s.sales.routerParcels = s.sales.routerParcels.filter((p: number) => p !== 0);
+      },
+      /sales\.accounts\[0\]\.tierUnits should add up to 1 unit for a home, got 2/,
+    ],
+    ['an account on a cabinet id never issued', (s) => (s.sales.accounts[0].cabinet = s.nextId), /sales\.accounts\[0\]\.cabinet should be an integer in 1\.\.\d+, got \d+/],
+    ['an account on cabinet 0', (s) => (s.sales.accounts[0].cabinet = 0), /sales\.accounts\[0\]\.cabinet should be an integer in 1\.\./],
+    ['an account from the future', (s) => (s.sales.accounts[0].since = s.day + 1), /sales\.accounts\[0\]\.since should be an integer in 0\.\.\d+/],
+    ['a router on a home', (s) => (s.sales.routerParcels = [1]), /sales\.routerParcels\[0\] refers to parcel 1, which is not an apartment building/],
+    ['a router on an unknown parcel', (s) => (s.sales.routerParcels = [480]), /sales\.routerParcels\[0\] should be an integer in 0\.\.47, got 480/],
+    ['routers out of order', (s) => (s.sales.routerParcels = [4, 0]), /sales\.routerParcels\[1\] should be greater than the entry before it \(4\), got 0/],
+    ['duplicate routers', (s) => (s.sales.routerParcels = [0, 0]), /sales\.routerParcels\[1\] should be greater/],
+    ['negative connects', (s) => (s.sales.connectsTotal = -1), /sales\.connectsTotal should be an integer >= 0, got -1/],
+    ['full cabinets out of order', (s) => (s.sales.fullCabinets = [2, 1]), /sales\.fullCabinets\[1\] should be greater than the entry before it \(2\), got 1/],
+    ['a full cabinet id never issued', (s) => (s.sales.fullCabinets = [s.nextId]), /sales\.fullCabinets\[0\] should be an integer in 1\.\./],
+    ['missing month accrual', (s) => delete s.sales.month, /sales\.month should be an object, got nothing/],
+    ['negative revenue accrual', (s) => (s.sales.month.revenueDollarDays = -1), /sales\.month\.revenueDollarDays should be an integer >= 0, got -1/],
+    ['fractional marketing accrual', (s) => (s.sales.month.marketingDollarDays = 1.5), /sales\.month\.marketingDollarDays should be an integer >= 0/],
+    ['missing subscriber-days', (s) => delete s.sales.month.subscriberUnitDays, /sales\.month\.subscriberUnitDays should be an integer >= 0, got nothing/],
+    ['string gross adds', (s) => (s.sales.month.grossAdds = '2'), /sales\.month\.grossAdds should be an integer >= 0/],
+    ['negative lost service', (s) => (s.sales.month.lostService = -2), /sales\.month\.lostService should be an integer >= 0, got -2/],
+    ['a parcel too big to simulate', (s) => (s.city.parcels[0].units = 1e9), /city\.parcels\[0\]\.units should be an integer in 0\.\.10000, got 1000000000/],
+    // Progress
+    ['milestones not a list', (s) => (s.milestones = null), /milestones should be an array, got null/],
+    ['an unknown milestone', (s) => (s.milestones[0].id = 'moonshot'), /milestones\[0\]\.id should be one of .*got "moonshot"/],
+    ['a milestone twice', (s) => s.milestones.push({ ...s.milestones[0] }), /milestones\[1\]\.id "firstLight" is listed twice/],
+    ['a milestone from the future', (s) => (s.milestones[0].day = s.day + 1), /milestones\[0\]\.day should be an integer in 0\.\.\d+/],
+    ['notices not a list', (s) => (s.notices = 'none'), /notices should be an array, got "none"/],
+    ['a notice id not below nextNoticeId', (s) => (s.notices[0].id = s.nextNoticeId), /notices\[0\]\.id should be an integer in 1\.\./],
+    ['notices out of order', (s) => s.notices.push({ ...s.notices[0] }), /notices \(by id\)\[1\] should be greater than the entry before it/],
+    ['an unknown notice kind', (s) => (s.notices[0].kind = 'gossip'), /notices\[0\]\.kind should be one of .*got "gossip"/],
+    ['a notice from the future', (s) => (s.notices[0].day = s.day + 1), /notices\[0\]\.day should be an integer in 0\.\./],
+    ['a numeric notice message', (s) => (s.notices[0].message = 4), /notices\[0\]\.message should be a string, got 4/],
+    ['a notice about a cabinet id never issued', (s) => (s.notices[0].cabinet = s.nextId), /notices\[0\]\.cabinet should be an integer in 1\.\./],
+    ['a notice about an unknown milestone', (s) => (s.notices[0].milestone = 'moonshot'), /notices\[0\]\.milestone should be one of/],
+    ['a missing notice milestone ref', (s) => delete s.notices[0].milestone, /notices\[0\]\.milestone should be one of/],
+    ['zero nextNoticeId', (s) => (s.nextNoticeId = 0), /nextNoticeId should be an integer >= 1, got 0/],
+    ['missing gameOver', (s) => delete s.gameOver, /gameOver should be an object, got nothing/],
+    ['gameOver for an unknown reason', (s) => (s.gameOver = { day: 1, reason: 'bored', message: 'x' }), /gameOver\.reason should be one of "insolvent", got "bored"/],
+    ['gameOver in the future', (s) => (s.gameOver = { day: s.day + 1, reason: 'insolvent', message: 'x' }), /gameOver\.day should be an integer in 0\.\.\d+/],
+    ['gameOver without a message', (s) => (s.gameOver = { day: 1, reason: 'insolvent' }), /gameOver\.message should be a string, got nothing/],
   ];
 
   it.each(cases)('rejects %s', (_name, mutate, message) => {
     expectSaveError(corrupted(mutate), message);
+  });
+
+  it('covers a save with every round-2 record present', () => {
+    const save: Save = JSON.parse(good);
+    expect(save.sales.accounts.length).toBeGreaterThan(1);
+    expect(save.sales.routerParcels).toContain(0);
+    expect(save.sales.accounts[0].parcel).toBe(0);
+    expect(save.milestones[0].id).toBe('firstLight');
+    expect(save.notices.length).toBeGreaterThan(0);
+    expect(save.notices[0].milestone).not.toBeNull();
+    expect(save.finance.reports[0].stats).toBeDefined();
   });
 
   it('rejects map geometry that would crash street picking on a generated town', () => {
@@ -257,6 +441,10 @@ describe('deserialize errors', () => {
     };
     walk(JSON.parse(text), []);
     expect(paths.length).toBeGreaterThan(100);
+    // The play-through below crosses month closes with subscribers on the books.
+    const base = deserialize(text);
+    expect(base.sales.accounts.length).toBeGreaterThan(0);
+    expect(paths.some((p) => p[0] === 'sales' && p[1] === 'accounts')).toBe(true);
 
     const DELETE = Symbol('delete');
     const replacements: unknown[] = [DELETE, null, 'x', -1, 0, 1.5, true, {}, []];
@@ -282,7 +470,10 @@ describe('deserialize errors', () => {
           applyCommand(state, { type: 'layCable', segments: [0, 1, 2, 3], method: 'aerial' });
           applyCommand(state, { type: 'placeCabinet', node: 3 });
           applyCommand(state, { type: 'removeSpan', span: 2 });
-          runDays(state, 62);
+          applyCommand(state, { type: 'setPricing', tiers: tierSettings({ fiber500: 60 }) as never, smbMultiplier: 1.75 });
+          runDays(state, 31);
+          applyCommand(state, { type: 'setMarketing', perMonth: 0 });
+          runDays(state, 31);
           getService(state);
           // Hovering and clicking the map picks streets through the spatial index.
           nearestNode(state.city, 1, 1);
@@ -294,5 +485,75 @@ describe('deserialize errors', () => {
       }
     }
     expect(failures).toEqual([]);
+  });
+});
+
+/** Saves written by the round-1 (schemaVersion 1) build, frozen before round 2 began. */
+function v1Fixture(name: 'v1-grid' | 'v1-town'): string {
+  return readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8');
+}
+
+describe('schemaVersion 1 saves', () => {
+  it.each(['v1-grid', 'v1-town'] as const)('migrates the frozen %s save and keeps the game', (name) => {
+    const text = v1Fixture(name);
+    const v1: Save = JSON.parse(text);
+    expect(v1.schemaVersion).toBe(1);
+    const state = deserialize(text);
+    expect(state.schemaVersion).toBe(2);
+
+    // The town, plant, money and history are the player's own.
+    expect(state.city).toEqual(v1.city);
+    expect(state.day).toBe(v1.day);
+    expect(state.nextId).toBe(v1.nextId);
+    expect(state.rng.events).toBe(v1.rng.events);
+    expect(state.rng.sales).toBe(deriveSeed(v1.seed, 'sales'));
+    expect(state.finance.cash).toBe(v1.finance.cash);
+    expect(state.finance.reports).toEqual(v1.finance.reports);
+    expect(state.finance.monthToDate).toEqual(v1.finance.monthToDate);
+    expect(state.network.cabinets).toEqual(v1.network.cabinets);
+    expect(state.network.spans).toEqual(v1.network.spans.map((s: Save) => ({ ...s, refundable: s.cost })));
+    expect(state.network.olt).toEqual({ ...v1.network.olt, cards: Math.ceil(v1.network.olt.ponPorts / OLT_PORTS_PER_CARD) });
+    expect(state.network.makeReady).toEqual([]);
+
+    // Capex is everything v1 spent net of refunds.
+    const capexCategories = ['construction', 'equipment', 'refund'];
+    const closed = v1.finance.reports.reduce(
+      (sum: number, r: Save) => sum + capexCategories.reduce((t, c) => t + (r.totals[c] ?? 0), 0),
+      0,
+    );
+    const open = v1.finance.monthToDate.filter((e: Save) => capexCategories.includes(e.category)).reduce((t: number, e: Save) => t + e.amount, 0);
+    expect(state.finance.capex).toEqual({ osp: -(closed + open), connect: 0, co: 0 });
+    expect(state.finance.capex.osp).toBeGreaterThan(0);
+    expect(state.finance.negativeMonths).toBe(0);
+    expect(state.sales).toEqual(newSales());
+    expect(state.milestones).toEqual([]);
+    expect(state.notices).toEqual([]);
+    expect(state.nextNoticeId).toBe(1);
+    expect(state.gameOver).toBeNull();
+
+    // Service is unchanged by the migration, and the migrated game saves as v2.
+    const again = deserialize(serialize(state));
+    expect(again).toEqual(state);
+    expect(getService(again).passings).toBe(getService(state).passings);
+  });
+
+  it('migrates into the same key order as a fresh game, so equal games hash alike', () => {
+    const state = deserialize(v1Fixture('v1-grid'));
+    const keys = (value: unknown): unknown =>
+      Array.isArray(value)
+        ? value.map(keys)
+        : typeof value === 'object' && value !== null
+          ? Object.entries(value).map(([k, v]) => [k, keys(v)])
+          : null;
+    const fresh = newGame(state.seed, { city: state.city });
+    expect(Object.keys(state)).toEqual(Object.keys(fresh));
+    expect(keys(state.network.olt)).toEqual(keys(fresh.network.olt));
+    expect(Object.keys(state.finance)).toEqual(Object.keys(fresh.finance));
+  });
+
+  it('still rejects a corrupt v1 save with the field named', () => {
+    const v1: Save = JSON.parse(v1Fixture('v1-grid'));
+    v1.network.spans[0].segment = 999;
+    expectSaveError(JSON.stringify(v1), /network\.spans\[0\]\.segment should be an integer in 0\.\.16, got 999/);
   });
 });

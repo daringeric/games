@@ -1,14 +1,18 @@
-// The map scene. Layers, bottom to top: board, roads, trees, pole overlay,
-// parcels, cables, route preview, central office, cabinets, tool marks. The
-// world container is a render group, so panning and zooming only change its
-// transform; each layer is redrawn only when the state it shows changes.
+// The map scene. Layers, bottom to top: board, roads, rock stipple, trees,
+// strong rock texture (underground tool), $/ft cost overlay, pole overlay,
+// parcels, cables, coverage shading and route preview, central office,
+// cabinets, tool marks. The world container is a render group, so panning and
+// zooming only change its transform; each layer is redrawn only when the
+// state it shows changes.
 
 import { Container, Graphics } from 'pixi.js';
 import type { Application } from 'pixi.js';
 import { getService } from '../sim/network';
-import type { City, GameState, ServiceSnapshot } from '../sim/types';
+import { accountUnits } from '../sim/sales';
+import type { City, GameState, ParcelId, ServiceSnapshot } from '../sim/types';
 import type { Bounds, Camera } from './camera';
-import { boardBounds, drawBoard, drawPoleOverlay, drawRoads, drawTrees, townBounds } from './cityLayer';
+import { boardBounds, drawBoard, drawCostOverlay, drawPoleOverlay, drawRoads, drawRock, drawTrees, townBounds } from './cityLayer';
+import type { CostOverlayMode } from './cityLayer';
 import { buildCentralOffice } from './coLayer';
 import { placeTrees } from './decor';
 import { NetworkLayer } from './networkLayer';
@@ -19,10 +23,36 @@ import type { Theme } from './theme';
 
 const ANIM_FRAME_MS = 33;
 
+/**
+ * Debug/test read-out of what the map shows (window.__lst.stats() spreads it).
+ * e2e tests rely on passedLots counting every lot drawn as passed or subscribed.
+ */
+export interface SceneStats {
+  /** Lots drawn passed or subscribed. */
+  passedLots: number;
+  /** Lots drawn in the subscriber look. */
+  subscribedLots: number;
+  liveSpans: number;
+  liveRedraws: number;
+  /** Live spans washed out: connected to the CO but out of every cabinet's reach. */
+  dimSpans: number;
+  /** Cabinets ringed as full (turning signups away). */
+  fullCabinets: number;
+  /** The $/ft overlay's mode, or null when it is off. */
+  costOverlay: CostOverlayMode | null;
+  /** The strong rock texture is showing (underground tool). */
+  rockEmphasis: boolean;
+}
+
 export class Scene {
   readonly world = new Container({ isRenderGroup: true });
   private readonly ground = new Container({ isRenderGroup: true });
   private readonly poles = new Graphics();
+  private readonly rockStrong = new Graphics();
+  private readonly cost = new Graphics();
+  private rockStrongCity: City | null = null;
+  private costMode: CostOverlayMode | null = null;
+  private costDrawn: { city: City; mode: CostOverlayMode } | null = null;
   private readonly parcels: ParcelLayer;
   private readonly network: NetworkLayer;
   private readonly overlay: OverlayLayer;
@@ -31,6 +61,9 @@ export class Scene {
   private state: GameState | null = null;
   private service: ServiceSnapshot | null = null;
   private networkVersion = -1;
+  private fullKey = '';
+  /** Subscribed units per parcel, recomputed when the state or the day changes. */
+  private subscribers: { state: GameState; day: number; units: Map<ParcelId, number> } | null = null;
   /** Something changed since the last frame was drawn. */
   private dirty = true;
   private lastAnimMs = -Infinity;
@@ -44,8 +77,12 @@ export class Scene {
     this.network = new NetworkLayer(theme);
     this.overlay = new OverlayLayer(theme);
     this.poles.visible = false;
+    this.rockStrong.visible = false;
+    this.cost.visible = false;
     this.world.addChild(
       this.ground,
+      this.rockStrong,
+      this.cost,
       this.poles,
       this.parcels.container,
       this.network.below,
@@ -78,17 +115,31 @@ export class Scene {
       this.state = state;
       this.service = null;
       this.networkVersion = -1;
+      this.fullKey = '';
     }
     const service = getService(state);
-    if (service !== this.service) {
+    const subscribers = this.subscribedUnits(state);
+    if (service !== this.service || subscribers.changed) {
       this.service = service;
-      if (this.parcels.sync(state.day, new Set(service.passedParcels))) this.dirty = true;
+      if (this.parcels.sync(state.day, new Set(service.passedParcels), subscribers.units)) this.dirty = true;
     }
-    if (state.network.version !== this.networkVersion) {
+    const fullKey = state.sales.fullCabinets.join(',');
+    if (state.network.version !== this.networkVersion || fullKey !== this.fullKey) {
       this.networkVersion = state.network.version;
+      this.fullKey = fullKey;
       this.network.sync(state, service);
       this.dirty = true;
     }
+  }
+
+  /** Subscribed units per parcel (from Sales.accounts), recomputed once per state and day. */
+  private subscribedUnits(state: GameState): { units: ReadonlyMap<ParcelId, number>; changed: boolean } {
+    const cached = this.subscribers;
+    if (cached && cached.state === state && cached.day === state.day) return { units: cached.units, changed: false };
+    const units = new Map<ParcelId, number>();
+    for (const account of state.sales.accounts) units.set(account.parcel, accountUnits(account));
+    this.subscribers = { state, day: state.day, units };
+    return { units, changed: true };
   }
 
   /** Advance map animations, at most ~30 times a second: they are small and subtle. */
@@ -114,13 +165,57 @@ export class Scene {
     this.dirty = true;
   }
 
+  /** Show the strong rock texture (while the underground tool is active). Drawn on first use per city. */
+  setRockEmphasis(on: boolean): void {
+    if (on && this.city && this.rockStrongCity !== this.city) {
+      this.rockStrong.clear();
+      drawRock(this.rockStrong, this.city, this.theme, true);
+      this.rockStrongCity = this.city;
+      if (this.rockStrong.visible) this.dirty = true;
+    }
+    if (this.rockStrong.visible === on) return;
+    this.rockStrong.visible = on;
+    this.dirty = true;
+  }
+
+  /** Color every street by its $/ft band for a method (or the cheaper buildable one); null hides the overlay. */
+  setCostOverlay(mode: CostOverlayMode | null): void {
+    this.costMode = mode;
+    this.refreshCostOverlay();
+  }
+
+  private refreshCostOverlay(): void {
+    const mode = this.costMode;
+    const city = this.city;
+    if (mode && city && (this.costDrawn?.city !== city || this.costDrawn.mode !== mode)) {
+      this.cost.clear();
+      drawCostOverlay(this.cost, city, this.theme, mode);
+      this.costDrawn = { city, mode };
+      this.dirty = true;
+    }
+    const visible = mode !== null && city !== null;
+    if (this.cost.visible !== visible) {
+      this.cost.visible = visible;
+      this.dirty = true;
+    }
+  }
+
   setOverlay(spec: OverlaySpec): void {
     if (this.city && this.overlay.draw(this.city, spec)) this.dirty = true;
   }
 
-  /** What the map currently shows, for debugging and tests: lots drawn as passed, live spans drawn, live cable redraws. */
-  stats(): { passedLots: number; liveSpans: number; liveRedraws: number } {
-    return { passedLots: this.parcels.passedLots, liveSpans: this.network.liveSpans, liveRedraws: this.network.liveRedraws };
+  /** What the map currently shows, for debugging and tests. */
+  stats(): SceneStats {
+    return {
+      passedLots: this.parcels.passedLots,
+      subscribedLots: this.parcels.subscribedLots,
+      liveSpans: this.network.liveSpans,
+      liveRedraws: this.network.liveRedraws,
+      dimSpans: this.network.dimSpans,
+      fullCabinets: this.network.fullRings,
+      costOverlay: this.cost.visible ? this.costMode : null,
+      rockEmphasis: this.rockStrong.visible,
+    };
   }
 
   /** Whether the frame needs drawing; clears the flag. An idle map costs no GPU time. */
@@ -140,13 +235,23 @@ export class Scene {
     drawBoard(board, city, this.theme);
     const roads = new Graphics();
     drawRoads(roads, city, this.theme);
+    const rock = new Graphics();
+    drawRock(rock, city, this.theme, false);
     const trees = new Graphics();
     drawTrees(trees, placeTrees(city, this.theme), this.theme);
-    this.ground.addChild(board, roads, trees);
+    this.ground.addChild(board, roads, rock, trees);
 
     this.poles.clear();
     drawPoleOverlay(this.poles, city, this.theme);
     this.parcels.setCity(city);
+    // Redrawn for the new streets: the strong rock texture now if it is showing, else on first use.
+    this.rockStrong.clear();
+    this.rockStrongCity = null;
+    if (this.rockStrong.visible) {
+      drawRock(this.rockStrong, city, this.theme, true);
+      this.rockStrongCity = city;
+    }
+    this.costDrawn = null;
 
     // Graphics.destroy given options keeps its context (and the GPU buffers
     // behind it) unless asked: say so, or every new town leaks the old building.
@@ -159,5 +264,6 @@ export class Scene {
     this.world.addChildAt(this.co, this.world.getChildIndex(this.network.above));
     this.overlay.draw(city, {});
     this.city = city;
+    this.refreshCostOverlay();
   }
 }

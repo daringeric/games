@@ -1,0 +1,389 @@
+/* Map tools chrome: itemized quote card, cabinet coverage card, OLT panel,
+   cost-overlay toggle and legend. Imported by main.ts after style.css. Colors
+   and sizes come from the theme's CSS custom properties (themeCss.ts), e.g.
+   var(--cpp-green), var(--cpp-amber), var(--cpp-red).
+
+   Owner: ui-map workstream. (style.css belongs to ui-economy.) */
+
+/* Cost overlay switch: set apart from the tools by a hairline. ------------------ */
+
+.toolbar .tool-overlay {
+  margin-top: 4px;
+}
+
+.toolbar .tool-overlay::before {
+  content: '';
+  position: absolute;
+  top: -6px;
+  right: 14px;
+  left: 14px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--card-border);
+}
+
+/* Floating quote card ----------------------------------------------------------- */
+
+.float-card.has-lines {
+  max-width: 340px;
+}
+
+.quote-lines {
+  width: 100%;
+  margin: 0 0 6px;
+  padding-bottom: 4px;
+  border-collapse: collapse;
+  border-bottom: 1px dashed var(--card-border);
+  font-size: 12.5px;
+}
+
+.quote-lines th,
+.quote-lines td {
+  padding: 1px 0;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+.quote-lines th {
+  padding-right: 10px;
+  color: var(--text);
+  font-weight: 700;
+  text-align: left;
+}
+
+.quote-lines .quote-detail {
+  padding-right: 10px;
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+.quote-lines .quote-amount {
+  font-size: 13px;
+  text-align: right;
+}
+
+.float-card dd.tone-value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.float-card dd.tone-cpp-green,
+.float-card dd.tone-cpp-amber,
+.float-card dd.tone-cpp-red {
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
+.float-card dd.tone-cpp-green::before,
+.float-card dd.tone-cpp-amber::before,
+.float-card dd.tone-cpp-red::before {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.float-card .tone-cpp-green {
+  color: var(--cpp-green);
+}
+
+.float-card .tone-cpp-amber {
+  color: var(--cpp-amber);
+}
+
+.float-card .tone-cpp-red {
+  color: var(--cpp-red);
+}
+
+.float-card .tone-muted {
+  color: var(--text-2);
+  font-weight: 700;
+}
+
+/* Small print after a value (the cost-per-passing target), never band-colored. */
+.float-card .row-sub {
+  margin-left: 2px;
+  color: var(--text-2);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.card-warnings {
+  margin: 7px 0 0;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cpp-amber) 13%, var(--card));
+  color: color-mix(in srgb, var(--cpp-amber) 70%, var(--text));
+  font-size: 12.5px;
+  font-weight: 800;
+  list-style: none;
+}
+
+.card-note {
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+/* Cost overlay legend: never takes clicks, so it can't cover a control. ---------- */
+
+.cost-legend {
+  position: absolute;
+  z-index: 9;
+  bottom: 12px;
+  left: 92px;
+  padding: 6px 10px 7px;
+  border-radius: 14px;
+  font-size: 12px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.cost-legend[hidden] {
+  display: none;
+}
+
+.cost-legend-title {
+  margin: 0 0 3px;
+  font: 600 13px / 1.2 var(--font-display);
+}
+
+.cost-legend-mode {
+  color: var(--text-2);
+}
+
+.cost-legend ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cost-legend li[hidden] {
+  display: none;
+}
+
+.cost-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.cost-swatch {
+  width: 16px;
+  height: 7px;
+  border-radius: 4px;
+}
+
+/* OLT panel ------------------------------------------------------------------------ */
+
+.olt-panel {
+  position: absolute;
+  z-index: 15;
+  top: 96px;
+  right: 12px;
+  width: 320px;
+  max-height: calc(100% - 120px);
+  padding: 10px 14px 14px;
+  overflow: auto;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.olt-panel[hidden] {
+  display: none;
+}
+
+.olt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.olt-icon {
+  color: var(--tone-underground);
+}
+
+.olt-title {
+  flex: 1;
+  margin: 0;
+  font: 600 16px / 1.2 var(--font-display);
+}
+
+.olt-close {
+  background: var(--chip);
+}
+
+.olt-close svg {
+  width: 18px;
+  height: 18px;
+}
+
+.olt-meter {
+  height: 10px;
+  margin-bottom: 8px;
+  overflow: hidden;
+  border-radius: var(--pill);
+  background: var(--chip);
+}
+
+.olt-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--pill);
+  background: var(--tone-underground);
+}
+
+.olt-meter.is-full .olt-meter-fill {
+  background: var(--danger);
+}
+
+.olt-stats {
+  display: grid;
+  gap: 3px;
+  margin: 0 0 8px;
+}
+
+.olt-stats .row,
+.olt-cabinets li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.olt-stats dt {
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.olt-stats dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.olt-sub {
+  margin: 10px 0 4px;
+  font: 600 14px / 1.2 var(--font-display);
+}
+
+.olt-empty {
+  margin: 0 0 10px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.olt-cabinets {
+  max-height: 168px;
+  margin: 0 0 10px;
+  padding: 0;
+  overflow: auto;
+  font-size: 13px;
+  list-style: none;
+}
+
+.olt-cabinets li {
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--card-border);
+}
+
+.olt-cab-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.olt-cab-stage {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.btn.olt-add {
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  min-height: 52px;
+  border-radius: 14px;
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+}
+
+.btn.olt-add:disabled {
+  background: var(--chip);
+  color: var(--text-2);
+  box-shadow: none;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.olt-add-label {
+  font: 600 16px / 1 var(--font-display);
+}
+
+.olt-add-detail {
+  font: 700 12.5px / 1 var(--font-ui);
+}
+
+/* Short screens and phones -------------------------------------------------------- */
+
+@media (max-height: 500px) {
+  .cost-legend {
+    left: 82px;
+  }
+}
+
+@media (max-width: 880px) {
+  .toolbar .tool-overlay {
+    margin-top: 0;
+    margin-left: 4px;
+  }
+
+  .toolbar .tool-overlay::before {
+    top: 14px;
+    right: auto;
+    bottom: 14px;
+    left: -6px;
+    width: 2px;
+    height: auto;
+  }
+
+  .cost-legend {
+    top: 124px;
+    bottom: auto;
+    left: 8px;
+  }
+
+  .olt-panel {
+    top: auto;
+    right: 8px;
+    bottom: 84px;
+    left: 8px;
+    width: auto;
+    max-height: 58vh;
+  }
+
+  .float-card.has-lines {
+    max-width: min(340px, calc(100vw - 16px));
+  }
+}

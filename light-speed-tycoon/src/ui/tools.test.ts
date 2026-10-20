@@ -1,8 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import { CABINET_REACH_FT, SPLIT_RATIO } from '../sim/balance';
+import { coveragePreview } from '../sim/coverage';
 import { applyCommand, newGame, runDays } from '../sim/game';
+import {
+  getService,
+  ponPortsUsed,
+  quoteCabinet,
+  quoteCable,
+  quoteRemoveCabinet,
+  quoteSplitter,
+  segmentCostPerFt,
+  spanOnSegment,
+} from '../sim/network';
 import { makeGridCity } from '../sim/testing/fixtures';
-import type { GameState } from '../sim/types';
-import { ToolController, cornerLabel } from './tools';
+import type { Command, CommandResult, GameState } from '../sim/types';
+import { formatMoney, formatNumber, formatPerFt } from './format';
+import { ToolController, accountAt, cancelRefund, cornerLabel, wrongSideWarning } from './tools';
+import type { CardModel } from './tools';
 
 // Grid town: nodes (i, j) at (4i, 2j), id j * 4 + i; the CO is node 0 at (0, 0).
 // Horizontal segment (i, j) has id j * 3 + i; vertical (i, j) has id 9 + j * 4 + i.
@@ -11,7 +25,23 @@ function game(opts: Parameters<typeof makeGridCity>[0] = {}): GameState {
 }
 
 function dispatcher(state: GameState) {
-  return (cmd: Parameters<typeof applyCommand>[1]) => applyCommand(state, cmd);
+  return (cmd: Command) => applyCommand(state, cmd);
+}
+
+/** A dispatcher that applies commands and remembers them. */
+function recorder(state: GameState): { dispatch: (cmd: Command) => CommandResult; commands: Command[] } {
+  const commands: Command[] = [];
+  return {
+    commands,
+    dispatch: (cmd) => {
+      commands.push(cmd);
+      return applyCommand(state, cmd);
+    },
+  };
+}
+
+function row(card: CardModel | null | undefined, label: string): string | undefined {
+  return card?.rows.find((r) => r.label === label)?.value;
 }
 
 describe('cable tools', () => {
@@ -29,8 +59,9 @@ describe('cable tools', () => {
     tools.hoverAt(7.8, 0.3);
     const view = tools.view(state);
     expect(view.overlay.path).toEqual({ segments: [0, 1], fresh: [0, 1], method: 'underground', ok: true });
+    const quote = quoteCable(state, [0, 1], 'underground');
     expect(view.card?.title).toBe('Underground cable');
-    expect(view.card?.rows.find((r) => r.label === 'Cost')?.value).toBe('$14,400');
+    expect(row(view.card, 'Cost')).toBe(formatMoney(quote.cost));
     expect(view.card?.blockers).toEqual([]);
 
     const cash = state.finance.cash;
@@ -38,9 +69,74 @@ describe('cable tools', () => {
     expect(outcome?.ok).toBe(true);
     expect(outcome?.message).toContain('2 spans');
     expect(state.network.spans.map((s) => s.segment)).toEqual([0, 1]);
-    expect(state.finance.cash).toBe(cash - 14_400);
+    expect(state.finance.cash).toBe(cash - quote.cost);
     // The run continues from where it ended.
     expect(tools.view(state).overlay.origin).toBe(2);
+  });
+
+  it('itemizes the quote: one line per charge, totals, $/ft, passings, cost per passing, timing and refund', () => {
+    const state = game({ rock: true });
+    const tools = new ToolController();
+    tools.setTool('underground');
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(8, 0);
+    const card = tools.view(state).card;
+    const quote = quoteCable(state, [0, 1], 'underground');
+
+    expect(card?.lines?.map((l) => l.label)).toEqual(quote.lines.map((l) => l.label));
+    expect(card?.lines?.map((l) => l.amount)).toEqual(quote.lines.map((l) => formatMoney(l.amount)));
+    // The rock surcharge is its own line, priced per foot.
+    const rock = quote.lines.find((l) => l.kind === 'rock');
+    expect(rock).toBeDefined();
+    expect(card?.lines?.find((l) => l.label === rock!.label)?.detail).toBe(`${formatNumber(rock!.quantity)} ft × ${formatPerFt(rock!.rate)}`);
+    expect(card?.lines?.find((l) => l.label === 'Engineering')?.detail).toBe('per order');
+
+    expect(row(card, 'Cost')).toBe(formatMoney(quote.cost));
+    expect(row(card, 'Per foot')).toBe(formatPerFt(quote.costPerFt));
+    expect(row(card, 'Passings')).toBe(formatNumber(quote.passingsAlong));
+    expect(row(card, 'In reach')).toBe(`${formatNumber(quote.passingsInReach)} of ${formatNumber(quote.passingsAlong)}`);
+    const cpp = card?.rows.find((r) => r.label === 'Cost per passing');
+    expect(cpp?.value).toBe(formatMoney(quote.cpp!));
+    expect(cpp?.tone).toBe(quote.cppBand);
+    expect(row(card, 'Permit')).toBe(`${quote.permitDaysMin}–${quote.permitDaysMax} days`);
+    expect(card?.note).toBe(`Cancel while permitting: ${formatMoney(cancelRefund(quote.refundable))} back`);
+    // No cabinet yet, so the homes along it are not in reach.
+    expect(card?.warnings).toContain(`${formatNumber(quote.passingsAlong)} not yet within ${formatNumber(CABINET_REACH_FT)} ft of a cabinet`);
+  });
+
+  it('warns about buildings that face another street and emphasizes the ones the route serves', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('underground');
+    // Down A Ave (segment 9): the corner lots beside it front 1st and 2nd St.
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(0, 2);
+    const view = tools.view(state);
+    const quote = quoteCable(state, [9], 'underground');
+    expect(quote.wrongSideParcels.length).toBe(2);
+    expect(view.card?.warnings).toContain(wrongSideWarning(2));
+    expect(wrongSideWarning(3)).toBe('3 buildings along this route face another street');
+    expect(view.overlay.wrongSide).toEqual(quote.wrongSideParcels);
+    expect(view.overlay.served).toEqual([]);
+    // Along 1st St every home it passes gets its drop point emphasized.
+    tools.cancel();
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(4, 0);
+    const along = state.city.parcels.filter((p) => p.segment === 0).map((p) => p.id);
+    expect(tools.view(state).overlay.served).toEqual(along);
+  });
+
+  it('says a remembered make-ready is already surveyed', () => {
+    const state = game();
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'aerial' });
+    applyCommand(state, { type: 'removeSpan', span: spanOnSegment(state, 0)!.id });
+    const tools = new ToolController();
+    tools.setTool('aerial');
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(4, 0);
+    const quote = quoteCable(state, [0], 'aerial');
+    expect(quote.rememberedPermitDays).not.toBeNull();
+    expect(row(tools.view(state).card, 'Make-ready')).toBe(`${quote.permitDaysMin} days (already surveyed)`);
   });
 
   it('shows blockers for aerial runs without poles and refuses the order', () => {
@@ -98,38 +194,203 @@ describe('cable tools', () => {
   });
 });
 
+describe('drag to draw', () => {
+  it('orders exactly one layCable for the dragged route on release', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('underground');
+    const { dispatch, commands } = recorder(state);
+
+    expect(tools.dragStart(state, 0.15, 0.1)).toBe(true);
+    expect(tools.dragging).toBe(true);
+    tools.dragMove(state, 3.8, 0.2);
+    tools.dragMove(state, 7.9, -0.1);
+    const view = tools.view(state);
+    expect(view.overlay.path).toEqual({ segments: [0, 1], fresh: [0, 1], method: 'underground', ok: true });
+    expect(view.overlay.origin).toBe(0);
+    expect(view.card?.hint).toMatch(/^Release to order/);
+    const quote = quoteCable(state, [0, 1], 'underground');
+    expect(row(view.card, 'Cost')).toBe(formatMoney(quote.cost));
+
+    const ledger = state.finance.monthToDate.length;
+    const outcome = tools.dragEnd(state, dispatch, 8, 0);
+    expect(outcome?.ok).toBe(true);
+    expect(commands).toEqual([{ type: 'layCable', segments: [0, 1], method: 'underground' }]);
+    expect(state.network.spans.map((s) => s.segment)).toEqual([0, 1]);
+    // One order: the per-order fees are charged once, in one ledger entry.
+    const entries = state.finance.monthToDate.slice(ledger);
+    expect(entries.map((e) => e.category)).toEqual(['construction']);
+    expect(entries[0]!.amount).toBe(-quote.cost);
+    expect(tools.dragging).toBe(false);
+    // A drag doesn't leave a click-by-click run behind.
+    expect(tools.drawing).toBe(false);
+  });
+
+  it('only starts on a corner in a cable tool', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('underground');
+    expect(tools.dragStart(state, 2, 0.9)).toBe(false);
+    // A generous pick radius (zoomed out) still needs the press near the corner.
+    expect(tools.dragStart(state, 0.7, 0.6, 1)).toBe(true);
+    tools.dragCancel();
+    tools.setTool('cabinet');
+    expect(tools.dragStart(state, 0, 0)).toBe(false);
+    tools.setTool('inspect');
+    expect(tools.dragStart(state, 0, 0)).toBe(false);
+  });
+
+  it('cancels without ordering (Esc, right-click or a second finger)', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('aerial');
+    const { dispatch, commands } = recorder(state);
+    tools.dragStart(state, 0, 0);
+    tools.dragMove(state, 4, 0);
+    expect(tools.dragCancel()).toBe(true);
+    expect(tools.dragEnd(state, dispatch, 4, 0)).toBeNull();
+    expect(commands).toEqual([]);
+    expect(tools.dragCancel()).toBe(false);
+    // Esc through cancel() ends a drag too.
+    tools.dragStart(state, 0, 0);
+    tools.dragMove(state, 4, 0);
+    expect(tools.cancel()).toBe(true);
+    expect(tools.dragEnd(state, dispatch, 4, 0)).toBeNull();
+    expect(commands).toEqual([]);
+  });
+
+  it('backtracks, orders nothing for a drag that returns to its start, and reports a failed quote', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('underground');
+    const { dispatch, commands } = recorder(state);
+    tools.dragStart(state, 0, 0);
+    tools.dragMove(state, 4, 0);
+    tools.dragMove(state, 8, 0);
+    tools.dragMove(state, 4, 0);
+    expect(tools.view(state).overlay.path?.segments).toEqual([0]);
+    tools.dragMove(state, 0, 0);
+    expect(tools.dragEnd(state, dispatch, 0, 0)).toBeNull();
+    expect(commands).toEqual([]);
+
+    state.finance.cash = 100;
+    tools.dragStart(state, 0, 0);
+    tools.dragMove(state, 4, 0);
+    expect(tools.view(state).card?.blockers.join(' ')).toMatch(/Not enough cash/);
+    const outcome = tools.dragEnd(state, dispatch, 4, 0);
+    expect(outcome?.ok).toBe(false);
+    expect(outcome?.message).toMatch(/Not enough cash/);
+    expect(commands).toEqual([]);
+  });
+});
+
 describe('cabinet tool', () => {
-  it('quotes and places a cabinet at the nearest corner', () => {
+  it('previews coverage at an empty corner and places a cabinet there', () => {
     const state = game();
     const tools = new ToolController();
     tools.setTool('cabinet');
     tools.hoverAt(4.3, 1.8);
     const view = tools.view(state);
+    const quote = quoteCabinet(state, 5);
+    const preview = coveragePreview(state, 5);
     expect(view.overlay.cabinet).toEqual({ node: 5, ok: true });
-    expect(view.card?.rows.find((r) => r.label === 'Cost')?.value).toBe('$16,200');
+    expect(view.overlay.reach?.map((r) => r.id)).toEqual(preview.segments.map((s) => s.segment));
+    expect(view.overlay.reach?.every((r) => r.t >= 0 && r.t < 1 && !r.elsewhere)).toBe(true);
+    expect(row(view.card, 'Passings')).toBe(`${formatNumber(preview.passingsNow)} now`);
+    expect(row(view.card, 'Already served')).toBe(formatNumber(preview.passingsServedElsewhere));
+    expect(row(view.card, 'Passable today')).toBe(formatNumber(preview.passingsPassableToday));
+    const cpp = view.card?.rows.find((r) => r.label === 'Cost per passing');
+    expect(cpp?.value).toBe(`${formatMoney(preview.projectedCpp!)} projected`);
+    expect(cpp?.tone).toBe(preview.projectedCppBand);
+    expect(row(view.card, 'Ports')).toMatch(new RegExp(`^${preview.ports} `));
+    expect(row(view.card, 'Cost')).toBe(formatMoney(quote.cost));
+
     const outcome = tools.click(state, dispatcher(state), 4.3, 1.8);
-    expect(outcome).toEqual({ ok: true, message: `Cabinet ordered at ${cornerLabel(state, 5)} for $16,200` });
+    expect(outcome).toEqual({ ok: true, message: `Cabinet ordered at ${cornerLabel(state, 5)} for ${formatMoney(quote.cost)}` });
     expect(state.network.cabinets.map((c) => c.node)).toEqual([5]);
-    // A second one on the same corner is refused with the sim's reason.
-    expect(tools.click(state, dispatcher(state), 4.3, 1.8)?.ok).toBe(false);
+  });
+
+  it('shades streets another cabinet already serves and shows existing coverage', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    applyCommand(state, { type: 'layCable', segments: [0, 1], method: 'underground' });
+    runDays(state, 120);
+    const service = getService(state);
+    const cabinet = state.network.cabinets[0]!;
+    expect(service.litSegments.has(0)).toBe(true);
+
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(8.1, 0.1);
+    const view = tools.view(state);
+    const preview = coveragePreview(state, 2);
+    const elsewhere = preview.segments.filter((s) => s.servedBy !== null).map((s) => s.segment);
+    expect(elsewhere.length).toBeGreaterThan(0);
+    expect(view.overlay.reach?.filter((r) => r.elsewhere).map((r) => r.id)).toEqual(elsewhere);
+    expect(row(view.card, 'Already served')).toBe(formatNumber(preview.passingsServedElsewhere));
+    expect(view.overlay.coverage).toEqual([
+      { cabinet: cabinet.id, lit: service.cabinetCoverage.get(cabinet.id)!.segments, reach: expect.arrayContaining([0, 1, 9]) },
+    ]);
+    // The coverage stays up while the pointer is off the map.
+    tools.clearHover();
+    expect(tools.view(state).overlay.coverage).toHaveLength(1);
+  });
+
+  it('adds a splitter to an existing cabinet', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 5 });
+    const cabinet = state.network.cabinets[0]!;
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(4.1, 2.2);
+    const view = tools.view(state);
+    const quote = quoteSplitter(state, cabinet.id);
+    expect(view.card?.title).toBe('Add a splitter');
+    expect(view.overlay.ring).toEqual({ node: 5, tone: 'cabinet' });
+    expect(row(view.card, 'Cost')).toBe(formatMoney(quote.cost));
+    expect(row(view.card, 'Splitters')).toBe(`1 → ${quote.splittersAfter}`);
+    expect(row(view.card, 'Ports')).toBe(`0 of ${SPLIT_RATIO} used → ${quote.portsAfter}`);
+    expect(row(view.card, 'PON ports')).toBe(`${quote.ponPortsUsedAfter} of ${quote.ponPorts} after`);
+    expect(view.card?.warnings).toEqual([]);
+
+    const { dispatch, commands } = recorder(state);
+    const used = ponPortsUsed(state);
+    const outcome = tools.click(state, dispatch, 4.1, 2.2);
+    expect(outcome?.ok).toBe(true);
+    expect(commands).toEqual([{ type: 'addSplitter', cabinet: cabinet.id }]);
+    expect(cabinet.splitters).toBe(2);
+    expect(ponPortsUsed(state)).toBe(used + 1);
+  });
+
+  it('warns when a cabinet is turning signups away', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 5 });
+    state.sales.fullCabinets = [state.network.cabinets[0]!.id];
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(4, 2);
+    expect(tools.view(state).card?.warnings).toEqual(['Full: turning signups away']);
   });
 });
 
 describe('remove tool', () => {
-  it('highlights a cabled street and refunds it while permitting', () => {
+  it('highlights a cabled street and refunds its construction while permitting', () => {
     const state = game();
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    const span = spanOnSegment(state, 0)!;
+    const refund = cancelRefund(span.refundable);
     const cash = state.finance.cash;
     const tools = new ToolController();
     tools.setTool('remove');
     tools.hoverAt(2, 0.2);
     const view = tools.view(state);
     expect(view.overlay.segment).toEqual({ id: 0, tone: 'remove' });
-    expect(view.card?.rows.find((r) => r.label === 'Refund')?.value).toBe('$7,200');
+    expect(row(view.card, 'Refund')).toBe(formatMoney(refund));
+    expect(view.card?.hint).toMatch(/fees and make-ready are kept/);
     const outcome = tools.click(state, dispatcher(state), 2, 0.2);
-    expect(outcome?.message).toMatch(/\$7,200 refunded/);
+    expect(outcome?.message).toBe(`Cable on 1st St cancelled, ${formatMoney(refund)} refunded`);
     expect(state.network.spans).toEqual([]);
-    expect(state.finance.cash).toBe(cash + 7_200);
+    expect(state.finance.cash).toBe(cash + refund);
   });
 
   it('says there is no refund once crews have started', () => {
@@ -139,7 +400,7 @@ describe('remove tool', () => {
     const tools = new ToolController();
     tools.setTool('remove');
     tools.hoverAt(2, 0);
-    expect(tools.view(state).card?.rows.find((r) => r.label === 'Refund')?.value).toBe('No refund');
+    expect(row(tools.view(state).card, 'Refund')).toBe('No refund');
     expect(tools.click(state, dispatcher(state), 2, 0)?.message).toMatch(/no refund/);
   });
 
@@ -151,6 +412,48 @@ describe('remove tool', () => {
     expect(tools.view(state)).toEqual({ overlay: {}, card: null });
     expect(tools.click(state, dispatcher(state), 2, 0)).toBeNull();
   });
+
+  it('removes a cabinet, refunded while permitting', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 5 });
+    const cabinet = state.network.cabinets[0]!;
+    const quote = quoteRemoveCabinet(state, cabinet.id);
+    expect(quote.refund).toBeGreaterThan(0);
+    const tools = new ToolController();
+    tools.setTool('remove');
+    tools.hoverAt(4.2, 2.1);
+    const view = tools.view(state);
+    expect(view.card?.title).toBe(`Remove cabinet at ${cornerLabel(state, 5)}`);
+    expect(view.overlay.ring).toEqual({ node: 5, tone: 'remove' });
+    expect(row(view.card, 'Refund')).toBe(formatMoney(quote.refund));
+    expect(row(view.card, 'Subscribers')).toBe('None affected');
+    expect(row(view.card, 'PON ports freed')).toBe(String(quote.ponPortsFreed));
+
+    const cash = state.finance.cash;
+    const { dispatch, commands } = recorder(state);
+    const outcome = tools.click(state, dispatch, 4.2, 2.1);
+    expect(commands).toEqual([{ type: 'removeCabinet', cabinet: cabinet.id }]);
+    expect(outcome?.message).toBe(`Cabinet at ${cornerLabel(state, 5)} cancelled, ${formatMoney(quote.refund)} refunded`);
+    expect(state.network.cabinets).toEqual([]);
+    expect(state.finance.cash).toBe(cash + quote.refund);
+  });
+
+  it('counts the subscribers a cabinet removal disconnects', () => {
+    const state = game();
+    applyCommand(state, { type: 'placeCabinet', node: 0 });
+    const cabinet = state.network.cabinets[0]!;
+    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }];
+    runDays(state, 30);
+    // (The account disconnects at the next daily step because nothing is lit; put it back for the quote.)
+    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }];
+    const tools = new ToolController();
+    tools.setTool('remove');
+    tools.hoverAt(0.1, 0.1);
+    const card = tools.view(state).card;
+    expect(row(card, 'Refund')).toBe('No refund');
+    expect(row(card, 'Subscribers')).toBe('1 loses service');
+    expect(card?.warnings).toEqual(['1 subscriber loses service']);
+  });
 });
 
 describe('inspect tool', () => {
@@ -159,30 +462,79 @@ describe('inspect tool', () => {
     const tools = new ToolController();
 
     tools.hoverAt(0.1, 0.1);
-    expect(tools.view(state).card?.title).toBe('Central office');
+    const co = tools.view(state).card;
+    expect(co?.title).toBe('Central office');
+    expect(row(co, 'PON ports in use')).toBe(`0 of ${state.network.olt.ponPorts}`);
+    expect(co?.hint).toMatch(/Click to open the OLT panel/);
 
     tools.hoverAt(2, 0.1);
     const street = tools.view(state);
     expect(street.card?.title).toBe('1st St');
-    expect(street.card?.rows.find((r) => r.label === 'Cable')?.value).toBe('None yet');
+    expect(row(street.card, 'Cable')).toBe('None yet');
     expect(street.overlay.segment).toEqual({ id: 0, tone: 'inspect' });
 
     tools.hoverAt(1.5, 0.6);
     const home = tools.view(state);
     expect(home.card?.title).toBe('Home');
-    expect(home.card?.rows.find((r) => r.label === 'Fiber')?.value).toBe('Unserved');
+    expect(row(home.card, 'Fiber')).toBe('Unserved');
+    // Its lot is outlined and its serving street highlighted.
+    expect(home.overlay).toEqual({ parcel: 2, serving: 0 });
   });
 
-  it('marks homes passed once the network lights their street', () => {
+  it('opens the OLT panel from a click on the CO, and nothing elsewhere', () => {
+    const state = game();
+    const tools = new ToolController();
+    expect(tools.click(state, dispatcher(state), 0.1, 0.1)).toEqual({ ok: true, message: '', open: 'olt' });
+    expect(tools.tap(state, dispatcher(state), 0.1, 0.1)).toEqual({ ok: true, message: '', open: 'olt' });
+    expect(tools.click(state, dispatcher(state), 2, 0.1)).toBeNull();
+  });
+
+  it('shows a street’s rates per method', () => {
+    const state = game({ rock: true });
+    const seg = state.city.segments[0]!;
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    const card = tools.view(state).card;
+    expect(row(card, 'Aerial')).toBe(`${formatPerFt(segmentCostPerFt(seg, 'aerial')!)} incl. make-ready`);
+    expect(row(card, 'Underground')).toBe(`${formatPerFt(segmentCostPerFt(seg, 'underground')!)} incl. rock`);
+    expect(row(card, 'Ground')).toMatch(/^Rock/);
+
+    const bare = game({ hasPoles: false });
+    tools.hoverAt(2, 0.1);
+    expect(row(tools.view(bare).card, 'Aerial')).toBe('No poles');
+  });
+
+  it('shows a remembered make-ready on the street', () => {
+    const state = game();
+    applyCommand(state, { type: 'layCable', segments: [0], method: 'aerial' });
+    const days = state.network.makeReady[0]!.days;
+    applyCommand(state, { type: 'removeSpan', span: spanOnSegment(state, 0)!.id });
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    expect(row(tools.view(state).card, 'Make-ready on file')).toBe(`${days} days`);
+  });
+
+  it('marks homes passed once the network lights their street, and subscribers', () => {
     const state = game();
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
     applyCommand(state, { type: 'placeCabinet', node: 0 });
     runDays(state, 120);
     const tools = new ToolController();
     tools.hoverAt(1.5, 0.6);
-    expect(tools.view(state).card?.rows.find((r) => r.label === 'Fiber')?.value).toBe('Passed, ready for service');
+    const expected = accountAt(state, 2) ? 'Subscriber' : 'Passed, ready for service';
+    expect(row(tools.view(state).card, 'Fiber')).toBe(expected);
     tools.hoverAt(0.1, 0.1);
-    expect(tools.view(state).card?.rows.find((r) => r.label === 'Cabinet here')?.value).toMatch(/Active/);
+    expect(row(tools.view(state).card, 'Cabinet here')).toMatch(/Active/);
+
+    // An apartment building counts its subscribing units.
+    const mdus = newGame(7, { city: makeGridCity({ parcelKinds: (p) => (p.id === 2 ? { kind: 'mdu', units: 12 } : undefined) }) });
+    applyCommand(mdus, { type: 'placeCabinet', node: 0 });
+    mdus.sales.accounts = [{ parcel: 2, cabinet: mdus.network.cabinets[0]!.id, tierUnits: { fiber500: 2, fiber1g: 1, fiber2g: 0 }, since: 0 }];
+    tools.hoverAt(1.5, 0.6);
+    const card = tools.view(mdus).card;
+    expect(card?.title).toBe('Apartment building');
+    expect(row(card, 'Fiber')).toBe('Subscriber');
+    expect(row(card, 'Subscribers')).toBe('3 of 12 units');
   });
 
   it('memoizes the view until something it reads changes', () => {
@@ -200,7 +552,7 @@ describe('inspect tool', () => {
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
     const tools = new ToolController();
     tools.hoverAt(2, 0.1);
-    const cable = () => tools.view(state).card?.rows.find((r) => r.label === 'Cable')?.value;
+    const cable = () => row(tools.view(state).card, 'Cable');
     const before = cable();
     expect(before).toMatch(/permitting, \d+ days left/);
     const version = state.network.version;
@@ -235,7 +587,9 @@ describe('inspect tool', () => {
     tools.hoverAt(4.1, 2.1);
     expect(tools.view(state).card?.blockers).toEqual([]);
     state.finance.cash = 100;
-    expect(tools.view(state).card?.blockers).toEqual(['Not enough cash: need $16,200, have $100']);
+    const blockers = tools.view(state).card?.blockers;
+    expect(blockers).toEqual(quoteCabinet(state, 5).reasons);
+    expect(blockers?.join(' ')).toMatch(/Not enough cash/);
   });
 });
 
@@ -246,8 +600,8 @@ describe('view cache across games', () => {
     const second = newGame(8, { city: makeGridCity({ hasPoles: false }) });
     const tools = new ToolController();
     tools.hoverAt(2, 0.1);
-    expect(tools.view(first).card?.rows.find((r) => r.label === 'Poles')?.value).not.toMatch(/None/);
-    expect(tools.view(second).card?.rows.find((r) => r.label === 'Poles')?.value).toMatch(/None/);
+    expect(row(tools.view(first).card, 'Poles')).not.toMatch(/None/);
+    expect(row(tools.view(second).card, 'Poles')).toMatch(/None/);
   });
 });
 
@@ -267,7 +621,7 @@ describe('touch taps', () => {
     expect(state.network.spans).toEqual([]);
     const preview = tools.view(state);
     expect(preview.overlay.path?.segments).toEqual([0, 1]);
-    expect(preview.card?.rows.find((r) => r.label === 'Cost')?.value).toBe('$14,400');
+    expect(row(preview.card, 'Cost')).toBe(formatMoney(quoteCable(state, [0, 1], 'underground').cost));
     expect(preview.card?.hint).toBe('Tap this corner again to order');
 
     // A tap on a different corner moves the preview instead of ordering.
@@ -280,7 +634,7 @@ describe('touch taps', () => {
     expect(state.network.spans.map((s) => s.segment)).toEqual([0]);
   });
 
-  it('asks for a confirming tap before placing a cabinet or removing cable', () => {
+  it('asks for a confirming tap before placing a cabinet, adding a splitter or removing cable', () => {
     const state = game();
     const tools = new ToolController();
     const dispatch = dispatcher(state);
@@ -290,6 +644,13 @@ describe('touch taps', () => {
     expect(tools.view(state).card?.hint).toMatch(/^Tap again to place/);
     expect(tools.tap(state, dispatch, 4.1, 2.1)?.ok).toBe(true);
     expect(state.network.cabinets.map((c) => c.node)).toEqual([5]);
+
+    // The cabinet is now there: the next tap previews a splitter, the one after adds it.
+    expect(tools.tap(state, dispatch, 4.1, 2.1)).toBeNull();
+    expect(tools.view(state).card?.hint).toMatch(/^Tap again to add/);
+    expect(state.network.cabinets[0]!.splitters).toBe(1);
+    expect(tools.tap(state, dispatch, 4, 2)?.ok).toBe(true);
+    expect(state.network.cabinets[0]!.splitters).toBe(2);
 
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
     tools.setTool('remove');
@@ -319,5 +680,15 @@ describe('touch taps', () => {
     tools.hoverAt(4.3, 1.8);
     expect(tools.view(state).card?.hint).toMatch(/^Click to place/);
     expect(tools.click(state, dispatcher(state), 4.3, 1.8)?.ok).toBe(true);
+  });
+
+  it('says "lift your finger" while a finger draws', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('underground');
+    tools.touch = true;
+    tools.dragStart(state, 0, 0);
+    tools.dragMove(state, 4, 0);
+    expect(tools.view(state).card?.hint).toMatch(/^Lift your finger to order/);
   });
 });

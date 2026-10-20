@@ -13,10 +13,14 @@
 // Two containers: `below` (cables and markers) sits under the central office
 // so cables run in beneath it; `above` (cabinets) sits over it so a cabinet at
 // the CO stays visible.
+//
+// Cabinets carry a splitter-count badge, and a red ring while they are turning
+// signups away (Sales.fullCabinets). Live cable that reaches the CO but lies
+// beyond every cabinet's reach is washed out: it lights nothing.
 
-import { Container, Graphics } from 'pixi.js';
+import { Container, Graphics, Text } from 'pixi.js';
 import { polesOnSegment } from '../sim/streets';
-import type { CableMethod, CableSpan, City, GameState, NodeId, ServiceSnapshot } from '../sim/types';
+import type { CableMethod, CableSpan, CabinetId, City, GameState, NodeId, ServiceSnapshot } from '../sim/types';
 import { addDashes, highlightLine, midpoint, pointsAlong, segmentLine, strokeLines } from './shapes';
 import type { Line } from './shapes';
 import type { Theme } from './theme';
@@ -45,6 +49,9 @@ export class NetworkLayer {
   private readonly glow = new Graphics();
   private readonly markers = new Graphics();
   private readonly cabinets = new Graphics();
+  /** Splitter-count labels, one per cabinet, reused across redraws. */
+  private readonly badges = new Container();
+  private badgeTexts: Text[] = [];
   private constructing: { line: Line; method: CableMethod }[] = [];
   /** When each active cabinet was first seen active (performance.now ms), for this game. */
   private activeSince = new Map<number, number>();
@@ -57,12 +64,15 @@ export class NetworkLayer {
   /** Live spans drawn, and how many times the live cable has been redrawn (debug and test read-outs). */
   liveSpans = 0;
   liveRedraws = 0;
+  /** Live spans drawn washed out (connected to the CO, out of every cabinet's reach), and cabinets ringed as full. */
+  dimSpans = 0;
+  fullRings = 0;
 
   constructor(private readonly theme: Theme) {
     this.stripeGroup.addChild(this.stripes);
     this.glowGroup.addChild(this.glow);
     this.below.addChild(this.live, this.cables, this.stripeGroup, this.markers);
-    this.above.addChild(this.glowGroup, this.cabinets);
+    this.above.addChild(this.glowGroup, this.cabinets, this.badges);
   }
 
   sync(state: GameState, service: ServiceSnapshot, now = performance.now()): void {
@@ -116,6 +126,16 @@ export class NetworkLayer {
         strokeLines(this.live, shine, { width: Math.max(1.2, style.width * 0.3), color: style.highlight, cap: 'round' });
       }
       this.drawPoles(this.live, this.polesOf(city, byStage.live));
+    }
+
+    // Live cable that reaches the CO but no cabinet's reach lights nothing: wash it out.
+    this.dimSpans = 0;
+    for (const method of ['underground', 'aerial'] as const) {
+      const dim = byStage.live.filter(
+        (s) => s.method === method && service.connectedSegments.has(s.segment) && !service.litSegments.has(s.segment),
+      );
+      this.dimSpans += dim.length;
+      strokeLines(this.cables, dim.map(lineOf), { width: cable[method].width + 1.5, color: cable.dim.color, alpha: cable.dim.alpha, cap: 'round', join: 'round' });
     }
 
     // Peg poles carry every aerial span that is being built (live ones are drawn with the live cable).
@@ -231,17 +251,25 @@ export class NetworkLayer {
     const { cabinet } = this.theme;
     const g = this.cabinets;
     const s = cabinet.size;
+    const full = new Set<CabinetId>(state.sales?.fullCabinets ?? []);
+    this.fullRings = 0;
     for (const id of [...this.activeSince.keys()]) if (!service.activeCabinets.has(id)) this.activeSince.delete(id);
-    for (const cab of state.network.cabinets) {
+    state.network.cabinets.forEach((cab, i) => {
       const { x: cx, y: cy } = cabinetCenter(city, cab.node, this.theme);
       const x = cx - s / 2;
       const y = cy - s / 2;
       const active = service.activeCabinets.has(cab.id);
+      if (full.has(cab.id)) {
+        // Turning signups away: a red ring, so the player knows where to add a splitter.
+        g.roundRect(x - 5, y - 5, s + 10, s + 10, cabinet.radius + 5).stroke({ width: 3, color: cabinet.full });
+        this.fullRings++;
+      }
       g.roundRect(x + 1, y + 3, s, s, cabinet.radius).fill(this.theme.co.side);
       g.roundRect(x, y, s, s, cabinet.radius)
         .fill(active ? cabinet.body : cabinet.dimBody)
         .stroke({ width: 2.5, color: active ? cabinet.border : cabinet.dimBorder, alignment: 1 });
       g.circle(cx, cy, 3.4).fill(active ? cabinet.light : cabinet.dimLight);
+      this.drawBadge(i, cx + s / 2 - 1, cy - s / 2 + 1, cab.splitters);
       if (active) {
         this.glow.circle(cx, cy, s * 0.85).fill(cabinet.glow);
         if (!this.activeSince.has(cab.id)) {
@@ -250,6 +278,31 @@ export class NetworkLayer {
           this.glowSettled = false;
         }
       }
+    });
+    // Drop the labels of cabinets that are gone.
+    for (const text of this.badgeTexts.splice(state.network.cabinets.length)) text.destroy();
+  }
+
+  /** Dark disc on the cabinet's corner with its splitter count. */
+  private drawBadge(index: number, x: number, y: number, splitters: number): void {
+    const { cabinet, fonts } = this.theme;
+    const r = cabinet.badgeRadius;
+    this.cabinets.circle(x, y, r + 1.2).fill(cabinet.border);
+    this.cabinets.circle(x, y, r).fill(cabinet.badge);
+    let text = this.badgeTexts[index];
+    if (!text) {
+      text = new Text({
+        text: '',
+        style: { fontFamily: `${fonts.display}, ${fonts.ui}, sans-serif`, fontWeight: '700', fontSize: 10, fill: cabinet.badgeText },
+        // Rendered large so it stays crisp when zoomed in.
+        resolution: 4,
+      });
+      text.anchor.set(0.5);
+      this.badgeTexts[index] = text;
+      this.badges.addChild(text);
     }
+    const label = String(splitters);
+    if (text.text !== label) text.text = label;
+    text.position.set(x, y + 0.5);
   }
 }

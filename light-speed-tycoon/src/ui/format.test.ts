@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatDayRange, formatMoney, formatSignedMoney, formatStage, plural } from './format';
+import { formatDayRange, formatMaybeMoney, formatMoney, formatPercent, formatPerFt, formatSignedMoney, formatStage, plural } from './format';
 
 describe('format', () => {
   it('formats whole dollars with separators and a leading minus', () => {
@@ -23,5 +23,14 @@ describe('format', () => {
     expect(formatStage('permitting', 12)).toBe('Permitting, 12 days left');
     expect(formatStage('constructing', 1)).toBe('Under construction, 1 day left');
     expect(formatStage('live', 0)).toBe('Live');
+  });
+
+  it('formats per-foot rates, percents and missing KPIs', () => {
+    expect(formatPerFt(14.2)).toBe('$14.20/ft');
+    expect(formatPerFt(1234.5)).toBe('$1,234.50/ft');
+    expect(formatPercent(0.384)).toBe('38%');
+    expect(formatPercent(0)).toBe('0%');
+    expect(formatMaybeMoney(520.4)).toBe('$520');
+    expect(formatMaybeMoney(null)).toBe('–');
   });
 });

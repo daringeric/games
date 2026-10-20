@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { MARKETING_MAX_PER_MONTH, TIER_DEFAULTS } from './balance';
+import { isFirstOfMonth } from './calendar';
 import { applyCommand, newGame, runDays } from './game';
 import { getService } from './network';
+import { subscriberUnits } from './sales';
 import { deserialize, hashState, serialize } from './save';
 import { shortestPath } from './streets';
 import { makeGridCity } from './testing/fixtures';
@@ -135,5 +138,78 @@ describe('determinism', () => {
     expect(getService(a.state).litSegments.size).toBeGreaterThan(0);
     expect(deserialize(serialize(a.state))).toEqual(a.state);
     expect(hashState(generatedSession(100).state)).not.toBe(hashState(a.state));
+  });
+});
+
+// A sales-heavy session: apartment buildings and businesses on a small grid,
+// heavy marketing and prices above default so signups and churn both happen.
+const SALES_CITY = makeGridCity({
+  cols: 3,
+  rows: 3,
+  coAt: [1, 1],
+  parcelKinds: (p) => (p.id % 4 === 0 ? { kind: 'mdu', units: 16 } : p.id % 4 === 1 ? { kind: 'smb', units: 1 } : undefined),
+});
+const PRICIER = TIER_DEFAULTS.map((t) => ({ id: t.id, price: Math.round(t.price * 1.5), offered: true }));
+const SALES_SCRIPT: ReadonlyArray<Command | number> = [
+  { type: 'setMarketing', perMonth: Math.min(10_000, MARKETING_MAX_PER_MONTH) },
+  { type: 'placeCabinet', node: 5 },
+  { type: 'layCable', segments: [3, 4, 5, 6, 7, 8], method: 'underground' },
+  { type: 'layCable', segments: [16, 17, 18, 19, 20, 21, 22, 23], method: 'underground' },
+  80,
+  { type: 'setPricing', tiers: PRICIER, smbMultiplier: 2 },
+  { type: 'layCable', segments: [0, 1, 2, 9, 10, 11], method: 'aerial' },
+  100,
+  { type: 'setMarketing', perMonth: 2_000 },
+  150,
+];
+
+function salesSession(seed: number, steps: ReadonlyArray<Command | number> = SALES_SCRIPT): Session {
+  return play(newGame(seed, { city: SALES_CITY }), steps);
+}
+
+describe('determinism of sales', () => {
+  it('replays signups, installs and churn identically from the same seed', () => {
+    const a = salesSession(5);
+    const b = salesSession(5);
+    expect(a.results.every((r) => r.ok)).toBe(true);
+    expect(subscriberUnits(a.state)).toBeGreaterThan(20);
+    const churned = a.state.finance.reports.reduce((sum, r) => sum + (r.stats?.churned ?? 0), 0);
+    expect(churned).toBeGreaterThan(0);
+    expect(a.state.sales.routerParcels.length).toBeGreaterThan(0);
+    expect(a.state.sales).toEqual(b.state.sales);
+    expect(a.state.finance.reports).toEqual(b.state.finance.reports);
+    expect(hashState(a.state)).toBe(hashState(b.state));
+  });
+
+  it('diverges with a different sales stream, even on identical plant', () => {
+    const a = newGame(5, { city: SALES_CITY });
+    const b = newGame(5, { city: SALES_CITY });
+    b.rng.sales = (a.rng.sales ^ 0x9e3779b9) >>> 0;
+    play(a, SALES_SCRIPT);
+    play(b, SALES_SCRIPT);
+    // Same make-ready draws, so the network matches; who signs up does not.
+    expect(timeline(a)).toEqual(timeline(b));
+    expect(a.sales.accounts).not.toEqual(b.sales.accounts);
+  });
+
+  it('diverges for a different seed', () => {
+    expect(hashState(salesSession(5).state)).not.toBe(hashState(salesSession(6).state));
+  });
+
+  it('replays identically through a save and load in the middle of a month', () => {
+    const straight = salesSession(9);
+    // Stop mid-month with subscribers and a half-accrued bill.
+    const split = SALES_SCRIPT.indexOf(100);
+    const first = play(newGame(9, { city: SALES_CITY }), SALES_SCRIPT.slice(0, split));
+    expect(isFirstOfMonth(first.state.day)).toBe(false);
+    expect(subscriberUnits(first.state)).toBeGreaterThan(0);
+    expect(first.state.sales.month.revenueDollarDays).toBeGreaterThan(0);
+    expect(first.state.sales.month.marketingDollarDays).toBeGreaterThan(0);
+    const reloaded = deserialize(serialize(first.state));
+    expect(reloaded.sales.month).toEqual(first.state.sales.month);
+    const second = play(reloaded, SALES_SCRIPT.slice(split));
+    expect([...first.results, ...second.results]).toEqual(straight.results);
+    expect(second.state.finance.reports).toEqual(straight.state.finance.reports);
+    expect(hashState(second.state)).toBe(hashState(straight.state));
   });
 });

@@ -1,8 +1,15 @@
-// Pointer and keyboard input: camera pan/zoom and routing clicks to tools.
+// Pointer and keyboard input: camera pan/zoom and routing clicks, taps and
+// drags to tools.
 //
 // Panning: left-drag with the inspect tool, middle- or right-drag in any tool,
 // Space+drag in any tool, and one-finger drag on touch screens (a tap still
 // clicks). Wheel and pinch zoom around the cursor; +/- zoom around the centre.
+//
+// Drawing: in the cable tools a left-button press (or one finger) that starts
+// on a corner and moves past DRAG_SLOP draws a cable run along the streets
+// instead (dragStart/dragMove/dragEnd); releasing orders it. Esc, a right-click
+// or a second finger cancels the drag with no order. A press that doesn't move
+// is still a click or tap, so the click-by-click flow keeps working.
 //
 // Space toggles pause on a plain tap. A press made while it is held is a pan
 // (never a tool click) and cancels the pause toggle. Space still presses a
@@ -15,8 +22,12 @@ import type { Speed } from './session';
 import type { ToolId } from './tools';
 
 /** Movement (CSS px) before a press counts as a drag instead of a click. */
-const DRAG_SLOP = 6;
+export const DRAG_SLOP = 6;
 const KEY_ZOOM = 1.25;
+/** How near (CSS px) a press must start to a corner to draw from it, at least the tools' own pick radius. */
+const DRAW_PICK_PX = 18;
+/** ...but never more than this many map cells, however far out the map is zoomed. */
+const DRAW_PICK_MAX_CELLS = 1.2;
 
 export interface InputHandlers {
   /** Cursor moved over the map (grid units), or left it (null); `touch` when a finger moved. */
@@ -31,6 +42,21 @@ export interface InputHandlers {
   togglePause(): void;
   /** Esc with nothing to cancel on the map (closes menus). */
   escape(): void;
+  /**
+   * A left-button or one-finger press that began at `start` (grid units) moved
+   * past the slop: return true to draw from there (it began on a corner in a
+   * cable tool), false to leave it a pan (touch) or nothing (mouse). `pick` is
+   * a corner radius in grid units suited to the current zoom.
+   */
+  dragStart(start: { x: number; y: number }, pick: number, touch: boolean): boolean;
+  /** The drawing pointer moved (grid units, and screen position for the card). */
+  dragMove(grid: { x: number; y: number }, screen: { x: number; y: number }): void;
+  /** The drawing pointer was released at `grid`: order the run. */
+  dragEnd(grid: { x: number; y: number }, touch: boolean): void;
+  /** Esc, right-click, a second finger or a lost pointer: drop the drawing with no order. */
+  dragCancel(): void;
+  /** The O key: toggle the $/ft cost overlay. */
+  toggleOverlay(): void;
 }
 
 interface Press {
@@ -45,12 +71,17 @@ interface Press {
   touch: boolean;
   /** Space was held when the press began: it pans and never clicks. */
   space: boolean;
+  /** The press is drawing a cable run (dragStart said yes). */
+  drawing: boolean;
+  /** A drawing was cancelled mid-press: the release does nothing. */
+  cancelled: boolean;
 }
 
 /** Controls the browser presses with Space when they have keyboard focus. */
 const SPACE_CONTROLS = 'button, [role="menuitem"], a[href], summary, select';
 
 const TOOL_KEYS: Record<string, ToolId> = { i: 'inspect', a: 'aerial', u: 'underground', c: 'cabinet', x: 'remove' };
+const OVERLAY_KEY = 'o';
 const SPEED_KEYS: Record<string, Speed> = { '1': 1, '2': 2, '3': 4 };
 
 export class Input {
@@ -77,7 +108,11 @@ export class Input {
     canvas.addEventListener('pointercancel', this.onCancel);
     canvas.addEventListener('pointerleave', this.onLeave);
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    canvas.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      // A right-click while drawing (a chorded press reports no pointerdown) cancels it.
+      this.cancelDrawing();
+    });
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', () => {
@@ -103,7 +138,23 @@ export class Input {
   private updateCursor(): void {
     const panning = this.press?.pan && this.press.moved;
     const tool = this.handlers.currentTool();
-    this.canvas.style.cursor = panning ? 'grabbing' : this.spaceHeld || tool === 'inspect' ? 'grab' : 'crosshair';
+    this.canvas.style.cursor = panning ? 'grabbing' : this.press?.drawing ? 'crosshair' : this.spaceHeld || tool === 'inspect' ? 'grab' : 'crosshair';
+  }
+
+  /** Corner radius (grid units) for starting a drawing at the current zoom. */
+  private drawPick(): number {
+    return Math.min(DRAW_PICK_MAX_CELLS, DRAW_PICK_PX / (this.cell * this.camera.scale));
+  }
+
+  /** Drop a drawing in progress (no order); true if there was one. The press stays, inert, until released. */
+  private cancelDrawing(): boolean {
+    const press = this.press;
+    if (!press?.drawing) return false;
+    press.drawing = false;
+    press.cancelled = true;
+    this.handlers.dragCancel();
+    this.updateCursor();
+    return true;
   }
 
   private readonly onDown = (e: PointerEvent) => {
@@ -111,14 +162,19 @@ export class Input {
     if (e.pointerType === 'touch') {
       this.touches.set(e.pointerId, p);
       if (this.touches.size === 2) {
-        // Second finger: switch to pinch and drop the pending tap.
+        // Second finger: switch to pinch, cancel any drawing and drop the pending tap.
+        this.cancelDrawing();
         this.press = null;
         this.pinchDist = this.touchSpread().dist;
         return;
       }
     }
     if (this.press) return;
-    this.canvas.setPointerCapture(e.pointerId);
+    try {
+      this.canvas.setPointerCapture(e.pointerId);
+    } catch {
+      // A synthetic or already-released pointer can't be captured; the press still works.
+    }
     if (this.spaceHeld) this.spaceUsedForPan = true;
     const inspect = this.handlers.currentTool() === 'inspect';
     this.press = {
@@ -133,6 +189,8 @@ export class Input {
       moved: false,
       touch: e.pointerType === 'touch',
       space: this.spaceHeld,
+      drawing: false,
+      cancelled: false,
     };
     if (e.button === 1) e.preventDefault();
   };
@@ -148,13 +206,23 @@ export class Input {
     }
     const press = this.press;
     if (press && press.id === e.pointerId) {
+      // A right button pressed while the left one draws (a chorded press reports no pointerdown).
+      if (press.drawing && (e.buttons & 2) !== 0) this.cancelDrawing();
       if (!press.moved && Math.hypot(p.x - press.startX, p.y - press.startY) > DRAG_SLOP) {
         press.moved = true;
-        // A one-finger drag pans in every tool; a mouse drag only where panning was chosen.
-        if (press.touch) press.pan = true;
+        // Starting on a corner in a cable tool, a left-button or one-finger drag draws.
+        const canDraw = !press.pan && press.button === 0 && !press.space && !this.spaceHeld;
+        if (canDraw && this.handlers.dragStart(this.toGrid({ x: press.startX, y: press.startY }), this.drawPick(), press.touch)) {
+          press.drawing = true;
+        } else if (press.touch) {
+          // Otherwise a one-finger drag pans in every tool; a mouse drag only where panning was chosen.
+          press.pan = true;
+        }
         if (this.spaceHeld) this.spaceUsedForPan = true;
       }
-      if (press.pan && press.moved) {
+      if (press.drawing) {
+        this.handlers.dragMove(this.toGrid(p), p);
+      } else if (press.pan && press.moved) {
         this.camera.panBy(p.x - press.lastX, p.y - press.lastY);
       }
       press.lastX = p.x;
@@ -170,7 +238,10 @@ export class Input {
     if (!press || press.id !== e.pointerId) return;
     this.press = null;
     const p = this.local(e);
-    if (!press.moved) {
+    if (press.drawing) {
+      this.handlers.dragEnd(this.toGrid(p), press.touch);
+      this.handlers.hover(this.toGrid(p), p);
+    } else if (!press.moved && !press.cancelled) {
       if (press.button === 2) {
         this.handlers.cancel();
       } else if (press.button === 0 && !press.space && !this.spaceHeld) {
@@ -183,7 +254,10 @@ export class Input {
 
   private readonly onCancel = (e: PointerEvent) => {
     this.touches.delete(e.pointerId);
-    if (this.press?.id === e.pointerId) this.press = null;
+    if (this.press?.id === e.pointerId) {
+      this.cancelDrawing();
+      this.press = null;
+    }
     this.updateCursor();
   };
 
@@ -240,11 +314,19 @@ export class Input {
       }
       return;
     }
+    if (e.key === 'Escape' && this.cancelDrawing()) {
+      e.preventDefault();
+      return;
+    }
     if (e.repeat && key !== '+' && key !== '=' && key !== '-' && key !== '_') return;
     const tool = TOOL_KEYS[key];
     const speed = SPEED_KEYS[key];
-    if (tool) this.handlers.pickTool(tool);
-    else if (speed) this.handlers.setSpeed(speed);
+    if (tool) {
+      // Switching tools mid-drag drops the drawing.
+      this.cancelDrawing();
+      this.handlers.pickTool(tool);
+    } else if (speed) this.handlers.setSpeed(speed);
+    else if (key === OVERLAY_KEY) this.handlers.toggleOverlay();
     else if (key === '+' || key === '=') this.zoomCenter(KEY_ZOOM);
     else if (key === '-' || key === '_') this.zoomCenter(1 / KEY_ZOOM);
     else if (e.key === 'Escape') {

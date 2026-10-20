@@ -1,55 +1,6 @@
 import { expect, test } from '@playwright/test';
-import type { ConsoleMessage, Page } from '@playwright/test';
-
-// Web fonts come from Google Fonts; a sandbox or CI box without internet access
-// fails those requests, which is not an app error.
-function isFontNoise(msg: ConsoleMessage): boolean {
-  return /fonts\.(googleapis|gstatic)\.com/.test(msg.location().url);
-}
-
-async function nodeOnScreen(page: Page, node: number): Promise<{ x: number; y: number }> {
-  return page.evaluate((id) => {
-    const lst = window.__lst!;
-    const n = lst.getState().city.nodes[id]!;
-    return lst.worldToScreen(n.x, n.y);
-  }, node);
-}
-
-async function clickNode(page: Page, node: number): Promise<void> {
-  const p = await nodeOnScreen(page, node);
-  await page.mouse.click(p.x, p.y);
-}
-
-/** The best `length`-segment route out of the CO by homes fronting it, with every corner on open map. */
-async function routeFromCo(page: Page, length: 1 | 2): Promise<{ nodes: number[]; segments: number[]; score: number } | null> {
-  return page.evaluate((length) => {
-    const lst = window.__lst!;
-    const { city } = lst.getState();
-    const onCanvas = (id: number) => {
-      const n = city.nodes[id]!;
-      const p = lst.worldToScreen(n.x, n.y);
-      return document.elementFromPoint(p.x, p.y)?.tagName === 'CANVAS';
-    };
-    const fronting = (seg: number) => city.parcels.filter((p) => p.segment === seg && p.appearsDay === 0).length;
-    const next = (node: number) =>
-      city.segments.filter((s) => s.a === node || s.b === node).map((s) => ({ seg: s.id, to: s.a === node ? s.b : s.a }));
-    let best: { nodes: number[]; segments: number[]; score: number } | null = null;
-    const consider = (nodes: number[], segments: number[]) => {
-      if (!nodes.every(onCanvas)) return;
-      const score = segments.reduce((sum, seg) => sum + fronting(seg), 0);
-      if (!best || score > best.score) best = { nodes, segments, score };
-    };
-    for (const first of next(city.coNode)) {
-      if (length === 1) consider([city.coNode, first.to], [first.seg]);
-      else {
-        for (const second of next(first.to)) {
-          if (second.to !== city.coNode) consider([city.coNode, first.to, second.to], [first.seg, second.seg]);
-        }
-      }
-    }
-    return best;
-  }, length);
-}
+import type { Page } from '@playwright/test';
+import { clickNode, currentGame, isFontNoise, nodeOnScreen, open, routeFromCo, watchErrors } from './helpers';
 
 test('lay fiber from the CO, light homes, and see it in the HUD', async ({ page }) => {
   // Headless Chromium draws WebGL in software, so each map redraw is slow here.
@@ -60,8 +11,7 @@ test('lay fiber from the CO, light homes, and see it in the HUD', async ({ page 
   });
   page.on('pageerror', (err) => errors.push(err.message));
 
-  await page.goto('/?seed=12345');
-  await page.waitForFunction(() => window.__lst !== undefined);
+  await open(page, '/?seed=12345');
   await expect(page.locator('canvas')).toBeVisible();
   await expect(page.getByTestId('hud-date')).toHaveText('Jan 1, 2027');
   await page.getByRole('button', { name: 'Got it' }).click();
@@ -154,8 +104,7 @@ test.describe('on a phone', () => {
     });
     page.on('pageerror', (err) => errors.push(err.message));
 
-    await page.goto('/?seed=12345');
-    await page.waitForFunction(() => window.__lst !== undefined);
+    await open(page, '/?seed=12345');
     await page.getByRole('button', { name: 'Got it' }).tap();
     const route = await routeFromCo(page, 1);
     expect(route, 'a cable route out of the CO').not.toBeNull();
@@ -182,27 +131,6 @@ test.describe('on a phone', () => {
 
 // --- Regression tests -------------------------------------------------------
 
-function watchErrors(page: Page): string[] {
-  const errors: string[] = [];
-  page.on('console', (msg) => {
-    if (msg.type() === 'error' && !isFontNoise(msg)) errors.push(msg.text());
-  });
-  page.on('pageerror', (err) => errors.push(err.message));
-  return errors;
-}
-
-async function open(page: Page, url: string): Promise<void> {
-  await page.goto(url);
-  await page.waitForFunction(() => window.__lst !== undefined);
-}
-
-async function currentGame(page: Page): Promise<{ seed: number; day: number; name: string; cash: number; cabinets: number[] }> {
-  return page.evaluate(() => {
-    const s = window.__lst!.getState();
-    return { seed: s.seed, day: s.day, name: s.city.name, cash: s.finance.cash, cabinets: s.network.cabinets.map((c) => c.node) };
-  });
-}
-
 const speedOf = (page: Page) => page.locator('.speed[aria-pressed="true"]').getAttribute('data-speed');
 
 // Phones, tablets and narrow windows: every control must be on screen and on top.
@@ -226,7 +154,7 @@ for (const layout of LAYOUTS) {
       await page.evaluate(() => document.fonts.ready);
       const problems = await page.evaluate(() => {
         const out: string[] = [];
-        for (const el of document.querySelectorAll<HTMLElement>('.speed, .menu-button, .tool, .hint-close')) {
+        for (const el of document.querySelectorAll<HTMLElement>('.speed, .menu-button, .hud-action, .tool, .hint-close, .panel-toggle')) {
           const r = el.getBoundingClientRect();
           const label = el.getAttribute('aria-label') ?? el.textContent ?? el.className;
           if (r.left < 0 || r.top < 0 || r.right > window.innerWidth || r.bottom > window.innerHeight) {
@@ -277,7 +205,8 @@ test('a ?seed link keeps its own progress and never replaces the main game', asy
   await page.getByRole('dialog').getByRole('button', { name: 'Start a new town' }).click();
   await expect(page.getByRole('dialog')).toBeHidden();
   const fresh = await currentGame(page);
-  expect(new URL(page.url()).search).toBe('');
+  // ?seed is dropped; ?debug=1 stays so the reload below still has the hook.
+  expect(new URL(page.url()).search).toBe('?debug=1');
   await page.reload();
   await page.waitForFunction(() => window.__lst !== undefined);
   expect(await currentGame(page)).toEqual(fresh);
@@ -418,11 +347,11 @@ test('keyboard users can press buttons with Space and move through the menu', as
   await page.keyboard.press('ArrowDown');
   expect(await focused()).toBe('Save');
   await page.keyboard.press('End');
-  expect(await focused()).toBe('Import');
+  expect(await focused()).toBe('Rate card');
   await page.keyboard.press('ArrowDown');
   expect(await focused()).toBe('New game');
   await page.keyboard.press('ArrowUp');
-  expect(await focused()).toBe('Import');
+  expect(await focused()).toBe('Rate card');
   await page.keyboard.press('Home');
   expect(await focused()).toBe('New game');
   await page.keyboard.press('Escape');

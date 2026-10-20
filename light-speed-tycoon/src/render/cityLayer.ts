@@ -1,13 +1,17 @@
-// Static layers drawn once per city: the grass board, roads, trees, and the
-// pole overlay shown while planning aerial runs.
+// Static layers drawn once per city: the grass board, roads, rock stipple,
+// trees, the pole overlay shown while planning aerial runs, the stronger rock
+// texture shown while planning underground runs, and the $/ft cost overlay.
 
 import type { Graphics } from 'pixi.js';
+import { TILE_FT } from '../sim/balance';
+import { cppBand } from '../sim/metrics';
+import { segmentCostPerFt } from '../sim/network';
 import { polesOnSegment } from '../sim/streets';
-import type { City } from '../sim/types';
+import type { CableMethod, City, CppBand, StreetSegment } from '../sim/types';
 import type { Tree } from './decor';
 import type { Bounds } from './camera';
-import { mapExit, straightRuns, streetLattice } from './geometry';
-import { addCenteredDashes, disc, pointsAlong, segmentLine } from './shapes';
+import { hashInt, mapExit, straightRuns, streetLattice } from './geometry';
+import { addCenteredDashes, disc, pointsAlong, segmentLine, strokeLines } from './shapes';
 import type { Line } from './shapes';
 import type { Theme } from './theme';
 
@@ -136,4 +140,82 @@ export function drawPoleOverlay(g: Graphics, city: City, theme: Theme): void {
   if (pts.length > 0) g.fill(aerial.poleRim);
   for (const p of pts) disc(g, p.x, p.y, aerial.poleRadius - 1.3);
   if (pts.length > 0) g.fill(aerial.pole);
+}
+
+/**
+ * Stipple on rocky streets (StreetSegment.rock): a subtle scatter of grit
+ * across the road, or (`strong`) a denser, darker one for while the
+ * underground tool is active. Deterministic per segment. Returns the number of
+ * rock segments drawn.
+ */
+export function drawRock(g: Graphics, city: City, theme: Theme, strong: boolean): number {
+  const { road, rock } = theme;
+  const step = strong ? 6 : 8;
+  const size = strong ? 2.3 : 1.7;
+  const rows = strong ? [-0.66, -0.22, 0.22, 0.66] : [-0.5, 0.05, 0.55];
+  let count = 0;
+  for (const seg of city.segments) {
+    if (!seg.rock) continue;
+    count++;
+    const l = segmentLine(city, seg, theme);
+    const len = Math.hypot(l.bx - l.ax, l.by - l.ay);
+    if (len <= 0) continue;
+    const ux = (l.bx - l.ax) / len;
+    const uy = (l.by - l.ay) / len;
+    const half = road.width[seg.streetClass] / 2;
+    let i = 0;
+    for (let t = step / 2; t < len; t += step, i++) {
+      rows.forEach((row, k) => {
+        const h = hashInt(seg.id * 7919 + i * 31 + k);
+        // Staggered rows, nudged a little so the grit doesn't read as a grid.
+        const along = t + ((i + k) % 2 === 0 ? 0 : step / 2) + (((h & 0xff) / 255) - 0.5) * step * 0.5;
+        if (along <= 0 || along >= len) return;
+        const across = (row + ((((h >>> 8) & 0xff) / 255) - 0.5) * 0.18) * half;
+        const x = l.ax + ux * along - uy * across;
+        const y = l.ay + uy * along + ux * across;
+        g.rect(x - size / 2, y - size / 2, size, size);
+      });
+    }
+  }
+  if (count > 0) g.fill({ color: strong ? rock.strong : rock.stipple, alpha: strong ? rock.strongAlpha : rock.alpha });
+  return count;
+}
+
+/** What the $/ft overlay prices: one method, or per street the cheaper method it can be built with. */
+export type CostOverlayMode = CableMethod | 'cheapest';
+
+/**
+ * All-in $/ft for cabling `seg` under an overlay mode (network.segmentCostPerFt,
+ * before per-order fees); null where the method can't be built (aerial
+ * without poles).
+ */
+export function overlayCostPerFt(seg: StreetSegment, mode: CostOverlayMode): number | null {
+  if (mode !== 'cheapest') return segmentCostPerFt(seg, mode);
+  const under = segmentCostPerFt(seg, 'underground');
+  const aerial = segmentCostPerFt(seg, 'aerial');
+  if (aerial === null) return under;
+  if (under === null) return aerial;
+  return Math.min(aerial, under);
+}
+
+/** The overlay's color band for a street: cost per lot frontage ($/ft x TILE_FT) against the CPP target. */
+export function overlayBand(seg: StreetSegment, mode: CostOverlayMode): CppBand | null {
+  const perFt = overlayCostPerFt(seg, mode);
+  return perFt === null ? null : cppBand(perFt * TILE_FT);
+}
+
+/** Every street colored by its $/ft band (theme.cpp), or the "can't build" color. */
+export function drawCostOverlay(g: Graphics, city: City, theme: Theme, mode: CostOverlayMode): void {
+  const buckets: Record<CppBand | 'none', Line[]> = { green: [], amber: [], red: [], none: [] };
+  for (const seg of city.segments) buckets[overlayBand(seg, mode) ?? 'none'].push(segmentLine(city, seg, theme));
+  const { costOverlay } = theme;
+  for (const band of ['none', 'green', 'amber', 'red'] as const) {
+    strokeLines(g, buckets[band], {
+      width: costOverlay.width,
+      color: band === 'none' ? costOverlay.none : theme.cpp[band],
+      alpha: costOverlay.alpha,
+      cap: 'round',
+      join: 'round',
+    });
+  }
 }

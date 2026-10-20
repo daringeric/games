@@ -22,11 +22,16 @@ src/
     calendar.ts   day <-> date
     citygen.ts    procedural town
     streets.ts    street-graph queries (paths, picking)
-    network.ts    cable/cabinet orders, build pipeline, service (what's lit)
-    finance.ts    ledger and monthly close
+    network.ts    cable/cabinet/splitter/OLT orders, build pipeline, service (what's lit)
+    coverage.ts   cabinet reach and the placement preview
+    sales.ts      subscribers: signups, installs, ports, billing accruals, churn, pricing
+    finance.ts    ledger, monthly close, insolvency
+    metrics.ts    cost-per-passing bands and report KPIs
+    milestones.ts scorecard milestones
+    notices.ts    player-facing notices raised by the sim
     game.ts       newGame / applyCommand / tick
-    save.ts       serialize / deserialize
-    testing/      fixtures for unit tests
+    save.ts       serialize / deserialize, v1 -> v2 migration
+    testing/      fixtures for unit tests (incl. frozen schemaVersion 1 saves)
   render/       PixiJS scene drawing and themes
   ui/           HTML/CSS HUD, tools, input, storage
   main.ts       bootstrap
@@ -41,3 +46,5 @@ e2e/            Playwright tests
 - **Units:** feet, whole dollars, days. Day 0 is Jan 1, 2027.
 - **IDs:** nodes, segments and parcels have `id === index`. Spans and cabinets draw from `state.nextId`.
 - **Render reads, never writes.** Renderers take state and draw it. Input handlers turn pointer events into `Command`s.
+- **Deterministic math.** The sim uses arithmetic and `Math.sqrt` only (no `Math.pow`/`log`/`exp`/trig), so a seed and a command log replay identically on every engine.
+- **Balance is symbolic.** Tests reference `balance.ts` constants (or quote results), never literal dollar amounts, so tuning never breaks them.

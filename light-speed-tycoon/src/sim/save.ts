@@ -1,24 +1,54 @@
 // Save/load. Pure string <-> GameState; browser storage lives in the UI layer.
+//
+// This build writes schemaVersion 2 and reads 2 and 1. A version-1 save (round
+// 1, still in players' browsers as autosaves) is validated against the v1
+// shape, migrated with migrateV1toV2, then validated as v2.
+//
+// Owner after the round-2 contract: sim-economy workstream (migration tests
+// against the frozen v1 fixtures in testing/, new corruption cases, review).
 
-import { START_YEAR } from './balance';
+import { OLT_MAX_CARDS, OLT_PORTS_PER_CARD, START_YEAR } from './balance';
+import { deriveSeed } from './rng';
+import { newSales } from './sales';
 import type {
   BuildStage,
   CableMethod,
+  CableSpan,
   GameState,
   LedgerCategory,
+  LedgerEntry,
+  MilestoneId,
+  MonthlyStats,
+  NoticeKind,
   ParcelKind,
   PonTech,
   StreetClass,
+  TierId,
   Zone,
 } from './types';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const UINT32_MAX = 0xffffffff;
 /**
  * Largest map edge in cells a save may have: several times a generated town
  * (96 x 64), and small enough for the per-cell buffers the map is drawn from.
  */
 const MAX_MAP_CELLS = 512;
+/**
+ * Validation bounds are about what the sim can run without crashing or posting
+ * non-integer money, never about tunable rules (TIER_PRICE_MAX, OLT_MAX_CARDS,
+ * INSOLVENCY_GRACE_MONTHS, ...): saves outlive balance changes, and a save made
+ * under old rules must still load. Commands enforce the rules.
+ */
+const SANE_PRICE_MAX = 100_000;
+/**
+ * Most units one parcel may hold. Signups and churn loop per unit, so a
+ * corrupted million-unit building would stall every month close; generated
+ * apartment buildings have tens of units.
+ */
+const SANE_PARCEL_UNITS_MAX = 10_000;
+const SANE_MULTIPLIER_MAX = 100;
+const SANE_BUDGET_MAX = 1_000_000_000;
 
 export class SaveError extends Error {
   override name = 'SaveError';
@@ -31,7 +61,8 @@ export function serialize(state: GameState): string {
 
 /**
  * Parse and validate a save. Throws SaveError for malformed JSON, a missing or
- * unsupported schemaVersion, or a structurally invalid state.
+ * unsupported schemaVersion, or a structurally invalid state. A schemaVersion 1
+ * save is migrated to the current version.
  */
 export function deserialize(json: string): GameState {
   let raw: unknown;
@@ -44,12 +75,18 @@ export function deserialize(json: string): GameState {
   if (!('schemaVersion' in raw)) {
     throw new SaveError(`Save has no schemaVersion (this build reads version ${SCHEMA_VERSION})`);
   }
+  if (raw.schemaVersion === 1) {
+    checkState(raw, 1);
+    const migrated = migrateV1toV2(raw);
+    checkState(migrated as unknown as Json, 2);
+    return migrated;
+  }
   if (raw.schemaVersion !== SCHEMA_VERSION) {
     throw new SaveError(
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
-  checkState(raw);
+  checkState(raw, 2);
   return raw as unknown as GameState;
 }
 
@@ -69,12 +106,107 @@ export function fnv1a(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn a parsed, v1-valid save into a v2 GameState (the input object is not
+ * reused). Players keep their town, plant, cash, ledger and reports:
+ * - rng.sales = deriveSeed(seed, 'sales'); rng.events kept, so make-ready
+ *   draws continue exactly as before.
+ * - olt.cards = ceil(ponPorts / OLT_PORTS_PER_CARD), clamped to 0..OLT_MAX_CARDS
+ *   (ponPorts itself is kept: it stays the authoritative capacity).
+ * - every span gets refundable = cost (v1 orders had no fees or make-ready).
+ * - network.makeReady = [] (v1 draws were not remembered).
+ * - finance.capex.osp = everything v1 ever spent net of refunds: -(sum of the
+ *   construction, equipment and refund totals of every report plus the open
+ *   month's entries), floored at 0; connect = co = 0 (v1 had neither).
+ * - negativeMonths = 0; reports keep no `stats` (shown as "-").
+ * - sales = newSales() (no subscribers yet; signups start on the next day
+ *   for homes that are already passed), no milestones, notices or game over.
+ * Keys are written in newGame's order so migrated and fresh saves hash alike.
+ */
+export function migrateV1toV2(v1: Record<string, unknown>): GameState {
+  const old = v1 as unknown as V1State;
+  const capexCategories: readonly LedgerCategory[] = ['construction', 'equipment', 'refund'];
+  let spent = 0;
+  for (const report of old.finance.reports) {
+    for (const category of capexCategories) spent -= report.totals[category] ?? 0;
+  }
+  for (const entry of old.finance.monthToDate) if (capexCategories.includes(entry.category)) spent -= entry.amount;
+
+  return {
+    schemaVersion: 2,
+    seed: old.seed,
+    day: old.day,
+    rng: { events: old.rng.events, sales: deriveSeed(old.seed, 'sales') },
+    nextId: old.nextId,
+    city: old.city,
+    network: {
+      spans: old.network.spans.map((s) => ({
+        id: s.id,
+        segment: s.segment,
+        method: s.method,
+        stage: s.stage,
+        stageDaysLeft: s.stageDaysLeft,
+        constructDays: s.constructDays,
+        cost: s.cost,
+        refundable: s.cost,
+        orderedDay: s.orderedDay,
+        liveDay: s.liveDay,
+      })),
+      cabinets: old.network.cabinets,
+      olt: {
+        ponPorts: old.network.olt.ponPorts,
+        cards: Math.min(OLT_MAX_CARDS, Math.ceil(old.network.olt.ponPorts / OLT_PORTS_PER_CARD)),
+        tech: old.network.olt.tech,
+      },
+      makeReady: [],
+      version: old.network.version,
+    },
+    finance: {
+      cash: old.finance.cash,
+      monthToDate: old.finance.monthToDate,
+      reports: old.finance.reports,
+      capex: { osp: Math.max(0, spent), connect: 0, co: 0 },
+      negativeMonths: 0,
+    },
+    sales: newSales(),
+    milestones: [],
+    notices: [],
+    nextNoticeId: 1,
+    gameOver: null,
+  };
+}
+
+/** The v1 shape, as far as the migration reads it (already validated by checkState(_, 1)). */
+interface V1State {
+  seed: number;
+  day: number;
+  rng: { events: number };
+  nextId: number;
+  city: GameState['city'];
+  network: {
+    spans: Omit<CableSpan, 'refundable'>[];
+    cabinets: GameState['network']['cabinets'];
+    olt: { ponPorts: number; tech: PonTech };
+    version: number;
+  };
+  finance: {
+    cash: number;
+    monthToDate: LedgerEntry[];
+    reports: { year: number; month: number; totals: Partial<Record<LedgerCategory, number>>; net: number; cashEnd: number; passings: number }[];
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Structural validation. Everything the sim indexes by, divides by or formats
 // is checked here, so a corrupted or hand-edited save fails on load with a
 // message naming the bad field instead of crashing mid-game.
 // ---------------------------------------------------------------------------
 
 type Json = Record<string, unknown>;
+type Version = 1 | 2;
 
 /** Keys of an exhaustive record: adding a union member is a compile error until it is listed. */
 function members<T extends string>(record: Record<T, true>): readonly T[] {
@@ -87,16 +219,52 @@ const PARCEL_KINDS = members<ParcelKind>({ home: true, mdu: true, smb: true });
 const CABLE_METHODS = members<CableMethod>({ aerial: true, underground: true });
 const BUILD_STAGES = members<BuildStage>({ permitting: true, constructing: true, live: true });
 const PON_TECHS = members<PonTech>({ gpon: true, xgspon: true });
+const TIER_IDS = members<TierId>({ fiber500: true, fiber1g: true, fiber2g: true });
+const MILESTONE_IDS = members<MilestoneId>({
+  firstLight: true,
+  passings1000UnderTarget: true,
+  subscribers100: true,
+  cashFlowPositive: true,
+  subscribers1000: true,
+  takeRate30: true,
+});
+const NOTICE_KINDS = members<NoticeKind>({
+  cabinetFull: true,
+  serviceLost: true,
+  oltFull: true,
+  insolvencyWarning: true,
+  gameOver: true,
+  milestone: true,
+});
 const LEDGER_CATEGORIES = members<LedgerCategory>({
   construction: true,
   equipment: true,
+  install: true,
   refund: true,
   poleRent: true,
   revenue: true,
+  overhead: true,
   payroll: true,
   marketing: true,
   interest: true,
   other: true,
+});
+/** Categories a schemaVersion 1 save can contain. */
+const V1_LEDGER_CATEGORIES: readonly LedgerCategory[] = LEDGER_CATEGORIES.filter((c) => c !== 'install' && c !== 'overhead');
+const STATS_FIELDS = members<keyof MonthlyStats>({
+  subscribers: true,
+  accounts: true,
+  subscriberDays: true,
+  grossAdds: true,
+  churned: true,
+  lostService: true,
+  connectsTotal: true,
+  capexOsp: true,
+  capexConnect: true,
+  capexCo: true,
+  ponPortsUsed: true,
+  ponPorts: true,
+  fullCabinets: true,
 });
 
 function isRecord(value: unknown): value is Json {
@@ -156,6 +324,14 @@ function positive(value: unknown, path: string): number {
   return value;
 }
 
+/** Finite number in [min, max]. */
+function num(value: unknown, path: string, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
+    expected(path, `a number in ${min}..${max}`, value);
+  }
+  return value;
+}
+
 function oneOf<T extends string>(value: unknown, path: string, options: readonly T[]): T {
   if (!options.includes(value as T)) expected(path, `one of ${options.map((o) => `"${o}"`).join(', ')}`, value);
   return value as T;
@@ -172,19 +348,42 @@ function ref(value: unknown, path: string, count: number, what: string): number 
   return int(value, path, 0, count - 1);
 }
 
+/** Each value strictly greater than the one before (sorted, no duplicates). */
+function ascending(values: readonly number[], path: string): void {
+  for (let i = 1; i < values.length; i++) {
+    if ((values[i] as number) <= (values[i - 1] as number)) {
+      corrupt(`${path}[${i}]`, `should be greater than the entry before it (${values[i - 1]}), got ${values[i]}`);
+    }
+  }
+}
+
 interface CityShape {
   nodes: number;
   segments: number;
+  parcels: readonly { kind: ParcelKind; units: number }[];
 }
 
-function checkState(save: Json): void {
+interface Context {
+  version: Version;
+  day: number;
+  nextId: number;
+  city: CityShape;
+}
+
+function checkState(save: Json, version: Version): void {
   int(save.seed, 'seed', 0, UINT32_MAX);
-  int(save.day, 'day', 0);
-  int(obj(save.rng, 'rng').events, 'rng.events', 0, UINT32_MAX);
+  const day = int(save.day, 'day', 0);
+  const rng = obj(save.rng, 'rng');
+  int(rng.events, 'rng.events', 0, UINT32_MAX);
+  if (version === 2) int(rng.sales, 'rng.sales', 0, UINT32_MAX);
   const nextId = int(save.nextId, 'nextId', 1);
   const city = checkCity(obj(save.city, 'city'));
-  checkNetwork(obj(save.network, 'network'), city, nextId);
-  checkFinance(obj(save.finance, 'finance'));
+  const ctx: Context = { version, day, nextId, city };
+  checkNetwork(obj(save.network, 'network'), ctx);
+  checkFinance(obj(save.finance, 'finance'), ctx);
+  if (version === 1) return;
+  checkSales(obj(save.sales, 'sales'), ctx);
+  checkProgress(save, ctx);
 }
 
 function checkCity(city: Json): CityShape {
@@ -227,11 +426,11 @@ function checkCity(city: Json): CityShape {
     oneOf(seg.zone, `${path}.zone`, ZONES);
   });
 
-  list(city.parcels, 'city.parcels').forEach((value, i) => {
+  const parcels = list(city.parcels, 'city.parcels').map((value, i) => {
     const path = `city.parcels[${i}]`;
     const parcel = obj(value, path);
     indexId(parcel.id, `${path}.id`, i);
-    oneOf(parcel.kind, `${path}.kind`, PARCEL_KINDS);
+    const kind = oneOf(parcel.kind, `${path}.kind`, PARCEL_KINDS);
     ref(parcel.segment, `${path}.segment`, segments.length, 'segment');
     const x = int(parcel.x, `${path}.x`, 0, width - 1);
     const y = int(parcel.y, `${path}.y`, 0, height - 1);
@@ -240,13 +439,14 @@ function checkCity(city: Json): CityShape {
     if (x + w > width || y + h > height) {
       corrupt(path, `runs off the ${width} x ${height} map (cells ${x}..${x + w - 1} x ${y}..${y + h - 1})`);
     }
-    int(parcel.units, `${path}.units`, 0);
+    const units = int(parcel.units, `${path}.units`, 0, SANE_PARCEL_UNITS_MAX);
     int(parcel.appearsDay, `${path}.appearsDay`, 0);
     oneOf(parcel.zone, `${path}.zone`, ZONES);
+    return { kind, units };
   });
 
   ref(city.coNode, 'city.coNode', nodes.length, 'node');
-  return { nodes: nodes.length, segments: segments.length };
+  return { nodes: nodes.length, segments: segments.length, parcels };
 }
 
 /** Fields spans and cabinets share; returns the stage. */
@@ -264,7 +464,8 @@ function checkBuildable(asset: Json, path: string, nextId: number, usedIds: Set<
   return stage;
 }
 
-function checkNetwork(network: Json, city: CityShape, nextId: number): void {
+function checkNetwork(network: Json, ctx: Context): void {
+  const { city, nextId, version } = ctx;
   const usedIds = new Set<number>();
 
   const cabled = new Set<number>();
@@ -277,6 +478,7 @@ function checkNetwork(network: Json, city: CityShape, nextId: number): void {
     cabled.add(segment);
     oneOf(span.method, `${path}.method`, CABLE_METHODS);
     int(span.constructDays, `${path}.constructDays`, 1);
+    if (version === 2) int(span.refundable, `${path}.refundable`, 0, span.cost as number);
   });
 
   const cabinetNodes = new Set<number>();
@@ -292,18 +494,35 @@ function checkNetwork(network: Json, city: CityShape, nextId: number): void {
 
   const olt = obj(network.olt, 'network.olt');
   int(olt.ponPorts, 'network.olt.ponPorts', 0);
+  if (version === 2) int(olt.cards, 'network.olt.cards', 0);
   oneOf(olt.tech, 'network.olt.tech', PON_TECHS);
+
+  if (version === 2) {
+    const keys: number[] = [];
+    list(network.makeReady, 'network.makeReady').forEach((value, i) => {
+      const path = `network.makeReady[${i}]`;
+      const memo = obj(value, path);
+      const segment = ref(memo.segment, `${path}.segment`, city.segments, 'segment');
+      const method = oneOf(memo.method, `${path}.method`, CABLE_METHODS);
+      int(memo.days, `${path}.days`, 1);
+      int(memo.drawnDay, `${path}.drawnDay`, 0, ctx.day);
+      keys.push(segment * 2 + (method === 'aerial' ? 0 : 1));
+    });
+    // Sorted by segment then method, one memo per pair.
+    ascending(keys, 'network.makeReady');
+  }
   int(network.version, 'network.version', 0);
 }
 
-function checkFinance(finance: Json): void {
+function checkFinance(finance: Json, ctx: Context): void {
+  const categories = ctx.version === 2 ? LEDGER_CATEGORIES : V1_LEDGER_CATEGORIES;
   int(finance.cash, 'finance.cash');
 
   list(finance.monthToDate, 'finance.monthToDate').forEach((value, i) => {
     const path = `finance.monthToDate[${i}]`;
     const entry = obj(value, path);
     int(entry.day, `${path}.day`, 0);
-    oneOf(entry.category, `${path}.category`, LEDGER_CATEGORIES);
+    oneOf(entry.category, `${path}.category`, categories);
     int(entry.amount, `${path}.amount`);
     str(entry.memo, `${path}.memo`);
   });
@@ -315,11 +534,119 @@ function checkFinance(finance: Json): void {
     int(report.month, `${path}.month`, 1, 12);
     const totals = obj(report.totals, `${path}.totals`);
     for (const [category, total] of Object.entries(totals)) {
-      oneOf(category, `${path}.totals key`, LEDGER_CATEGORIES);
+      oneOf(category, `${path}.totals key`, categories);
       int(total, `${path}.totals.${category}`);
     }
     int(report.net, `${path}.net`);
     int(report.cashEnd, `${path}.cashEnd`);
     int(report.passings, `${path}.passings`, 0);
+    if (ctx.version === 2 && report.stats !== undefined) {
+      const stats = obj(report.stats, `${path}.stats`);
+      for (const field of STATS_FIELDS) int(stats[field], `${path}.stats.${field}`, 0);
+    }
   });
+
+  if (ctx.version === 1) return;
+  const capex = obj(finance.capex, 'finance.capex');
+  int(capex.osp, 'finance.capex.osp', 0);
+  int(capex.connect, 'finance.capex.connect', 0);
+  int(capex.co, 'finance.capex.co', 0);
+  int(finance.negativeMonths, 'finance.negativeMonths', 0);
+}
+
+function checkSales(sales: Json, ctx: Context): void {
+  const { city, day, nextId } = ctx;
+
+  const pricing = obj(sales.pricing, 'sales.pricing');
+  const tiers = list(pricing.tiers, 'sales.pricing.tiers');
+  if (tiers.length !== TIER_IDS.length) {
+    corrupt('sales.pricing.tiers', `should list the ${TIER_IDS.length} tiers ${TIER_IDS.join(', ')}, got ${tiers.length}`);
+  }
+  let offered = 0;
+  tiers.forEach((value, i) => {
+    const path = `sales.pricing.tiers[${i}]`;
+    const tier = obj(value, path);
+    const id = TIER_IDS[i] as TierId;
+    if (tier.id !== id) expected(`${path}.id`, `"${id}"`, tier.id);
+    str(tier.name, `${path}.name`);
+    int(tier.downMbps, `${path}.downMbps`, 1);
+    int(tier.upMbps, `${path}.upMbps`, 1);
+    int(tier.price, `${path}.price`, 1, SANE_PRICE_MAX);
+    if (bool(tier.offered, `${path}.offered`)) offered++;
+  });
+  if (offered === 0) corrupt('sales.pricing.tiers', 'should offer at least one tier');
+  num(pricing.smbMultiplier, 'sales.pricing.smbMultiplier', 0.01, SANE_MULTIPLIER_MAX);
+  int(sales.marketingPerMonth, 'sales.marketingPerMonth', 0, SANE_BUDGET_MAX);
+
+  const parcelsWithService: number[] = [];
+  list(sales.accounts, 'sales.accounts').forEach((value, i) => {
+    const path = `sales.accounts[${i}]`;
+    const account = obj(value, path);
+    const parcel = ref(account.parcel, `${path}.parcel`, city.parcels.length, 'parcel');
+    parcelsWithService.push(parcel);
+    // A removed cabinet's subscribers stay until the next daily step drops
+    // them, so the id need not exist, only have been issued.
+    int(account.cabinet, `${path}.cabinet`, 1, nextId - 1);
+    const tierUnits = obj(account.tierUnits, `${path}.tierUnits`);
+    for (const key of Object.keys(tierUnits)) oneOf(key, `${path}.tierUnits key`, TIER_IDS);
+    let units = 0;
+    for (const id of TIER_IDS) units += int(tierUnits[id], `${path}.tierUnits.${id}`, 0);
+    const { units: capacity, kind } = city.parcels[parcel] as { units: number; kind: ParcelKind };
+    if (units < 1 || units > capacity) {
+      corrupt(`${path}.tierUnits`, `should add up to 1..${capacity} units (parcel ${parcel} has ${capacity}), got ${units}`);
+    }
+    // Homes and businesses are one household or business each.
+    if (kind !== 'mdu' && units !== 1) corrupt(`${path}.tierUnits`, `should add up to 1 unit for a ${kind}, got ${units}`);
+    int(account.since, `${path}.since`, 0, day);
+  });
+  ascending(parcelsWithService, 'sales.accounts (by parcel)');
+
+  const routers = list(sales.routerParcels, 'sales.routerParcels').map((value, i) => {
+    const path = `sales.routerParcels[${i}]`;
+    const parcel = ref(value, path, city.parcels.length, 'parcel');
+    if (city.parcels[parcel]?.kind !== 'mdu') corrupt(path, `refers to parcel ${parcel}, which is not an apartment building`);
+    return parcel;
+  });
+  ascending(routers, 'sales.routerParcels');
+  int(sales.connectsTotal, 'sales.connectsTotal', 0);
+  const full = list(sales.fullCabinets, 'sales.fullCabinets').map((value, i) => int(value, `sales.fullCabinets[${i}]`, 1, nextId - 1));
+  ascending(full, 'sales.fullCabinets');
+
+  const month = obj(sales.month, 'sales.month');
+  for (const field of ['revenueDollarDays', 'marketingDollarDays', 'subscriberUnitDays', 'grossAdds', 'lostService'] as const) {
+    int(month[field], `sales.month.${field}`, 0);
+  }
+}
+
+function checkProgress(save: Json, ctx: Context): void {
+  const seen = new Set<string>();
+  list(save.milestones, 'milestones').forEach((value, i) => {
+    const path = `milestones[${i}]`;
+    const record = obj(value, path);
+    const id = oneOf(record.id, `${path}.id`, MILESTONE_IDS);
+    if (seen.has(id)) corrupt(`${path}.id`, `"${id}" is listed twice`);
+    seen.add(id);
+    int(record.day, `${path}.day`, 0, ctx.day);
+  });
+
+  const nextNoticeId = int(save.nextNoticeId, 'nextNoticeId', 1);
+  const ids = list(save.notices, 'notices').map((value, i) => {
+    const path = `notices[${i}]`;
+    const notice = obj(value, path);
+    const id = int(notice.id, `${path}.id`, 1, nextNoticeId - 1);
+    int(notice.day, `${path}.day`, 0, ctx.day);
+    oneOf(notice.kind, `${path}.kind`, NOTICE_KINDS);
+    str(notice.message, `${path}.message`);
+    if (notice.cabinet !== null) int(notice.cabinet, `${path}.cabinet`, 1, ctx.nextId - 1);
+    if (notice.milestone !== null) oneOf(notice.milestone, `${path}.milestone`, MILESTONE_IDS);
+    return id;
+  });
+  ascending(ids, 'notices (by id)');
+
+  if (save.gameOver !== null) {
+    const over = obj(save.gameOver, 'gameOver');
+    int(over.day, 'gameOver.day', 0, ctx.day);
+    oneOf(over.reason, 'gameOver.reason', ['insolvent'] as const);
+    str(over.message, 'gameOver.message');
+  }
 }

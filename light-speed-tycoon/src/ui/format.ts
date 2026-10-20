@@ -59,3 +59,18 @@ const STAGE_LABEL: Record<BuildStage, string> = {
 export function formatStage(stage: BuildStage, daysLeft: number): string {
   return stage === 'live' ? STAGE_LABEL.live : `${STAGE_LABEL[stage]}, ${plural(daysLeft, 'day')} left`;
 }
+
+/** Dollars per foot with cents: 14.2 -> "$14.20/ft". */
+export function formatPerFt(dollarsPerFt: number): string {
+  return `$${dollarsPerFt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/ft`;
+}
+
+/** A 0..1 fraction as a whole percent: 0.384 -> "38%". */
+export function formatPercent(fraction: number): string {
+  return `${Math.round(fraction * 100)}%`;
+}
+
+/** A KPI that may be missing (no passings, a v1-era report): whole dollars or an en dash. */
+export function formatMaybeMoney(amount: number | null): string {
+  return amount === null ? '–' : formatMoney(amount);
+}

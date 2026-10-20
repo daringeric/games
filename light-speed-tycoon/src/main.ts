@@ -1,53 +1,45 @@
-// Entry point: boot the game, wire the scene, camera, HUD, tools and input,
-// and run the frame loop.
+// Entry point: boot the game, wire the scene, camera, HUD, map controls and
+// menus, and run the frame loop.
+//
+// Owner: ui-economy workstream. Map interaction (tools, input, map panels)
+// lives behind MapControls (ui-build-tools); this file only places its DOM and
+// calls it each frame.
 
 import './ui/style.css';
+import './ui/mapTools.css';
 import { Application } from 'pixi.js';
-import { formatMonth } from './sim/calendar';
 import { newGame } from './sim/game';
-import type { Command, CommandResult, GameState } from './sim/types';
+import type { GameState } from './sim/types';
 import { Camera } from './render/camera';
 import type { Insets } from './render/camera';
 import { Scene } from './render/scene';
 import { toyTown } from './render/theme';
 import type { Theme } from './render/theme';
-import { el } from './ui/dom';
-import { formatNumber, formatSignedMoney } from './ui/format';
-import { Hud } from './ui/hud';
-import { Input } from './ui/input';
 import { confirmDialog } from './ui/confirm';
+import { installDebugHook, searchWithoutSeed } from './ui/debugHook';
+import { el } from './ui/dom';
+import { GameOverDialog } from './ui/gameOverDialog';
+import { Hud } from './ui/hud';
+import { MapControls } from './ui/mapControls';
 import { Menu } from './ui/menu';
-import { FloatingCard, HintCard, Toasts } from './ui/overlays';
-import { ReportPanel } from './ui/panel';
+import { MilestonesPanel } from './ui/milestonesPanel';
+import { HintCard, Toasts, noticeTone } from './ui/overlays';
+import { ReportPanel, monthClosedMessage } from './ui/panel';
+import { PricingPanel } from './ui/pricingPanel';
+import { RateCard } from './ui/rateCard';
 import { GameSession } from './ui/session';
-import type { Speed } from './ui/session';
-import { AUTOSAVE_KEY, SAVE_KEY, SEED_AUTOSAVE_KEY, exportSave, importSave, readSave, removeSave, writeSave } from './ui/storage';
+import {
+  AUTOSAVE_KEY,
+  SAVE_KEY,
+  SEED_AUTOSAVE_KEY,
+  exportSave,
+  hasSave,
+  importSave,
+  readSave,
+  removeSave,
+  writeSave,
+} from './ui/storage';
 import { applyThemeCss } from './ui/themeCss';
-import { Toolbar } from './ui/toolbar';
-import { ToolController } from './ui/tools';
-import type { ToolId } from './ui/tools';
-
-/** Test and debugging hook. Coordinates are map grid units and CSS client pixels. */
-interface DebugHook {
-  getState(): GameState;
-  dispatch(cmd: Command): CommandResult;
-  tick(days?: number): void;
-  setSpeed(speed: Speed): void;
-  worldToScreen(x: number, y: number): { x: number; y: number };
-  screenToWorld(x: number, y: number): { x: number; y: number };
-  /**
-   * Frame-loop counters (animation frames run, and how many of them drew the
-   * map) and what the map shows: lots drawn as passed, live spans drawn, and
-   * how many times the live cable was redrawn.
-   */
-  stats(): { frames: number; renders: number; passedLots: number; liveSpans: number; liveRedraws: number };
-}
-
-declare global {
-  interface Window {
-    __lst?: DebugHook;
-  }
-}
 
 const HINT = 'Lay fiber out from the CO, then drop a cabinet to light homes.';
 
@@ -131,21 +123,31 @@ async function boot(): Promise<void> {
 
   const scene = new Scene(app, theme);
   const camera = new Camera();
-  const tools = new ToolController();
   const toasts = new Toasts();
-  const card = new FloatingCard();
   const hint = new HintCard(HINT);
-  const hud = new Hud(session);
+  const pricing = new PricingPanel(session, toasts);
+  const milestones = new MilestonesPanel(() => session.state);
+  const rateCard = new RateCard();
+  const gameOver = new GameOverDialog();
+  const hud = new Hud(session, { pricing: () => pricing.open(), milestones: () => milestones.open() });
   const panel = new ReportPanel();
-  const toolbar = new Toolbar((tool) => pickTool(tool));
-  root.append(hud.root, toolbar.root, panel.root, hint.root, toasts.root, card.root);
+  const controls = new MapControls({ canvas: app.canvas, camera, theme, scene, session, toasts, hint });
+  const toolbar = controls.toolbar;
+  root.append(hud.root, toolbar.root, panel.root, hint.root, toasts.root, controls.card.root);
+
+  // Cards that sit under the HUD (the tip, the short-screen toolbar, the menu) follow its height.
+  const publishHudBottom = () =>
+    document.documentElement.style.setProperty('--hud-bottom', `${Math.round(hud.root.getBoundingClientRect().bottom)}px`);
+  hud.update(session);
+  publishHudBottom();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(publishHudBottom).observe(hud.root);
 
   const autosave = () => writeSave(autosaveKey, session.state);
   /**
    * Put a new, loaded or imported game in play; false if it can't be shown, in
    * which case the current game stays and a toast says why. The game in play
-   * becomes the main one: ?seed is dropped so a reload resumes it from the
-   * main autosave.
+   * becomes the main one: ?seed is dropped (debug=1 stays) so a reload resumes
+   * it from the main autosave.
    */
   const replaceGame = (state: GameState, message: string): boolean => {
     const previous = session.state;
@@ -156,21 +158,30 @@ async function boot(): Promise<void> {
       toasts.show(`Could not open that game: ${err instanceof Error ? err.message : String(err)}`, false);
       return false;
     }
-    window.history.replaceState(null, '', window.location.pathname);
+    window.history.replaceState(null, '', `${window.location.pathname}${searchWithoutSeed(window.location.search)}`);
     autosaveKey = AUTOSAVE_KEY;
     toasts.show(message, true);
     return true;
   };
+  const startNewTown = () => {
+    if (replaceGame(newGame(randomSeed()), 'A new town to wire up!')) autosave();
+  };
+  const loadSave = (saved: GameState) => replaceGame(saved, 'Saved game loaded');
   /** Ask before anything replaces the town in play; it is autosaved over, so there's no undo. */
   const confirmReplace = (confirmLabel: string, detail: string) =>
     confirmDialog({ title: `Replace ${session.state.city.name}?`, detail, confirmLabel });
   const menu = new Menu(hud.menuButton, {
     newGame: () => {
       void confirmReplace('Start a new town', 'Your current town will be replaced by a fresh one. Save or export first if you want to come back to it.').then((yes) => {
-        if (yes && replaceGame(newGame(randomSeed()), 'A new town to wire up!')) autosave();
+        if (yes) startNewTown();
       });
     },
     save: () => {
+      // A bankrupt town would overwrite the save the game-over dialog offers to go back to.
+      if (session.isOver) {
+        toasts.show('This town is bankrupt, so it was not saved over your last save. Export it to keep it.', 'warn');
+        return;
+      }
       const ok = writeSave(SAVE_KEY, session.state);
       toasts.show(ok ? 'Game saved' : 'Could not save: browser storage is unavailable', ok);
     },
@@ -181,7 +192,7 @@ async function boot(): Promise<void> {
         return;
       }
       void confirmReplace('Load saved game', `Your current town will be replaced by your last save (${saved.city.name}).`).then((yes) => {
-        if (yes) replaceGame(saved, 'Saved game loaded');
+        if (yes) loadSave(saved);
       });
     },
     exportFile: () => exportSave(session.state),
@@ -194,8 +205,34 @@ async function boot(): Promise<void> {
         (err: unknown) => toasts.show(`Could not import: ${err instanceof Error ? err.message : 'unreadable file'}`, false),
       );
     },
+    rateCard: () => rateCard.open(),
   });
   hud.root.append(menu.root);
+
+  /** The game in play has ended: stop everything and offer a way on. */
+  const showGameOver = () => {
+    const over = session.state.gameOver;
+    if (!over) {
+      gameOver.close();
+      return;
+    }
+    controls.reset();
+    pricing.close();
+    milestones.close();
+    rateCard.close();
+    if (menu.isOpen) menu.close();
+    gameOver.show(over, session.state.city.name, {
+      loadLastSave: hasSave(SAVE_KEY)
+        ? () => {
+            const saved = readSave(SAVE_KEY);
+            if (saved) loadSave(saved);
+            else toasts.show('Your last save could not be read', false);
+          }
+        : undefined,
+      startNewTown,
+      exportGame: () => exportSave(session.state),
+    });
+  };
 
   const fitCamera = () => {
     camera.setViewport(window.innerWidth, window.innerHeight);
@@ -213,66 +250,36 @@ async function boot(): Promise<void> {
   };
 
   session.onMonthClosed((report) => {
+    // Autosaves the close that ends a game too: reloading shows the game-over dialog again.
     autosave();
-    toasts.show(
-      `${formatMonth(report.year, report.month)} closed: net ${formatSignedMoney(report.net)}, ${formatNumber(report.passings)} passings`,
-      true,
-      'month',
-    );
+    toasts.show(monthClosedMessage(report), true, 'month');
   });
+  session.onNotice((notice) => {
+    // The game-over dialog says it in full; a toast behind it would only repeat it.
+    if (notice.kind !== 'gameOver') toasts.show(notice.message, noticeTone(notice));
+  });
+  session.onGameOver(showGameOver);
   session.onReplaced(() => {
-    tools.cancel();
+    controls.reset();
+    pricing.close();
+    milestones.close();
     scene.sync(session.state);
     fitCamera();
+    showGameOver();
   });
 
-  function pickTool(tool: ToolId): void {
-    tools.setTool(tool);
-    toolbar.select(tool);
-    scene.setPoleOverlay(tool === 'aerial');
-  }
+  controls.attachInput(menu);
 
-  const pointer = { x: 0, y: 0, onMap: false };
-  new Input(app.canvas, camera, theme.cell, {
-    hover(grid, screen, touch) {
-      if (touch !== undefined) tools.touch = touch;
-      pointer.x = screen.x;
-      pointer.y = screen.y;
-      pointer.onMap = grid !== null;
-      if (grid) tools.hoverAt(grid.x, grid.y);
-      else tools.clearHover();
-    },
-    click(grid, touch) {
-      const dispatch = (cmd: Command) => session.dispatch(cmd);
-      tools.touch = touch;
-      const outcome = touch ? tools.tap(session.state, dispatch, grid.x, grid.y) : tools.click(session.state, dispatch, grid.x, grid.y);
-      if (!outcome) return;
-      toasts.show(outcome.message, outcome.ok);
-      if (outcome.ok) hint.hide();
-    },
-    cancel() {
-      if (menu.isOpen) {
-        menu.close();
-        return true;
-      }
-      return tools.cancel();
-    },
-    escape() {
-      if (tools.tool !== 'inspect') pickTool('inspect');
-    },
-    pickTool,
-    currentTool: () => tools.tool,
-    setSpeed: (speed) => session.setSpeed(speed),
-    togglePause: () => session.togglePause(),
+  window.addEventListener('resize', () => {
+    camera.setViewport(window.innerWidth, window.innerHeight);
+    publishHudBottom();
   });
-
-  window.addEventListener('resize', () => camera.setViewport(window.innerWidth, window.innerHeight));
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') autosave();
   });
 
   const counters = { frames: 0, renders: 0 };
-  window.__lst = {
+  installDebugHook({
     getState: () => session.state,
     dispatch: (cmd) => session.dispatch(cmd),
     tick: (days = 1) => session.advanceDays(days),
@@ -288,11 +295,13 @@ async function boot(): Promise<void> {
       return { x: p.x / theme.cell, y: p.y / theme.cell };
     },
     stats: () => ({ ...counters, ...scene.stats() }),
-  };
+  });
 
   scene.sync(session.state);
-  pickTool('inspect');
+  controls.pickTool('inspect');
   fitCamera();
+  // A game autosaved at the close that ended it opens on its game-over dialog.
+  showGameOver();
 
   let last = performance.now();
   const frame = (now: number) => {
@@ -300,9 +309,7 @@ async function boot(): Promise<void> {
     last = now;
     const state = session.state;
     scene.sync(state);
-    const view = tools.view(state);
-    scene.setOverlay(view.overlay);
-    card.render(pointer.onMap ? view.card : null, pointer.x, pointer.y, window.innerWidth, window.innerHeight);
+    controls.update(state);
     hud.update(session);
     panel.update(state);
     scene.applyCamera(camera);

@@ -1,7 +1,8 @@
 // Test-only helpers: small, hand-checkable cities that don't depend on the generator.
 
-import { TILE_FT } from '../balance';
-import type { City, Parcel, StreetNode, StreetSegment } from '../types';
+import { CABINET_START_SPLITTERS, TILE_FT } from '../balance';
+import { newGame } from '../game';
+import type { CabinetId, City, GameState, NodeId, Parcel, ParcelKind, SegmentId, StreetNode, StreetSegment } from '../types';
 
 export interface GridCityOptions {
   /** Blocks across. Default 3. */
@@ -18,6 +19,12 @@ export interface GridCityOptions {
   rock?: boolean;
   /** Lattice coordinates (in blocks) of the CO node. Default [0, 0]. */
   coAt?: [number, number];
+  /**
+   * Override a lot's kind and units (default: every lot is a 1-unit home).
+   * Called once per lot in id order with the lot as built; return undefined to
+   * keep the home.
+   */
+  parcelKinds?: (parcel: Readonly<Parcel>) => { kind: ParcelKind; units: number } | undefined;
 }
 
 /**
@@ -85,7 +92,7 @@ export function makeGridCity(opts: GridCityOptions = {}): City {
 
   const parcels: Parcel[] = [];
   const addHome = (x: number, y: number, segment: number) => {
-    parcels.push({
+    const parcel: Parcel = {
       id: parcels.length,
       kind: 'home',
       segment,
@@ -96,7 +103,13 @@ export function makeGridCity(opts: GridCityOptions = {}): City {
       units: 1,
       appearsDay: 0,
       zone: 'residential',
-    });
+    };
+    const override = opts.parcelKinds?.(parcel);
+    if (override) {
+      parcel.kind = override.kind;
+      parcel.units = override.units;
+    }
+    parcels.push(parcel);
   };
   for (let bj = 0; bj < rows; bj++) {
     for (let bi = 0; bi < cols; bi++) {
@@ -119,6 +132,78 @@ export function makeGridCity(opts: GridCityOptions = {}): City {
     parcels,
     coNode: nodeId(coI, coJ),
   };
+}
+
+export interface TestStateOptions {
+  /** Game seed (default 1). */
+  seed?: number;
+  /** Override rng.events (default 12345, a fixed stream independent of the seed). */
+  rngEvents?: number;
+  /** Override rng.sales (default 54321). */
+  rngSales?: number;
+}
+
+/**
+ * A complete, valid current-schema GameState on `city` for unit tests: exactly
+ * newGame(seed, { city }) with fixed RNG states, so tests never hand-build
+ * state literals that go stale when GameState grows.
+ */
+export function makeTestState(city: City = makeGridCity(), opts: TestStateOptions = {}): GameState {
+  const state = newGame(opts.seed ?? 1, { city });
+  state.rng = { events: opts.rngEvents ?? 12345, sales: opts.rngSales ?? 54321 };
+  return state;
+}
+
+export interface LivePlantOptions {
+  /** Segments to cable (live underground spans, cost 0). Default: every segment of the city. */
+  segments?: readonly SegmentId[];
+  /** Corner for a live cabinet. Default: the CO node. Null: no cabinet. */
+  node?: NodeId | null;
+  /** Splitters in that cabinet. Default CABINET_START_SPLITTERS. */
+  splitters?: number;
+}
+
+/**
+ * Plant as if it was built long ago and paid for elsewhere: live spans on
+ * `segments` and a live cabinet, written straight into state (no ledger, no
+ * capex) with network.version bumped. Returns the cabinet id (or null). Keep
+ * the plant within CABINET_REACH_FT of the cabinet along the cable when the
+ * test needs every segment lit.
+ */
+export function addLivePlant(state: GameState, opts: LivePlantOptions = {}): CabinetId | null {
+  const segments = opts.segments ?? state.city.segments.map((s) => s.id);
+  for (const segment of segments) {
+    if (state.network.spans.some((s) => s.segment === segment)) continue;
+    state.network.spans.push({
+      id: state.nextId++,
+      segment,
+      method: 'underground',
+      stage: 'live',
+      stageDaysLeft: 0,
+      constructDays: 1,
+      cost: 0,
+      refundable: 0,
+      orderedDay: 0,
+      liveDay: 0,
+    });
+  }
+  let cabinet: CabinetId | null = null;
+  const node = opts.node === undefined ? state.city.coNode : opts.node;
+  if (node !== null) {
+    cabinet = state.nextId++;
+    state.network.cabinets.push({
+      id: cabinet,
+      node,
+      splitters: opts.splitters ?? CABINET_START_SPLITTERS,
+      stage: 'live',
+      stageDaysLeft: 0,
+      cost: 0,
+      orderedDay: 0,
+      liveDay: 0,
+    });
+  }
+  state.network.version++;
+  return cabinet;
 }
 
 function ordinalSuffix(n: number): string {

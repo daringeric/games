@@ -2,10 +2,16 @@ import { describe, expect, it } from 'vitest';
 import {
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
+  CABINET_START_SPLITTERS,
   CABINET_PERMIT_DAYS,
+  INSOLVENCY_GRACE_MONTHS,
+  MARKETING_DEFAULT_PER_MONTH,
+  OLT_START_CARDS,
   OLT_START_PON_PORTS,
+  OVERHEAD_PER_MONTH,
   PERMIT_DAYS_MAX,
   PERMIT_DAYS_MIN,
+  PERMITTING_CANCEL_REFUND,
   POLE_RENT_PER_POLE_PER_MONTH,
   SPLITTER_COST,
   START_CASH,
@@ -13,14 +19,16 @@ import {
 import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
 import { applyCommand, newGame, runDays, tick } from './game';
-import { getService, layCable } from './network';
+import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng } from './rng';
-import { makeGridCity } from './testing/fixtures';
+import { defaultPricing, newSales } from './sales';
+import { addLivePlant, makeGridCity } from './testing/fixtures';
 import type { City, Command, GameState, MonthlyReport } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells, CO at node 0. Horizontal segments
 // 0..8 are 240 ft with four homes fronting each of 0..5 from below or above;
 // vertical segments 9..16 are 120 ft with no frontage.
+// Cable prices come from quoteCable, never literals, so the cost model can change.
 const CABINET_PRICE = CABINET_COST + SPLITTER_COST;
 
 function game(city: City = makeGridCity()): GameState {
@@ -37,14 +45,25 @@ describe('newGame', () => {
     const city = makeGridCity();
     const state = newGame(42, { city });
     expect(state).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       seed: 42,
       day: 0,
-      rng: { events: deriveSeed(42, 'events') },
+      rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales') },
       nextId: 1,
       city,
-      network: { spans: [], cabinets: [], olt: { ponPorts: OLT_START_PON_PORTS, tech: 'gpon' }, version: 0 },
-      finance: { cash: START_CASH, monthToDate: [], reports: [] },
+      network: {
+        spans: [],
+        cabinets: [],
+        olt: { ponPorts: OLT_START_PON_PORTS, cards: OLT_START_CARDS, tech: 'gpon' },
+        makeReady: [],
+        version: 0,
+      },
+      finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
+      sales: newSales(),
+      milestones: [],
+      notices: [],
+      nextNoticeId: 1,
+      gameOver: null,
     });
     expect(state.city).toBe(city);
   });
@@ -82,10 +101,12 @@ describe('applyCommand', () => {
     const state = game();
     const twin = structuredClone(state);
     const rng = new Rng(state.rng.events);
+    const cost = quoteCable(state, [0, 9], 'aerial').cost;
+    expect(cost).toBeGreaterThan(0);
 
-    expect(applyCommand(state, { type: 'layCable', segments: [0, 9], method: 'aerial' })).toEqual({ ok: true, cost: 3_600 });
+    expect(applyCommand(state, { type: 'layCable', segments: [0, 9], method: 'aerial' })).toEqual({ ok: true, cost });
     // Same outcome as calling network.layCable with the stored stream, which is then advanced.
-    expect(layCable(twin, [0, 9], 'aerial', rng)).toEqual({ ok: true, cost: 3_600 });
+    expect(layCable(twin, [0, 9], 'aerial', rng)).toEqual({ ok: true, cost });
     expect(state.network).toEqual(twin.network);
     expect(state.rng.events).toBe(rng.state);
     expect(state.rng.events).not.toBe(twin.rng.events);
@@ -95,14 +116,15 @@ describe('applyCommand', () => {
       [2, 9, 'permitting', 0],
     ]);
     expect(state.nextId).toBe(3);
-    expect(state.finance.cash).toBe(START_CASH - 3_600);
-    expect(state.finance.monthToDate).toMatchObject([{ day: 0, category: 'construction', amount: -3_600 }]);
+    expect(state.finance.cash).toBe(START_CASH - cost);
+    expect(state.finance.monthToDate).toMatchObject([{ day: 0, category: 'construction', amount: -cost }]);
   });
 
   it('lays underground cable', () => {
     const state = game();
     const before = state.rng.events;
-    expect(applyCommand(state, { type: 'layCable', segments: [0, 9], method: 'underground' })).toEqual({ ok: true, cost: 10_800 });
+    const cost = quoteCable(state, [0, 9], 'underground').cost;
+    expect(applyCommand(state, { type: 'layCable', segments: [0, 9], method: 'underground' })).toEqual({ ok: true, cost });
     expect(state.rng.events).not.toBe(before);
     const permitDays = state.network.spans[0]?.stageDaysLeft;
     expect(permitDays).toBeGreaterThanOrEqual(PERMIT_DAYS_MIN);
@@ -121,11 +143,14 @@ describe('applyCommand', () => {
   it('refunds a span cancelled during permitting', () => {
     const state = game();
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    const span = state.network.spans[0]!;
+    const refund = Math.round(span.refundable * PERMITTING_CANCEL_REFUND);
+    expect(refund).toBeGreaterThan(0);
     const version = state.network.version;
-    expect(applyCommand(state, { type: 'removeSpan', span: 1 })).toEqual({ ok: true, cost: -7_200 });
+    expect(applyCommand(state, { type: 'removeSpan', span: 1 })).toEqual({ ok: true, cost: -refund });
     expect(state.network.spans).toEqual([]);
     expect(state.network.version).toBeGreaterThan(version);
-    expect(state.finance.cash).toBe(START_CASH);
+    expect(state.finance.cash).toBe(START_CASH - span.cost + refund);
   });
 
   it('removes a live span without a refund', () => {
@@ -133,9 +158,10 @@ describe('applyCommand', () => {
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
     runDays(state, PERMIT_DAYS_MAX + 1);
     expect(state.network.spans[0]?.stage).toBe('live');
+    const cash = state.finance.cash;
     expect(applyCommand(state, { type: 'removeSpan', span: 1 })).toEqual({ ok: true, cost: 0 });
     expect(state.network.spans).toEqual([]);
-    expect(state.finance.cash).toBe(START_CASH - 7_200);
+    expect(state.finance.cash).toBe(cash);
   });
 
   it('stamps orders with the current day', () => {
@@ -147,6 +173,11 @@ describe('applyCommand', () => {
     expect(state.network.cabinets[0]?.orderedDay).toBe(10);
   });
 });
+
+/** setPricing tiers for the default lineup, with optional price overrides. */
+function tierSettings(prices: Record<string, number> = {}): unknown[] {
+  return defaultPricing().tiers.map((t) => ({ id: t.id, price: prices[t.id] ?? t.price, offered: t.offered }));
+}
 
 interface RejectCase {
   name: string;
@@ -178,7 +209,48 @@ const REJECTIONS: RejectCase[] = [
   { name: 'placeCabinet with a string node', cmd: { type: 'placeCabinet', node: '0' }, reason: /needs a street corner/ },
   { name: 'removeSpan without a span', cmd: { type: 'removeSpan' }, reason: /needs a cable span id/ },
   { name: 'removeSpan with a string span', cmd: { type: 'removeSpan', span: '1' }, reason: /needs a cable span id/ },
+  { name: 'addSplitter without a cabinet', cmd: { type: 'addSplitter' }, reason: /addSplitter needs a cabinet id/ },
+  { name: 'addSplitter with a string cabinet', cmd: { type: 'addSplitter', cabinet: '1' }, reason: /addSplitter needs a cabinet id/ },
+  { name: 'removeCabinet without a cabinet', cmd: { type: 'removeCabinet' }, reason: /removeCabinet needs a cabinet id/ },
+  { name: 'removeCabinet with a null cabinet', cmd: { type: 'removeCabinet', cabinet: null }, reason: /removeCabinet needs a cabinet id/ },
+  { name: 'setPricing without tiers', cmd: { type: 'setPricing', smbMultiplier: 1.5 }, reason: /setPricing needs a list of tiers/ },
+  { name: 'setPricing with an object for tiers', cmd: { type: 'setPricing', tiers: { fiber500: 55 }, smbMultiplier: 1.5 }, reason: /setPricing needs a list of tiers/ },
+  {
+    name: 'setPricing with a tier missing its price',
+    cmd: { type: 'setPricing', tiers: [{ id: 'fiber500', offered: true }], smbMultiplier: 1.5 },
+    reason: /each \{ id, price, offered \}/,
+  },
+  {
+    name: 'setPricing with a string price',
+    cmd: { type: 'setPricing', tiers: [{ id: 'fiber500', price: '55', offered: true }], smbMultiplier: 1.5 },
+    reason: /each \{ id, price, offered \}/,
+  },
+  {
+    name: 'setPricing with a numeric offered flag',
+    cmd: { type: 'setPricing', tiers: [{ id: 'fiber500', price: 55, offered: 1 }], smbMultiplier: 1.5 },
+    reason: /each \{ id, price, offered \}/,
+  },
+  { name: 'setPricing with a null tier', cmd: { type: 'setPricing', tiers: [null], smbMultiplier: 1.5 }, reason: /each \{ id, price, offered \}/ },
+  {
+    name: 'setPricing without a multiplier',
+    cmd: { type: 'setPricing', tiers: tierSettings() },
+    reason: /setPricing needs an SMB multiplier/,
+  },
+  {
+    name: 'setPricing with a string multiplier',
+    cmd: { type: 'setPricing', tiers: tierSettings(), smbMultiplier: '1.5' },
+    reason: /setPricing needs an SMB multiplier/,
+  },
+  { name: 'setMarketing without a budget', cmd: { type: 'setMarketing' }, reason: /setMarketing needs a monthly budget/ },
+  { name: 'setMarketing with a string budget', cmd: { type: 'setMarketing', perMonth: '5000' }, reason: /setMarketing needs a monthly budget/ },
   // Well-formed commands the rules refuse
+  {
+    name: 'a price out of range',
+    cmd: { type: 'setPricing', tiers: tierSettings({ fiber1g: 100_000 }), smbMultiplier: 1.5 },
+    reason: /1 Gig price must be/,
+  },
+  { name: 'an unknown tier', cmd: { type: 'setPricing', tiers: [{ id: 'fiber9g', price: 50, offered: true }], smbMultiplier: 1.5 }, reason: /Unknown tier/ },
+  { name: 'a negative marketing budget', cmd: { type: 'setMarketing', perMonth: -5 }, reason: /marketing budget must be/ },
   { name: 'an unknown segment', cmd: { type: 'layCable', segments: [99], method: 'aerial' }, reason: /Unknown street segment: 99/ },
   { name: 'a negative segment', cmd: { type: 'layCable', segments: [-1], method: 'aerial' }, reason: /Unknown street segment: -1/ },
   { name: 'a fractional segment', cmd: { type: 'layCable', segments: [1.5], method: 'aerial' }, reason: /Unknown street segment: 1\.5/ },
@@ -299,27 +371,47 @@ describe('tick and runDays', () => {
     const state = game();
     applyCommand(state, { type: 'placeCabinet', node: 0 });
     applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
+    // Keep the street dark through January so the month has no subscribers.
+    state.network.spans[0]!.stageDaysLeft = 40;
+    const cable = state.network.spans[0]!.cost;
     runDays(state, 30);
     expect(state.finance.reports).toEqual([]);
     expect(state.finance.monthToDate).toHaveLength(2);
 
     tick(state);
     expect(state.day).toBe(31);
+    // Day 0 gets no sales step, so January's marketing accrues for 30 of its 31 days.
+    const marketing = Math.round((MARKETING_DEFAULT_PER_MONTH * 30) / 31);
+    const net = -cable - CABINET_PRICE - OVERHEAD_PER_MONTH - marketing;
     expect(state.finance.reports).toEqual([
       {
         year: 2027,
         month: 1,
-        totals: { construction: -7_200, equipment: -CABINET_PRICE },
-        net: -7_200 - CABINET_PRICE,
-        cashEnd: START_CASH - 7_200 - CABINET_PRICE,
-        passings: getService(state).passings,
+        totals: { construction: -cable, equipment: -CABINET_PRICE, overhead: -OVERHEAD_PER_MONTH, marketing: -marketing },
+        net,
+        cashEnd: START_CASH + net,
+        passings: 0,
+        stats: {
+          subscribers: 0,
+          accounts: 0,
+          grossAdds: 0,
+          churned: 0,
+          lostService: 0,
+          connectsTotal: 0,
+          capexOsp: state.finance.capex.osp,
+          capexConnect: 0,
+          capexCo: 0,
+          ponPortsUsed: CABINET_START_SPLITTERS,
+          ponPorts: OLT_START_PON_PORTS,
+          fullCabinets: 0,
+        },
       },
     ]);
-    expect(state.finance.cash).toBe(START_CASH - 7_200 - CABINET_PRICE);
+    expect(state.finance.cash).toBe(START_CASH + net);
     expect(state.finance.monthToDate).toEqual([]);
   });
 
-  it('closes every month of the year in order', () => {
+  it('closes every month of the year in order, charging overhead and marketing every month', () => {
     const state = game();
     runDays(state, 365);
     expect(state.finance.reports.map((r) => [r.year, r.month])).toEqual(
@@ -327,7 +419,21 @@ describe('tick and runDays', () => {
     );
     expect(state.finance.reports.map(closedOn)).toEqual([31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365]);
     runDays(state, 31);
-    expect(state.finance.reports.at(-1)).toMatchObject({ year: 2028, month: 1, net: 0, cashEnd: START_CASH });
+    const idle = -(OVERHEAD_PER_MONTH + MARKETING_DEFAULT_PER_MONTH);
+    const january = state.finance.reports.at(-1)!;
+    expect(january).toMatchObject({
+      year: 2028,
+      month: 1,
+      totals: { overhead: -OVERHEAD_PER_MONTH, marketing: -MARKETING_DEFAULT_PER_MONTH },
+      net: idle,
+    });
+    let cash = START_CASH;
+    for (const report of state.finance.reports) {
+      cash += report.net;
+      expect(report.cashEnd).toBe(cash);
+      expect(report.stats).toBeDefined();
+    }
+    expect(state.finance.cash).toBe(cash);
   });
 
   it('charges pole rent for live aerial spans only', () => {
@@ -387,7 +493,7 @@ describe('tick and runDays', () => {
     expect(january).toMatchObject({ year: 2027, month: 1, passings: 0 });
     expect(january.totals.poleRent).toBeUndefined();
     // The ledger has no rent dated Jan 31 either.
-    expect(state.finance.monthToDate).toEqual([]);
+    expect(state.finance.monthToDate.filter((e) => e.category === 'poleRent')).toEqual([]);
     expect(getService(state).passings).toBe(4);
 
     runDays(state, 28);
@@ -409,5 +515,114 @@ describe('tick and runDays', () => {
     tick(state);
     expect(state.finance.reports[0]).toMatchObject({ year: 2027, month: 1, passings: 3 });
     expect(getService(state).passings).toBe(4);
+  });
+});
+
+describe('pricing and marketing commands', () => {
+  it('sets prices and the marketing budget for free', () => {
+    const state = game();
+    const tiers = tierSettings({ fiber500: 50, fiber2g: 120 });
+    expect(applyCommand(state, { type: 'setPricing', tiers: tiers as never, smbMultiplier: 2 })).toEqual({ ok: true, cost: 0 });
+    expect(state.sales.pricing.tiers.map((t) => t.price)).toEqual([50, defaultPricing().tiers[1]!.price, 120]);
+    expect(state.sales.pricing.smbMultiplier).toBe(2);
+    expect(applyCommand(state, { type: 'setMarketing', perMonth: 4_000 })).toEqual({ ok: true, cost: 0 });
+    expect(state.sales.marketingPerMonth).toBe(4_000);
+    expect(state.finance.cash).toBe(START_CASH);
+    expect(state.finance.monthToDate).toEqual([]);
+  });
+});
+
+/** A game one negative close away from insolvency, on the last day of January. */
+function nearlyBroke(): GameState {
+  const state = game();
+  state.day = 30;
+  state.finance.cash = -1;
+  state.finance.negativeMonths = INSOLVENCY_GRACE_MONTHS - 1;
+  return state;
+}
+
+describe('the daily tick, round 2', () => {
+  it('runs no sales step on day 0: the first step is day 1', () => {
+    const state = game();
+    addLivePlant(state);
+    const before = structuredClone(state.sales);
+    expect(state.sales.month.marketingDollarDays).toBe(0);
+    tick(state);
+    expect(state.day).toBe(1);
+    expect(state.sales.month.marketingDollarDays).toBe(state.sales.marketingPerMonth);
+    expect(before.month.marketingDollarDays).toBe(0);
+  });
+
+  it('closes the month before the new day\'s network progress and sales', () => {
+    const state = game();
+    addLivePlant(state);
+    runDays(state, 30);
+    const accrued = state.sales.month.marketingDollarDays;
+    expect(accrued).toBe(30 * state.sales.marketingPerMonth);
+    tick(state); // Feb 1: close January, then step Feb 1
+    expect(state.finance.reports[0]!.totals.marketing).toBe(-Math.round(accrued / 31));
+    expect(state.sales.month.marketingDollarDays).toBe(state.sales.marketingPerMonth);
+  });
+
+  it('stops a tick whose close ends the game before any network progress or sales', () => {
+    const state = nearlyBroke();
+    applyCommandUnchecked(state);
+    const span = state.network.spans[0]!;
+    const daysLeft = span.stageDaysLeft;
+    const salesRng = state.rng.sales;
+    tick(state);
+    expect(state.day).toBe(31);
+    expect(state.gameOver).toMatchObject({ day: 31, reason: 'insolvent' });
+    expect(state.finance.reports).toHaveLength(1);
+    expect(span.stageDaysLeft).toBe(daysLeft);
+    // No sales step ran after the close: the new month's accrual is still empty.
+    expect(state.sales.month.marketingDollarDays).toBe(0);
+    expect(state.rng.sales).toBe(salesRng);
+    expect(state.notices.at(-1)).toMatchObject({ kind: 'gameOver', day: 31 });
+  });
+
+  it('does nothing once the game is over, and runDays stops advancing', () => {
+    const state = nearlyBroke();
+    runDays(state, 100);
+    expect(state.day).toBe(31);
+    expect(state.gameOver).not.toBeNull();
+    const frozen = structuredClone(state);
+    tick(state);
+    runDays(state, 365);
+    expect(state).toEqual(frozen);
+  });
+});
+
+/** Order something that will still be permitting tomorrow (bypasses the cash check). */
+function applyCommandUnchecked(state: GameState): void {
+  const cash = state.finance.cash;
+  state.finance.cash = START_CASH;
+  expect(applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' }).ok).toBe(true);
+  state.finance.cash = cash;
+}
+
+describe('game over', () => {
+  const COMMANDS: unknown[] = [
+    { type: 'layCable', segments: [0], method: 'aerial' },
+    { type: 'placeCabinet', node: 0 },
+    { type: 'removeSpan', span: 1 },
+    { type: 'addSplitter', cabinet: 1 },
+    { type: 'removeCabinet', cabinet: 1 },
+    { type: 'addOltCard' },
+    { type: 'setPricing', tiers: tierSettings(), smbMultiplier: 1.5 },
+    { type: 'setMarketing', perMonth: 0 },
+    { type: 'teleport' },
+    {},
+  ];
+
+  it.each(COMMANDS)('rejects %j after the game has ended and changes nothing', (cmd) => {
+    const state = nearlyBroke();
+    applyCommandUnchecked(state);
+    tick(state);
+    expect(state.gameOver).not.toBeNull();
+    const before = structuredClone(state);
+    const result = applyCommand(state, cmd as Command);
+    expect(result).toEqual({ ok: false, reason: `Game over: ${state.gameOver!.message}` });
+    expect(state).toEqual(before);
   });
 });

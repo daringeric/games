@@ -1,69 +1,63 @@
-// Transient HTML overlays: toasts, the floating quote/inspect card, and the
-// first-run hint card.
+// Transient HTML overlays: toasts and the first-run hint card. (The floating
+// quote/inspect card lives in floatingCard.ts with the map tools.)
+//
+// Owner: ui-economy workstream.
 
+import { INSTALLS_RESUMED_PREFIX } from '../sim/sales';
+import type { Notice } from '../sim/types';
 import { el, icon } from './dom';
 import { ICONS } from './icons';
-import type { CardModel } from './tools';
 
 const TOAST_MS = 3800;
+/** Warnings carry instructions ("add a splitter..."): give them time to be read. */
+const WARN_TOAST_MS = 6500;
 const MAX_TOASTS = 3;
+
+/** ok = good news, warn = needs attention, err = something failed or went badly wrong. */
+export type ToastTone = 'ok' | 'warn' | 'err';
+
+const TONE_ICON: Record<ToastTone, string> = { ok: ICONS.spark, warn: ICONS.warning, err: ICONS.close };
+
+/** How a sim notice is toasted: milestones are good news, the end of the game is bad, the rest need attention. */
+export function noticeTone(notice: Notice): ToastTone {
+  switch (notice.kind) {
+    case 'milestone':
+      return 'ok';
+    case 'gameOver':
+      return 'err';
+    case 'insolvencyWarning':
+      // "Installs resumed" rides on the cash-trouble kind (sales.ts) but is good news.
+      return notice.message.startsWith(INSTALLS_RESUMED_PREFIX) ? 'ok' : 'warn';
+    case 'cabinetFull':
+    case 'serviceLost':
+    case 'oltFull':
+      return 'warn';
+  }
+}
 
 export class Toasts {
   readonly root = el('div', { class: 'toasts', attrs: { role: 'status', 'aria-live': 'polite' } });
 
-  /** A toast with a `key` replaces the visible toast with the same key (e.g. one month report at a time). */
-  show(message: string, ok: boolean, key?: string): void {
-    const toast = el('div', { class: `toast ${ok ? 'toast-ok' : 'toast-err'}` }, [
-      icon(ok ? ICONS.spark : ICONS.close),
-      el('span', { text: message }),
-    ]);
+  /**
+   * Show a toast. `tone` is a ToastTone, or a boolean for ok (true) / err (false).
+   * A toast with a `key` replaces the visible toast with the same key (e.g. one month report at a time).
+   */
+  show(message: string, tone: ToastTone | boolean, key?: string): void {
+    const t: ToastTone = tone === true ? 'ok' : tone === false ? 'err' : tone;
+    const toast = el('div', { class: `toast toast-${t}` }, [icon(TONE_ICON[t]), el('span', { text: message })]);
     if (key) {
       toast.dataset.key = key;
       for (const old of this.root.querySelectorAll<HTMLElement>('.toast')) if (old.dataset.key === key) old.remove();
     }
     this.root.append(toast);
     while (this.root.childElementCount > MAX_TOASTS) this.root.firstElementChild?.remove();
-    window.setTimeout(() => {
-      toast.classList.add('leaving');
-      window.setTimeout(() => toast.remove(), 250);
-    }, TOAST_MS);
-  }
-}
-
-/** Card that follows the cursor with a quote or details for whatever is under it. */
-export class FloatingCard {
-  // Hidden until the first frame has something to show (and for good if boot fails).
-  readonly root = el('div', { class: 'float-card pill-card', attrs: { 'aria-live': 'polite', hidden: '' } });
-  private key = '';
-
-  render(card: CardModel | null, x: number, y: number, viewW: number, viewH: number): void {
-    if (!card) {
-      this.root.hidden = true;
-      this.key = '';
-      return;
-    }
-    const key = JSON.stringify(card);
-    if (key !== this.key) {
-      this.key = key;
-      this.root.className = `float-card pill-card tone-${card.tone}`;
-      const parts: Node[] = [el('h3', { text: card.title })];
-      if (card.rows.length > 0) {
-        parts.push(el('dl', {}, card.rows.map((r) => el('div', { class: 'row' }, [el('dt', { text: r.label }), el('dd', { text: r.value })]))));
-      }
-      if (card.blockers.length > 0) parts.push(el('ul', { class: 'blockers' }, card.blockers.map((b) => el('li', { text: b }))));
-      if (card.hint) parts.push(el('p', { class: 'hint-line', text: card.hint }));
-      this.root.replaceChildren(...parts);
-    }
-    this.root.hidden = false;
-    // Sit below-right of the cursor, flipping to stay on screen.
-    const w = this.root.offsetWidth;
-    const h = this.root.offsetHeight;
-    const gap = 18;
-    let left = x + gap;
-    let top = y + gap;
-    if (left + w > viewW - 8) left = x - gap - w;
-    if (top + h > viewH - 8) top = y - gap - h;
-    this.root.style.transform = `translate(${Math.max(8, Math.round(left))}px, ${Math.max(8, Math.round(top))}px)`;
+    window.setTimeout(
+      () => {
+        toast.classList.add('leaving');
+        window.setTimeout(() => toast.remove(), 250);
+      },
+      t === 'warn' ? WARN_TOAST_MS : TOAST_MS,
+    );
   }
 }
 

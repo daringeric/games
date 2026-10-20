@@ -135,6 +135,8 @@ export interface LotFrame {
   depth: number;
   /** World rect of a lot-local rect (u, v, along, deep). */
   toWorld(u: number, v: number, along: number, deep: number): Rect;
+  /** World point of a lot-local point; negative v lies between the lot and the street. */
+  point(u: number, v: number): { x: number; y: number };
   /** True when the street runs horizontally past this lot. */
   horizontal: boolean;
 }
@@ -159,7 +161,93 @@ export function lotFrame(lot: Rect, side: Side): LotFrame {
           return { x: lot.x + lot.w - v - deep, y: lot.y + u, w: deep, h: along };
       }
     },
+    point(u, v) {
+      switch (side) {
+        case 'top':
+          return { x: lot.x + u, y: lot.y + v };
+        case 'bottom':
+          return { x: lot.x + u, y: lot.y + lot.h - v };
+        case 'left':
+          return { x: lot.x + v, y: lot.y + u };
+        case 'right':
+          return { x: lot.x + lot.w - v, y: lot.y + u };
+      }
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Building tells: every building shows the one street that serves it
+// (Parcel.segment). Homes have a front walk with a doorstep and a notch at the
+// curb, shops an awning facing the street, apartment buildings a demarc box on
+// the serving wall with a dashed fiber entry out to the curb.
+// ---------------------------------------------------------------------------
+
+/** Roof inset of an apartment building from its lot edge (world px). */
+export const MDU_ROOF_PAD = 4;
+/** Width of a home's front walk (world px). */
+export const HOME_PATH_WIDTH = 3.5;
+
+/** 0..1 from a slice of a hash, for deterministic per-lot variety. */
+export function vary(hash: number, shift: number): number {
+  return ((hash >>> shift) & 0xff) / 255;
+}
+
+function clampTo(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/** Where a home's house sits in its lot frame: `u` along the street, `setback` from it. */
+export interface HomePlan {
+  u: number;
+  along: number;
+  deep: number;
+  setback: number;
+  /** Centre of the front walk along the street (u). */
+  walkU: number;
+}
+
+export function homePlan(f: LotFrame, hash: number): HomePlan {
+  const along = clampTo(f.front * (0.64 + 0.12 * vary(hash, 0)), 14, 46);
+  const deep = clampTo(f.depth * (0.5 + 0.1 * vary(hash, 8)), 12, 26);
+  const setback = clampTo(f.depth * 0.14, 3, 8);
+  const u = (f.front - along) * (0.3 + 0.4 * vary(hash, 16));
+  return { u, along, deep, setback, walkU: u + along / 2 };
+}
+
+/** An apartment building's demarc: the box on its serving wall and the fiber entry out to the curb. */
+export interface DemarcTell {
+  side: Side;
+  /** Box straddling the middle of the serving wall (world px). */
+  box: Rect;
+  /** From the box's street-side edge to the curb (world px). */
+  entry: { ax: number; ay: number; bx: number; by: number };
+  /** Where the entry meets the curb: the building's drop point. */
+  curb: { x: number; y: number };
+}
+
+export function mduDemarc(lot: Rect, side: Side, theme: Theme): DemarcTell {
+  const f = lotFrame(lot, side);
+  const s = theme.demarc.size;
+  const mid = f.front / 2;
+  const box = f.toWorld(mid - s / 2, MDU_ROOF_PAD - s / 2, s, s);
+  const from = f.point(mid, MDU_ROOF_PAD - s / 2);
+  const curb = f.point(mid, -theme.lot.curbGap);
+  return { side, box, entry: { ax: from.x, ay: from.y, bx: curb.x, by: curb.y }, curb };
+}
+
+/**
+ * The curb point where a building's drop comes off its serving street: the end
+ * of a home's front walk, the middle of a shop front, an apartment building's
+ * fiber entry. World px.
+ */
+export function dropPoint(city: City, lattice: StreetLattice, parcel: Parcel, theme: Theme): { x: number; y: number } {
+  const lot = lotRect(lattice, parcel, theme);
+  const side = frontageSide(city, parcel);
+  if (parcel.kind === 'mdu') return mduDemarc(lot, side, theme).curb;
+  const f = lotFrame(lot, side);
+  const u = parcel.kind === 'home' ? homePlan(f, hashInt(parcel.id)).walkU : f.front / 2;
+  return f.point(u, -theme.lot.curbGap);
 }
 
 /** Cheap stable 32-bit hash of an integer, for per-parcel visual variety. */

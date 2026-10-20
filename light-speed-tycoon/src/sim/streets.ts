@@ -3,7 +3,7 @@
 // WeakMaps; City objects are never mutated after generation.
 
 import { POLE_SPACING_FT } from './balance';
-import type { City, NodeId, SegmentId, StreetNode, StreetSegment } from './types';
+import type { City, NodeId, ParcelId, SegmentId, StreetNode, StreetSegment } from './types';
 
 const EMPTY: readonly SegmentId[] = Object.freeze([]);
 
@@ -361,4 +361,206 @@ export function nearestSegment(city: City, x: number, y: number, maxDist = Infin
 /** Number of utility poles along a segment (0 when it has none): max(1, round(lengthFt / POLE_SPACING_FT)). */
 export function polesOnSegment(segment: StreetSegment): number {
   return segment.hasPoles ? Math.max(1, Math.round(segment.lengthFt / POLE_SPACING_FT)) : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Reach (bounded street distance)
+// ---------------------------------------------------------------------------
+
+/** A segment within reach of a node, with the street distance (ft) to its nearer endpoint. */
+export interface SegmentReach {
+  segment: SegmentId;
+  distanceFt: number;
+}
+
+/**
+ * Segments with an endpoint strictly closer than `limitFt` to `from` along
+ * streets, travelling only on segments `allowed` accepts (default: every
+ * street); only accepted segments are returned. distanceFt is the shortest
+ * route length (sum of lengthFt) from `from` to the segment's nearer endpoint,
+ * so a segment touching `from` has distance 0 however long it is. Ascending by
+ * segment id. An invalid node or a limit that is not > 0 returns [].
+ *
+ * A bounded Dijkstra: it only touches nodes closer than the limit, so its cost
+ * scales with the area in reach, not the town. Deterministic, arithmetic only.
+ */
+export function segmentsWithin(
+  city: City,
+  from: NodeId,
+  limitFt: number,
+  allowed?: (segment: StreetSegment) => boolean,
+): SegmentReach[] {
+  if (!isNodeId(city, from) || !(limitFt > 0)) return [];
+  const { adjacency } = graphIndex(city);
+  // Reuse the City's scratch arrays (cleared in O(1) by bumping the stamp)
+  // unless a callback re-entered us, which then gets arrays of its own.
+  const shared = reachScratch(city);
+  const sc = shared.busy ? newReachScratch(city) : shared;
+  sc.busy = true;
+  try {
+    if (sc.stamp >= 0xfffffffe) {
+      sc.nodeStamp.fill(0);
+      sc.doneStamp.fill(0);
+      sc.segStamp.fill(0);
+      sc.stamp = 0;
+    }
+    const stamp = ++sc.stamp;
+    const { dist, nodeStamp, doneStamp, segStamp, segDist } = sc;
+    const found: SegmentId[] = [];
+    const heap: HeapItem[] = [{ dist: 0, node: from }];
+    dist[from] = 0;
+    nodeStamp[from] = stamp;
+
+    // Every node on the heap is closer than the limit; nodes settle in order of
+    // distance, so the first settled endpoint of a segment is its nearer one.
+    for (let item = heapPop(heap); item; item = heapPop(heap)) {
+      const u = item.node;
+      if (doneStamp[u] === stamp) continue;
+      doneStamp[u] = stamp;
+      for (const segId of adjacency[u] ?? EMPTY) {
+        const seg = city.segments[segId] as StreetSegment;
+        if (allowed && !allowed(seg)) continue;
+        if (segStamp[segId] !== stamp) {
+          segStamp[segId] = stamp;
+          segDist[segId] = item.dist;
+          found.push(segId);
+        }
+        const v = otherEnd(seg, u);
+        if (doneStamp[v] === stamp) continue;
+        const d = item.dist + seg.lengthFt;
+        if (d < limitFt && (nodeStamp[v] !== stamp || d < (dist[v] as number))) {
+          dist[v] = d;
+          nodeStamp[v] = stamp;
+          heapPush(heap, { dist: d, node: v });
+        }
+      }
+    }
+
+    found.sort((x, y) => x - y);
+    return found.map((segment) => ({ segment, distanceFt: segDist[segment] as number }));
+  } finally {
+    sc.busy = false;
+  }
+}
+
+interface ReachScratch {
+  /** Tentative node distances, valid where nodeStamp === stamp. */
+  dist: Float64Array;
+  nodeStamp: Uint32Array;
+  /** Settled nodes: doneStamp === stamp. */
+  doneStamp: Uint32Array;
+  /** Found segments (segStamp === stamp) and their distances. */
+  segStamp: Uint32Array;
+  segDist: Float64Array;
+  stamp: number;
+  busy: boolean;
+}
+
+const reachScratchCache = new WeakMap<City, ReachScratch>();
+
+function newReachScratch(city: City): ReachScratch {
+  const n = city.nodes.length;
+  const m = city.segments.length;
+  return {
+    dist: new Float64Array(n),
+    nodeStamp: new Uint32Array(n),
+    doneStamp: new Uint32Array(n),
+    segStamp: new Uint32Array(m),
+    segDist: new Float64Array(m),
+    stamp: 0,
+    busy: false,
+  };
+}
+
+function reachScratch(city: City): ReachScratch {
+  let sc = reachScratchCache.get(city);
+  if (!sc) {
+    sc = newReachScratch(city);
+    reachScratchCache.set(city, sc);
+  }
+  return sc;
+}
+
+// ---------------------------------------------------------------------------
+// Parcels along streets
+// ---------------------------------------------------------------------------
+
+const EMPTY_PARCELS: readonly ParcelId[] = Object.freeze([]);
+
+const servedCache = new WeakMap<City, ParcelId[][]>();
+
+/**
+ * Parcels (present and future) whose serving segment (Parcel.segment) is
+ * `segment`, ascending ids. These are the only parcels cable on the segment
+ * passes. Indexed lazily per City. Unknown segment -> [].
+ */
+export function parcelsServedBy(city: City, segment: SegmentId): readonly ParcelId[] {
+  let index = servedCache.get(city);
+  if (!index) {
+    index = city.segments.map(() => []);
+    // Parcels are visited in id order, so every list comes out ascending.
+    for (const parcel of city.parcels) index[parcel.segment]?.push(parcel.id);
+    servedCache.set(city, index);
+  }
+  return (isSegmentId(city, segment) ? index[segment] : undefined) ?? EMPTY_PARCELS;
+}
+
+const touchingCache = new WeakMap<City, ParcelId[][]>();
+
+/**
+ * Every parcel (present or future) whose footprint shares an edge of positive
+ * length with the segment's street line, whether or not the segment serves it
+ * (corner and through lots touch more than one street). Ascending ids.
+ * Indexed lazily per City like the other caches. Used for "N buildings along
+ * this route face another street" (parcels touching a segment whose
+ * Parcel.segment is different). Unknown segment -> [].
+ */
+export function parcelsTouchingSegment(city: City, segment: SegmentId): readonly ParcelId[] {
+  let index = touchingCache.get(city);
+  if (!index) {
+    index = buildTouchingIndex(city);
+    touchingCache.set(city, index);
+  }
+  return (isSegmentId(city, segment) ? index[segment] : undefined) ?? EMPTY_PARCELS;
+}
+
+function buildTouchingIndex(city: City): ParcelId[][] {
+  // Unit lattice edges: the edge from (x, y) one cell east (dir 0) or south (dir 1).
+  let maxX = city.width;
+  for (const n of city.nodes) maxX = Math.max(maxX, n.x);
+  for (const p of city.parcels) maxX = Math.max(maxX, p.x + p.w);
+  const stride = maxX + 1;
+  const edgeKey = (x: number, y: number, dir: 0 | 1) => (y * stride + x) * 2 + dir;
+
+  const edgeSegment = new Map<number, SegmentId>();
+  for (const seg of city.segments) {
+    const a = city.nodes[seg.a];
+    const b = city.nodes[seg.b];
+    if (!a || !b) continue;
+    if (a.y === b.y) {
+      for (let x = Math.min(a.x, b.x); x < Math.max(a.x, b.x); x++) edgeSegment.set(edgeKey(x, a.y, 0), seg.id);
+    } else if (a.x === b.x) {
+      for (let y = Math.min(a.y, b.y); y < Math.max(a.y, b.y); y++) edgeSegment.set(edgeKey(a.x, y, 1), seg.id);
+    }
+  }
+
+  const index: ParcelId[][] = city.segments.map(() => []);
+  for (const p of city.parcels) {
+    const touched = new Set<SegmentId>();
+    const add = (key: number) => {
+      const id = edgeSegment.get(key);
+      if (id !== undefined) touched.add(id);
+    };
+    for (let i = 0; i < p.w; i++) {
+      add(edgeKey(p.x + i, p.y, 0)); // top side
+      add(edgeKey(p.x + i, p.y + p.h, 0)); // bottom side
+    }
+    for (let j = 0; j < p.h; j++) {
+      add(edgeKey(p.x, p.y + j, 1)); // left side
+      add(edgeKey(p.x + p.w, p.y + j, 1)); // right side
+    }
+    // Parcels are visited in id order, so every list comes out ascending.
+    for (const id of touched) index[id]?.push(p.id);
+  }
+  return index;
 }

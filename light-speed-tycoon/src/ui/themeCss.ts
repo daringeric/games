@@ -38,6 +38,9 @@ export function applyThemeCss(theme: Theme, root: HTMLElement = document.documen
     '--tone-info': house.passed.roof,
     '--passed-dark': house.passed.ridge,
     '--crew': cable.constructing.tube,
+    '--cpp-green': theme.cpp.green,
+    '--cpp-amber': theme.cpp.amber,
+    '--cpp-red': theme.cpp.red,
   };
   for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
   document.querySelector('meta[name="theme-color"]')?.setAttribute('content', ui.page);

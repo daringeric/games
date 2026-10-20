@@ -1,5 +1,7 @@
 /* Toy Town UI chrome. Colors and sizes come from theme.ts via custom properties
-   (see themeCss.ts); this file only arranges them. */
+   (see themeCss.ts); this file only arranges them.
+
+   Owner: ui-economy workstream (map tool panels live in mapTools.css). */
 
 * {
   box-sizing: border-box;
@@ -30,6 +32,11 @@ body {
   inset: 0;
   display: block;
   touch-action: none;
+}
+
+/* Every element with display set by a class still hides with the hidden attribute. */
+[hidden] {
+  display: none !important;
 }
 
 .num {
@@ -188,50 +195,38 @@ body {
 
 /* HUD ---------------------------------------------------------------------- */
 
+/* A card at the top: the clock, date and money on top, a row of chips under
+   it. Grid areas let phones rearrange the same elements (see the media
+   queries at the end of the file). */
 .hud {
   position: absolute;
-  z-index: 10;
+  /* Above the toolbar, so the menu that drops from it is never cut off by it. */
+  z-index: 12;
   top: 12px;
   left: 50%;
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(5, auto);
+  grid-template-areas:
+    'speeds when cash actions menu'
+    'stats stats stats stats stats';
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  gap: 6px 8px;
   max-width: calc(100vw - 24px);
   padding: 6px;
-  border-radius: var(--pill);
+  border-radius: 26px;
   transform: translateX(-50%);
 }
 
-.hud-row {
-  display: contents;
-}
-
-/* On wide screens the two rows flow as one bar, menu last. */
-.speed-group {
-  order: 1;
-}
-
-.hud-when {
-  order: 2;
-}
-
-.hud-cash {
-  order: 3;
-}
-
-.chip-passings {
-  order: 4;
-}
-
-.chip-building {
-  order: 5;
-}
-
-.menu-button {
-  order: 6;
+.hud.alerting {
+  grid-template-columns: repeat(6, auto);
+  grid-template-areas:
+    'speeds when cash alert actions menu'
+    'stats stats stats stats stats stats';
 }
 
 .speed-group {
+  grid-area: speeds;
   display: flex;
   gap: 2px;
   padding: 2px;
@@ -244,7 +239,13 @@ body {
   padding: 0 10px;
 }
 
+.speed:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .hud-when {
+  grid-area: when;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -254,20 +255,21 @@ body {
 }
 
 .hud-town {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  overflow: hidden;
   color: var(--text-2);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.02em;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .hud-town::before {
   content: '';
+  display: inline-block;
   width: 7px;
   height: 7px;
+  margin: 0 5px 1px 0;
   border-radius: 50%;
   background: var(--accent);
 }
@@ -278,12 +280,44 @@ body {
 }
 
 .hud-cash {
+  grid-area: cash;
   /* Fixed widths keep the centred bar from jiggling as numbers change. */
   min-width: 128px;
   padding: 0 8px;
   font-size: 21px;
   text-align: center;
   white-space: nowrap;
+}
+
+.hud-alert {
+  grid-area: alert;
+  justify-self: center;
+}
+
+.hud-actions {
+  grid-area: actions;
+  display: flex;
+  gap: 2px;
+}
+
+.hud-action {
+  background: var(--chip);
+}
+
+.hud-action:hover {
+  background: var(--hover);
+}
+
+.menu-button {
+  grid-area: menu;
+  margin-left: 2px;
+}
+
+.hud-stats {
+  grid-area: stats;
+  display: flex;
+  justify-content: center;
+  gap: 6px;
 }
 
 .chip {
@@ -308,6 +342,18 @@ body {
   min-width: 136px;
 }
 
+.chip-subs {
+  min-width: 108px;
+}
+
+.chip-mrr {
+  min-width: 140px;
+}
+
+.chip-pon {
+  min-width: 112px;
+}
+
 .chip-building {
   min-width: 156px;
 }
@@ -316,12 +362,44 @@ body {
   color: var(--passed-dark);
 }
 
+.chip-subs .icon {
+  color: var(--accent);
+}
+
+.chip-mrr .icon {
+  color: var(--success);
+}
+
+.chip-pon .icon {
+  color: var(--tone-cabinet);
+}
+
 .chip-building .icon {
   color: var(--crew);
 }
 
-.menu-button {
-  margin-left: 2px;
+/* Needs attention soon (amber) or now (red). */
+.chip.chip-warn {
+  background: color-mix(in srgb, var(--cpp-amber) 16%, var(--card));
+  box-shadow: inset 0 0 0 2px var(--cpp-amber);
+}
+
+.chip.chip-warn .icon {
+  color: var(--cpp-amber);
+}
+
+.chip.chip-danger {
+  background: var(--danger-bg);
+  box-shadow: inset 0 0 0 2px var(--danger);
+  color: var(--danger);
+}
+
+.chip.chip-danger .icon {
+  color: var(--danger);
+}
+
+.chip-alert {
+  font-weight: 800;
 }
 
 /* Menu --------------------------------------------------------------------- */
@@ -335,6 +413,11 @@ body {
   flex-direction: column;
   gap: 2px;
   width: 260px;
+  /* Room to scroll on a short screen instead of running off the bottom. */
+  max-height: calc(100vh - var(--hud-bottom, 120px) - 18px);
+  max-height: calc(100dvh - var(--hud-bottom, 120px) - 18px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 6px;
 }
 
@@ -343,6 +426,7 @@ body {
 }
 
 .menu-item {
+  flex: none;
   flex-direction: column;
   align-items: flex-start;
   gap: 3px;
@@ -418,13 +502,59 @@ body {
   z-index: 5;
   right: 12px;
   bottom: 12px;
-  width: 280px;
-  padding: 10px 14px 12px;
+  width: 300px;
+  max-height: calc(100vh - var(--hud-bottom, 120px) - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 14px 12px;
 }
 
 .panel-title {
-  margin: 0 0 6px;
+  margin: 0 0 4px;
+}
+
+.panel-toggle {
+  justify-content: space-between;
+  width: calc(100% + 12px);
+  min-height: 34px;
+  margin: 0 -6px;
+  padding: 0 6px;
+  border-radius: 12px;
   font: 600 15px / 1.2 var(--font-display);
+  text-align: left;
+}
+
+.panel-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-2);
+  font: 800 12px / 1 var(--font-ui);
+}
+
+.panel-toggle-label::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: translateY(1px) rotate(-135deg);
+}
+
+.panel-toggle[aria-expanded='false'] .panel-toggle-label::after {
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.panel-toggle:disabled {
+  cursor: default;
+}
+
+.panel-toggle:disabled:hover {
+  background: transparent;
+}
+
+.panel-toggle:disabled .panel-toggle-label {
+  display: none;
 }
 
 .stats {
@@ -432,11 +562,6 @@ body {
   grid-template-columns: repeat(3, 1fr);
   gap: 6px;
   margin: 0;
-}
-
-.stats[hidden],
-.panel-empty[hidden] {
-  display: none;
 }
 
 .stat dt {
@@ -448,6 +573,61 @@ body {
 .stat dd {
   margin: 0;
   font-size: var(--fs-num);
+  white-space: nowrap;
+}
+
+.report-details {
+  display: grid;
+  gap: 3px;
+  margin: 8px 0 0;
+  padding-top: 8px;
+  border-top: 1px dashed var(--card-border);
+}
+
+.panel:not(.expanded) .report-details {
+  display: none;
+}
+
+/* Opened on a short screen it may reach up to the tip card: stay readable over it. */
+.panel.expanded {
+  z-index: 9;
+}
+
+.report-details .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.report-details dt {
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.report-details dd {
+  margin: 0;
+  font-size: 14px;
+  text-align: right;
+}
+
+.row-movements .num {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.cpp-green {
+  color: var(--cpp-green);
+}
+
+.cpp-amber {
+  color: var(--cpp-amber);
+}
+
+.cpp-red {
+  color: var(--cpp-red);
 }
 
 .panel-empty {
@@ -475,7 +655,8 @@ body {
 .hint-card {
   position: absolute;
   z-index: 8;
-  top: 86px;
+  /* Just under the HUD, whatever its height (main.ts publishes --hud-bottom). */
+  top: calc(var(--hud-bottom, 112px) + 10px);
   left: 50%;
   display: flex;
   align-items: center;
@@ -647,6 +828,15 @@ body {
   color: var(--danger);
 }
 
+.toast-warn {
+  border-color: color-mix(in srgb, var(--cpp-amber) 55%, var(--card-border));
+}
+
+.toast-warn .icon {
+  background: color-mix(in srgb, var(--cpp-amber) 18%, var(--card));
+  color: var(--cpp-amber);
+}
+
 .toast.leaving {
   opacity: 0;
   transform: translateY(6px);
@@ -672,51 +862,64 @@ body {
 
 /* Short screens ------------------------------------------------------------------ */
 
-/* Centred on a short screen (a large phone in landscape), the toolbar would reach
-   up over the HUD's speed controls: hang it below the HUD instead, with slightly
-   smaller buttons. Narrower screens get the phone layout below. */
+/* A short screen (a large phone in landscape): slightly smaller tool buttons,
+   so the toolbar still fits down the side, centred beside the two-row HUD
+   (which stays narrow enough to clear it: see below). Narrower screens get the
+   phone layout further down. */
 @media (max-height: 500px) {
-  .toolbar {
-    top: 86px;
-    transform: none;
-  }
-
   .tool {
     width: 46px;
     height: 46px;
+  }
+
+  .menu-item {
+    min-height: 44px;
+    padding: 6px 12px;
+  }
+
+  .menu-detail {
+    display: none;
+  }
+}
+
+/* Wide but short: the overdraft warning takes a row of its own, so the HUD never
+   grows wide enough to reach over the toolbar centred down the left side. */
+@media (min-width: 881px) and (max-height: 500px) {
+  .hud.alerting {
+    grid-template-columns: repeat(5, auto);
+    grid-template-areas:
+      'speeds when cash actions menu'
+      'stats stats stats stats stats'
+      'alert alert alert alert alert';
   }
 }
 
 /* Phones and narrow tablets ----------------------------------------------------- */
 
-/* The one-row HUD needs about 860px (its items' minimum widths plus margins);
-   below that it stacks into two rows and the toolbar moves to the bottom. */
+/* The two-row HUD needs about 700px; below 880px it spans the screen, the
+   overdraft warning gets a row of its own, and the toolbar moves to the bottom. */
 @media (max-width: 880px) {
-  .hud {
+  .hud,
+  .hud.alerting {
     top: 8px;
     right: 8px;
     left: 8px;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+    grid-template-areas:
+      'speeds when cash actions menu'
+      'stats stats stats stats stats';
+    justify-content: stretch;
+    gap: 4px 6px;
     max-width: none;
     border-radius: 24px;
     transform: none;
   }
 
-  .hud-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .hud-primary {
-    justify-content: space-between;
-  }
-
-  .hud-stats {
-    justify-content: space-between;
-    padding: 0 2px 2px;
+  .hud.alerting {
+    grid-template-areas:
+      'speeds when cash actions menu'
+      'stats stats stats stats stats'
+      'alert alert alert alert alert';
   }
 
   .speed {
@@ -725,22 +928,30 @@ body {
   }
 
   .hud-when {
-    flex: 1;
     min-width: 0;
     align-items: center;
+  }
+
+  .hud-town {
+    max-width: 100%;
   }
 
   .hud-cash {
     min-width: 0;
     padding: 0 2px;
-    font-size: 17px;
+    font-size: 18px;
+  }
+
+  .hud-stats {
+    gap: 4px;
+    padding: 0 2px 2px;
   }
 
   .chip {
     min-width: 0;
     height: 32px;
-    padding: 0 7px;
-    gap: 3px;
+    padding: 0 8px;
+    gap: 4px;
     font-size: 12.5px;
   }
 
@@ -771,11 +982,12 @@ body {
     bottom: 84px;
     left: 8px;
     width: auto;
-    padding: 8px 12px;
+    max-height: calc(100vh - var(--hud-bottom, 120px) - 100px);
+    padding: 6px 12px 8px;
   }
 
-  .panel-title {
-    margin-bottom: 2px;
+  .panel-toggle {
+    min-height: 30px;
     font-size: 14px;
   }
 
@@ -789,7 +1001,6 @@ body {
   }
 
   .hint-card {
-    top: 124px;
     right: 8px;
     left: 8px;
     width: auto;
@@ -811,9 +1022,93 @@ body {
   }
 }
 
+/* Phone portrait: the clock and menu on top, money and the pricing and
+   milestones buttons next, then the chips (labels dropped, numbers kept). */
+@media (max-width: 600px) {
+  .hud,
+  .hud.alerting {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'speeds when menu'
+      'cash cash actions'
+      'stats stats stats';
+  }
+
+  .hud.alerting {
+    grid-template-areas:
+      'speeds when menu'
+      'cash cash actions'
+      'stats stats stats'
+      'alert alert alert';
+  }
+
+  .hud-cash {
+    justify-self: start;
+    padding-left: 8px;
+    font-size: 20px;
+  }
+
+  .chip-label {
+    display: none;
+  }
+
+  .hud-stats {
+    flex-wrap: wrap;
+  }
+
+  .chip {
+    padding: 0 7px;
+  }
+}
+
+/* Short landscape phones: the panel's collapsed figures sit on one line. */
+@media (max-width: 880px) and (max-height: 500px) {
+  .panel:not(.expanded) {
+    display: grid;
+    grid-template-columns: minmax(0, auto) 1fr auto;
+    align-items: center;
+    gap: 2px 12px;
+  }
+
+  .panel:not(.expanded) .panel-title {
+    margin: 0;
+  }
+
+  .panel:not(.expanded) .stats {
+    display: flex;
+    gap: 14px;
+  }
+
+  .panel:not(.expanded) .stat {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+  }
+
+  .panel:not(.expanded) .mtd {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    white-space: nowrap;
+  }
+
+  .panel:not(.expanded) .panel-empty {
+    grid-column: 2 / 4;
+  }
+
+  .toasts {
+    bottom: 136px;
+  }
+}
+
 @media (max-width: 360px) {
-  .chip-building {
-    font-size: 12px;
+  .chip {
+    padding: 0 5px;
+    gap: 3px;
+  }
+
+  .speed {
+    min-width: 40px;
   }
 }
 
@@ -859,4 +1154,429 @@ body {
 
 .confirm-ok:hover {
   background: var(--active);
+}
+
+/* Sheets: pricing, milestones, rate card, game over ----------------------- */
+
+.sheet {
+  width: min(540px, calc(100vw - 24px));
+  max-width: none;
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  padding: 0;
+  overflow: hidden;
+  color: var(--text);
+}
+
+.sheet[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.sheet::backdrop {
+  background: rgb(35 48 58 / 35%);
+}
+
+.sheet-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 14px 8px 20px;
+}
+
+.sheet-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.sheet-title {
+  margin: 0;
+  font: 600 22px / 1.15 var(--font-display);
+}
+
+.sheet-subtitle {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font: 700 14px / 1.35 var(--font-ui);
+}
+
+.sheet-close {
+  flex: none;
+  background: var(--hover);
+}
+
+.sheet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 20px 14px;
+}
+
+.sheet-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px 16px;
+  border-top: 1px dashed var(--card-border);
+}
+
+.sheet-actions:empty {
+  display: none;
+}
+
+.sheet-primary,
+.sheet-primary:hover {
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+}
+
+.sheet-secondary {
+  background: var(--hover);
+}
+
+.sheet-hint {
+  margin: 10px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.sheet-error {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.sheet h3 {
+  margin: 0 0 6px;
+  color: var(--text-2);
+  font: 800 12px / 1.2 var(--font-ui);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Pricing */
+
+.tier-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.tier-table th,
+.tier-table td {
+  padding: 7px 4px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.tier-table thead th {
+  padding-top: 0;
+  color: var(--text-2);
+  font: 800 12px / 1.2 var(--font-ui);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tier-table tbody tr {
+  border-top: 1px dashed var(--card-border);
+}
+
+.tier-name {
+  display: block;
+  font: 600 16px / 1.15 var(--font-display);
+}
+
+.tier-speed,
+.tier-smb {
+  display: block;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tier-smb {
+  margin-top: 3px;
+}
+
+.tier-table .tier-offered,
+.tier-table .tier-mix,
+.tier-table thead th:nth-child(n + 3) {
+  text-align: center;
+}
+
+.tier-mix .num {
+  font-size: 15px;
+}
+
+.money-field,
+.mult-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 800;
+}
+
+.money-field .per {
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.field {
+  width: 88px;
+  min-height: 40px;
+  padding: 0 8px;
+  border: 2px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 16px;
+}
+
+.field:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.field[aria-invalid='true'] {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.sheet input[type='checkbox'] {
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: var(--active);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-top: 12px;
+}
+
+.field-label {
+  font: 600 15px / 1.2 var(--font-display);
+}
+
+.field-hint {
+  margin: 4px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  text-align: right;
+}
+
+.preview {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--chip);
+}
+
+.take-rates {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin: 0;
+}
+
+.take-rate dt {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.take-rate dd {
+  margin: 0;
+  font-size: 19px;
+}
+
+/* Milestones */
+
+.milestone-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.milestone {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--chip);
+}
+
+.milestone-icon {
+  width: 30px;
+  height: 30px;
+  padding: 5px;
+  border-radius: 50%;
+  background: var(--card);
+  color: var(--text-2);
+}
+
+.milestone.achieved .milestone-icon {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.sheet .milestone-title {
+  margin: 0;
+  color: var(--text);
+  font: 600 16px / 1.2 var(--font-display);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.milestone-desc {
+  margin: 2px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.milestone-progress {
+  margin: 5px 0 0;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.milestone-when {
+  color: var(--text-2);
+  font: 600 13px / 1.4 var(--font-display);
+  white-space: nowrap;
+}
+
+.milestone.achieved .milestone-when {
+  color: var(--success);
+}
+
+/* Rate card */
+
+.rate-section + .rate-section {
+  margin-top: 16px;
+}
+
+.rate-section dl {
+  display: grid;
+  margin: 0;
+}
+
+.rate-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--card-border);
+}
+
+.rate-row dt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.rate-row dt small {
+  flex-basis: 100%;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.rate-row dd {
+  margin: 0;
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.band-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+}
+
+.cpp-bg-green {
+  background: var(--cpp-green);
+}
+
+.cpp-bg-amber {
+  background: var(--cpp-amber);
+}
+
+.cpp-bg-red {
+  background: var(--cpp-red);
+}
+
+/* Game over */
+
+.game-over .sheet-title {
+  color: var(--danger);
+}
+
+.game-over-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.game-over-message p {
+  margin: 0;
+}
+
+.game-over-icon {
+  width: 26px;
+  height: 26px;
+}
+
+@media (max-width: 480px) {
+  .sheet-head {
+    padding: 14px 10px 6px 16px;
+  }
+
+  .sheet-body {
+    padding: 4px 14px 12px;
+  }
+
+  .sheet-actions {
+    padding: 10px 14px 14px;
+  }
+
+  .tier-table th,
+  .tier-table td {
+    padding: 6px 2px;
+  }
+
+  .field {
+    width: 72px;
+  }
 }
