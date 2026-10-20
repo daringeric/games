@@ -452,11 +452,16 @@ export interface TermLoan {
   /** Term in months: termYears x 12. */
   termMonths: number;
   /**
-   * Level monthly payment, whole dollars >= 1 (debt.levelPayment of the
-   * balance over monthsLeft; re-amortized by a partial prepayment). Each
-   * regular payment's interest is round(balance x effective bps / 120,000)
-   * and its principal is payment - interest (never below 0); the last one
-   * (monthsLeft === 1) pays the whole remaining balance plus its interest.
+   * Level monthly payment, whole dollars >= 1: debt.levelPayment of the
+   * balance over monthsLeft at the effective rate (rateBps + the penalty
+   * surcharge of the stage). Set at origination, and re-set over the months
+   * left by a partial prepayment, whenever a close starts or stops the
+   * penalty, and after a missed payment capitalizes interest (debt.reviewDebt),
+   * so it always repays the loan on schedule. Each regular payment's interest
+   * is round(balance x effective bps / 120,000) and its principal is payment -
+   * interest (never below 0); the last one (monthsLeft === 1) pays the whole
+   * remaining balance plus its interest, which differs from payment only by
+   * the whole-dollar rounding.
    */
   payment: number;
   /** Regular payments still due, 1..termMonths. A missed payment leaves it unchanged (the schedule slips a month). */
@@ -613,7 +618,7 @@ export type NoticeKind =
   | 'installsPaused' // cash could not cover the next install; new customers wait (Sales.installsPaused set)
   | 'installsResumed' // an install connected again after a pause (Sales.installsPaused cleared)
   | 'rulesUpdated' // an older save loaded under rules that changed what it gets (e.g. cabinet reach)
-  | 'paymentDue' // PAYMENT_REMINDER_DAYS before a close, cash is below the debt service that close will charge
+  | 'paymentDue' // PAYMENT_REMINDER_DAYS before a close, the cash projected at it (finance.estimateCashAtClose) is below the debt service it will charge
   | 'paymentMissed' // a close could not pay its debt service: late fee, credit frozen (not yet frozen before)
   | 'covenantWarning' // a covenant breach stepped the stage up to 'warning'
   | 'covenantPenalty' // a covenant breach stepped the stage up to 'penalty' (rate step-up)
@@ -972,15 +977,24 @@ export interface CovenantMetrics {
    * (no revenue yet and burning cash).
    */
   underwritingCashFlow: number;
-  /** Scheduled debt service over the next 12 months: each loan's payment x min(12, monthsLeft) + the line's balance x effective rate for a year. */
+  /**
+   * Scheduled debt service over the next 12 months at today's effective rates
+   * (debt.annualDebtService): each loan's next min(12, monthsLeft) payments as
+   * the closes will charge them, the last one exact, + the line's balance x
+   * effective rate for a year.
+   */
   annualDebtService: number;
-  /** totalDebt / underwritingCashFlow (x, unrounded); 0 with no debt; null when debt > 0 and underwritingCashFlow <= 0 (unmeasurable: a breach). */
+  /**
+   * totalDebt / underwritingCashFlow (x) to the hundredth, as shown and as the
+   * covenant and pricing use it; 0 with no debt; null when debt > 0 and
+   * underwritingCashFlow <= 0 (unmeasurable: a breach).
+   */
   leverage: number | null;
-  /** underwritingCashFlow / annualDebtService (x, unrounded, may be <= 0); null when annualDebtService is 0. */
+  /** underwritingCashFlow / annualDebtService (x) to the hundredth, may be <= 0; null when annualDebtService is 0. */
   coverage: number | null;
-  /** No debt, or leverage measurable and <= COVENANT_MAX_LEVERAGE. */
+  /** No debt, or leverage measurable and <= COVENANT_MAX_LEVERAGE (to the hundredth: 5.00x passes). */
   leverageOk: boolean;
-  /** Nothing scheduled, or coverage >= COVENANT_MIN_COVERAGE. */
+  /** Nothing scheduled, or coverage >= COVENANT_MIN_COVERAGE (to the hundredth). */
   coverageOk: boolean;
   /** leverageOk && coverageOk. */
   compliant: boolean;
@@ -1025,13 +1039,17 @@ export interface TermLoanQuote {
   maxAmount: number;
   /** Priced on pro forma leverage (debt + amount) and today's lifetime CPP. */
   rate: RateBreakdown;
-  /** Level monthly payment at rate.rateBps (debt.levelPayment); 0 when the amount is invalid. */
+  /**
+   * Level monthly payment at rate.effectiveRateBps (debt.levelPayment: the
+   * penalty included while it lasts, re-set when it lifts); 0 when the amount
+   * is invalid.
+   */
   payment: number;
-  /** The final regular payment (absorbs rounding), from the exact schedule. */
+  /** The final regular payment (absorbs rounding), from the exact schedule at rate.effectiveRateBps. */
   lastPayment: number;
   /** Interest-only charge at this month's close for the days from today to month end (debt.stubDays), at the effective rate. */
   stubInterest: number;
-  /** stubInterest + every regular payment's interest at rate.rateBps (no penalty), from the exact schedule. */
+  /** stubInterest + every regular payment's interest at rate.effectiveRateBps (as if today's rate held for the whole term), from the exact schedule. */
   totalInterest: number;
   /** Covenant figures today and pro forma with this loan (today's cash flows: the build it funds is not counted). */
   before: CovenantMetrics;
@@ -1055,7 +1073,7 @@ export interface PrepayQuote {
   total: number;
   /** Repays the whole balance (the loan closes). */
   paysOff: boolean;
-  /** Re-amortized level payment over the same months left (0 when it pays off). */
+  /** Re-amortized level payment over the same months left at the effective rate (0 when it pays off). */
   paymentAfter: number;
 }
 

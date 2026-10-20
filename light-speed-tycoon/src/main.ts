@@ -15,7 +15,7 @@ import type { Insets } from './render/camera';
 import { Scene } from './render/scene';
 import { toyTown } from './render/theme';
 import type { Theme } from './render/theme';
-import { BankPanel } from './ui/bankPanel';
+import { BankPanel, isBankNotice, noticeHeadline } from './ui/bankPanel';
 import { confirmDialog } from './ui/confirm';
 import { installDebugHook, searchWithoutSeed } from './ui/debugHook';
 import { el } from './ui/dom';
@@ -25,7 +25,7 @@ import { MapControls } from './ui/mapControls';
 import { Menu } from './ui/menu';
 import { MilestonesPanel } from './ui/milestonesPanel';
 import { HintCard, Toasts, noticeTone } from './ui/overlays';
-import { ReportPanel, monthClosedMessage } from './ui/panel';
+import { ReportPanel, monthClosedMessage, monthClosedTone } from './ui/panel';
 import { PricingPanel } from './ui/pricingPanel';
 import { RateCard } from './ui/rateCard';
 import { GameSession } from './ui/session';
@@ -43,6 +43,8 @@ import {
 import { applyThemeCss } from './ui/themeCss';
 
 const HINT = 'Lay fiber out from the CO, then drop a cabinet to light homes.';
+/** Screens narrow enough that a full debt notice toast would cover most of the map. */
+const NARROW_TOASTS = '(max-width: 600px)';
 
 function randomSeed(): number {
   // The UI may use Math.random to pick a seed; the sim itself never does.
@@ -275,11 +277,14 @@ async function boot(): Promise<void> {
   session.onMonthClosed((report) => {
     // Autosaves the close that ends a game too: reloading shows the game-over dialog again.
     autosave();
-    toasts.show(monthClosedMessage(report), true, 'month');
+    toasts.show(monthClosedMessage(report), monthClosedTone(report), 'month');
   });
   session.onNotice((notice) => {
     // The game-over dialog says it in full; a toast behind it would only repeat it.
-    if (notice.kind !== 'gameOver') toasts.show(notice.message, noticeTone(notice));
+    if (notice.kind === 'gameOver') return;
+    // On a phone a full debt notice covers most of the map: toast its headline, the Bank lists it in full.
+    const narrow = typeof window.matchMedia === 'function' && window.matchMedia(NARROW_TOASTS).matches;
+    toasts.show(narrow && isBankNotice(notice.kind) ? noticeHeadline(notice.message) : notice.message, noticeTone(notice));
   });
   session.onGameOver(showGameOver);
   session.onReplaced(() => {

@@ -528,6 +528,13 @@ describe('HUD chips', () => {
     expect(overdraftStatus(state)!.text).toBe(`Overdrawn: ${plural(1, 'close')} left`);
     state.finance.cash = 0;
     expect(overdraftStatus(state)).toMatchObject({ text: `Recovering: ${plural(1, 'close')} left`, tone: 'warn' });
+    // Frozen with debt owed, the bank tolerates no close in the red: it would be a default.
+    state.debt.covenant.stage = 'frozen';
+    state.debt.credit.balance = 1_000;
+    expect(overdraftStatus(state)).toMatchObject({ text: 'Recovering: no closes left', tone: 'warn' });
+    state.finance.cash = -1;
+    expect(overdraftStatus(state)).toMatchObject({ text: 'Overdrawn: no closes left', tone: 'danger' });
+    expect(overdraftStatus(state)!.tip).toMatch(/default/);
     state.gameOver = { day: 31, reason: 'insolvent', message: 'Out of cash.' };
     expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: out of cash', tone: 'danger', tip: 'Out of cash.' });
     state.gameOver = { day: 31, reason: 'default', message: 'Defaulted.' };

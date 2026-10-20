@@ -31,8 +31,9 @@
 // (FINANCING_CATEGORIES) as well as capex; net cash flow (report.net)
 // includes it; CPP (capex.osp) is untouched by debt.
 //
-// Cost of the reads (for the UI and the bots): covenantMetrics, creditOffer,
-// termCapacity and estimateNextDebtService are O(loans + ARR_TRAILING_MONTHS);
+// Cost of the reads (for the UI and the bots): creditOffer, termCapacity and
+// estimateNextDebtService are O(loans + ARR_TRAILING_MONTHS), covenantMetrics
+// O(12 x loans + ARR_TRAILING_MONTHS) (a year of each loan's schedule);
 // quoteTermLoan adds pricingCpp (getService, memoized on network.version and
 // day) and one amortization schedule (termYears x 12 steps); quotePrepay one
 // level-payment loop (monthsLeft steps). None allocates more than a schedule.
@@ -60,7 +61,7 @@ import {
   UNDERWRITING_MIN_MARGIN,
 } from './balance';
 import { dateOf, DAYS_PER_YEAR, formatMonth, isFirstOfMonth, MONTH_ABBR, MONTH_LENGTHS } from './calendar';
-import { formatMoney, postEntry, postEntryOn } from './finance';
+import { estimateCashAtClose, formatMoney, postEntry, postEntryOn } from './finance';
 import { costPerPassing, cppBand, operatingCashFlow } from './metrics';
 import { getService } from './network';
 import { postNotice } from './notices';
@@ -202,19 +203,22 @@ export function formatRateBps(bps: number): string {
   return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}%`;
 }
 
-/** 4.123 -> "4.12x", -0.5 -> "-0.50x". */
+/** The multiplication sign the UI writes multiples with (ui/format.formatRatio), so sim reasons and UI figures read alike. */
+const TIMES = '\u00d7';
+
+/** 4.123 -> "4.12×", -0.5 -> "-0.50×". */
 export function formatMultiple(x: number): string {
   const v = round(x * 100);
   const sign = v < 0 ? '-' : '';
   const abs = Math.abs(v);
-  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}x`;
+  return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}${TIMES}`;
 }
 
-/** A capacity multiple for prose: 0.5 -> "0.5x", 3 -> "3x", 1.25 -> "1.25x". */
+/** A capacity multiple for prose: 0.5 -> "0.5×", 3 -> "3×", 1.25 -> "1.25×". */
 function shortMultiple(x: number): string {
   const v = round(x * 100);
-  if (v % 100 === 0) return `${v / 100}x`;
-  if (v % 10 === 0) return `${Math.floor(v / 100)}.${(v % 100) / 10}x`;
+  if (v % 100 === 0) return `${v / 100}${TIMES}`;
+  if (v % 10 === 0) return `${Math.floor(v / 100)}.${(v % 100) / 10}${TIMES}`;
   return formatMultiple(x);
 }
 
@@ -230,6 +234,11 @@ function termBalances(state: GameState): number {
   return owed;
 }
 
+/** "Feb 1": the next month close after `day` (the 1st of the month after it). */
+function closeDate(day: number): string {
+  return `${MONTH_ABBR[dateOf(day).month % 12] as string} 1`;
+}
+
 /** "1 compliant close", "2 compliant closes" */
 function closes(n: number, what: string): string {
   return `${n} ${what}${n === 1 ? '' : 's'}`;
@@ -239,8 +248,18 @@ function reject(reason: string): CommandResult {
   return { ok: false, reason };
 }
 
-/** Why nothing can be borrowed while frozen, and how to lift it. */
-export function frozenReason(): string {
+/**
+ * Why nothing can be borrowed while frozen, and how to lift it. With nothing
+ * owed the next month close lifts it (reviewDebt), so that is what it says.
+ */
+export function frozenReason(state: GameState): string {
+  if (totalDebt(state) === 0) {
+    return (
+      'Your credit line is frozen after a covenant breach or a missed payment, but you owe nothing now: ' +
+      `the bank lifts the freeze and the penalty rate at the next month close (the ${closeDate(state.day)} close). ` +
+      'No draws or new term loans until then.'
+    );
+  }
   return (
     'Your credit line is frozen after a covenant breach or a missed payment: no draws or new term loans until it cures. ' +
     `${closes(COVENANT_CURE_CLOSES, 'month close')} in a row with every payment made, leverage at most ` +
@@ -282,16 +301,30 @@ export function annualOperatingCashFlow(state: GameState): number {
 }
 
 /**
- * Debt service scheduled over the next 12 months: for each loan payment x
- * min(12, monthsLeft), plus round(credit balance x (line rate + penalty) /
- * 10,000) for the line (a year of interest at today's balance). Stub and
- * last-payment rounding are ignored.
+ * Debt service scheduled over the next 12 months at today's effective rates:
+ * for each loan its next min(12, monthsLeft) regular payments exactly as the
+ * closes will charge them while the stage holds (scheduledPayments: the last
+ * one repays whatever balance is left), plus round(credit balance x (line
+ * rate + penalty) / 10,000) for the line (a year of interest at today's
+ * balance). A loan's stub interest is ignored.
  */
 export function annualDebtService(state: GameState): number {
   const { credit, loans, covenant } = state.debt;
-  let service = round((credit.balance * (rateOf(credit.rate) + penaltyBps(covenant.stage))) / 10_000);
-  for (const loan of loans) service += loan.payment * Math.min(12, loan.monthsLeft);
+  const penalty = penaltyBps(covenant.stage);
+  let service = round((credit.balance * (rateOf(credit.rate) + penalty)) / 10_000);
+  for (const loan of loans) service += scheduledPayments(loan, loan.rateBps + penalty, Math.min(12, loan.monthsLeft));
   return service;
+}
+
+/** x to the hundredth, as the UI and report.debt show it: round(x x 100) / 100 (held to safe integers). */
+function hundredth(x: number): number {
+  return safeX100(x) / 100;
+}
+
+/** Leverage to the hundredth: 0 with no debt, null (unmeasurable) when there is debt and no positive cash flow. */
+function leverageOf(debt: number, underwritingCashFlow: number): number | null {
+  if (debt === 0) return 0;
+  return underwritingCashFlow > 0 ? hundredth(debt / underwritingCashFlow) : null;
 }
 
 /** A hypothetical extra loan for covenantMetrics: its amount and its yearly debt service. */
@@ -306,6 +339,8 @@ export interface ProForma {
  * debt / max(annualOperatingCashFlow, trailingArr x UNDERWRITING_MIN_MARGIN)
  * (0 with no debt; null, a breach, when debt > 0 and that is <= 0); coverage
  * = the same cash flow / annualDebtService (null when nothing is scheduled).
+ * Both are rounded to the hundredth once, here, and tested, priced and shown
+ * at that figure (a leverage that reads 5.00x is within the 5x limit).
  * Limits: COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE. Pure read.
  */
 export function covenantMetrics(state: GameState, proForma?: ProForma): CovenantMetrics {
@@ -314,8 +349,8 @@ export function covenantMetrics(state: GameState, proForma?: ProForma): Covenant
   const ocf = annualOperatingCashFlow(state);
   const underwritingCashFlow = Math.max(ocf, arr * UNDERWRITING_MIN_MARGIN);
   const service = annualDebtService(state) + (proForma?.addAnnualDebtService ?? 0);
-  const leverage = debt === 0 ? 0 : underwritingCashFlow > 0 ? debt / underwritingCashFlow : null;
-  const coverage = service === 0 ? null : underwritingCashFlow / service;
+  const leverage = leverageOf(debt, underwritingCashFlow);
+  const coverage = service === 0 ? null : hundredth(underwritingCashFlow / service);
   const leverageOk = debt === 0 || (leverage !== null && leverage <= COVENANT_MAX_LEVERAGE);
   const coverageOk = service === 0 || (coverage !== null && coverage >= COVENANT_MIN_COVERAGE);
   return {
@@ -361,7 +396,9 @@ export function priceRate(product: DebtProduct, leverage: number | null, cpp: nu
   const leverageBps = leverageSpreadBps(leverage);
   const band = cpp === null ? null : cppBand(cpp);
   const cppBps = band === null ? 0 : CPP_SPREAD_BPS[band];
-  const productBps = product.kind === 'line' ? CREDIT_LINE_EXTRA_BPS : (TERM_EXTRA_BPS[product.years] ?? 0);
+  // A term not on offer (only reachable by calling with junk) adds nothing.
+  const termExtra: unknown = product.kind === 'term' ? TERM_EXTRA_BPS[product.years] : undefined;
+  const productBps = product.kind === 'line' ? CREDIT_LINE_EXTRA_BPS : typeof termExtra === 'number' ? termExtra : 0;
   const penalty = penaltyBps(stage);
   const rateBps = BASE_RATE_BPS + leverageBps + cppBps + productBps;
   return {
@@ -472,7 +509,7 @@ export function creditOffer(state: GameState): CreditOffer {
   const rateBps = rateOf(credit.rate);
   const reasons: string[] = [];
   if (available === 0) {
-    if (frozen) reasons.push(frozenReason());
+    if (frozen) reasons.push(frozenReason(state));
     else if (limit === 0) reasons.push(noCreditLineReason());
     else reasons.push(lineFullReason(limit, credit.balance));
   }
@@ -506,9 +543,11 @@ export function creditOffer(state: GameState): CreditOffer {
  * term): ok false with a reason, figures for what can be computed (an amount
  * that is not a positive number counts as 0; an unknown term has
  * termMonths 0 and no payment). Rate: priceRate({ kind: 'term', years },
- * pro forma leverage, pricingCpp, stage). Reasons, most fundamental first:
- * game over, term, amount not whole dollars, frozen, no capacity, below
- * TERM_LOAN_MIN, above maxAmount.
+ * pro forma leverage (to the hundredth, as covenantMetrics shows it),
+ * pricingCpp, stage). The payment and schedule are at the effective rate (the
+ * penalty included while it lasts), as the loan would be set up today.
+ * Reasons, most fundamental first: game over, term, amount not whole
+ * dollars, frozen, no capacity, below TERM_LOAN_MIN, above maxAmount.
  */
 export function quoteTermLoan(state: GameState, amount: number, termYears: TermYears): TermLoanQuote {
   const knownTerm = TERM_LOAN_YEARS.includes(termYears);
@@ -519,11 +558,10 @@ export function quoteTermLoan(state: GameState, amount: number, termYears: TermY
   const maxAmount = termCapacity(state);
   const before = covenantMetrics(state);
 
-  const proDebt = before.totalDebt + usable;
-  const leverage = proDebt === 0 ? 0 : before.underwritingCashFlow > 0 ? proDebt / before.underwritingCashFlow : null;
+  const leverage = leverageOf(before.totalDebt + usable, before.underwritingCashFlow);
   const rate = priceRate({ kind: 'term', years: termYears }, leverage, pricingCpp(state), state.debt.covenant.stage);
-  const payment = whole && knownTerm ? levelPayment(amount, rate.rateBps, termMonths) : 0;
-  const schedule = payment > 0 ? amortize(amount, rate.rateBps, termMonths, payment) : [];
+  const payment = whole && knownTerm ? levelPayment(amount, rate.effectiveRateBps, termMonths) : 0;
+  const schedule = payment > 0 ? amortize(amount, rate.effectiveRateBps, termMonths, payment) : [];
   const final = schedule.at(-1);
   const stubInterest = dayCountInterest(usable * stubDays(state.day), rate.effectiveRateBps);
   let totalInterest = stubInterest;
@@ -534,7 +572,7 @@ export function quoteTermLoan(state: GameState, amount: number, termYears: TermY
   if (state.gameOver) reasons.push('The game is over');
   if (!knownTerm) reasons.push(`Term must be ${joinOr(TERM_LOAN_YEARS)} years`);
   if (!whole) reasons.push(`A term loan must be a whole number of dollars (got ${describeValue(amount)})`);
-  if (frozen) reasons.push(frozenReason());
+  if (frozen) reasons.push(frozenReason(state));
   else if (maxAmount === 0) reasons.push(noTermCapacityReason(state));
   if (whole && amount < TERM_LOAN_MIN) reasons.push(`The smallest term loan is ${formatMoney(TERM_LOAN_MIN)}`);
   else if (whole && maxAmount > 0 && amount > maxAmount) reasons.push(overCapacityReason(state, maxAmount));
@@ -611,16 +649,52 @@ export function quotePrepay(state: GameState, loan: LoanId, amount: number): Pre
     const interest = accruedInterest > 0 ? ` (${formatMoney(amount)} plus ${formatMoney(accruedInterest)} of accrued interest)` : '';
     reasons.push(`Not enough cash: need ${formatMoney(total)}${interest}, have ${formatMoney(state.finance.cash)}`);
   }
-  const paymentAfter =
-    whole && amount < found.balance ? levelPayment(found.balance - amount, found.rateBps, found.monthsLeft) : 0;
+  // Re-amortized at the effective rate, like every level payment (TermLoan.payment).
+  const effective = found.rateBps + penaltyBps(state.debt.covenant.stage);
+  const paymentAfter = whole && amount < found.balance ? levelPayment(found.balance - amount, effective, found.monthsLeft) : 0;
   return { ok: reasons.length === 0, reasons, loan, amount, accruedInterest, total, paysOff, paymentAfter };
 }
 
-/** A regular (non-stub) payment of `loan` at `effectiveBps`: interest, and principal (the whole balance on the last payment). */
-function regularPayment(loan: TermLoan, effectiveBps: number): { interest: number; principal: number } {
-  const interest = monthInterest(loan.balance, effectiveBps);
-  const principal = loan.monthsLeft <= 1 ? loan.balance : Math.min(loan.balance, Math.max(0, loan.payment - interest));
+/**
+ * A regular (non-stub) payment of level `payment` on `balance` with
+ * `monthsLeft` payments to go, at `effectiveBps`: interest, and principal
+ * (the whole balance on the last payment).
+ */
+function paymentParts(balance: number, monthsLeft: number, payment: number, effectiveBps: number): { interest: number; principal: number } {
+  const interest = monthInterest(balance, effectiveBps);
+  const principal = monthsLeft <= 1 ? balance : Math.min(balance, Math.max(0, payment - interest));
   return { interest, principal };
+}
+
+/** The next regular payment of `loan` at `effectiveBps` (TermLoan.payment doc). */
+function regularPayment(loan: TermLoan, effectiveBps: number): { interest: number; principal: number } {
+  return paymentParts(loan.balance, loan.monthsLeft, loan.payment, effectiveBps);
+}
+
+/**
+ * The next `count` regular payments of `loan` at `effectiveBps` (the stage
+ * held), summed, each exactly as closeDebtMonth would charge it; stops once
+ * the balance is repaid. O(count).
+ */
+function scheduledPayments(loan: TermLoan, effectiveBps: number, count: number): number {
+  let balance = loan.balance;
+  let total = 0;
+  for (let k = 0; k < count && balance > 0; k++) {
+    const { interest, principal } = paymentParts(balance, loan.monthsLeft - k, loan.payment, effectiveBps);
+    total += interest + principal;
+    balance -= principal;
+  }
+  return total;
+}
+
+/**
+ * What the last payment of `loan` will be if today's stage holds: the exact
+ * schedule of its remaining payments at the effective rate (amortize). The
+ * Bank lists it beside the level payment when they differ.
+ */
+export function finalPayment(state: GameState, loan: TermLoan): number {
+  const final = amortize(loan.balance, loan.rateBps + penaltyBps(state.debt.covenant.stage), loan.monthsLeft, loan.payment).at(-1);
+  return final ? final.interest + final.principal : 0;
 }
 
 /**
@@ -665,7 +739,7 @@ export function drawCredit(state: GameState, amount: number): CommandResult {
     return reject(`A credit line draw must be a whole number of dollars, at least $1 (got ${describeValue(amount)})`);
   }
   const { credit, covenant } = state.debt;
-  if (covenant.stage === 'frozen') return reject(frozenReason());
+  if (covenant.stage === 'frozen') return reject(frozenReason(state));
   const limit = creditLimit(state);
   if (limit === 0) return reject(noCreditLineReason());
   const available = creditAvailable(state);
@@ -757,7 +831,9 @@ export function prepayLoan(state: GameState, loan: LoanId, amount: number): Comm
  * End of state.day (called at the start of tick, before the day advances and
  * before any close; never once the game is over): balanceDollarDays +=
  * credit balance. Then, if a close is PAYMENT_REMINDER_DAYS days away
- * (calendar.isFirstOfMonth(state.day + PAYMENT_REMINDER_DAYS)) and cash <
+ * (calendar.isFirstOfMonth(state.day + PAYMENT_REMINDER_DAYS)) and the cash
+ * that close will have at its debt step (finance.estimateCashAtClose: after
+ * the month's billing, running costs and installs) is below
  * estimateNextDebtService(state) > 0 (estimated before today's balance is
  * added, so today counts once), post one 'paymentDue' notice.
  */
@@ -765,12 +841,13 @@ export function endDebtDay(state: GameState): void {
   if (state.gameOver) return;
   const closeDay = state.day + PAYMENT_REMINDER_DAYS;
   const due = isFirstOfMonth(closeDay) ? estimateNextDebtService(state) : 0;
+  const atClose = due > 0 ? estimateCashAtClose(state) : 0;
   const { credit } = state.debt;
   credit.balanceDollarDays += credit.balance;
-  if (due > 0 && state.finance.cash < due) postNotice(state, 'paymentDue', paymentDueMessage(state, closeDay, due));
+  if (due > 0 && atClose < due) postNotice(state, 'paymentDue', paymentDueMessage(state, closeDay, due, atClose));
 }
 
-function paymentDueMessage(state: GameState, closeDay: number, due: number): string {
+function paymentDueMessage(state: GameState, closeDay: number, due: number, atClose: number): string {
   const date = dateOf(closeDay);
   const when = `${MONTH_ABBR[date.month - 1] as string} ${date.day}`;
   const frozen = state.debt.covenant.stage === 'frozen';
@@ -778,7 +855,11 @@ function paymentDueMessage(state: GameState, closeDay: number, due: number): str
   const consequence = frozen
     ? 'or it is a default: with the credit line frozen, the bank calls your loans and the game ends.'
     : 'or the payment is missed: a late fee and a frozen credit line.';
-  return `Loan payments of about ${formatMoney(due)} are due at the ${when} close and cash is ${formatMoney(state.finance.cash)}: ${raise}, ${consequence}`;
+  return (
+    `Loan payments of about ${formatMoney(due)} are due at the ${when} close, and after this month's billing and running costs ` +
+    `cash is projected at about ${formatMoney(atClose)} then (${formatMoney(state.finance.cash)} today), ` +
+    `${formatMoney(due - atClose)} short: ${raise}, ${consequence}`
+  );
 }
 
 /** What the debt part of a month close did (closeDebtMonth -> reviewDebt). */
@@ -817,8 +898,9 @@ interface LoanCharge {
  *   monthsLeft -= 1 for regular payments, remove loans that reach 0.
  * - cash < due (missed): post nothing of it; capitalize every interest part
  *   into its balance (line and loans), leave monthsLeft (the schedule slips a
- *   month); if the stage is not 'frozen' post a late fee 'interest'
- *   -max(LATE_FEE_MIN, round(due x LATE_FEE_SHARE)), else mark defaulted.
+ *   month; reviewDebt re-sets the payments to the new balances); if the stage
+ *   is not 'frozen' post a late fee 'interest' -max(LATE_FEE_MIN, round(due x
+ *   LATE_FEE_SHARE)), else mark defaulted.
  * Always resets balanceDollarDays to 0. Returns the DebtClose.
  */
 export function closeDebtMonth(state: GameState, lastDay: number): DebtClose {
@@ -918,26 +1000,41 @@ function cureRule(): string {
   return `${closes(COVENANT_CURE_CLOSES, 'compliant close')} in a row`;
 }
 
-function breachNotice(state: GameState, label: string, stage: CovenantStage, m: CovenantMetrics): void {
+/**
+ * The debt service the Bank shows after the close re-priced the line and
+ * re-set loan payments, when it differs from the figure the review tested:
+ * " At the new rates, $X of payments are due in the next 12 months
+ * (coverage Y)." ('' when unchanged).
+ */
+function repricedClause(tested: CovenantMetrics, now: CovenantMetrics): string {
+  if (now.annualDebtService === tested.annualDebtService) return '';
+  const coverage = now.coverage === null ? '' : ` (coverage ${formatMultiple(now.coverage)})`;
+  return ` At the new rates, ${formatMoney(now.annualDebtService)} of payments are due in the next 12 months${coverage}.`;
+}
+
+/** `m`: the metrics the review tested; `now`: the same after re-pricing (what the Bank shows from now on). */
+function breachNotice(state: GameState, label: string, stage: CovenantStage, m: CovenantMetrics, now: CovenantMetrics): void {
   const failing = breachDetails(m);
+  const repriced = repricedClause(m, now);
   const penalty = formatRateBps(PENALTY_STEP_UP_BPS);
   if (stage === 'warning') {
     postNotice(
       state,
       'covenantWarning',
-      `Covenant warning at the ${label} close: ${failing}. Nothing changes yet, but another breach adds a ${penalty} penalty rate to every balance; ${cureRule()} clear the warning.`,
+      `Covenant warning at the ${label} close: ${failing}.${repriced} Nothing changes yet, but another breach adds a ${penalty} penalty rate to every balance; ${cureRule()} clear the warning.`,
     );
   } else if (stage === 'penalty') {
     postNotice(
       state,
       'covenantPenalty',
-      `Covenant breach at the ${label} close while on warning: ${failing}. Every balance now pays ${penalty} more until ${cureRule()} step it back down; another breach freezes the credit line.`,
+      `Covenant breach at the ${label} close while on warning: ${failing}. Every balance now pays ${penalty} more (term-loan payments rise to match) ` +
+        `until ${cureRule()} step it back down; another breach freezes the credit line.${repriced}`,
     );
   } else if (stage === 'frozen') {
     postNotice(
       state,
       'creditFrozen',
-      `Credit line frozen at the ${label} close after another covenant breach: ${failing}. No draws or new term loans (repaying and prepaying still work), ` +
+      `Credit line frozen at the ${label} close after another covenant breach: ${failing}.${repriced} No draws or new term loans (repaying and prepaying still work), ` +
         `the ${penalty} penalty rate stays, and a payment missed while frozen is a default that ends the game. ${cureRule()} lift the freeze.`,
     );
   }
@@ -949,7 +1046,7 @@ function cureNotice(state: GameState, label: string, stage: CovenantStage): void
     stage === 'penalty'
       ? `The credit line is unfrozen, but the ${penalty} penalty rate still applies until ${cureRule()} more.`
       : stage === 'warning'
-        ? `The ${penalty} penalty rate is lifted; you are still on warning, so another breach brings it back.`
+        ? `The ${penalty} penalty rate is lifted and term-loan payments come back down; you are still on warning, so another breach brings it back.`
         : 'You are back in good standing with the bank.';
   postNotice(state, 'covenantCured', `Covenants met at the ${label} close: your standing is back to ${stage}. ${still}`);
 }
@@ -967,16 +1064,27 @@ function cureNotice(state: GameState, label: string, stage: CovenantStage): void
  *   'creditFrozen'; already frozen: no notice); compliant closes count up and
  *   every COVENANT_CURE_CLOSES of them step it down one ('covenantCured');
  *   compliant while 'compliant' keeps compliantCloses at 0.
- * Then one 'loanPaidOff' notice per close.paidOff, re-price the credit line
- * (priceRate line parts at the close's leverage, pricingCpp and the stage
- * after the review) and set report.debt (DebtStats: stage after the review,
- * average rate after re-pricing).
+ * Then (unless defaulted), when the close missed (interest capitalized) or
+ * the penalty surcharge started or stopped, re-set every loan's level payment
+ * over its months left at its new effective rate (TermLoan.payment). Re-price
+ * the credit line (priceRate line parts at the close's leverage, to the
+ * hundredth as report.debt records it, the ended month's CPP from
+ * report.stats.capexOsp / report.passings (pricingCpp for a report without
+ * stats) and the stage after the review, so creditOffer shows exactly what
+ * the line was priced on). A breach notice is posted after that, with the
+ * tested figures and, when they changed, the debt service and coverage at the
+ * new rates (what the Bank shows from then on). Then one 'loanPaidOff' notice
+ * per close.paidOff, and report.debt (DebtStats: the tested figures, stage
+ * after the review, average rate after re-pricing).
  */
 export function reviewDebt(state: GameState, report: MonthlyReport, close: DebtClose): void {
   const debt = state.debt;
   const covenant = debt.covenant;
   const label = formatMonth(report.year, report.month);
   const m = covenantMetrics(state);
+  const penaltyBefore = penaltyBps(covenant.stage);
+  /** The stage a breach stepped up to (its notice waits for the re-priced figures). */
+  let breached: CovenantStage | null = null;
 
   if (close.defaulted) {
     const message =
@@ -992,7 +1100,8 @@ export function reviewDebt(state: GameState, report: MonthlyReport, close: DebtC
       state,
       'paymentMissed',
       `Missed payment: the ${formatMoney(close.due)} of loan payments due at the ${label} close could not be paid (cash ${formatMoney(cash)}). ` +
-        `The bank charged a ${formatMoney(close.lateFee)} late fee, added the unpaid interest to what you owe and froze your credit line: ` +
+        `The bank charged a ${formatMoney(close.lateFee)} late fee, added the unpaid interest to what you owe (term-loan payments are re-set to repay it on schedule) ` +
+        'and froze your credit line: ' +
         `no draws or new term loans, and a ${formatRateBps(PENALTY_STEP_UP_BPS)} penalty rate on every balance. ` +
         `Another missed payment while frozen is a default that ends the game; ${cureRule()} lift the freeze.`,
     );
@@ -1010,7 +1119,7 @@ export function reviewDebt(state: GameState, report: MonthlyReport, close: DebtC
     covenant.compliantCloses = 0;
     if (covenant.stage !== 'frozen') {
       covenant.stage = STEP_UP[covenant.stage];
-      breachNotice(state, label, covenant.stage, m);
+      breached = covenant.stage;
     }
   } else if (covenant.stage === 'compliant') {
     covenant.compliantCloses = 0;
@@ -1023,16 +1132,31 @@ export function reviewDebt(state: GameState, report: MonthlyReport, close: DebtC
     }
   }
 
+  // A level payment repays its loan only at the rate it was set for: when the
+  // penalty starts or stops, or a missed payment added interest to the
+  // balances, re-set each payment over the months left, so the surcharge is
+  // paid as it accrues and never piles up on the last payment.
+  const penalty = penaltyBps(covenant.stage);
+  if (!close.defaulted && (close.missed || penalty !== penaltyBefore)) {
+    for (const loan of debt.loans) loan.payment = levelPayment(loan.balance, loan.rateBps + penalty, loan.monthsLeft);
+  }
+
+  // Priced on the figures this close records, which are what creditOffer shows
+  // until the next close: leverage to the hundredth (covenantMetrics,
+  // report.debt.leverageX100) and the ended month's CPP (report.passings, taken
+  // before the day moved on; a lot that appears on the 1st belongs to the new month).
+  const leverageX100 = m.leverage === null ? null : safeX100(m.leverage);
+  const cpp = report.stats ? costPerPassing(report.stats.capexOsp, report.passings) : pricingCpp(state);
+  const priced = priceRate({ kind: 'line' }, m.leverage, cpp, covenant.stage);
+  debt.credit.rate = { baseBps: priced.baseBps, leverageBps: priced.leverageBps, cppBps: priced.cppBps, productBps: priced.productBps };
+
+  if (breached !== null) breachNotice(state, label, breached, m, covenantMetrics(state));
   if (!close.defaulted) {
     for (const id of close.paidOff) {
       postNotice(state, 'loanPaidOff', `Term loan #${id} is paid off: its last payment was made at the ${label} close.`);
     }
   }
 
-  const priced = priceRate({ kind: 'line' }, m.leverage, pricingCpp(state), covenant.stage);
-  debt.credit.rate = { baseBps: priced.baseBps, leverageBps: priced.leverageBps, cppBps: priced.cppBps, productBps: priced.productBps };
-
-  const penalty = penaltyBps(covenant.stage);
   const total = totalDebt(state);
   let weighted = debt.credit.balance * (rateOf(debt.credit.rate) + penalty);
   for (const loan of debt.loans) weighted += loan.balance * (loan.rateBps + penalty);
@@ -1043,7 +1167,7 @@ export function reviewDebt(state: GameState, report: MonthlyReport, close: DebtC
     arr: m.arr,
     annualOperatingCashFlow: m.annualOperatingCashFlow,
     annualDebtService: m.annualDebtService,
-    leverageX100: m.leverage === null ? null : safeX100(m.leverage),
+    leverageX100,
     coverageX100: m.coverage === null ? null : safeX100(m.coverage),
     stage: covenant.stage,
     averageRateBps: total === 0 ? null : round(weighted / total),

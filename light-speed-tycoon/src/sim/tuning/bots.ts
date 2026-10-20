@@ -7,13 +7,30 @@
 //   connects it to the plant, cables its streets with homes in few orders,
 //   adds splitters and OLT cards as ports fill, markets about
 //   SMART_MARKETING_PER_PASSING dollars per passing per month (none while
-//   installs are paused for cash), default prices.
+//   installs are paused for cash), default prices. Round 3: it borrows
+//   responsibly. A 7-year term loan funds its next cabinet project (plus the
+//   connects it expects) when the project is not red on its own, the lifetime
+//   cost per passing after it - what the bank prices on - stays under
+//   opts.loanLifetimeCpp, its reserve is covered and the quote's pro forma
+//   covenants keep a buffer (never a quote that breaches); the credit line
+//   covers timing gaps (draw when cash dips under a small floor, repay when
+//   cash is comfortably above the reserve, repay first when a covenant is at
+//   risk), so its reserve leans on the undrawn line instead of idle cash.
+//   smartBot({ borrow: false }) is the round-2 SMART.
+// - LEVERED: borrows to the limit (every term loan termCapacity allows plus the
+//   whole credit line, ignoring covenants and the quote's warning), overbuilds
+//   (SMART's project picker, amber and red allowed, heavy marketing) and keeps
+//   no reserve for its debt service once the bank lends. It breaches, is
+//   frozen, misses a payment and defaults.
+// - RURAL: SMART's borrowing rules on red rural cabinet areas only, so
+//   its lifetime cost per passing is red while it borrows: the bank's CPP spread.
 // - CARELESS: overbuilds underground toward random far corners whenever cash
 //   covers it (no reserve), cabinets at every 4th corner reached, marketing at
-//   the maximum, never adds splitters.
+//   the maximum, never adds splitters, never borrows.
 // - IDLE: does nothing.
 // - MIXED: SMART plus random removals, price and budget changes, extra
-//   splitters and OLT cards: every command type, for the invariant sessions.
+//   splitters and OLT cards, credit-line draws and repayments, term loans and
+//   prepayments (and junk of each): every command type, for the invariant sessions.
 //
 // Bots read the game only through public sim functions and change it only
 // through `send` (applyCommand). Their randomness comes from their own Rng.
@@ -23,7 +40,10 @@ import {
   CABINET_COST,
   CABINET_REACH_FT,
   CABINET_START_SPLITTERS,
+  COVENANT_MAX_LEVERAGE,
+  COVENANT_MIN_COVERAGE,
   CPP_TARGET,
+  LOAN_ROUNDING,
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
   MDU_ROUTER_COST,
@@ -33,11 +53,14 @@ import {
   SIGNUP_RAMP_PER_DAY,
   SPLITTER_COST,
   SUPPORT_COST_PER_SUB_PER_MONTH,
+  TERM_LOAN_MIN,
+  TERM_LOAN_YEARS,
   TIER_DEFAULTS,
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
 } from '../balance';
 import { coveragePreview, segmentsWithinReach } from '../coverage';
+import { covenantMetrics, creditAvailable, creditOffer, estimateNextDebtService, quoteTermLoan, termCapacity } from '../debt';
 import { cppBand } from '../metrics';
 import { cableRoute, getService, orderFees, plannedService, ponPortsUsed, quoteCabinet, quoteCable } from '../network';
 import { deriveSeed, Rng } from '../rng';
@@ -53,7 +76,18 @@ import {
   targetTakeRate,
 } from '../sales';
 import { otherEnd, parcelsServedBy, segmentsAtNode } from '../streets';
-import type { CableMethod, City, GameState, NodeId, ParcelId, SegmentId, StreetSegment } from '../types';
+import type {
+  CableMethod,
+  City,
+  CovenantMetrics,
+  GameState,
+  NodeId,
+  ParcelId,
+  ParcelKind,
+  SegmentId,
+  StreetSegment,
+  TermYears,
+} from '../types';
 import { cheapestMethod, streetTree, treePath } from './harness';
 import type { BotFactory, Send } from './harness';
 
@@ -89,6 +123,48 @@ export interface SmartOptions {
   orderMaxFt: number;
   /** Candidate areas tried (best first) before waiting for more cash. */
   candidatesTried: number;
+
+  // Financing (round 3)
+  /** Borrow: term loans for its projects (see loanLifetimeCpp), the credit line for timing gaps (false: the round-2 SMART). */
+  borrow: boolean;
+  /** A term loan's pro forma leverage stays at most this share of COVENANT_MAX_LEVERAGE ... */
+  loanLeverageShare: number;
+  /** ... and its pro forma debt-service coverage at least this multiple of COVENANT_MIN_COVERAGE. */
+  loanCoverageMultiple: number;
+  /**
+   * The credit line's (smaller) buffer: a draw keeps leverage within this
+   * share of the limit and coverage above this multiple of the minimum, and
+   * outside it the line is repaid first (a covenant is at risk).
+   */
+  lineLeverageShare: number;
+  lineCoverageMultiple: number;
+  /** Term of the loans it takes. */
+  termYears: TermYears;
+  /**
+   * It borrows for a project that is not red on its own (projectCpp, feeder
+   * included) and keeps the projected lifetime cost per passing - the figure
+   * the bank prices on - at most this (lifetime capex.osp plus the project's
+   * plant, over passings plus its new units): green money for green plant.
+   */
+  loanLifetimeCpp: number;
+  /** Borrow for a project even while its own reserve is short (only the covenant buffers limit it): the rural-heavy bot. */
+  borrowWhenShort: boolean;
+  /** Smallest term loan it takes (it borrows in chunks); at least TERM_LOAN_MIN. */
+  minLoan: number;
+  /** Loan amounts are rounded up to a multiple of this. */
+  loanStep: number;
+  /** Cash floor below which it draws on the line: months of fixed costs (overhead + marketing) ... */
+  floorMonths: number;
+  /** ... plus this many days of expected installs, plus the next close's debt service. */
+  floorInstallDays: number;
+  /** Share of the drawable line (within the line buffer) its reserve counts instead of idle cash. */
+  lineLean: number;
+  /** Build red cabinet areas too, and borrow for any band. */
+  allowRed: boolean;
+  /** Build only red cabinet areas (the rural-heavy bot; implies allowRed). */
+  redOnly: boolean;
+  /** RunResult.bot. */
+  name: string;
 }
 
 /**
@@ -110,6 +186,22 @@ export const SMART_DEFAULTS: SmartOptions = {
   maxStreetCpp: 2 * CPP_TARGET,
   orderMaxFt: 3_000,
   candidatesTried: 6,
+  borrow: true,
+  loanLeverageShare: 0.8,
+  loanCoverageMultiple: 1.2,
+  lineLeverageShare: 0.9,
+  lineCoverageMultiple: 1.1,
+  termYears: 7,
+  loanLifetimeCpp: 0.9 * CPP_TARGET,
+  borrowWhenShort: false,
+  minLoan: 25_000,
+  loanStep: 5_000,
+  floorMonths: 1,
+  floorInstallDays: 60,
+  lineLean: 1,
+  allowRed: false,
+  redOnly: false,
+  name: 'smart',
 };
 
 interface Order {
@@ -122,7 +214,10 @@ interface Project {
   /** Buy an OLT card first (no free PON port for the cabinet). */
   oltCard: boolean;
   orders: Order[];
+  /** Plant cost from quotes: cabinet, OLT card, cable orders. */
   cost: number;
+  /** Install spend its expected signups will take over the reserve's horizon (part of its budget). */
+  connect: number;
   newUnits: number;
 }
 
@@ -139,8 +234,9 @@ function streetConnectCost(
   subscribed: ReadonlyMap<ParcelId, number>,
   routers: ReadonlySet<ParcelId>,
   share: number,
+  rates: Readonly<Record<ParcelKind, number>>,
 ): number {
-  const { city, sales, day } = state;
+  const { city, day } = state;
   let target = 0;
   let subs = 0;
   let open = 0;
@@ -149,7 +245,7 @@ function streetConnectCost(
     const parcel = city.parcels[pid];
     if (!parcel || parcel.appearsDay > day) continue;
     const sub = subscribed.get(pid) ?? 0;
-    target += targetTakeRate(sales.pricing, parcel.kind) * parcel.units;
+    target += rates[parcel.kind] * parcel.units;
     subs += sub;
     open += parcel.units - sub;
     parcels.push({ id: pid, kind: parcel.kind, free: parcel.units - sub });
@@ -199,15 +295,16 @@ export function daysUntilPlannedLive(state: GameState): number {
 
 /**
  * Cash a careful operator never spends on new plant: opts.reserveMonths of
- * fixed costs (overhead + marketing), the part of them that revenue does not
- * cover yet for opts.burnMonths plus the months until the plant already
- * ordered is live (a long make-ready delays the first revenue), and the
- * installs it expects (expectedInstalls over opts.installDays).
+ * fixed costs (overhead + marketing), the part of them (and of a month's
+ * `debtService`, for a borrower) that revenue does not cover yet for
+ * opts.burnMonths plus the months until the plant already ordered is live (a
+ * long make-ready delays the first revenue), and the installs it expects
+ * (expectedInstalls over opts.installDays).
  */
-export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAULTS): number {
+export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAULTS, debtService = 0): number {
   const fixed = OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
   const earning = monthlyRecurringRevenue(state) - SUPPORT_COST_PER_SUB_PER_MONTH * subscriberUnits(state);
-  const uncovered = Math.max(0, fixed - earning);
+  const uncovered = Math.max(0, fixed + debtService - earning);
   const burnMonths = opts.burnMonths + daysUntilPlannedLive(state) / 30;
   return (
     opts.reserveMonths * fixed +
@@ -216,6 +313,21 @@ export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAUL
   );
 }
 
+/** Target take rate by building kind at today's prices (sales.targetTakeRate), for streetConnectCost. */
+function takeRates(state: GameState): Record<ParcelKind, number> {
+  const { pricing } = state.sales;
+  return { home: targetTakeRate(pricing, 'home'), mdu: targetTakeRate(pricing, 'mdu'), smb: targetTakeRate(pricing, 'smb') };
+}
+
+/**
+ * Last expectedInstalls results per state, keyed by everything they read: the
+ * day (parcels appear by day), the plant (network.version), accounts and
+ * building routers, prices, the horizon and the marketing assumption. A weekly
+ * look asks several times on one day; this keeps the bots fast and never
+ * changes an answer.
+ */
+const installsMemo = new WeakMap<GameState, Map<string, number>>();
+
 /**
  * Install spend expected over the next `days` on every street that will be
  * lit once everything ordered is built: streetConnectCost with the share of
@@ -223,14 +335,27 @@ export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAUL
  */
 export function expectedInstalls(state: GameState, days: number, marketingPerPassing = SMART_MARKETING_PER_PASSING): number {
   const { sales } = state;
+  const key =
+    `${state.day}:${state.network.version}:${sales.accounts.length}:${sales.routerParcels.length}:${days}:${marketingPerPassing}:` +
+    JSON.stringify(sales.pricing);
+  let memo = installsMemo.get(state);
+  const hit = memo?.get(key);
+  if (hit !== undefined) return hit;
   const planned = plannedService(state);
   const subscribed = new Map<ParcelId, number>();
   for (const account of sales.accounts) subscribed.set(account.parcel, accountUnits(account));
   const routers = new Set(sales.routerParcels);
   const share = installShare(days, marketingPerPassing);
+  const rates = takeRates(state);
   let cost = 0;
-  for (const segment of planned.servingCabinet.keys()) cost += streetConnectCost(state, segment, subscribed, routers, share);
-  return Math.round(cost);
+  for (const segment of planned.servingCabinet.keys()) cost += streetConnectCost(state, segment, subscribed, routers, share, rates);
+  const result = Math.round(cost);
+  if (!memo || memo.size >= 8) {
+    memo = new Map();
+    installsMemo.set(state, memo);
+  }
+  memo.set(key, result);
+  return result;
 }
 
 /** Group segments into connected same-method orders of at most maxFt each (one oversized segment is its own order). */
@@ -336,6 +461,8 @@ interface PlanContext {
   subscribed: ReadonlyMap<ParcelId, number>;
   /** Share of a street's take-rate gap counted as install spend (the reserve's horizon). */
   installShare: number;
+  /** Target take rate by kind (takeRates). */
+  rates: Readonly<Record<ParcelKind, number>>;
 }
 
 /**
@@ -401,7 +528,7 @@ function planProject(
     }
     const units = ctx.units[entry.segment] as number;
     const addCost = costOf(adds);
-    const addConnect = streetConnectCost(state, entry.segment, ctx.subscribed, ctx.routers, ctx.installShare);
+    const addConnect = streetConnectCost(state, entry.segment, ctx.subscribed, ctx.routers, ctx.installShare, ctx.rates);
     // Leave room for per-order fees (about one order per six streets) when estimating.
     const fees = (Math.ceil((build.size + adds.length) / 6) + 1) * orderFees('underground');
     if (estimate + addCost + fees + connect + addConnect > budget) continue;
@@ -423,7 +550,7 @@ function planProject(
     ];
     let cost = fixed;
     for (const order of orders) cost += quoteCable(state, order.segments, order.method).cost;
-    if (cost + connect <= budget) return { node, oltCard, orders, cost, newUnits };
+    if (cost + connect <= budget) return { node, oltCard, orders, cost, connect, newUnits };
     const last = accepted.pop();
     if (!last) return null;
     for (const id of last.segments) build.delete(id);
@@ -463,13 +590,29 @@ function segmentBuildCosts(city: City): Float64Array {
   return costs;
 }
 
+/** Outside-plant cost per unit the project newly passes (its cabinet and cable; an OLT card is CO capex). */
+function projectCpp(project: Project): number {
+  return (project.cost - (project.oltCard ? OLT_CARD_COST : 0)) / project.newUnits;
+}
+
 /**
  * Best cabinet area to build or extend next within `budget`: every corner
  * scored by the units it would newly pass per dollar of cabinet, in-reach
  * build-out (coveragePreview's figures) and feeder from the committed plant;
- * areas whose projected cost per passing is green first, amber next, red never.
+ * areas whose projected cost per passing is green first, amber next, red only
+ * with opts.allowRed (opts.redOnly: red areas only). `maxBand` (a BAND_RANK)
+ * caps the area's band and the planned project's own cost per passing
+ * (projectCpp, which counts its feeder) when `strict`; `accept` may veto a
+ * planned project (SMART's lifetime test for what it borrows for).
  */
-function chooseProject(state: GameState, budget: number, opts: SmartOptions): Project | null {
+function chooseProject(
+  state: GameState,
+  budget: number,
+  opts: SmartOptions,
+  maxBand = defaultBand(opts),
+  strict = false,
+  accept: (project: Project) => boolean = () => true,
+): Project | null {
   const { city, network } = state;
   const { cost: feeder, source } = feederCosts(state);
   const ctx: PlanContext = {
@@ -479,6 +622,7 @@ function chooseProject(state: GameState, budget: number, opts: SmartOptions): Pr
     routers: new Set(state.sales.routerParcels),
     subscribed: new Map(state.sales.accounts.map((a) => [a.parcel, accountUnits(a)])),
     installShare: installShare(opts.installDays, opts.marketingPerPassing),
+    rates: takeRates(state),
   };
   const reach = streetReach(city);
   const buildCost = segmentBuildCosts(city);
@@ -496,16 +640,35 @@ function chooseProject(state: GameState, budget: number, opts: SmartOptions): Pr
     }
     if (newly < opts.minNewUnits) continue;
     const band = BAND_RANK[cppBand(cost / newly)];
-    if (band > BAND_RANK.amber) continue;
+    if (band > maxBand || (opts.redOnly && band < BAND_RANK.red)) continue;
     const score = newly / (cost + (feeder[node] as number));
     candidates.push({ node, band, score });
   }
   candidates.sort((x, y) => x.band - y.band || y.score - x.score || x.node - y.node);
   for (const candidate of candidates.slice(0, opts.candidatesTried)) {
     const project = planProject(state, candidate.node, source[candidate.node] as number, budget, ctx, opts);
-    if (project) return project;
+    if (!project) continue;
+    const band = BAND_RANK[cppBand(projectCpp(project))];
+    if ((strict && band > maxBand) || (opts.redOnly && band < BAND_RANK.red) || !accept(project)) continue;
+    return project;
   }
   return null;
+}
+
+/** The worst band a bot builds with its own cash: amber, or red with opts.allowRed. */
+function defaultBand(opts: SmartOptions): number {
+  return opts.allowRed || opts.redOnly ? BAND_RANK.red : BAND_RANK.amber;
+}
+
+/** The worst band of a project a bot borrows for: amber (with the lifetime test), or red with opts.allowRed. */
+function loanBand(opts: SmartOptions): number {
+  return opts.allowRed || opts.redOnly ? BAND_RANK.red : BAND_RANK.amber;
+}
+
+/** Lifetime cost per passing once `project` is built: (capex.osp + its plant) / (passings + its new units). */
+function projectedLifetimeCpp(state: GameState, project: Project): number {
+  const plant = project.cost - (project.oltCard ? OLT_CARD_COST : 0);
+  return (state.finance.capex.osp + plant) / (getService(state).passings + project.newUnits);
 }
 
 /** Splitters where ports run short (and OLT cards to feed them), while cash allows. */
@@ -537,35 +700,278 @@ function buildProject(state: GameState, send: Send, project: Project): boolean {
   return true;
 }
 
-/** One weekly look by the careful operator (shared by SMART and MIXED). */
+// ---------------------------------------------------------------------------
+// SMART's financing (round 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The metrics keep `leverageShare` x COVENANT_MAX_LEVERAGE and
+ * `coverageMultiple` x COVENANT_MIN_COVERAGE (no debt, or nothing scheduled,
+ * passes that test).
+ */
+export function withinBuffer(m: CovenantMetrics, leverageShare: number, coverageMultiple: number): boolean {
+  if (m.totalDebt > 0 && (m.leverage === null || m.leverage > leverageShare * COVENANT_MAX_LEVERAGE)) return false;
+  if (m.annualDebtService > 0 && (m.coverage === null || m.coverage < coverageMultiple * COVENANT_MIN_COVERAGE)) return false;
+  return true;
+}
+
+/** Largest multiple of `step` in [0, max] for which `ok` holds (`ok` true at 0 and monotone: once false, false above). */
+function largestOk(max: number, step: number, ok: (amount: number) => boolean): number {
+  let lo = 0;
+  let hi = Math.floor(max / step);
+  if (hi <= 0) return 0;
+  if (ok(hi * step)) return hi * step;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (ok(mid * step)) lo = mid;
+    else hi = mid;
+  }
+  return lo * step;
+}
+
+/** Overhead + this month's marketing. */
+function fixedCosts(state: GameState): number {
+  return OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
+}
+
+/**
+ * Most the credit line can draw now while the covenant metrics keep the
+ * line's buffer (opts.lineLeverageShare, opts.lineCoverageMultiple), a year of
+ * interest at the line's effective rate counted as debt service; 0 unless the
+ * stage is 'compliant'.
+ */
+export function lineRoom(state: GameState, opts: SmartOptions): number {
+  if (state.debt.covenant.stage !== 'compliant') return 0;
+  const offer = creditOffer(state);
+  if (offer.available <= 0) return 0;
+  const bps = offer.rate.effectiveRateBps;
+  return largestOk(offer.available, LOAN_ROUNDING, (amount) =>
+    withinBuffer(
+      covenantMetrics(state, { addDebt: amount, addAnnualDebtService: Math.round((amount * bps) / 10_000) }),
+      opts.lineLeverageShare,
+      opts.lineCoverageMultiple,
+    ),
+  );
+}
+
+/**
+ * Largest term loan (opts.termYears, a multiple of LOAN_ROUNDING up to
+ * termCapacity) whose quote is ok, does not breach a covenant and keeps the
+ * loan buffer (opts.loanLeverageShare, opts.loanCoverageMultiple) pro forma;
+ * 0 when that is below opts.minLoan or the stage is not 'compliant'.
+ */
+export function safeTermLoan(state: GameState, opts: SmartOptions): number {
+  const min = Math.max(TERM_LOAN_MIN, opts.minLoan);
+  if (state.debt.covenant.stage !== 'compliant' || termCapacity(state) < min) return 0;
+  const amount = largestOk(termCapacity(state), LOAN_ROUNDING, (a) => {
+    if (a < TERM_LOAN_MIN) return true;
+    const quote = quoteTermLoan(state, a, opts.termYears);
+    return quote.ok && !quote.breachesCovenant && withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple);
+  });
+  return amount >= min ? amount : 0;
+}
+
+/**
+ * The borrowing operator's cash floor: opts.floorMonths of fixed costs, the
+ * next close's debt service (debt.estimateNextDebtService) and
+ * opts.floorInstallDays of expected installs. Below it, it draws on the line.
+ */
+export function cashFloor(state: GameState, opts: SmartOptions): number {
+  return (
+    opts.floorMonths * fixedCosts(state) +
+    estimateNextDebtService(state) +
+    expectedInstalls(state, opts.floorInstallDays, opts.marketingPerPassing)
+  );
+}
+
+/**
+ * Cash SMART does not spend on new plant. Without borrowing, the round-2
+ * smartReserve. A borrower counts the next close's debt service as a monthly
+ * cost revenue must cover (smartReserve's burn runway) and keeps it in hand,
+ * less opts.lineLean of what the line could draw within its buffer
+ * (lineRoom), never below cashFloor.
+ */
+export function borrowerReserve(state: GameState, opts: SmartOptions): number {
+  if (!opts.borrow) return smartReserve(state, opts);
+  const service = estimateNextDebtService(state);
+  const lean = opts.lineLean > 0 ? opts.lineLean * lineRoom(state, opts) : 0;
+  return Math.max(cashFloor(state, opts), smartReserve(state, opts, service) + service - lean);
+}
+
+/**
+ * The credit line for timing gaps: with a covenant at risk (stage not
+ * 'compliant', or the metrics outside the line's buffer) repay the line from
+ * everything above one month of fixed costs and the next debt service; else
+ * repay what is above the full reserve (smartReserve + next debt service), or
+ * draw back up to the cash floor when cash is under it (within the buffer).
+ */
+function manageCredit(state: GameState, send: Send, opts: SmartOptions): void {
+  const balance = state.debt.credit.balance;
+  const cash = state.finance.cash;
+  const nextService = estimateNextDebtService(state);
+  const atRisk =
+    state.debt.covenant.stage !== 'compliant' ||
+    !withinBuffer(covenantMetrics(state), opts.lineLeverageShare, opts.lineCoverageMultiple);
+  if (balance > 0) {
+    const keep = atRisk ? fixedCosts(state) + nextService : smartReserve(state, opts, nextService) + nextService;
+    const repay = Math.min(balance, Math.floor(cash - keep));
+    if (repay >= 1) {
+      send({ type: 'repayCredit', amount: repay });
+      return;
+    }
+  }
+  if (atRisk) return;
+  const floor = cashFloor(state, opts);
+  if (cash >= floor) return;
+  const want = Math.ceil((floor - cash) / LOAN_ROUNDING) * LOAN_ROUNDING;
+  const amount = Math.min(want, lineRoom(state, opts));
+  if (amount >= 1) send({ type: 'drawCredit', amount });
+}
+
+/**
+ * Take the term loan that funds `project` beyond `own` cash: its cost plus
+ * expected connects less own, rounded up to opts.loanStep, at least
+ * opts.minLoan, at most `room` (safeTermLoan). Checks the quote once more.
+ */
+function borrowFor(state: GameState, send: Send, opts: SmartOptions, project: Project, own: number, room: number): boolean {
+  const need = project.cost + project.connect - Math.max(0, own);
+  if (need <= 0) return true;
+  const amount = Math.min(room, Math.max(opts.minLoan, TERM_LOAN_MIN, Math.ceil(need / opts.loanStep) * opts.loanStep));
+  if (amount < need) return false;
+  const quote = quoteTermLoan(state, amount, opts.termYears);
+  if (!quote.ok || quote.breachesCovenant || !withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple)) return false;
+  return send({ type: 'takeTermLoan', amount, termYears: opts.termYears }).ok;
+}
+
+/** One weekly look by the careful operator (shared by SMART, RURAL and MIXED). */
 function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idleKey: string | null }): void {
   const passings = getService(state).passings;
   // No point advertising while cash cannot connect the customers it brings in.
   const budget = installsPaused(state) ? 0 : Math.min(MARKETING_MAX_PER_MONTH, Math.round(opts.marketingPerPassing * passings));
   if (budget !== state.sales.marketingPerMonth) send({ type: 'setMarketing', perMonth: budget });
 
+  if (opts.borrow) manageCredit(state, send, opts);
   addCapacity(state, send, opts);
 
   for (let i = 0; i < opts.maxProjectsPerLook; i++) {
-    const available = state.finance.cash - smartReserve(state, opts);
-    if (available <= 0) return;
+    const own = state.finance.cash - borrowerReserve(state, opts);
+    // SMART never borrows to build while its reserve (debt service included) is short.
+    if (own <= 0 && !(opts.borrowWhenShort && opts.borrow)) break;
+    const room = opts.borrow ? safeTermLoan(state, opts) : 0;
+    if (own <= 0 && room <= 0) break;
     // Nothing worth building last time and nothing changed since: skip the scan.
-    const key = `${state.network.version}:${Math.floor(state.day / 28)}:${Math.floor(available / 25_000)}`;
-    if (memo.idleKey === key) return;
-    const project = chooseProject(state, available, opts);
+    const key = `${state.network.version}:${Math.floor(state.day / 28)}:${Math.floor(own / 25_000)}:${Math.floor(room / 25_000)}`;
+    if (memo.idleKey === key) break;
+    // With loan room: the best project it would borrow for (not red on its own,
+    // lifetime cost per passing kept under opts.loanLifetimeCpp); else what its
+    // own cash builds (amber too).
+    const lifetimeOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.loanLifetimeCpp;
+    let project = room > 0 ? chooseProject(state, Math.max(0, own) + room, opts, loanBand(opts), true, lifetimeOk) : null;
+    if (!project && own > 0) project = chooseProject(state, own, opts);
     if (!project) {
       memo.idleKey = key;
-      return;
+      break;
     }
-    if (!buildProject(state, send, project)) return;
+    if (project.cost + project.connect > own && !borrowFor(state, send, opts, project, own, room)) break;
+    if (!buildProject(state, send, project)) break;
   }
+  // Installs and the build just ordered may leave cash under the floor: the line covers the gap.
+  if (opts.borrow) manageCredit(state, send, opts);
 }
 
 export function smartBot(options: Partial<SmartOptions> = {}): BotFactory {
   const opts: SmartOptions = { ...SMART_DEFAULTS, ...options };
   return () => {
     const memo = { idleKey: null as string | null };
-    return { name: 'smart', act: (state, send) => smartAct(state, send, opts, memo) };
+    return { name: opts.name, act: (state, send) => smartAct(state, send, opts, memo) };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RURAL (red cost per passing, borrowing by SMART's rules)
+// ---------------------------------------------------------------------------
+
+/**
+ * The rural-heavy operator: SMART's covenant buffers, but it builds only red
+ * (rural) cabinet areas, judged on each project's own cost per passing, and
+ * borrows for them whenever the buffers allow (even with its reserve short),
+ * so its lifetime cost per passing is red while it borrows. Rural lanes are
+ * long and sparse, so it accepts small areas and expensive streets. A red-only
+ * network never covers the overhead, so it bleeds: its rate is the point.
+ */
+export const RURAL_OPTIONS: Partial<SmartOptions> = {
+  redOnly: true,
+  borrowWhenShort: true,
+  minNewUnits: 10,
+  maxStreetCpp: Infinity,
+  name: 'rural',
+};
+
+export function ruralBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return smartBot({ ...RURAL_OPTIONS, ...options });
+}
+
+// ---------------------------------------------------------------------------
+// LEVERED (borrows to the limit)
+// ---------------------------------------------------------------------------
+
+/** The levered operator's marketing, dollars per passing per month (heavy: SMART runs SMART_MARKETING_PER_PASSING). */
+export const LEVERED_MARKETING_PER_PASSING = 6;
+
+/**
+ * The levered operator: SMART's project picker with amber and red areas,
+ * heavy marketing, and every dollar the bank offers. Until the bank lends at
+ * all (no revenue yet) it keeps SMART's runway, or it would simply run out of
+ * cash before borrowing (CARELESS's story); from then on its reserve is
+ * opts.reserveMonths of fixed costs and opts.installDays of installs, with
+ * nothing kept for debt service.
+ */
+export const LEVERED_OPTIONS: Partial<SmartOptions> = {
+  marketingPerPassing: LEVERED_MARKETING_PER_PASSING,
+  borrow: false,
+  allowRed: true,
+  reserveMonths: 1,
+  installDays: 60,
+  name: 'levered',
+};
+
+export function leveredBot(options: Partial<SmartOptions> = {}): BotFactory {
+  const opts: SmartOptions = { ...SMART_DEFAULTS, ...LEVERED_OPTIONS, ...options };
+  return () => {
+    const memo = { idleKey: null as string | null };
+    let lending = false;
+    return {
+      name: opts.name,
+      act(state, send) {
+        const passings = getService(state).passings;
+        const budget = Math.min(MARKETING_MAX_PER_MONTH, Math.round(opts.marketingPerPassing * passings));
+        if (budget !== state.sales.marketingPerMonth) send({ type: 'setMarketing', perMonth: budget });
+
+        // Every term loan the bank allows, then the whole line: covenants and warnings ignored.
+        const capacity = termCapacity(state);
+        if (capacity >= TERM_LOAN_MIN) send({ type: 'takeTermLoan', amount: capacity, termYears: TERM_LOAN_YEARS.at(-1) as TermYears });
+        const available = creditAvailable(state);
+        if (available > 0) send({ type: 'drawCredit', amount: available });
+        lending ||= capacity > 0 || available > 0;
+
+        addCapacity(state, send, opts);
+        for (let i = 0; i < opts.maxProjectsPerLook; i++) {
+          const reserve = lending
+            ? opts.reserveMonths * fixedCosts(state) + expectedInstalls(state, opts.installDays, opts.marketingPerPassing)
+            : smartReserve(state, SMART_DEFAULTS);
+          const own = state.finance.cash - reserve;
+          if (own <= 0) return;
+          const key = `${state.network.version}:${Math.floor(state.day / 28)}:${Math.floor(own / 25_000)}`;
+          if (memo.idleKey === key) return;
+          const project = chooseProject(state, own, opts);
+          if (!project) {
+            memo.idleKey = key;
+            return;
+          }
+          if (!buildProject(state, send, project)) return;
+        }
+      },
+    };
   };
 }
 
@@ -630,10 +1036,47 @@ export const idleBot: BotFactory = () => ({ name: 'idle', act() {} });
 // ---------------------------------------------------------------------------
 
 /**
+ * One random financing command (sometimes junk the sim must reject): draw on
+ * or repay the credit line, take a term loan, prepay one.
+ */
+function randomDebtCommand(state: GameState, send: Send, rng: Rng): void {
+  const { credit, loans } = state.debt;
+  const roll = rng.next();
+  if (roll < 0.3) {
+    const available = creditAvailable(state);
+    const amount = available > 0 && rng.chance(0.85) ? rng.int(1, available) : available + rng.int(1, 50_000);
+    send({ type: 'drawCredit', amount });
+  } else if (roll < 0.55) {
+    const amount = credit.balance > 0 && rng.chance(0.85) ? rng.int(1, credit.balance) : credit.balance + rng.int(1, 50_000);
+    send({ type: 'repayCredit', amount });
+  } else if (roll < 0.75) {
+    const capacity = termCapacity(state);
+    const amount = capacity >= TERM_LOAN_MIN && rng.chance(0.85) ? rng.int(TERM_LOAN_MIN, capacity) : capacity + rng.int(1, 50_000);
+    send({ type: 'takeTermLoan', amount, termYears: rng.pick(TERM_LOAN_YEARS) });
+  } else if (roll < 0.92) {
+    if (loans.length === 0) {
+      send({ type: 'prepayLoan', loan: rng.int(1, 5), amount: rng.int(1, 10_000) });
+    } else {
+      const loan = rng.pick(loans);
+      const amount = rng.chance(0.3) ? loan.balance : rng.int(1, loan.balance);
+      send({ type: 'prepayLoan', loan: loan.id, amount });
+    }
+  } else {
+    // Junk: fractions, negatives, an unknown term.
+    const junk = rng.int(0, 3);
+    if (junk === 0) send({ type: 'drawCredit', amount: -rng.int(1, 1_000) });
+    else if (junk === 1) send({ type: 'repayCredit', amount: 0.5 });
+    else if (junk === 2) send({ type: 'takeTermLoan', amount: 50_000, termYears: 6 as TermYears });
+    else send({ type: 'prepayLoan', loan: -1, amount: 1.5 });
+  }
+}
+
+/**
  * SMART plus, each weekly look, a few random extras from its own Rng: cancel
  * or remove a span (any stage), remove a cabinet, add a splitter or an OLT
  * card, change prices (sometimes out of range: rejected) or the marketing
- * budget, or send junk the sim must reject.
+ * budget, a financing command (randomDebtCommand), or send junk the sim must
+ * reject.
  */
 export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
   const opts: SmartOptions = { ...SMART_DEFAULTS, ...options };
@@ -646,6 +1089,10 @@ export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
         smartAct(state, send, opts, memo);
         const extras = rng.int(0, 3);
         for (let i = 0; i < extras; i++) {
+          if (rng.chance(0.25)) {
+            randomDebtCommand(state, send, rng);
+            continue;
+          }
           const roll = rng.next();
           const { spans, cabinets } = state.network;
           if (roll < 0.2 && spans.length > 0) {

@@ -7,10 +7,11 @@ import {
   OLT_MAX_CARDS,
   OLT_PORTS_PER_CARD,
   SMB_MULTIPLIER_MAX,
+  TERM_LOAN_MIN,
   TIER_DEFAULTS,
   TIER_PRICE_MAX,
 } from './balance';
-import { newDebt } from './debt';
+import { creditAvailable, newDebt, termCapacity, totalDebt, trailingArr } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
 import { deserialize, fnv1a, hashState, SaveError, serialize } from './save';
@@ -44,6 +45,30 @@ function playedGame(cityOpts: GridCityOptions = {}): GameState {
   runDays(state, 80);
   applyCommand(state, { type: 'layCable', segments: [1], method: 'underground' });
   runDays(state, 3);
+  return state;
+}
+
+/**
+ * playedGame on credit: the closed months are given TERM_LOAN_MIN more
+ * revenue each (something to lend against), then the real commands draw half
+ * the credit line and take a term loan, the game closes March with debt
+ * service and report.debt, and a little more is drawn in April so the line
+ * has dollar-days. `max` borrows everything the bank offers instead.
+ */
+function borrowedGame(cityOpts: GridCityOptions = {}, max = false): GameState {
+  const state = playedGame(cityOpts);
+  for (const report of state.finance.reports) {
+    report.totals.revenue = (report.totals.revenue ?? 0) + TERM_LOAN_MIN;
+    report.net += TERM_LOAN_MIN;
+  }
+  const draw = max ? creditAvailable(state) : Math.floor(creditAvailable(state) / 2);
+  const loan = max ? termCapacity(state) : TERM_LOAN_MIN;
+  expect(applyCommand(state, { type: 'drawCredit', amount: draw })).toEqual({ ok: true, cost: -draw });
+  expect(applyCommand(state, { type: 'takeTermLoan', amount: loan, termYears: 5 })).toEqual({ ok: true, cost: -loan });
+  runDays(state, 10);
+  expect(state.finance.reports.at(-1)?.debt?.termBalance).toBe(loan);
+  expect(applyCommand(state, { type: 'drawCredit', amount: 1 }).ok).toBe(!max);
+  runDays(state, 2);
   return state;
 }
 
@@ -152,6 +177,29 @@ describe('serialize / deserialize', () => {
     delete quiet.debt;
     delete quiet.sales.installsPaused;
     expect(deserialize(JSON.stringify(quiet)).sales).toEqual(state.sales);
+  });
+
+  it('round-trips a game on credit: loans, a drawn line, a covenant stage past compliant and reports with debt', () => {
+    const state = borrowedGame({}, true);
+    // Once the months that carried the loans leave the trailing window, the covenants bite.
+    runDays(state, 100);
+    expect(state.gameOver).toBeNull();
+    expect(state.debt.loans.length).toBeGreaterThan(0);
+    expect(state.debt.credit.balance).toBeGreaterThan(0);
+    expect(state.debt.credit.balanceDollarDays).toBeGreaterThan(0);
+    expect(state.debt.covenant.stage).not.toBe('compliant');
+    expect(state.finance.reports.filter((r) => r.debt !== undefined).length).toBeGreaterThan(3);
+    expect(state.notices.some((n) => n.kind === 'covenantWarning')).toBe(true);
+    const loaded = deserialize(serialize(state));
+    expect(loaded).toEqual(state);
+    expect(serialize(loaded)).toBe(serialize(state));
+    // ...and it keeps playing exactly like the original.
+    for (const game of [state, loaded]) {
+      applyCommand(game, { type: 'repayCredit', amount: 1_000 });
+      applyCommand(game, { type: 'prepayLoan', loan: 1, amount: 500 });
+      runDays(game, 70);
+    }
+    expect(hashState(loaded)).toBe(hashState(state));
   });
 
   it('writes plain JSON', () => {
@@ -545,8 +593,9 @@ describe('deserialize errors', () => {
 
   it('either rejects or loads a playable game for any single-field corruption', () => {
     // A tiny town keeps this exhaustive sweep fast: every path in the save,
-    // every kind of wrong value.
-    const text = serialize(playedGame({ cols: 1, rows: 1, blockW: 2, blockH: 2 }));
+    // every kind of wrong value. It is on credit, so every debt path is swept:
+    // a drawn line with dollar-days, a term loan, reports with debt stats.
+    const text = serialize(borrowedGame({ cols: 1, rows: 1, blockW: 2, blockH: 2 }));
     const paths: Array<Array<string | number>> = [];
     const walk = (value: unknown, path: Array<string | number>): void => {
       if (path.length > 0) paths.push(path);
@@ -561,6 +610,10 @@ describe('deserialize errors', () => {
     const base = deserialize(text);
     expect(base.sales.accounts.length).toBeGreaterThan(0);
     expect(paths.some((p) => p[0] === 'sales' && p[1] === 'accounts')).toBe(true);
+    expect(base.debt.loans).toHaveLength(1);
+    expect(base.debt.credit.balance).toBeGreaterThan(0);
+    expect(base.debt.credit.balanceDollarDays).toBeGreaterThan(0);
+    expect(paths.some((p) => p[0] === 'finance' && p[2] === 2 && p[3] === 'debt')).toBe(true);
 
     const DELETE = Symbol('delete');
     const replacements: unknown[] = [DELETE, null, 'x', -1, 0, 1.5, true, {}, []];
@@ -587,8 +640,12 @@ describe('deserialize errors', () => {
           applyCommand(state, { type: 'placeCabinet', node: 3 });
           applyCommand(state, { type: 'removeSpan', span: 2 });
           applyCommand(state, { type: 'setPricing', tiers: tierSettings({ fiber500: 60 }) as never, smbMultiplier: 1.75 });
+          applyCommand(state, { type: 'drawCredit', amount: 1_000 });
+          applyCommand(state, { type: 'prepayLoan', loan: 1, amount: 100 });
           runDays(state, 31);
           applyCommand(state, { type: 'setMarketing', perMonth: 0 });
+          applyCommand(state, { type: 'repayCredit', amount: 500 });
+          applyCommand(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 7 });
           runDays(state, 31);
           getService(state);
           // Hovering and clicking the map picks streets through the spatial index.
@@ -763,6 +820,41 @@ describe('schemaVersion 2 saves', () => {
     expect(state.finance.reports.at(-1)?.stats?.subscribers).toBeGreaterThan(0);
     expect(getService(state).passings).toBeGreaterThanOrEqual(passings);
     expect(deserialize(serialize(state))).toEqual(state);
+  });
+
+  it.each(['v2-grid', 'v2-town'] as const)('borrows on the frozen %s save, closes months and defaults deterministically', (name) => {
+    const play = (reloadAfterMonths: number | null): GameState => {
+      let state = deserialize(v2Fixture(name));
+      expect(trailingArr(state)).toBeGreaterThan(0);
+      const draw = creditAvailable(state);
+      const loan = termCapacity(state);
+      expect(draw).toBeGreaterThan(0);
+      expect(loan).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+      expect(applyCommand(state, { type: 'drawCredit', amount: draw })).toEqual({ ok: true, cost: -draw });
+      expect(applyCommand(state, { type: 'takeTermLoan', amount: loan, termYears: 7 })).toEqual({ ok: true, cost: -loan });
+      // Then spend like there is no tomorrow.
+      expect(applyCommand(state, { type: 'setMarketing', perMonth: MARKETING_MAX_PER_MONTH }).ok).toBe(true);
+      for (let month = 1; month <= 60 && !state.gameOver; month++) {
+        runDays(state, 30);
+        if (month === reloadAfterMonths) state = deserialize(serialize(state));
+      }
+      return state;
+    };
+    const straight = play(null);
+    expect(straight.gameOver?.reason).toBe('default');
+    // Covenant breaches (or a missed payment) froze the line first; the payment missed while frozen was the default.
+    const kinds = straight.notices.map((n) => n.kind);
+    const froze = Math.max(kinds.lastIndexOf('creditFrozen'), kinds.lastIndexOf('paymentMissed'));
+    expect(froze).toBeGreaterThanOrEqual(0);
+    expect(froze).toBeLessThan(kinds.lastIndexOf('gameOver'));
+    expect(straight.finance.reports.at(-2)?.debt?.stage).toBe('frozen');
+    expect(kinds).not.toContain('insolvencyWarning');
+    expect(totalDebt(straight)).toBeGreaterThan(0);
+    expect(straight.finance.reports.at(-1)?.debt).toMatchObject({ missedPayment: true, stage: 'frozen' });
+    // The same every time, and through a save on the way.
+    expect(hashState(play(null))).toBe(hashState(straight));
+    expect(hashState(play(2))).toBe(hashState(straight));
+    expect(deserialize(serialize(straight))).toEqual(straight);
   });
 
   it('plays a migrated v2 game exactly like the same game loaded twice', () => {

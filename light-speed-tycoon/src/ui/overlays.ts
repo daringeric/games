@@ -7,10 +7,25 @@ import type { Notice } from '../sim/types';
 import { el, icon } from './dom';
 import { ICONS } from './icons';
 
-const TOAST_MS = 3800;
-/** Warnings carry instructions ("add a splitter..."): give them time to be read. */
-const WARN_TOAST_MS = 6500;
+export const TOAST_MS = 3800;
+/** Warnings and errors carry instructions ("add a splitter..."): give them time to be read. */
+export const WARN_TOAST_MS = 6500;
+/** Reading time per word for a long toast (about 250 words a minute) ... */
+export const TOAST_MS_PER_WORD = 240;
+/** ... up to this long; the Bank keeps the long debt notices to reread. */
+export const TOAST_MAX_MS = 16_000;
 const MAX_TOASTS = 3;
+
+/**
+ * How long a toast stays: long enough to read (TOAST_MS_PER_WORD a word, at
+ * most TOAST_MAX_MS) and never less than its tone's minimum: TOAST_MS for good
+ * news, WARN_TOAST_MS for warnings and errors (an error is no less urgent).
+ */
+export function toastDuration(message: string, tone: ToastTone): number {
+  const words = message.split(/\s+/).filter((w) => w !== '').length;
+  const min = tone === 'ok' ? TOAST_MS : WARN_TOAST_MS;
+  return Math.max(min, Math.min(TOAST_MAX_MS, words * TOAST_MS_PER_WORD));
+}
 
 /** ok = good news, warn = needs attention, err = something failed or went badly wrong. */
 export type ToastTone = 'ok' | 'warn' | 'err';
@@ -155,7 +170,7 @@ export class Toasts {
         toast.classList.add('leaving');
         window.setTimeout(() => toast.remove(), 250);
       },
-      t === 'warn' ? WARN_TOAST_MS : TOAST_MS,
+      toastDuration(message, t),
     );
   }
 }

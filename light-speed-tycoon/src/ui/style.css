@@ -952,6 +952,21 @@ body {
     display: none;
   }
 
+  /* The chips wrap rather than widen the HUD (the debt and covenant chips
+     would otherwise push it over the toolbar): the row takes the width the
+     clock, date, cash and buttons give the HUD and contributes none itself. */
+  .hud-stats {
+    flex-wrap: wrap;
+    width: 0;
+    min-width: 100%;
+  }
+
+  /* With debt the chips make room for the debt and covenant chips: icons,
+     numbers and tooltips stay, the words go (as on phones). */
+  .hud.has-debt .chip-label {
+    display: none;
+  }
+
   .hud.alerting {
     grid-template-columns: repeat(5, auto);
     grid-template-areas:
@@ -2109,6 +2124,46 @@ body {
   font-weight: 800;
 }
 
+/* Notices from the bank: the latest debt notices, newest first, to reread. */
+.bank-notice-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bank-notice {
+  display: grid;
+  gap: 2px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--chip);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bank-notice-warn {
+  border-left-color: var(--cpp-amber);
+}
+
+.bank-notice-err {
+  border-left-color: var(--danger);
+}
+
+.bank-notice-ok {
+  border-left-color: var(--success);
+}
+
+.bank-notice-date {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .bank-prepay-quote {
   margin: 0;
   color: var(--text-2);
@@ -2131,10 +2186,6 @@ body {
   .bank-form-label {
     min-width: 0;
     flex-basis: 100%;
-  }
-
-  .btn.bank-go {
-    flex: 1 1 100%;
   }
 }
 

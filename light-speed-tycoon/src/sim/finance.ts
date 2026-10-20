@@ -1,14 +1,14 @@
 // Cash, ledger and monthly close.
 
-import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH } from './balance';
+import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH, SUPPORT_COST_PER_SUB_PER_MONTH } from './balance';
 import { dateOf, formatMonth, MONTH_LENGTHS } from './calendar';
-import { closeDebtMonth, reviewDebt } from './debt';
+import { closeDebtMonth, reviewDebt, totalDebt } from './debt';
 import { operatingCashFlow } from './metrics';
 import { checkMilestones } from './milestones';
 import { ponPortsUsed } from './network';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
-import { closeSalesMonth, subscriberUnits } from './sales';
+import { closeSalesMonth, monthlyRecurringRevenue, subscriberUnits } from './sales';
 import { polesOnSegment } from './streets';
 import type { GameState, LedgerCategory, LedgerEntry, MonthlyReport, MonthlyStats } from './types';
 
@@ -82,6 +82,34 @@ function rentedPoles(state: GameState): number {
 /** Pole rent owed for one month: live aerial spans x poles on their segments x POLE_RENT_PER_POLE_PER_MONTH. */
 export function monthlyPoleRent(state: GameState): number {
   return rentedPoles(state) * POLE_RENT_PER_POLE_PER_MONTH;
+}
+
+/**
+ * Cash the next month close will have at its debt step (closeMonth steps 1-3
+ * done): today's cash, plus the billing it will post (revenue accrued so far,
+ * plus today's subscribers at today's prices for the days of the month not
+ * yet accrued), less pole rent for today's live aerial spans, the overhead,
+ * marketing and support (accrued so far plus today's rates for the days
+ * left), and installs for the days left at the month's pace so far. Exact on
+ * the month's last day, when nothing is left to accrue; before that an
+ * estimate (signups, churn and commands change it). The payment reminder
+ * (debt.endDebtDay) and the Bank's next payment compare it with
+ * debt.estimateNextDebtService. Pure read, O(accounts + ledger entries).
+ */
+export function estimateCashAtClose(state: GameState): number {
+  const { finance, sales } = state;
+  const date = dateOf(state.day);
+  const daysInMonth = MONTH_LENGTHS[date.month - 1] as number;
+  // Days still to accrue: tick() accrues each day as it moves onto it (day 0 on the first tick).
+  const left = daysInMonth - date.day + (state.day === 0 ? 1 : 0);
+  const month = sales.month;
+  const revenue = Math.round((month.revenueDollarDays + monthlyRecurringRevenue(state) * left) / daysInMonth);
+  const marketing = Math.round((month.marketingDollarDays + sales.marketingPerMonth * left) / daysInMonth);
+  const support = Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (month.subscriberUnitDays + subscriberUnits(state) * left)) / daysInMonth);
+  let installs = 0;
+  for (const entry of finance.monthToDate) if (entry.category === 'install') installs += entry.amount;
+  const installsLeft = Math.round((installs * left) / date.day);
+  return finance.cash + revenue - marketing - support - OVERHEAD_PER_MONTH - monthlyPoleRent(state) + installsLeft;
 }
 
 /**
@@ -191,8 +219,11 @@ function latestCloseLabel(state: GameState): string {
  * 'insolvent', message } and post a 'gameOver' notice; otherwise post an
  * 'insolvencyWarning' notice saying how many more negative closes end the game
  * ("Cash is below zero at the Mar 2027 close. 2 more closes in the red and the
- * bank shuts you down."). If cash >= 0: negativeMonths = 0 (no notice).
- * Does nothing once gameOver is set.
+ * bank shuts you down."). With the credit line frozen and debt outstanding the
+ * warning says instead that the next close in the red is a default: such a
+ * close cannot pay its loan payments, and a payment missed while frozen ends
+ * the game (debt.reviewDebt) before any grace runs out. If cash >= 0:
+ * negativeMonths = 0 (no notice). Does nothing once gameOver is set.
  */
 export function checkInsolvency(state: GameState): void {
   if (state.gameOver) return;
@@ -213,12 +244,11 @@ export function checkInsolvency(state: GameState): void {
     postNotice(state, 'gameOver', message);
     return;
   }
-  postNotice(
-    state,
-    'insolvencyWarning',
-    `Cash is below zero at the ${label} close (${formatMoney(finance.cash)}). ` +
-      `${left} more close${left === 1 ? '' : 's'} in the red and the bank shuts you down.`,
-  );
+  const next =
+    state.debt.covenant.stage === 'frozen' && totalDebt(state) > 0
+      ? 'Your credit line is frozen, so the next close in the red is a default: it cannot pay its loan payments, the bank calls your loans and the game ends.'
+      : `${left} more close${left === 1 ? '' : 's'} in the red and the bank shuts you down.`;
+  postNotice(state, 'insolvencyWarning', `Cash is below zero at the ${label} close (${formatMoney(finance.cash)}). ${next}`);
 }
 
 /**

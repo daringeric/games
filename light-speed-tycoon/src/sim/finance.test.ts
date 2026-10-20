@@ -1,12 +1,39 @@
 import { describe, expect, it } from 'vitest';
 import {
+  COVENANT_CURE_CLOSES,
+  CPP_AMBER_MULTIPLIER,
+  CPP_SPREAD_BPS,
+  CPP_TARGET,
   INSOLVENCY_GRACE_MONTHS,
+  LATE_FEE_MIN,
+  LATE_FEE_SHARE,
   OLT_START_PON_PORTS,
   OVERHEAD_PER_MONTH,
+  PENALTY_STEP_UP_BPS,
   POLE_RENT_PER_POLE_PER_MONTH,
   START_CASH,
   SUPPORT_COST_PER_SUB_PER_MONTH,
+  TERM_LOAN_MIN,
 } from './balance';
+import { dateOf, DAYS_PER_YEAR, formatMonth, MONTH_LENGTHS } from './calendar';
+import {
+  amortize,
+  annualDebtService,
+  annualOperatingCashFlow,
+  closeDebtMonth,
+  covenantMetrics,
+  creditLimit,
+  estimateNextDebtService,
+  formatRateBps,
+  levelPayment,
+  penaltyBps,
+  priceRate,
+  pricingCpp,
+  rateOf,
+  stubDays,
+  totalDebt,
+  trailingArr,
+} from './debt';
 import {
   canAfford,
   checkInsolvency,
@@ -18,11 +45,13 @@ import {
   postEntryOn,
   runwayMonths,
 } from './finance';
+import { applyCommand, runDays, tick } from './game';
 import { operatingCashFlow } from './metrics';
+import { getService } from './network';
 import { Rng } from './rng';
 import { subscriberUnits } from './sales';
-import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import type { BuildStage, CableMethod, City, GameState, MonthlyReport, SegmentId } from './types';
+import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats } from './testing/fixtures';
+import type { BuildStage, CableMethod, City, Command, CovenantStage, GameState, LedgerEntry, MonthlyReport, SegmentId, TermLoan } from './types';
 
 // Default grid: horizontal segments 0..8 are 240 ft (2 poles), vertical 9..16 are 120 ft (1 pole).
 
@@ -174,6 +203,8 @@ describe('closeMonth', () => {
       cashEnd: START_CASH + net,
       passings: 42,
       stats: ZERO_STATS,
+      // Every round-3 close records financing, debt or not.
+      debt: noDebtStats(state),
     });
     expect(Object.keys(report.totals)).toEqual(['construction', 'equipment', 'refund', 'poleRent', 'overhead']);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -207,6 +238,7 @@ describe('closeMonth', () => {
       cashEnd: START_CASH - OVERHEAD_PER_MONTH,
       passings: 0,
       stats: ZERO_STATS,
+      debt: noDebtStats(state),
     });
   });
 
@@ -368,5 +400,454 @@ describe('runwayMonths', () => {
     expect(burn).toBe(6_000);
     expect(runwayMonths(state)).toBe(Math.floor(100_000 / burn));
     expect(runwayMonths(withReport(totals, -1))).toBe(0);
+  });
+});
+
+describe('runwayMonths with debt (round 3)', () => {
+  function withReport(totals: MonthlyReport['totals'], cash: number): GameState {
+    const state = makeState();
+    const net = Object.values(totals).reduce((a, b) => a + (b ?? 0), 0);
+    state.finance.reports.push({ year: 2027, month: 1, totals, net, cashEnd: cash, passings: 0 });
+    state.finance.cash = cash;
+    return state;
+  }
+
+  it('burns debt service on top of operations, and never counts money borrowed as income', () => {
+    const levered = withReport({ revenue: 4_000, overhead: -10_000, interest: -1_000, principal: -2_000, loanProceeds: 50_000 }, 90_000);
+    expect(runwayMonths(levered)).toBe(Math.floor(90_000 / (6_000 + 1_000 + 2_000)));
+    // Operations pay their way, but not the loans.
+    const servicing = withReport({ revenue: 10_000, overhead: -8_000, interest: -1_500, principal: -1_500 }, 9_999);
+    expect(runwayMonths(servicing)).toBe(Math.floor(9_999 / 1_000));
+    // Borrowing does not stretch the runway.
+    const borrowed = withReport({ revenue: 4_000, overhead: -10_000, loanProceeds: 100_000 }, 60_000);
+    expect(runwayMonths(borrowed)).toBe(Math.floor(60_000 / 6_000));
+    expect(runwayMonths(withReport({ revenue: 10_000, overhead: -8_000, interest: -2_000 }, 5))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The month close with debt (round 3): closeDebtMonth and reviewDebt wired
+// into closeMonth.
+// ---------------------------------------------------------------------------
+
+/** Monthly revenue of the trading states (a test input, not a balance figure). */
+const REVENUE = 25_000;
+const DAY_DIVISOR = 10_000 * DAYS_PER_YEAR;
+
+/** REVENUE billed in each trailing month, `costs` spent, plenty of cash; the 10th of the month after. */
+function trading(costs = 0): GameState {
+  const state = makeTradingState(REVENUE, costs);
+  state.finance.cash = START_CASH * 10;
+  return state;
+}
+
+function monthStartOf(state: GameState): number {
+  return state.day - dateOf(state.day).day + 1;
+}
+
+/** The 1st of the month after state.day. */
+function nextCloseDay(state: GameState): number {
+  return monthStartOf(state) + (MONTH_LENGTHS[dateOf(state.day).month - 1] as number);
+}
+
+/** closeMonth on the 1st after state.day (no daily steps in between), with a throwaway sales stream. */
+function closeNext(state: GameState): MonthlyReport {
+  state.day = nextCloseDay(state);
+  return close(state);
+}
+
+/** Tick up to and through the next close; returns that close's report and the month's ledger entries. */
+function tickThroughClose(state: GameState): { report: MonthlyReport; entries: LedgerEntry[] } {
+  const closeDay = nextCloseDay(state);
+  let entries = state.finance.monthToDate;
+  while (state.day < closeDay) {
+    entries = state.finance.monthToDate;
+    tick(state);
+  }
+  return { report: state.finance.reports.at(-1)!, entries };
+}
+
+function apply(state: GameState, cmd: Command): number {
+  const result = applyCommand(state, cmd);
+  expect(result).toMatchObject({ ok: true });
+  return result.ok ? result.cost : Number.NaN;
+}
+
+function lastNotice(state: GameState) {
+  return state.notices.at(-1);
+}
+
+describe('closeMonth: credit-line interest', () => {
+  it('charges every end-of-day balance of the month, its last day included, at the line\'s rate', () => {
+    const state = trading();
+    const rate = rateOf(state.debt.credit.rate);
+    const start = state.day;
+    const lastDay = nextCloseDay(state) - 1;
+    apply(state, { type: 'drawCredit', amount: 30_000 });
+    runDays(state, 5);
+    apply(state, { type: 'drawCredit', amount: 10_000 });
+    runDays(state, 7);
+    apply(state, { type: 'repayCredit', amount: 15_000 });
+    runDays(state, lastDay - state.day);
+    expect(state.day).toBe(lastDay);
+    // A draw on the month's last day is held at the end of that day: it pays one day.
+    apply(state, { type: 'drawCredit', amount: 5_000 });
+    const dollarDays = 30_000 * 5 + 40_000 * 7 + 25_000 * (lastDay - start - 12) + 30_000;
+    const { report, entries } = tickThroughClose(state);
+
+    const interest = Math.round((dollarDays * rate) / DAY_DIVISOR);
+    expect(interest).toBeGreaterThan(0);
+    expect(report.totals.interest).toBe(-interest);
+    expect(report.totals.principal).toBe(-15_000);
+    expect(report.totals.loanProceeds).toBe(45_000);
+    const label = dateLabel(report);
+    expect(entries.filter((e) => e.category === 'interest')).toEqual([
+      { day: lastDay, category: 'interest', amount: -interest, memo: `Interest for ${label}: credit line ${formatMoney(interest)}` },
+    ]);
+    // The new month starts counting from zero.
+    expect(state.debt.credit.balanceDollarDays).toBe(0);
+    expect(report.debt).toMatchObject({ creditBalance: 30_000, termBalance: 0, missedPayment: false });
+  });
+
+  it('is predicted exactly by estimateNextDebtService when nothing changes before the close', () => {
+    const state = trading();
+    apply(state, { type: 'drawCredit', amount: 30_000 });
+    apply(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN * 2, termYears: 5 });
+    tickThroughClose(state);
+    // Mid-month, with one loan in its stub month and one on regular payments.
+    runDays(state, 9);
+    apply(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 7 });
+    runDays(state, 3);
+    const estimate = estimateNextDebtService(state);
+    const { report } = tickThroughClose(state);
+    expect(-(report.totals.interest ?? 0) - (report.totals.principal ?? 0)).toBe(estimate);
+  });
+});
+
+describe('closeMonth: term loans', () => {
+  it('charges stub interest the month a loan is taken, then level payments that follow its schedule', () => {
+    const state = trading();
+    const amount = TERM_LOAN_MIN * 6;
+    apply(state, { type: 'takeTermLoan', amount, termYears: 5 });
+    const loan = structuredClone(state.debt.loans[0]!);
+    const { report, entries } = tickThroughClose(state);
+    const stub = Math.round((amount * stubDays(loan.originatedDay) * loan.rateBps) / DAY_DIVISOR);
+    expect(report.totals.interest).toBe(-stub);
+    expect(report.totals.principal).toBeUndefined();
+    expect(entries.find((e) => e.category === 'interest')?.memo).toMatch(new RegExp(`loan #1 \\${formatMoney(stub)} \\(first month\\)$`));
+    // The stub month is not one of the regular payments.
+    expect(state.debt.loans[0]).toEqual(loan);
+
+    // Regular payments, closed with the stage held where it is, follow the exact schedule.
+    const rows = amortize(amount, loan.rateBps, loan.termMonths, loan.payment);
+    const books = structuredClone(state);
+    for (let m = 0; m < loan.termMonths; m++) {
+      books.day = nextCloseDay(books);
+      const before = books.finance.monthToDate.length;
+      const closed = closeDebtMonth(books, books.day - 1);
+      const posted = books.finance.monthToDate.slice(before);
+      expect(closed).toMatchObject({ interestPaid: rows[m]!.interest, principalPaid: rows[m]!.principal, missed: false });
+      expect(posted.find((e) => e.category === 'principal')?.amount).toBe(-rows[m]!.principal);
+      if (m < loan.termMonths - 1) expect(books.debt.loans[0]).toMatchObject({ balance: rows[m]!.balance, monthsLeft: loan.termMonths - m - 1 });
+    }
+    expect(books.debt.loans).toEqual([]);
+
+    // The real next close: a regular payment.
+    const next = tickThroughClose(state).report;
+    expect(next.totals.interest).toBe(-rows[0]!.interest);
+    expect(next.totals.principal).toBe(-rows[0]!.principal);
+    expect(state.debt.loans[0]).toMatchObject({ balance: rows[0]!.balance, monthsLeft: loan.termMonths - 1 });
+  });
+
+  it('makes the last payment in full, closes the loan and says so', () => {
+    const state = trading();
+    state.debt.loans = [makeLoan({ id: 4, monthsLeft: 1, balance: 3_210, principal: 60_000 }), makeLoan({ id: 5 })];
+    state.debt.nextLoanId = 6;
+    const last = state.debt.loans[0]!;
+    const interest = Math.round((last.balance * last.rateBps) / 120_000);
+    const before = state.finance.monthToDate;
+    const report = closeNext(state);
+    expect(state.debt.loans.map((l) => l.id)).toEqual([5]);
+    expect(before.find((e) => e.category === 'principal')?.memo).toMatch(/loan #4 \$3,210 \(paid off\)/);
+    expect(report.totals.principal).toBe(-(3_210 + (makeLoan({ id: 5 }).payment - Math.round((makeLoan().balance * makeLoan().rateBps) / 120_000))));
+    expect(report.totals.interest).toBeLessThanOrEqual(-interest);
+    const paid = state.notices.filter((n) => n.kind === 'loanPaidOff');
+    expect(paid.map((n) => n.message)).toEqual([`Term loan #4 is paid off: its last payment was made at the ${dateLabel(report)} close.`]);
+  });
+
+  it('charges the penalty surcharge on every balance while on penalty or frozen, and never fixes it into a loan', () => {
+    for (const stage of ['penalty', 'frozen'] as CovenantStage[]) {
+      const state = trading();
+      state.debt.covenant.stage = stage;
+      state.debt.credit.balance = 20_000;
+      state.debt.credit.balanceDollarDays = 20_000 * 30;
+      const p = penaltyBps(stage);
+      expect(p).toBe(PENALTY_STEP_UP_BPS);
+      // While the surcharge lasts a loan's level payment is the one that repays it at the effective rate.
+      const base = makeLoan({ id: 1 });
+      state.debt.loans = [{ ...base, payment: levelPayment(base.balance, base.rateBps + p, base.monthsLeft) }];
+      state.debt.nextLoanId = 2;
+      const loan = structuredClone(state.debt.loans[0]!);
+      const line = Math.round((20_000 * 30 * (rateOf(state.debt.credit.rate) + p)) / DAY_DIVISOR);
+      const loanInterest = Math.round((loan.balance * (loan.rateBps + p)) / 120_000);
+      const report = closeNext(state);
+      expect(report.totals.interest).toBe(-(line + loanInterest));
+      expect(report.totals.principal).toBe(-(loan.payment - loanInterest));
+      // The exact schedule at the effective rate: the surcharge never piles up on the last payment.
+      const schedule = amortize(loan.balance, loan.rateBps + p, loan.monthsLeft, loan.payment);
+      expect(schedule[0]).toMatchObject({ interest: loanInterest, principal: loan.payment - loanInterest });
+      const last = schedule.at(-1)!;
+      expect(last.interest + last.principal).toBeLessThanOrEqual(loan.payment);
+      expect(state.debt.loans[0]!.rateBps).toBe(loan.rateBps);
+    }
+  });
+});
+
+/** "Apr 2027" for a report's month. */
+function dateLabel(report: MonthlyReport): string {
+  return formatMonth(report.year, report.month);
+}
+
+describe('closeMonth: missed payments and default', () => {
+  /** Debt due at the next close with cash that cannot cover it. */
+  function short(stage: CovenantStage): GameState {
+    const state = trading();
+    state.debt.covenant = { stage, compliantCloses: stage === 'compliant' ? 0 : 1 };
+    state.debt.credit.balance = 20_000;
+    state.debt.credit.balanceDollarDays = 20_000 * 9;
+    state.debt.loans = [makeLoan({ id: 1 }), makeLoan({ id: 2, originatedDay: 0, balance: TERM_LOAN_MIN, principal: TERM_LOAN_MIN })];
+    state.debt.loans[1]!.originatedDay = monthStartOf(state) + 2;
+    state.debt.nextLoanId = 3;
+    state.finance.cash = OVERHEAD_PER_MONTH;
+    return state;
+  }
+
+  it('posts none of a payment cash cannot cover, capitalizes its interest, charges a late fee and freezes the line', () => {
+    const state = short('warning');
+    const [regular, stubLoan] = structuredClone(state.debt.loans);
+    const p = 0;
+    const line = Math.round((20_000 * 9 * (rateOf(state.debt.credit.rate) + p)) / DAY_DIVISOR);
+    const regularInterest = Math.round((regular!.balance * regular!.rateBps) / 120_000);
+    const stub = Math.round((stubLoan!.balance * stubDays(stubLoan!.originatedDay) * stubLoan!.rateBps) / DAY_DIVISOR);
+    const due = line + regularInterest + (regular!.payment - regularInterest) + stub;
+    const lateFee = Math.max(LATE_FEE_MIN, Math.round(due * LATE_FEE_SHARE));
+    const before = state.finance.monthToDate;
+    const report = closeNext(state);
+
+    expect(report.totals.principal).toBeUndefined();
+    expect(report.totals.interest).toBe(-lateFee);
+    expect(before.filter((e) => e.category === 'interest').map((e) => e.memo)).toEqual([
+      `Late fee: ${formatMoney(due)} of loan payments for ${dateLabel(report)} missed`,
+    ]);
+    expect(state.debt.credit.balance).toBe(20_000 + line);
+    // The schedule slips a month (monthsLeft unchanged) and each payment is re-set to repay the
+    // larger balance over it at the frozen line's penalty rate: no lump left for the last payment.
+    const reset = (loan: TermLoan, balance: number) => ({ ...loan, balance, payment: levelPayment(balance, loan.rateBps + PENALTY_STEP_UP_BPS, loan.monthsLeft) });
+    expect(state.debt.loans).toEqual([reset(regular!, regular!.balance + regularInterest), reset(stubLoan!, stubLoan!.balance + stub)]);
+    expect(state.debt.covenant).toEqual({ stage: 'frozen', compliantCloses: 0 });
+    expect(report.debt).toMatchObject({ missedPayment: true, stage: 'frozen', creditBalance: 20_000 + line });
+    const notice = state.notices.find((n) => n.kind === 'paymentMissed')!;
+    expect(notice.message).toContain(formatMoney(due));
+    expect(notice.message).toContain(formatMoney(lateFee));
+    expect(notice.message).toContain(`cash ${formatMoney(report.cashEnd + lateFee)}`);
+    expect(notice.message).toMatch(/froze your credit line: no draws or new term loans/);
+    expect(notice.message).toMatch(/Another missed payment while frozen is a default/);
+    expect(state.gameOver).toBeNull();
+  });
+
+  it('ends the game with a default when a payment is missed while frozen, without also calling it insolvency', () => {
+    const state = short('frozen');
+    state.finance.cash = 0;
+    state.day = nextCloseDay(state) - 1;
+    tick(state);
+    const report = state.finance.reports.at(-1)!;
+    expect(state.gameOver).toMatchObject({ day: state.day, reason: 'default' });
+    expect(state.gameOver!.message).toMatch(
+      new RegExp(`^Default: the \\$[\\d,]+ of loan payments due at the ${dateLabel(report)} close could not be paid \\(${formatMoney(report.cashEnd).replace('$', '\\$')} in cash\\) while your credit line was frozen, so the bank has called your loans\\.$`),
+    );
+    expect(lastNotice(state)).toMatchObject({ kind: 'gameOver', message: state.gameOver!.message, day: state.day });
+    expect(report.cashEnd).toBeLessThan(0);
+    expect(state.notices.some((n) => n.kind === 'insolvencyWarning')).toBe(false);
+    expect(state.finance.negativeMonths).toBe(0);
+    // No late fee on a default, and nothing paid.
+    expect(report.totals.interest).toBeUndefined();
+    expect(report.debt).toMatchObject({ missedPayment: true, stage: 'frozen' });
+    // The game stops.
+    const frozen = structuredClone(state);
+    runDays(state, 40);
+    expect(state).toEqual(frozen);
+  });
+});
+
+describe('closeMonth: covenants', () => {
+  it('steps up one stage per breach, compliant to warning to penalty to frozen, with a notice for each', () => {
+    // Debt with no revenue at all: leverage cannot be measured, a breach at every close.
+    const state = makeTestState();
+    state.day = 40;
+    state.finance.cash = START_CASH * 10;
+    state.debt.credit.balance = 10_000;
+    const stages: CovenantStage[] = [];
+    const kinds: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const notices = state.notices.length;
+      closeNext(state);
+      stages.push(state.debt.covenant.stage);
+      kinds.push(...state.notices.slice(notices).map((n) => n.kind));
+      expect(state.debt.covenant.compliantCloses).toBe(0);
+    }
+    expect(stages).toEqual(['warning', 'penalty', 'frozen', 'frozen']);
+    expect(kinds.filter((k) => k !== 'milestone')).toEqual(['covenantWarning', 'covenantPenalty', 'creditFrozen']);
+    const [warning, penalty, frozen] = state.notices.filter((n) => n.kind.startsWith('covenant') || n.kind === 'creditFrozen');
+    expect(warning!.message).toMatch(/^Covenant warning at the \w+ 2027 close: leverage cannot be measured: you owe \$[\d,]+ with no recurring revenue/);
+    expect(warning!.message).toContain(`another breach adds a ${formatRateBps(PENALTY_STEP_UP_BPS)} penalty rate`);
+    expect(penalty!.message).toMatch(/Every balance now pays [\d.]+% more .* another breach freezes the credit line/);
+    expect(frozen!.message).toMatch(/^Credit line frozen at the .* close after another covenant breach: .*No draws or new term loans/);
+    expect(state.finance.reports.at(-1)!.debt).toMatchObject({ stage: 'frozen', leverageX100: null, missedPayment: false });
+  });
+
+  it('names a failing coverage test with its figures and the limit', () => {
+    const state = trading();
+    const uw = covenantMetrics(state).underwritingCashFlow;
+    // A balloon due within the year: far more debt service than cash flow.
+    // Payments of a year's cash flow, with a balance that outlasts this close.
+    state.debt.loans = [makeLoan({ balance: uw * 3, principal: uw * 3, monthsLeft: 2, payment: uw })];
+    state.debt.nextLoanId = 2;
+    closeNext(state);
+    const warning = state.notices.find((n) => n.kind === 'covenantWarning')!;
+    expect(warning.message).toMatch(/debt-service coverage -?[\d.]+\u00d7 is under the [\d.]+\u00d7 minimum/);
+  });
+
+  it('cures one stage at a time after COVENANT_CURE_CLOSES compliant closes in a row', () => {
+    const state = trading();
+    const good = structuredClone(state.finance.reports);
+    state.debt.credit.balance = 5_000;
+    state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+    const stages: CovenantStage[] = [];
+    const cures: string[] = [];
+    for (let i = 0; i < 3 * COVENANT_CURE_CLOSES; i++) {
+      // Keep the trailing months healthy: only this close's own month is new.
+      state.finance.reports = structuredClone(good);
+      const notices = state.notices.length;
+      closeNext(state);
+      expect(covenantMetrics(state).compliant).toBe(true);
+      stages.push(state.debt.covenant.stage);
+      cures.push(...state.notices.slice(notices).filter((n) => n.kind === 'covenantCured').map((n) => n.message));
+      state.day += 3;
+    }
+    const expected: CovenantStage[] = [];
+    for (const stage of ['penalty', 'warning', 'compliant'] as CovenantStage[]) {
+      for (let k = 1; k < COVENANT_CURE_CLOSES; k++) expected.push(expected.at(-1) ?? 'frozen');
+      expected.push(stage);
+    }
+    expect(stages).toEqual(expected);
+    expect(cures).toHaveLength(3);
+    expect(cures[0]).toMatch(/your standing is back to penalty\. The credit line is unfrozen, but the [\d.]+% penalty rate still applies/);
+    expect(cures[1]).toMatch(/back to warning\. The [\d.]+% penalty rate is lifted/);
+    expect(cures[2]).toMatch(/back to compliant\. You are back in good standing/);
+    expect(state.debt.covenant.compliantCloses).toBe(0);
+  });
+
+  it('starts the count again after a breach in the middle of a cure', () => {
+    const state = trading();
+    const good = structuredClone(state.finance.reports);
+    state.debt.credit.balance = 5_000;
+    state.debt.covenant = { stage: 'frozen', compliantCloses: COVENANT_CURE_CLOSES - 1 };
+    state.finance.reports = [];
+    const notices = state.notices.length;
+    closeNext(state);
+    expect(state.debt.covenant).toEqual({ stage: 'frozen', compliantCloses: 0 });
+    expect(state.notices.slice(notices).filter((n) => n.kind !== 'milestone')).toEqual([]);
+    state.finance.reports = structuredClone(good);
+    state.day += 3;
+    closeNext(state);
+    if (COVENANT_CURE_CLOSES > 1) expect(state.debt.covenant).toEqual({ stage: 'frozen', compliantCloses: 1 });
+    else expect(state.debt.covenant).toEqual({ stage: 'penalty', compliantCloses: 0 });
+  });
+
+  it('returns to compliant once nothing is owed', () => {
+    const state = trading();
+    state.debt.covenant = { stage: 'penalty', compliantCloses: 1 };
+    closeNext(state);
+    expect(state.debt.covenant).toEqual({ stage: 'compliant', compliantCloses: 0 });
+    expect(state.notices.filter((n) => n.kind === 'covenantCured').map((n) => n.message)).toEqual([
+      expect.stringMatching(/^All debt repaid by the \w+ 2027 close: your standing is back to compliant/),
+    ]);
+    // Already compliant: nothing to say.
+    const notices = state.notices.length;
+    state.day += 3;
+    closeNext(state);
+    expect(state.notices.slice(notices).filter((n) => n.kind === 'covenantCured')).toEqual([]);
+  });
+});
+
+describe('closeMonth: pricing and report.debt', () => {
+  it('re-prices the line at each close on its leverage, the lifetime CPP and the stage', () => {
+    const state = trading(REVENUE / 2);
+    addLivePlant(state);
+    // A red-band build.
+    state.finance.capex.osp = Math.ceil(getService(state).passings * CPP_TARGET * CPP_AMBER_MULTIPLIER) + getService(state).passings;
+    const uw = covenantMetrics(state).underwritingCashFlow;
+    state.debt.credit.balance = Math.round(uw * 2.5);
+    // The passings as the month ended, as tick() hands them to the close.
+    state.day = nextCloseDay(state);
+    const report = close(state, getService(state).passings);
+    const m = covenantMetrics(state);
+    // Priced on what the close records and the Bank shows: leverage to the hundredth, the ended month's CPP.
+    expect(report.debt?.leverageX100).toBe(Math.round(m.leverage! * 100));
+    expect(pricingCpp(state)).toBe(report.stats!.capexOsp / report.passings);
+    const priced = priceRate({ kind: 'line' }, report.debt!.leverageX100! / 100, report.stats!.capexOsp / report.passings, state.debt.covenant.stage);
+    expect(state.debt.credit.rate).toEqual({ baseBps: priced.baseBps, leverageBps: priced.leverageBps, cppBps: priced.cppBps, productBps: priced.productBps });
+    expect(state.debt.credit.rate.cppBps).toBe(CPP_SPREAD_BPS.red);
+    expect(state.debt.credit.rate.leverageBps).toBeGreaterThan(0);
+  });
+
+  it('records the close\'s financing figures, debt or not', () => {
+    const state = trading();
+    apply(state, { type: 'drawCredit', amount: 12_000 });
+    apply(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN * 3, termYears: 7 });
+    const { report } = tickThroughClose(state);
+    const m = covenantMetrics(state);
+    const total = totalDebt(state);
+    const p = penaltyBps(state.debt.covenant.stage);
+    let weighted = state.debt.credit.balance * (rateOf(state.debt.credit.rate) + p);
+    for (const loan of state.debt.loans) weighted += loan.balance * (loan.rateBps + p);
+    expect(report.debt).toEqual({
+      creditBalance: 12_000,
+      termBalance: TERM_LOAN_MIN * 3,
+      creditLimit: creditLimit(state),
+      arr: trailingArr(state),
+      annualOperatingCashFlow: annualOperatingCashFlow(state),
+      annualDebtService: annualDebtService(state),
+      leverageX100: Math.round(m.leverage! * 100),
+      coverageX100: Math.round(m.coverage! * 100),
+      stage: state.debt.covenant.stage,
+      averageRateBps: Math.round(weighted / total),
+      missedPayment: false,
+    });
+    expect(state.debt.covenant.stage).toBe('compliant');
+    // With no debt: zeros, null coverage and rate.
+    const plain = trading();
+    closeNext(plain);
+    expect(plain.finance.reports.at(-1)!.debt).toEqual(noDebtStats(plain));
+  });
+
+  it('keeps financing out of operating cash flow and CPP, and in net cash flow', () => {
+    const state = trading();
+    addLivePlant(state);
+    state.finance.capex.osp = 40_000;
+    apply(state, { type: 'drawCredit', amount: 9_000 });
+    apply(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 5 });
+    runDays(state, 3);
+    apply(state, { type: 'repayCredit', amount: 4_000 });
+    apply(state, { type: 'prepayLoan', loan: 1, amount: TERM_LOAN_MIN / 2 });
+    const { report } = tickThroughClose(state);
+    const financing = (report.totals.interest ?? 0) + (report.totals.principal ?? 0) + (report.totals.loanProceeds ?? 0);
+    expect(report.totals.loanProceeds).toBe(9_000 + TERM_LOAN_MIN);
+    expect(report.totals.principal).toBe(-4_000 - TERM_LOAN_MIN / 2);
+    expect(report.totals.interest).toBeLessThan(0);
+    const capex = (report.totals.construction ?? 0) + (report.totals.equipment ?? 0) + (report.totals.install ?? 0) + (report.totals.refund ?? 0);
+    expect(report.net - capex - financing).toBe(operatingCashFlow(report));
+    expect(report.stats!.capexOsp).toBe(40_000);
+    expect(state.finance.capex.osp).toBe(40_000);
   });
 });

@@ -84,7 +84,7 @@ export class OltPanel {
     this.cashAfter = el('span', { class: 'num', attrs: { 'data-testid': 'olt-cash-after' } });
     const cashAfter = el('p', { class: 'olt-cash-after' }, [el('span', { text: 'Cash after ' }), this.cashAfter]);
     this.credit = el('p', { class: 'card-credit', attrs: { 'data-testid': 'olt-credit', hidden: '' } });
-    const body = el('div', { class: 'olt-body' }, [this.meter, summary, this.sub, this.empty, this.list, this.button, cashAfter, this.credit, this.blockers]);
+    const body = el('div', { class: 'olt-body' }, [this.meter, summary, this.sub, this.empty, this.list, this.button, cashAfter, this.blockers, this.credit]);
     this.root = el(
       'section',
       {

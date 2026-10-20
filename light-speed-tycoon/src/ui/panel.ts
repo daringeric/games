@@ -236,6 +236,11 @@ export function monthClosedMessage(report: MonthlyReport): string {
   return `${formatMonth(report.year, report.month)} closed: ${parts.join(', ')}`;
 }
 
+/** The month-close toast's tone: good news, unless the close missed its debt payment. */
+export function monthClosedTone(report: MonthlyReport): 'ok' | 'warn' {
+  return report.debt?.missedPayment ? 'warn' : 'ok';
+}
+
 /** A report used only to lay out the rows (labels and hints). */
 const SAMPLE: MonthlyReport = { year: 2027, month: 1, totals: {}, net: 0, cashEnd: 0, passings: 0 };
 

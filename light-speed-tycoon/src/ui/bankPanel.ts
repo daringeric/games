@@ -20,21 +20,36 @@ import {
   COVENANT_MIN_COVERAGE,
   CPP_TARGET,
   CREDIT_LIMIT_ARR_MULTIPLE,
+  DRAW_PRESETS,
   LOAN_ROUNDING,
   PENALTY_STEP_UP_BPS,
   TERM_CAPACITY_ARR_MULTIPLE,
+  TERM_DEFAULT_ROUNDING,
   TERM_LOAN_MIN,
   TERM_LOAN_YEARS,
   UNDERWRITING_MIN_MARGIN,
 } from '../sim/balance';
-import { dateOf, dayOf, formatDate } from '../sim/calendar';
-import { covenantMetrics, creditOffer, estimateNextDebtService, quotePrepay, quoteTermLoan, termCapacity, totalDebt } from '../sim/debt';
+import { dateOf, dayOf, formatDate, formatMonth } from '../sim/calendar';
+import {
+  covenantMetrics,
+  creditOffer,
+  estimateNextDebtService,
+  finalPayment,
+  quotePrepay,
+  quoteTermLoan,
+  termCapacity,
+  totalDebt,
+} from '../sim/debt';
+import { estimateCashAtClose } from '../sim/finance';
 import type {
   CovenantMetrics,
   CovenantStage,
   CreditOffer,
+  DebtStats,
   GameState,
   LoanId,
+  Notice,
+  NoticeKind,
   PrepayQuote,
   RateBreakdown,
   TermLoan,
@@ -45,7 +60,8 @@ import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { el, setText } from './dom';
 import { formatBpsDelta, formatMoney, formatPercent, formatRate, formatRatio, plural } from './format';
-import type { Toasts } from './overlays';
+import { noticeTone } from './overlays';
+import type { Toasts, ToastTone } from './overlays';
 import { parseNumberField } from './pricingPanel';
 import type { GameSession } from './session';
 
@@ -109,7 +125,7 @@ export function cureText(stage: CovenantStage, compliantCloses: number): string 
   const progress = compliantCloses > 0 ? ` (${compliantCloses} of ${COVENANT_CURE_CLOSES} so far)` : '';
   return (
     `${plural(COVENANT_CURE_CLOSES, 'compliant month close')} in a row step back one stage${progress}. ` +
-    'Repay debt or grow your operating cash flow to get back within the limits; with no debt at all the bank lifts everything.'
+    'Repay debt or grow your operating cash flow to get back within the limits; with no debt at all the bank lifts everything at the next month close.'
   );
 }
 
@@ -140,11 +156,14 @@ export function formatLeverage(leverage: number | null): string {
   return leverage === null ? 'not measurable' : formatRatio(leverage);
 }
 
-/** The plain-language line under the cost-per-passing spread. */
-export function cppLine(rate: Pick<RateBreakdown, 'cpp' | 'cppBand' | 'cppBps'>): string {
+/**
+ * The plain-language line under the cost-per-passing spread. `when` dates a
+ * figure that is not today's ("at the Jun 2027 close", for the credit line).
+ */
+export function cppLine(rate: Pick<RateBreakdown, 'cpp' | 'cppBand' | 'cppBps'>, when?: string): string {
   const spread = rate.cppBps > 0 ? formatBpsDelta(rate.cppBps) : 'no CPP spread';
-  if (rate.cpp === null || rate.cppBand === null) return 'Nothing passed yet: no CPP spread';
-  const cpp = formatMoney(rate.cpp);
+  if (rate.cpp === null || rate.cppBand === null) return when ? `Nothing passed ${when}: no CPP spread` : 'Nothing passed yet: no CPP spread';
+  const cpp = `${formatMoney(rate.cpp)}${when ? ` ${when}` : ''}`;
   switch (rate.cppBand) {
     case 'green':
       return `Cost per passing ${cpp} is ${Math.round(rate.cpp) < CPP_TARGET ? 'under' : 'on'} target: ${spread}`;
@@ -155,11 +174,22 @@ export function cppLine(rate: Pick<RateBreakdown, 'cpp' | 'cppBand' | 'cppBps'>)
   }
 }
 
-/** The leverage the leverage spread was priced on, in words. */
-export function leverageNote(leverage: number | null): string {
-  if (leverage === null) return 'leverage not measurable: the top spread';
-  if (leverage === 0) return 'no debt yet';
-  return `at ${formatRatio(leverage)} leverage`;
+/** The leverage the leverage spread was priced on, in words; `when` dates it ("at the Jun 2027 close"). */
+export function leverageNote(leverage: number | null, when?: string): string {
+  if (leverage === null) return `leverage not measurable${when ? ` ${when}` : ''}: the top spread`;
+  if (leverage === 0) return when ? `no debt ${when}` : 'no debt yet';
+  return `at ${formatRatio(leverage)} leverage${when ? ` ${when}` : ''}`;
+}
+
+/**
+ * When the credit line was priced: its breakdown shows the figures of the
+ * last close (the line floats and re-prices at every close), not today's.
+ */
+export interface LinePricing {
+  /** "Jun 2027": the close that priced it, or null before the first close (priced at base + premium). */
+  close: string | null;
+  /** "Aug 1, 2027": the next close, which re-prices it. */
+  next: string;
 }
 
 export interface RateRowView {
@@ -170,14 +200,23 @@ export interface RateRowView {
   note: string;
 }
 
-/** The rate's parts, in order; the penalty row only while it applies. */
-export function rateRows(rate: RateBreakdown, product: { kind: 'line' } | { kind: 'term'; years: TermYears }): RateRowView[] {
+/**
+ * The rate's parts, in order; the penalty row only while it applies. A term
+ * quote is priced on today's figures; the credit line on the last close's
+ * (`pricing`), and its notes say so.
+ */
+export function rateRows(rate: RateBreakdown, product: { kind: 'line' } | { kind: 'term'; years: TermYears }, pricing?: LinePricing): RateRowView[] {
+  const when = product.kind === 'line' && pricing?.close ? `at the ${pricing.close} close` : undefined;
+  const floats =
+    pricing === undefined
+      ? 'draw and repay any time; the rate floats'
+      : `draw and repay any time; the rate floats: re-priced at every month close, next on ${pricing.next}`;
   const rows: RateRowView[] = [
     { key: 'base', label: 'Base', value: formatRate(rate.baseBps), note: 'what every loan starts from' },
-    { key: 'leverage', label: 'Leverage spread', value: formatBpsDelta(rate.leverageBps), note: leverageNote(rate.leverage) },
-    { key: 'cpp', label: 'Cost-per-passing spread', value: formatBpsDelta(rate.cppBps), note: cppLine(rate) },
+    { key: 'leverage', label: 'Leverage spread', value: formatBpsDelta(rate.leverageBps), note: leverageNote(rate.leverage, when) },
+    { key: 'cpp', label: 'Cost-per-passing spread', value: formatBpsDelta(rate.cppBps), note: cppLine(rate, when) },
     product.kind === 'line'
-      ? { key: 'product', label: 'Line premium', value: formatBpsDelta(rate.productBps), note: 'draw and repay any time; the rate floats' }
+      ? { key: 'product', label: 'Line premium', value: formatBpsDelta(rate.productBps), note: floats }
       : { key: 'product', label: 'Term premium', value: formatBpsDelta(rate.productBps), note: `${product.years}-year term, fixed for its life` },
   ];
   if (rate.penaltyBps > 0) {
@@ -193,9 +232,7 @@ export interface Preset {
   disabled: boolean;
 }
 
-/** Fixed draw presets (whole dollars), then half and all of what is available. */
-export const DRAW_PRESETS: readonly number[] = [10_000, 25_000];
-
+/** Fixed draw presets (balance.DRAW_PRESETS, whole dollars), then half and all of what is available. */
 export function drawPresets(available: number): Preset[] {
   const half = Math.floor(available / 2);
   return [
@@ -227,7 +264,7 @@ export interface CreditView {
   /** Effective rate charged today. */
   rate: string;
   rateRows: RateRowView[];
-  /** One line on where the limit comes from (or why there is none yet). */
+  /** Where the limit comes from; '' before there is one (the reasons say why). */
   note: string;
   canDraw: boolean;
   /** Why nothing can be drawn (the offer's reasons); empty when canDraw. */
@@ -239,12 +276,10 @@ export interface CreditView {
   repayPresets: Preset[];
 }
 
-export function creditView(offer: CreditOffer): CreditView {
-  const multiple = formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE);
+/** `pricing`: when the line's rate was set (its breakdown is that close's figures); omitted, the notes are undated. */
+export function creditView(offer: CreditOffer, pricing?: LinePricing): CreditView {
   const note =
-    offer.limit <= 0
-      ? `No credit yet: the bank lends against recurring revenue. Your limit will be ${multiple} your annual recurring revenue (ARR), set at each month close once subscribers pay.`
-      : `Limit ${multiple} your annual recurring revenue (${formatMoney(offer.arr)} a year), reset at each month close.`;
+    offer.limit > 0 ? `Limit ${formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE)} your annual recurring revenue (${formatMoney(offer.arr)} a year), reset at each month close.` : '';
   return {
     figures: [
       { label: 'Limit', value: formatMoney(offer.limit) },
@@ -253,7 +288,7 @@ export function creditView(offer: CreditOffer): CreditView {
       { label: 'Interest so far this month', value: formatMoney(offer.accruedInterest) },
     ],
     rate: formatRate(offer.rate.effectiveRateBps),
-    rateRows: rateRows(offer.rate, { kind: 'line' }),
+    rateRows: rateRows(offer.rate, { kind: 'line' }, pricing),
     note,
     canDraw: offer.available > 0,
     reasons: offer.available > 0 ? [] : offer.reasons,
@@ -263,9 +298,6 @@ export function creditView(offer: CreditOffer): CreditView {
     repayPresets: repayPresets(offer),
   };
 }
-
-/** The builder's default amount rounds the capacity down to this. */
-export const TERM_DEFAULT_ROUNDING = 10_000;
 
 /** Capacity rounded down to TERM_DEFAULT_ROUNDING, at least TERM_LOAN_MIN. */
 export function defaultTermAmount(maxAmount: number): number {
@@ -317,7 +349,7 @@ export interface TermView {
   reasons: string[];
   /** "Borrow $120,000 over 7 years", or "Borrow" for an amount that can't be quoted. */
   confirmLabel: string;
-  /** "Up to $240,000 today" / why nothing can be borrowed. */
+  /** "Up to $240,000 today: ..."; '' when nothing can be borrowed (the reasons say why). */
   capacity: string;
   /** Fixed rate the loan would carry; with the penalty in force, what is charged today too. */
   rate: string;
@@ -328,26 +360,31 @@ export interface TermView {
   warning: string | null;
 }
 
-/** Words for the covenants a quote would break. */
-function brokenCovenants(after: CovenantMetrics): string {
+/** Words for the covenants these figures break (a quote's, or today's). */
+export function brokenCovenants(after: Pick<CovenantMetrics, 'leverageOk' | 'coverageOk'>): string {
   if (!after.leverageOk && !after.coverageOk) return 'the leverage and coverage covenants';
   return !after.leverageOk ? 'the leverage covenant' : 'the coverage covenant';
 }
 
 export function termView(quote: TermLoanQuote, stage: CovenantStage): TermView {
-  const valid = quote.payment > 0;
+  // Nothing to borrow: no figures for a loan that can't be taken.
+  const valid = quote.payment > 0 && quote.maxAmount > 0;
   const capacity =
     quote.maxAmount > 0
       ? `Up to ${formatMoney(quote.maxAmount)} today: ${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} your annual recurring revenue, less the term loans you owe.`
-      : stage === 'frozen'
-        ? 'No new term loans while the credit line is frozen.'
-        : `No term loans yet: the bank lends up to ${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} your annual recurring revenue, less the term loans you owe, from at least ${formatMoney(TERM_LOAN_MIN)}.`;
+      : '';
   const fixed = formatRate(quote.rate.rateBps);
+  const penalty = quote.rate.penaltyBps > 0;
+  // While the penalty lasts the payment repays the loan at the penalty rate (re-set when it lifts).
+  const paymentNotes = [
+    ...(penalty ? ['penalty included while it lasts'] : []),
+    ...(quote.lastPayment !== quote.payment ? [`last one ${formatMoney(quote.lastPayment)}`] : []),
+  ];
   const figures: Figure[] = [
     {
       label: 'Monthly payment',
       value: valid ? formatMoney(quote.payment) : '–',
-      sub: valid && quote.lastPayment !== quote.payment ? `last one ${formatMoney(quote.lastPayment)}` : undefined,
+      sub: valid && paymentNotes.length > 0 ? paymentNotes.join('; ') : undefined,
       tone: valid ? undefined : 'muted',
     },
     {
@@ -356,7 +393,12 @@ export function termView(quote: TermLoanQuote, stage: CovenantStage): TermView {
       sub: valid ? 'interest only, for the days left this month' : undefined,
       tone: valid ? undefined : 'muted',
     },
-    { label: 'Total interest', value: valid ? formatMoney(quote.totalInterest) : '–', tone: valid ? undefined : 'muted' },
+    {
+      label: 'Total interest',
+      value: valid ? formatMoney(quote.totalInterest) : '–',
+      sub: valid && penalty ? 'if the penalty lasted the whole term' : undefined,
+      tone: valid ? undefined : 'muted',
+    },
     { label: 'Cash after', value: formatMoney(quote.cashAfter), tone: quote.cashAfter < 0 ? 'danger' : undefined },
   ];
   const warning = quote.breachesCovenant
@@ -394,15 +436,22 @@ export function inFirstMonth(loan: Pick<TermLoan, 'originatedDay'>, day: number)
   return taken.year === now.year && taken.month === now.month;
 }
 
-export function loanView(loan: TermLoan, day: number, penaltyBps: number): LoanView {
+/**
+ * `lastPayment`: what the final payment will be at today's rate
+ * (debt.finalPayment); it is named when it differs from the level payment,
+ * and it is the payment itself when only one is left.
+ */
+export function loanView(loan: TermLoan, day: number, penaltyBps: number, lastPayment: number = loan.payment): LoanView {
   const first = inFirstMonth(loan, day);
+  const lastOnly = !first && loan.monthsLeft <= 1;
+  const last = loan.monthsLeft > 1 && lastPayment !== loan.payment ? `, the last ${formatMoney(lastPayment)}` : '';
   return {
     id: loan.id,
     title: `#${loan.id} · ${loan.termMonths / 12} years at ${formatRate(loan.rateBps)}`,
     balance: formatMoney(loan.balance),
-    payment: `${formatMoney(loan.payment)}/mo`,
-    schedule: first ? `first payment: interest only, then ${plural(loan.monthsLeft, 'payment')}` : `${plural(loan.monthsLeft, 'payment')} left`,
-    penalty: penaltyBps > 0 ? `${formatBpsDelta(penaltyBps)} penalty while it lasts` : '',
+    payment: lastOnly ? `${formatMoney(lastPayment)} (last)` : `${formatMoney(loan.payment)}/mo`,
+    schedule: first ? `first payment: interest only, then ${plural(loan.monthsLeft, 'payment')}${last}` : `${plural(loan.monthsLeft, 'payment')} left${last}`,
+    penalty: penaltyBps > 0 ? `${formatBpsDelta(penaltyBps)} penalty while it lasts, included in the payment` : '',
   };
 }
 
@@ -437,13 +486,60 @@ export interface CovenantView {
   cure: string;
 }
 
-/** The covenant section: stage, today's tests, the cash flow behind them, and what comes next. */
-export function covenantView(stage: CovenantStage, compliantCloses: number, metrics: CovenantMetrics): CovenantView {
-  const share = formatPercent(UNDERWRITING_MIN_MARGIN);
+/** Label of the covenant badge while the stage is compliant but today's figures break a covenant. */
+export const AT_RISK_LABEL = 'At risk';
+
+/**
+ * In good standing, but today's figures would breach at a close: what that
+ * means, hedged (the close re-tests on that month's figures, which can pass).
+ * `nextClose` is the day of the next close.
+ */
+export function atRiskMeaning(metrics: Pick<CovenantMetrics, 'leverageOk' | 'coverageOk'>, nextClose: number | null): string {
+  const when = nextClose === null ? 'the next month close' : `the ${formatDate(nextClose)} close`;
+  return (
+    `In good standing, but at today's figures your debt breaks ${brokenCovenants(metrics)}. ` +
+    `The bank tests them again at ${when} on that month's figures: a breach then brings a warning first.`
+  );
+}
+
+/** What the last close's covenant test found (report.debt), for the Bank to show beside today's figures. */
+export interface LastTest {
+  /** "Jul 2027": the month that close ended. */
+  close: string;
+  debt: Pick<DebtStats, 'creditBalance' | 'termBalance' | 'leverageX100' | 'coverageX100' | 'annualDebtService'>;
+}
+
+/** "6.02× · 0.91×" with what the test measured, or null when that close had no debt to test. */
+export function lastTestFigure(last: LastTest | null): Figure | null {
+  if (!last || last.debt.creditBalance + last.debt.termBalance <= 0) return null;
+  const { leverageX100, coverageX100, annualDebtService } = last.debt;
   return {
-    stage: STAGE_LABEL[stage],
-    tone: STAGE_TONE[stage],
-    meaning: stageMeaning(stage),
+    label: `Tested at the ${last.close} close`,
+    value: `${formatLeverage(leverageX100 === null ? null : leverageX100 / 100)} · ${formatRatio(coverageX100 === null ? null : coverageX100 / 100)}`,
+    sub: `leverage · coverage, on ${formatMoney(annualDebtService)}/yr of payments at the rates before that close re-priced`,
+  };
+}
+
+/**
+ * The covenant section: stage, today's tests, the cash flow behind them, and
+ * what comes next. A compliant stage whose figures break a covenant today
+ * reads 'At risk' (warn) with a hedged meaning; `nextClose` names that close
+ * and `last` adds what the last close tested.
+ */
+export function covenantView(
+  stage: CovenantStage,
+  compliantCloses: number,
+  metrics: CovenantMetrics,
+  nextClose: number | null = null,
+  last: LastTest | null = null,
+): CovenantView {
+  const share = formatPercent(UNDERWRITING_MIN_MARGIN);
+  const atRisk = stage === 'compliant' && !metrics.compliant;
+  const tested = lastTestFigure(last);
+  return {
+    stage: atRisk ? AT_RISK_LABEL : STAGE_LABEL[stage],
+    tone: atRisk ? 'warn' : STAGE_TONE[stage],
+    meaning: atRisk ? atRiskMeaning(metrics, nextClose) : stageMeaning(stage),
     checks: [leverageCheck(null, metrics), coverageCheck(null, metrics)],
     figures: [
       { label: 'Debt', value: formatMoney(metrics.totalDebt) },
@@ -454,7 +550,8 @@ export function covenantView(stage: CovenantStage, compliantCloses: number, metr
         sub: `your yearly operating cash flow (${formatMoney(metrics.annualOperatingCashFlow)}), or ${share} of recurring revenue if that is more`,
         tone: metrics.underwritingCashFlow > 0 ? undefined : 'danger',
       },
-      { label: 'Debt service, next 12 months', value: `${formatMoney(metrics.annualDebtService)}/yr` },
+      { label: 'Debt service, next 12 months', value: `${formatMoney(metrics.annualDebtService)}/yr`, sub: 'at today’s rates' },
+      ...(tested ? [tested] : []),
     ],
     next: stageNext(stage),
     cureLabel: stage === 'compliant' ? 'The tests' : 'How to cure',
@@ -468,16 +565,88 @@ export function nextCloseDay(day: number): number {
   return d.month === 12 ? dayOf({ year: d.year + 1, month: 1, day: 1 }) : dayOf({ year: d.year, month: d.month + 1, day: 1 });
 }
 
-/** "≈ $3,120 on Feb 1, 2027", warn-toned when cash is below it. */
-export function nextPaymentFigure(estimate: number, cash: number, day: number): Figure {
+/**
+ * "≈ $3,120 at the Feb 1, 2027 close", warn-toned when the cash projected at
+ * that close (finance.estimateCashAtClose: after the month's billing and
+ * running costs, which the close takes first) is below it.
+ */
+export function nextPaymentFigure(estimate: number, cashAtClose: number, day: number): Figure {
   if (estimate <= 0) return { label: 'Next payment', value: 'None due', tone: 'muted' };
-  const short = cash < estimate;
+  const short = cashAtClose < estimate;
   return {
     label: 'Next payment',
     value: `≈ ${formatMoney(estimate)}`,
-    sub: `at the ${formatDate(nextCloseDay(day))} close${short ? ': more than your cash' : ''}`,
+    sub: `at the ${formatDate(nextCloseDay(day))} close${short ? ': more than the cash projected then' : ''}`,
     tone: short ? 'warn' : undefined,
   };
+}
+
+/** The cash projected at the next close before its loan payments, while a payment is due (null otherwise). */
+export function cashAtCloseFigure(cashAtClose: number, estimate: number): Figure | null {
+  if (estimate <= 0) return null;
+  return {
+    label: 'Cash at the close',
+    value: `≈ ${formatMoney(cashAtClose)}`,
+    sub: 'projected, before loan payments',
+    tone: cashAtClose < 0 ? 'danger' : cashAtClose < estimate ? 'warn' : undefined,
+  };
+}
+
+/** Notices the Bank keeps to reread: the debt notices, long and gone from the toasts in seconds. */
+const BANK_NOTICE_KINDS: ReadonlySet<NoticeKind> = new Set<NoticeKind>([
+  'paymentDue',
+  'paymentMissed',
+  'covenantWarning',
+  'covenantPenalty',
+  'creditFrozen',
+  'covenantCured',
+  'loanPaidOff',
+]);
+
+/** How many of them the Bank lists. */
+export const BANK_NOTICES_SHOWN = 5;
+
+/** The Bank lists notices of this kind to reread. */
+export function isBankNotice(kind: NoticeKind): boolean {
+  return BANK_NOTICE_KINDS.has(kind);
+}
+
+/** Longest headline a narrow screen toasts for a bank notice. */
+const HEADLINE_MAX = 180;
+
+/**
+ * A bank notice cut to its headline, for a toast on a narrow screen (the full
+ * text would cover the map; the Bank lists it): the first sentence, or the
+ * part before its first colon when that sentence is long, or the first
+ * HEADLINE_MAX characters at a word; then where to read the rest.
+ */
+export function noticeHeadline(message: string): string {
+  const end = message.indexOf('. ');
+  let head = end >= 0 ? message.slice(0, end + 1) : message;
+  if (head.length > HEADLINE_MAX) {
+    const colon = head.indexOf(': ');
+    if (colon >= 0 && colon <= HEADLINE_MAX) head = `${head.slice(0, colon)}.`;
+    else head = `${head.slice(0, head.lastIndexOf(' ', HEADLINE_MAX))}…`;
+  }
+  return head === message ? message : `${head} Full notice in the Bank.`;
+}
+
+export interface BankNoticeView {
+  id: number;
+  /** "Aug 1, 2027" */
+  date: string;
+  text: string;
+  tone: ToastTone;
+}
+
+/** The latest debt notices, newest first, at most `max`. */
+export function bankNotices(notices: readonly Notice[], max: number = BANK_NOTICES_SHOWN): BankNoticeView[] {
+  const out: BankNoticeView[] = [];
+  for (let i = notices.length - 1; i >= 0 && out.length < max; i--) {
+    const n = notices[i] as Notice;
+    if (BANK_NOTICE_KINDS.has(n.kind)) out.push({ id: n.id, date: formatDate(n.day), text: n.message, tone: noticeTone(n) });
+  }
+  return out;
 }
 
 /** A typed amount the sim can take: a whole number >= 1, else null. */
@@ -655,6 +824,12 @@ class BankView {
   private seen = { state: null as GameState | null, day: -1, revision: -1 };
   private readonly stageBadge: HTMLElement;
   private readonly summary: FigureList;
+  /**
+   * The one live region: what the player's own input just quoted (a term
+   * loan, a prepayment). The figures themselves refresh every game day and
+   * would chatter if they were live.
+   */
+  private readonly live: HTMLElement;
   // Credit line.
   private readonly creditFigures: FigureList;
   private readonly creditNote: HTMLElement;
@@ -685,6 +860,7 @@ class BankView {
   private readonly termFigures: FigureList;
   private readonly termChecks: HTMLElement;
   private readonly termChecksKey = { value: '' };
+  private readonly termQuote: HTMLElement;
   private readonly termWarning: HTMLElement;
   private readonly termReasons: HTMLElement;
   private readonly termReasonsKey = { value: '' };
@@ -709,6 +885,10 @@ class BankView {
   private readonly covCureLabel: HTMLElement;
   private readonly covCure: HTMLElement;
   private readonly repayReason: HTMLElement;
+  // Notices from the bank, to reread.
+  private readonly noticesSection: HTMLElement;
+  private readonly noticeList: HTMLElement;
+  private noticesKey = '';
 
   constructor(
     sheet: Sheet,
@@ -739,7 +919,8 @@ class BankView {
     // Summary: stage badge, debt and the next payment.
     this.stageBadge = el('span', { class: 'bank-badge', attrs: { 'data-testid': 'bank-stage' } });
     this.summary = new FigureList('bank-summary-figs', 'bank-summary');
-    const summary = el('div', { class: 'bank-summary', attrs: { role: 'status' } }, [this.stageBadge, this.summary.root]);
+    const summary = el('div', { class: 'bank-summary' }, [this.stageBadge, this.summary.root]);
+    this.live = el('p', { class: 'visually-hidden', attrs: { role: 'status', 'aria-live': 'polite' } });
 
     // a) Credit line.
     this.creditFigures = new FigureList('bank-credit-figs', 'bank-credit');
@@ -834,15 +1015,16 @@ class BankView {
       el('div', { class: 'bank-form-row' }, [el('span', { class: 'bank-form-label', text: 'Amount' }), moneyField(this.termInput), years]),
       termPresets,
     ]);
+    this.termQuote = el('div', { class: 'bank-quote', attrs: { role: 'group', 'aria-label': 'Term loan quote' } }, [
+      el('div', { class: 'bank-rate' }, [el('p', { class: 'bank-rate-total' }, [el('span', { text: 'Rate' }), this.termRate]), this.termRateRows]),
+      this.termFigures.root,
+      el('h4', { class: 'bank-subhead', text: 'Covenants after this loan' }),
+      this.termChecks,
+    ]);
     const term = section('term', 'New term loan', [
       this.termCapacity,
       this.termFieldset,
-      el('div', { class: 'bank-quote', attrs: { role: 'status', 'aria-label': 'Term loan quote' } }, [
-        el('div', { class: 'bank-rate' }, [el('p', { class: 'bank-rate-total' }, [el('span', { text: 'Rate' }), this.termRate]), this.termRateRows]),
-        this.termFigures.root,
-        el('h4', { class: 'bank-subhead', text: 'Covenants after this loan' }),
-        this.termChecks,
-      ]),
+      this.termQuote,
       this.termWarning,
       this.termReasons,
       el('div', { class: 'bank-confirm' }, [this.termConfirm]),
@@ -850,7 +1032,7 @@ class BankView {
     ]);
 
     // c) Loans.
-    this.loanList = el('ul', { class: 'bank-loans', attrs: { 'data-testid': 'bank-loans' } });
+    this.loanList = el('ul', { class: 'bank-loans', attrs: { 'data-testid': 'bank-loan-list' } });
     this.loansEmpty = el('p', { class: 'bank-empty', text: 'No term loans' });
     const loans = section('loans', 'Your term loans', [this.loansEmpty, this.loanList]);
 
@@ -870,7 +1052,12 @@ class BankView {
       el('p', { class: 'bank-explain' }, [this.covCureLabel, this.covCure]),
     ]);
 
-    sheet.body.append(summary, credit, term, loans, covenant);
+    // e) The bank's latest notices (the toasts leave long before they can be read twice).
+    this.noticeList = el('ol', { class: 'bank-notice-list', attrs: { 'data-testid': 'bank-notice-list' } });
+    this.noticesSection = section('notices', 'Notices from the bank', [this.noticeList]);
+    this.noticesSection.hidden = true;
+
+    sheet.body.append(this.live, summary, credit, term, loans, covenant, this.noticesSection);
 
     // Typing updates the quotes at once; an Enter acts like the form's button.
     this.drawInput.addEventListener('input', () => this.hideError(this.creditError));
@@ -878,7 +1065,7 @@ class BankView {
     this.termInput.addEventListener('input', () => {
       this.termDirty = true;
       this.hideError(this.termError);
-      this.refreshTerm(this.session.state);
+      this.announceTerm(this.refreshTerm(this.session.state));
     });
     const enter = (input: HTMLInputElement, run: () => void) =>
       input.addEventListener('keydown', (e) => {
@@ -915,7 +1102,12 @@ class BankView {
       b.tabIndex = y === years ? 0 : -1;
     }
     this.hideError(this.termError);
-    this.refreshTerm(this.session.state);
+    this.announceTerm(this.refreshTerm(this.session.state));
+  }
+
+  private announceTerm(view: TermView): void {
+    const payment = view.figures[0];
+    setText(this.live, view.ok && payment ? `${view.confirmLabel}: ${payment.value} a month at ${view.rate}` : (view.reasons[0] ?? ''));
   }
 
   /** Refresh every figure when the day, a command or the game changed (or `force`). */
@@ -927,20 +1119,35 @@ class BankView {
     const offer = creditOffer(state);
     const metrics = covenantMetrics(state);
     const stage = state.debt.covenant.stage;
+    const lastReport = state.finance.reports.at(-1);
+    const lastClose = lastReport ? formatMonth(lastReport.year, lastReport.month) : null;
+    const nextClose = nextCloseDay(state.day);
+    const cov = covenantView(
+      stage,
+      state.debt.covenant.compliantCloses,
+      metrics,
+      nextClose,
+      lastReport?.debt && lastClose ? { close: lastClose, debt: lastReport.debt } : null,
+    );
 
-    // Summary.
-    setText(this.stageBadge, STAGE_LABEL[stage]);
-    this.setBadgeTone(this.stageBadge, STAGE_TONE[stage]);
+    // Summary: the badge reads like the covenant section's (an at-risk stage included).
+    setText(this.stageBadge, cov.stage);
+    this.setBadgeTone(this.stageBadge, cov.tone);
+    const estimate = estimateNextDebtService(state);
+    const atClose = estimateCashAtClose(state);
+    const projected = cashAtCloseFigure(atClose, estimate);
     this.summary.set([
       { label: 'Debt', value: formatMoney(totalDebt(state)) },
-      nextPaymentFigure(estimateNextDebtService(state), state.finance.cash, state.day),
+      nextPaymentFigure(estimate, atClose, state.day),
       { label: 'Cash', value: formatMoney(state.finance.cash), tone: state.finance.cash < 0 ? 'danger' : undefined },
+      ...(projected ? [projected] : []),
     ]);
 
-    // Credit line.
-    const credit = creditView(offer);
+    // Credit line: its rate's breakdown is the last close's figures.
+    const credit = creditView(offer, { close: lastClose, next: formatDate(nextClose) });
     this.creditFigures.set(credit.figures);
     setText(this.creditNote, credit.note);
+    this.creditNote.hidden = credit.note === '';
     setText(this.creditRate, credit.rate);
     setRateRows(this.creditRateRows, credit.rateRows, this.creditRateKey);
     this.drawPresets = credit.drawPresets;
@@ -986,7 +1193,6 @@ class BankView {
     this.refreshLoans(state);
 
     // Covenants.
-    const cov = covenantView(stage, state.debt.covenant.compliantCloses, metrics);
     setText(this.covStage, cov.stage);
     this.setBadgeTone(this.covStage, cov.tone);
     setText(this.covMeaning, cov.meaning);
@@ -995,18 +1201,34 @@ class BankView {
     setText(this.covNext, cov.next);
     setText(this.covCureLabel, `${cov.cureLabel}: `);
     setText(this.covCure, cov.cure);
+
+    // Notices from the bank.
+    const notices = bankNotices(state.notices);
+    const key = notices.map((n) => n.id).join(',');
+    if (key !== this.noticesKey) {
+      this.noticesKey = key;
+      this.noticeList.replaceChildren(
+        ...notices.map((n) =>
+          el('li', { class: `bank-notice bank-notice-${n.tone}` }, [el('time', { class: 'bank-notice-date', text: n.date }), el('span', { text: n.text })]),
+        ),
+      );
+      this.noticesSection.hidden = notices.length === 0;
+    }
   }
 
   private setBadgeTone(node: HTMLElement, tone: BankTone): void {
     for (const t of ['ok', 'warn', 'danger'] as const) node.classList.toggle(`tone-${t}`, tone === t);
   }
 
-  private refreshTerm(state: GameState): void {
+  private refreshTerm(state: GameState): TermView {
     const amount = parseNumberField(this.termInput.value);
     const quote = quoteTermLoan(state, amount, this.termYears);
     const view = termView(quote, state.debt.covenant.stage);
     setAttr(this.termInput, 'aria-invalid', String(!quote.ok && quote.maxAmount > 0 && quote.payment === 0));
     setText(this.termCapacity, view.capacity);
+    this.termCapacity.hidden = view.capacity === '';
+    // Nothing to borrow: the reasons say why, and there is no loan to quote.
+    this.termQuote.hidden = quote.maxAmount <= 0;
     setText(this.termRate, view.rate);
     setRateRows(this.termRateRows, view.rateRows, this.termRateKey);
     this.termFigures.set(view.figures);
@@ -1016,6 +1238,7 @@ class BankView {
     setList(this.termReasons, view.reasons, this.termReasonsKey);
     setText(this.termConfirm, view.confirmLabel);
     setDisabled(this.termConfirm, !view.ok);
+    return view;
   }
 
   private refreshLoans(state: GameState): void {
@@ -1038,7 +1261,7 @@ class BankView {
       }
       // Keep list order (ascending id) without moving rows that are already in place.
       if (this.loanList.children[i] !== dom.root) this.loanList.insertBefore(dom.root, this.loanList.children[i] ?? null);
-      const view = loanView(loan, state.day, penalty ? PENALTY_STEP_UP_BPS : 0);
+      const view = loanView(loan, state.day, penalty ? PENALTY_STEP_UP_BPS : 0, finalPayment(state, loan));
       setText(dom.title, view.title);
       setText(dom.balance, view.balance);
       setText(dom.payment, view.payment);
@@ -1060,7 +1283,7 @@ class BankView {
       class: 'field num bank-amount',
       attrs: { type: 'number', inputmode: 'numeric', min: '1', step: '1', placeholder: 'Amount', 'aria-label': `Amount to prepay on loan #${id}` },
     });
-    const quote = el('p', { class: 'bank-prepay-quote', attrs: { role: 'status' } });
+    const quote = el('p', { class: 'bank-prepay-quote' });
     const reasons = el('ul', { class: 'blockers bank-reasons', attrs: { hidden: '' } });
     const error = el('p', { class: 'sheet-error', attrs: { role: 'alert', hidden: '' } });
     const dom: LoanDom = {
@@ -1087,7 +1310,8 @@ class BankView {
     input.addEventListener('input', () => {
       error.hidden = true;
       dom.quoteKey = '';
-      this.refreshPrepay(this.session.state, dom, id);
+      const view = this.refreshPrepay(this.session.state, dom, id);
+      setText(this.live, view ? view.summary || (view.reasons[0] ?? '') : '');
     });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -1113,7 +1337,8 @@ class BankView {
     return dom;
   }
 
-  private refreshPrepay(state: GameState, dom: LoanDom, id: LoanId): void {
+  /** The prepay quote for what is typed (null for nothing typed). */
+  private refreshPrepay(state: GameState, dom: LoanDom, id: LoanId): PrepayView | null {
     const text = dom.input.value.trim();
     if (text === '') {
       setText(dom.quote, '');
@@ -1121,7 +1346,7 @@ class BankView {
       dom.reasons.hidden = true;
       setText(dom.prepay, 'Prepay');
       setDisabled(dom.prepay, true);
-      return;
+      return null;
     }
     const quote = quotePrepay(state, id, parseNumberField(text));
     const view = prepayView(quote);
@@ -1132,6 +1357,7 @@ class BankView {
     dom.quoteKey = key.value;
     setText(dom.prepay, view.label);
     setDisabled(dom.prepay, !view.ok);
+    return view;
   }
 
   // -------------------------------------------------------------------------

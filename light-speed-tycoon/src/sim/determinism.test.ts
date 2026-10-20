@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { MARKETING_MAX_PER_MONTH, TIER_DEFAULTS } from './balance';
+import { MARKETING_MAX_PER_MONTH, TERM_LOAN_MIN, TIER_DEFAULTS } from './balance';
 import { isFirstOfMonth } from './calendar';
+import { creditAvailable, termCapacity } from './debt';
 import { applyCommand, newGame, runDays } from './game';
 import { getService } from './network';
 import { subscriberUnits } from './sales';
@@ -37,11 +38,14 @@ interface Session {
   results: CommandResult[];
 }
 
-function play(state: GameState, steps: ReadonlyArray<Command | number> = SCRIPT): Session {
+/** A script step: a command, a command decided from the state at that moment, or days to run. */
+type Step = Command | ((state: GameState) => Command) | number;
+
+function play(state: GameState, steps: ReadonlyArray<Step> = SCRIPT): Session {
   const results: CommandResult[] = [];
   for (const step of steps) {
     if (typeof step === 'number') runDays(state, step);
-    else results.push(applyCommand(state, step));
+    else results.push(applyCommand(state, typeof step === 'function' ? step(state) : step));
   }
   return { state, results };
 }
@@ -163,7 +167,7 @@ const SALES_SCRIPT: ReadonlyArray<Command | number> = [
   150,
 ];
 
-function salesSession(seed: number, steps: ReadonlyArray<Command | number> = SALES_SCRIPT): Session {
+function salesSession(seed: number, steps: ReadonlyArray<Step> = SALES_SCRIPT): Session {
   return play(newGame(seed, { city: SALES_CITY }), steps);
 }
 
@@ -211,5 +215,46 @@ describe('determinism of sales', () => {
     expect([...first.results, ...second.results]).toEqual(straight.results);
     expect(second.state.finance.reports).toEqual(straight.state.finance.reports);
     expect(hashState(second.state)).toBe(hashState(straight.state));
+  });
+});
+
+// The sales session, then a year on credit: draws, term loans, repayments and
+// prepayments sized from the state at the time (so they are accepted), one
+// junk command, and month closes charging interest and principal.
+const DEBT_SCRIPT: ReadonlyArray<Step> = [
+  ...SALES_SCRIPT,
+  (s) => ({ type: 'drawCredit', amount: Math.floor(creditAvailable(s) / 2) }),
+  (s) => ({ type: 'takeTermLoan', amount: Math.max(TERM_LOAN_MIN, Math.floor(termCapacity(s) / 3)), termYears: 7 }),
+  45,
+  { type: 'repayCredit', amount: 1_000 },
+  { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 5 },
+  { type: 'drawCredit', amount: Number.NaN },
+  70,
+  { type: 'prepayLoan', loan: 1, amount: TERM_LOAN_MIN / 2 },
+  (s) => ({ type: 'drawCredit', amount: Math.max(1, Math.floor(creditAvailable(s) / 4)) }),
+  120,
+  // Pay off the second loan in full.
+  (s) => ({ type: 'prepayLoan', loan: 2, amount: s.debt.loans.find((l) => l.id === 2)?.balance ?? 1 }),
+  90,
+];
+
+describe('determinism with debt', () => {
+  it('replays a session on credit identically, straight or through a save and load', () => {
+    const a = salesSession(5, DEBT_SCRIPT);
+    const b = salesSession(5, DEBT_SCRIPT);
+    const debtResults = a.results.slice(-8);
+    expect(debtResults, JSON.stringify(debtResults)).toMatchObject([{ ok: true }, { ok: true }, { ok: true }, { ok: true }, { ok: false }, { ok: true }, { ok: true }, { ok: true }]);
+    expect(a.results).toEqual(b.results);
+    expect(a.state.finance.reports.some((r) => (r.totals.interest ?? 0) < 0 && (r.totals.principal ?? 0) < 0)).toBe(true);
+    expect(a.state.debt.loans.map((l) => l.id)).toEqual([1]);
+    expect(hashState(a.state)).toBe(hashState(b.state));
+
+    const split = DEBT_SCRIPT.indexOf(70);
+    const first = play(newGame(5, { city: SALES_CITY }), DEBT_SCRIPT.slice(0, split));
+    expect(first.state.debt.credit.balanceDollarDays).toBeGreaterThan(0);
+    const second = play(deserialize(serialize(first.state)), DEBT_SCRIPT.slice(split));
+    expect([...first.results, ...second.results]).toEqual(a.results);
+    expect(hashState(second.state)).toBe(hashState(a.state));
+    expect(hashState(salesSession(6, DEBT_SCRIPT).state)).not.toBe(hashState(a.state));
   });
 });

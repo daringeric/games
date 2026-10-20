@@ -8,13 +8,13 @@
 
 import { CPP_AMBER_MULTIPLIER, CPP_TARGET, INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
-import { totalDebt } from '../sim/debt';
+import { covenantMetrics, totalDebt } from '../sim/debt';
 import { runwayMonths } from '../sim/finance';
 import { costPerPassing, cppBand } from '../sim/metrics';
 import { getService, ponPortsUsed } from '../sim/network';
 import { monthlyRecurringRevenue, subscriberUnits } from '../sim/sales';
 import type { CppBand, GameOverReason, GameState } from '../sim/types';
-import { STAGE_TONE, covenantLimits, cureText, stageMeaning, stageNext } from './bankPanel';
+import { STAGE_TONE, brokenCovenants, covenantLimits, cureText, stageMeaning, stageNext } from './bankPanel';
 import { el, icon, setText } from './dom';
 import { formatMoney, formatNumber, plural } from './format';
 import { ICONS } from './icons';
@@ -99,7 +99,7 @@ export function debtStatus(state: GameState): DebtStatus | null {
 }
 
 export interface CovenantStatus {
-  /** "Covenant warning" / "Penalty rate" / "Credit frozen" */
+  /** "Covenant warning" / "Penalty rate" / "Credit frozen", or "Covenant at risk" while compliant with today's figures in breach */
   text: string;
   tone: 'warn' | 'danger';
   /** What it means, what comes next and how to cure it. */
@@ -108,10 +108,26 @@ export interface CovenantStatus {
 
 const COVENANT_CHIP_TEXT = { warning: 'Covenant warning', penalty: 'Penalty rate', frozen: 'Credit frozen' } as const;
 
-/** The HUD's covenant chip, or null while the loans are in good standing (compliant). */
+/**
+ * The HUD's covenant chip, or null while the loans are in good standing
+ * (compliant) and today's figures keep the covenants. Compliant with today's
+ * figures in breach, it warns ahead of the close ("Covenant at risk"),
+ * hedged: the close tests that month's figures, which can still pass.
+ */
 export function covenantStatus(state: GameState): CovenantStatus | null {
   const { stage, compliantCloses } = state.debt.covenant;
-  if (stage === 'compliant') return null;
+  if (stage === 'compliant') {
+    if (totalDebt(state) <= 0) return null;
+    const metrics = covenantMetrics(state);
+    if (metrics.compliant) return null;
+    return {
+      text: 'Covenant at risk',
+      tone: 'warn',
+      tip:
+        `Covenant at risk: at today's figures your debt breaks ${brokenCovenants(metrics)} (the bank requires ${covenantLimits()} at each month close). ` +
+        "The next close tests that month's figures: a breach then brings a warning first. Open the Bank for the figures.",
+    };
+  }
   const tone = STAGE_TONE[stage] === 'danger' ? 'danger' : 'warn';
   return {
     text: COVENANT_CHIP_TEXT[stage],
@@ -137,12 +153,23 @@ export interface OverdraftStatus {
 /**
  * The HUD's insolvency warning, or null while cash is at or above $0 and the
  * last month close was too. "Closes left" counts the negative month closes the
- * bank still tolerates (INSOLVENCY_GRACE_MONTHS in a row end the game).
+ * bank still tolerates (INSOLVENCY_GRACE_MONTHS in a row end the game). With
+ * the credit line frozen and debt owed it tolerates none: a close in the red
+ * cannot pay its loan payments, and a payment missed while frozen is a
+ * default that ends the game.
  */
 export function overdraftStatus(state: GameState): OverdraftStatus | null {
   const { cash, negativeMonths } = state.finance;
   if (state.gameOver) return { text: GAME_OVER_TEXT[state.gameOver.reason] ?? GAME_OVER_TEXT.insolvent, tone: 'danger', tip: state.gameOver.message };
   if (cash >= 0 && negativeMonths <= 0) return null;
+  if (state.debt.covenant.stage === 'frozen' && totalDebt(state) > 0) {
+    const rule =
+      'Your credit line is frozen with debt owed, so no close in the red is tolerated: a month close that cannot pay its loan payments ' +
+      'is a default, and the game ends. No draws or new loans while frozen: keep cash above the payment due at the close.';
+    return cash < 0
+      ? { text: 'Overdrawn: no closes left', tone: 'danger', tip: `Cash is below $0. ${rule}` }
+      : { text: 'Recovering: no closes left', tone: 'warn', tip: `Cash is back above $0: keep it there through the next month close. ${rule}` };
+  }
   const left = Math.max(0, INSOLVENCY_GRACE_MONTHS - negativeMonths);
   const closes = plural(left, 'close');
   const rule =
@@ -366,6 +393,8 @@ export class Hud {
       }
       const covenant = covenantStatus(state);
       this.covenantChip.hidden = covenant === null;
+      // Narrower screens drop the chip labels to make room for these two (see style.css).
+      this.root.classList.toggle('has-debt', debt !== null || covenant !== null);
       if (covenant) {
         setText(this.covenant, covenant.text);
         this.covenantChip.classList.toggle('chip-warn', covenant.tone === 'warn');

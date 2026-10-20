@@ -7,6 +7,10 @@
 // survives) across several seeds; TUNE_REPORT=1 npx vitest run
 // src/sim/tuning/report.test.ts prints the per-seed numbers. Tests reference
 // these constants symbolically, never as literal dollar amounts.
+// Round 3: the Financing section, tuned the same way (a careful borrower passes
+// half the town or more by month 60 without a covenant breach, at ~7%; a
+// rural-heavy borrower pays the red CPP spread; borrowing every dollar offered
+// ends in a default).
 
 import type { CppBand, ParcelKind, TermYears, TierId } from './types';
 
@@ -270,7 +274,14 @@ export const INSOLVENCY_GRACE_MONTHS = 3;
 export const NOTICE_LOG_MAX = 50;
 
 // ---------------------------------------------------------------------------
-// Financing (round 3: debt.ts). INITIAL GUESSES for the balance-tuning pass.
+// Financing (round 3: debt.ts). Tuned by the headless bots (tuning/): the
+// architect's starting values held every target, so none moved (see DESIGN.md,
+// "Financing"). What they produce on the tuning seeds: a careful borrower
+// (SMART) carries leverage ~3x and coverage ~1.5x at ~7.0% (7-year loans
+// priced at 3-4x leverage), passes 54-64% of the town by month 60 (27-34%
+// without loans) and never breaches; borrowing every dollar offered (3.5x ARR,
+// ~10x leverage on the cash-flow floor) goes warning, penalty, frozen and
+// defaults around month 10; a red-CPP rural borrower pays ~9.4-10%.
 //
 // Rates are whole basis points (100 bps = 1% a year). Money is whole dollars.
 // Borrowing capacity is a multiple of ARR, the annualized revenue of the
@@ -344,5 +355,15 @@ export const COVENANT_CURE_CLOSES = 2;
 /** Late fee for a missed payment: max(LATE_FEE_MIN, round(missed debt service x LATE_FEE_SHARE)). */
 export const LATE_FEE_MIN = 1_000;
 export const LATE_FEE_SHARE = 0.05;
-/** A 'paymentDue' notice is posted this many days before a close when cash is below the debt service it will charge. */
+/**
+ * A 'paymentDue' notice is posted this many days before a close when the cash
+ * that close will have at its debt step (finance.estimateCashAtClose: today's
+ * cash plus the month's billing, less its running costs and installs) is
+ * below the debt service it will charge.
+ */
 export const PAYMENT_REMINDER_DAYS = 5;
+
+/** Bank panel: fixed credit-line draw presets in whole dollars (the panel adds "Half" and "All" of what is available). */
+export const DRAW_PRESETS: readonly number[] = [10_000, 25_000];
+/** Bank panel: the term-loan builder's default amount is the capacity rounded down to a multiple of this (at least TERM_LOAN_MIN). */
+export const TERM_DEFAULT_ROUNDING = 10_000;
