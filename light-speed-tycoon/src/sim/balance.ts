@@ -98,6 +98,10 @@ export const CABINET_CANCEL_REFUND = 1;
 /**
  * A cabinet passes homes on connected cable whose nearer endpoint is strictly
  * less than this far from the cabinet's node, measured along that cable.
+ * Tuned so placement is a decision: the best downtown corner reaches about 500
+ * units (~30% of the town), a typical corner ~150-200, and covering the whole
+ * town takes ~17-22 cabinets (at 1,500 ft one corner reached ~1,200 units and
+ * two or three cabinets covered most of the town).
  */
 export const CABINET_REACH_FT = 800;
 
@@ -105,7 +109,12 @@ export const CABINET_REACH_FT = 800;
 // OLT at the CO
 // ---------------------------------------------------------------------------
 
-export const OLT_PORTS_PER_CARD = 8;
+/**
+ * Every cabinet's splitters take PON ports. One 16-port card (the owner's model:
+ * 16 cabinets before a CO upgrade) covers the opening build; covering the whole
+ * town takes 17-22 cabinets at CABINET_REACH_FT, so town-wide expansion needs a card.
+ */
+export const OLT_PORTS_PER_CARD = 16;
 export const OLT_START_CARDS = 1;
 /** Line-card slots in the one chassis (a second chassis comes later). */
 export const OLT_MAX_CARDS = 8;
@@ -170,7 +179,7 @@ export const TAKE_SPEED_RATIO_CAP = 4;
 export const TAKE_UPLOAD_WEIGHT = 0.02;
 export const TAKE_UPLOAD_RATIO_CAP = 10;
 export const TAKE_PRICE_WEIGHT = 1;
-export const TAKE_RATE_BASE = 0.33;
+export const TAKE_RATE_BASE = 0.31;
 export const TAKE_RATE_PER_ADVANTAGE = 0.25;
 export const TAKE_RATE_MIN = 0.03;
 export const TAKE_RATE_MAX = 0.6;
@@ -180,8 +189,11 @@ export const TAKE_RATE_KIND_FACTOR: Readonly<Record<ParcelKind, number>> = { hom
 /**
  * Signup ramp: each day a lit segment gains about
  * (target units - subscribed units) x SIGNUP_RAMP_PER_DAY x (1 + marketing boost).
+ * At ~$2 per passing per month of marketing a street closes about 60% of its
+ * gap in a year (take rate ~25% after a year, ~38% after three); a slower ramp
+ * lets churn hold the take rate well below its target for good.
  */
-export const SIGNUP_RAMP_PER_DAY = 1 / 650;
+export const SIGNUP_RAMP_PER_DAY = 1 / 550;
 
 // ---------------------------------------------------------------------------
 // Marketing
@@ -204,7 +216,7 @@ export const MARKETING_HALF_SAT_PER_PASSING = 3;
 //       x max(0, price_t - default price_t) / default price_t))
 // ---------------------------------------------------------------------------
 
-export const CHURN_MONTHLY_BASE = 0.012;
+export const CHURN_MONTHLY_BASE = 0.011;
 export const CHURN_PRICE_SENSITIVITY = 2;
 export const CHURN_MONTHLY_MAX = 0.2;
 
@@ -231,8 +243,12 @@ export const MDU_PORTS_PER_BUILDING = 1;
 // Operating costs
 // ---------------------------------------------------------------------------
 
-/** Fixed monthly overhead (NOC, billing, office, staff), posted at every month close. */
-export const OVERHEAD_PER_MONTH = 8_000;
+/**
+ * Fixed monthly overhead (NOC, billing, office, staff), posted at every month
+ * close. With the ramp above, careful play turns cash-flow positive around
+ * month 15 (tuning target 12-18).
+ */
+export const OVERHEAD_PER_MONTH = 9_000;
 /** Customer support per subscribed unit per month, accrued daily, posted at close. */
 export const SUPPORT_COST_PER_SUB_PER_MONTH = 4;
 

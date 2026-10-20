@@ -28,6 +28,7 @@ import {
   SPLIT_RATIO,
   SPLITTER_COST,
   START_CASH,
+  TILE_FT,
   UNDERGROUND_COST_PER_FT,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from './balance';
@@ -964,6 +965,8 @@ describe('splitters', () => {
     expect(quoteSplitter(state, 99)).toMatchObject({ ok: false, reasons: ['Unknown cabinet: 99'] });
 
     state.network.cabinets[0]!.splitters = MAX_SPLITTERS_PER_CABINET;
+    // Room on the OLT, so the full cabinet is the only blocker.
+    state.network.olt.ponPorts = MAX_SPLITTERS_PER_CABINET + 1;
     expectRejected(
       state,
       (s) => addSplitter(s, id),
@@ -1449,17 +1452,24 @@ describe('computeService', () => {
   });
 
   it('measures reach along connected cable, not streets', () => {
-    // 1,200 ft x 180 ft blocks. The cable reaches node 1 the long way round
-    // (A Ave, 2nd St, B Ave: 1,560 ft) although 1st St would be 1,200 ft.
-    const state = makeState(makeGridCity({ blockW: 20, blockH: 3 }));
+    // Blocks sized from the reach: 120 ft tall and just wide enough that the
+    // cable reaching node 1 the long way round (A Ave, 2nd St, B Ave: 2 x 120
+    // ft + wide) is out of reach although 1st St alone (wide) would be in.
+    const blockH = 2;
+    const blockW = Math.ceil((CABINET_REACH_FT - 2 * blockH * TILE_FT) / TILE_FT);
+    const tall = blockH * TILE_FT;
+    const wide = blockW * TILE_FT;
+    expect(2 * tall + wide).toBeGreaterThanOrEqual(CABINET_REACH_FT);
+    expect(tall + wide).toBeLessThan(CABINET_REACH_FT);
+    const state = makeState(makeGridCity({ blockW, blockH }));
     for (const id of [V(0, 0), H(0, 1), V(1, 0), H(1, 0)]) addSpan(state, id);
     addCabinet(state, 0);
     const service = computeService(state);
-    expect(service.servingDistanceFt.get(V(1, 0))).toBe(180 + 1_200);
+    expect(service.servingDistanceFt.get(V(1, 0))).toBe(tall + wide);
     expect(service.litSegments.has(H(1, 0))).toBe(false);
     // Cabling 1st St brings node 1 within reach.
     addSpan(state, H(0, 0));
-    expect(computeService(state).servingDistanceFt.get(H(1, 0))).toBe(1_200);
+    expect(computeService(state).servingDistanceFt.get(H(1, 0))).toBe(wide);
   });
 
   it('serves each segment from the nearest cabinet, ties to the lower id', () => {

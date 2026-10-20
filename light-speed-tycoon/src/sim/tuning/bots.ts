@@ -6,7 +6,8 @@
 //   with the best homes-per-dollar (green cost per passing first, never red),
 //   connects it to the plant, cables its streets with homes in few orders,
 //   adds splitters and OLT cards as ports fill, markets about
-//   SMART_MARKETING_PER_PASSING dollars per passing per month, default prices.
+//   SMART_MARKETING_PER_PASSING dollars per passing per month (none while
+//   installs are paused for cash), default prices.
 // - CARELESS: overbuilds underground toward random far corners whenever cash
 //   covers it (no reserve), cabinets at every 4th corner reached, marketing at
 //   the maximum, never adds splitters.
@@ -18,7 +19,10 @@
 // through `send` (applyCommand). Their randomness comes from their own Rng.
 
 import {
+  CABINET_CONSTRUCT_DAYS,
+  CABINET_COST,
   CABINET_REACH_FT,
+  CABINET_START_SPLITTERS,
   CPP_TARGET,
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
@@ -33,7 +37,7 @@ import {
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
 } from '../balance';
-import { coveragePreview } from '../coverage';
+import { coveragePreview, segmentsWithinReach } from '../coverage';
 import { cppBand } from '../metrics';
 import { cableRoute, getService, orderFees, plannedService, ponPortsUsed, quoteCabinet, quoteCable } from '../network';
 import { deriveSeed, Rng } from '../rng';
@@ -42,6 +46,7 @@ import {
   cabinetPortCapacity,
   cabinetPortsUsed,
   installCost,
+  installsPaused,
   marketingBoost,
   monthlyRecurringRevenue,
   subscriberUnits,
@@ -86,6 +91,14 @@ export interface SmartOptions {
   candidatesTried: number;
 }
 
+/**
+ * The careful operator's settings. Its reserve is deliberately larger than
+ * "3 months of fixed costs + 60 days of installs": with that rule it spends
+ * nearly all its cash on day 0 and goes bankrupt in months 8-10 on every
+ * tuning seed, because reaching break-even takes 12-18 months by design. So it
+ * also keeps the runway to break-even (burnMonths of the uncovered burn, plus
+ * the months until its plant is live) and a year of expected installs.
+ */
 export const SMART_DEFAULTS: SmartOptions = {
   marketingPerPassing: SMART_MARKETING_PER_PASSING,
   splitterAt: 0.8,
@@ -167,18 +180,38 @@ export function installShare(days: number, perPassing: number): number {
 }
 
 /**
+ * Days until everything already ordered is live: the longest remaining
+ * permitting plus construction of any span or cabinet not live yet (0 when
+ * all plant is live).
+ */
+export function daysUntilPlannedLive(state: GameState): number {
+  let days = 0;
+  for (const span of state.network.spans) {
+    if (span.stage === 'live') continue;
+    days = Math.max(days, span.stageDaysLeft + (span.stage === 'permitting' ? span.constructDays : 0));
+  }
+  for (const cabinet of state.network.cabinets) {
+    if (cabinet.stage === 'live') continue;
+    days = Math.max(days, cabinet.stageDaysLeft + (cabinet.stage === 'permitting' ? CABINET_CONSTRUCT_DAYS : 0));
+  }
+  return days;
+}
+
+/**
  * Cash a careful operator never spends on new plant: opts.reserveMonths of
- * fixed costs (overhead + marketing), opts.burnMonths of the part of them that
- * revenue does not cover yet, and the installs it expects (expectedInstalls
- * over opts.installDays).
+ * fixed costs (overhead + marketing), the part of them that revenue does not
+ * cover yet for opts.burnMonths plus the months until the plant already
+ * ordered is live (a long make-ready delays the first revenue), and the
+ * installs it expects (expectedInstalls over opts.installDays).
  */
 export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAULTS): number {
   const fixed = OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
   const earning = monthlyRecurringRevenue(state) - SUPPORT_COST_PER_SUB_PER_MONTH * subscriberUnits(state);
   const uncovered = Math.max(0, fixed - earning);
+  const burnMonths = opts.burnMonths + daysUntilPlannedLive(state) / 30;
   return (
     opts.reserveMonths * fixed +
-    opts.burnMonths * uncovered +
+    burnMonths * uncovered +
     expectedInstalls(state, opts.installDays, opts.marketingPerPassing)
   );
 }
@@ -401,11 +434,40 @@ function planProject(
 
 const BAND_RANK = { green: 0, amber: 1, red: 2 } as const;
 
+const streetReachCache = new WeakMap<City, SegmentId[][]>();
+
+/**
+ * Per corner, the segments a cabinet there would reach along streets (what
+ * coveragePreview measures), computed once per city: the city never changes,
+ * and scoring every corner through coveragePreview each weekly look was most
+ * of a run's time.
+ */
+function streetReach(city: City): SegmentId[][] {
+  let reach = streetReachCache.get(city);
+  if (!reach) {
+    reach = city.nodes.map((node) => segmentsWithinReach(city, node.id, CABINET_REACH_FT).map((r) => r.segment));
+    streetReachCache.set(city, reach);
+  }
+  return reach;
+}
+
+const buildCostCache = new WeakMap<City, Float64Array>();
+
+/** Cheapest buildable cable per segment before fees (cheapestMethod), computed once per city. */
+function segmentBuildCosts(city: City): Float64Array {
+  let costs = buildCostCache.get(city);
+  if (!costs) {
+    costs = Float64Array.from(city.segments, (seg) => cheapestMethod(seg).cost);
+    buildCostCache.set(city, costs);
+  }
+  return costs;
+}
+
 /**
  * Best cabinet area to build or extend next within `budget`: every corner
  * scored by the units it would newly pass per dollar of cabinet, in-reach
- * build-out (coveragePreview) and feeder from the committed plant; areas whose
- * projected cost per passing is green first, amber next, red never.
+ * build-out (coveragePreview's figures) and feeder from the committed plant;
+ * areas whose projected cost per passing is green first, amber next, red never.
  */
 function chooseProject(state: GameState, budget: number, opts: SmartOptions): Project | null {
   const { city, network } = state;
@@ -418,18 +480,24 @@ function chooseProject(state: GameState, budget: number, opts: SmartOptions): Pr
     subscribed: new Map(state.sales.accounts.map((a) => [a.parcel, accountUnits(a)])),
     installShare: installShare(opts.installDays, opts.marketingPerPassing),
   };
+  const reach = streetReach(city);
+  const buildCost = segmentBuildCosts(city);
+  const standing = new Set<NodeId>(network.cabinets.map((c) => c.node));
   const candidates: Array<{ node: NodeId; band: number; score: number }> = [];
   for (const { id: node } of city.nodes) {
     if ((source[node] as number) < 0) continue;
-    const preview = coveragePreview(state, node);
+    // coveragePreview's figures from the cached street reach: the units on
+    // segments nothing ordered will serve, and cabinetCost + buildOutCost.
     let newly = 0;
-    for (const entry of preview.segments) {
-      if (entry.servedBy === null && !ctx.plannedLit.has(entry.segment)) newly += ctx.units[entry.segment] as number;
+    let cost = standing.has(node) ? 0 : CABINET_COST + CABINET_START_SPLITTERS * SPLITTER_COST;
+    for (const segment of reach[node] as SegmentId[]) {
+      if (!ctx.plannedLit.has(segment)) newly += ctx.units[segment] as number;
+      if (!ctx.cabled.has(segment)) cost += buildCost[segment] as number;
     }
     if (newly < opts.minNewUnits) continue;
-    const band = BAND_RANK[cppBand((preview.cabinetCost + preview.buildOutCost) / newly)];
+    const band = BAND_RANK[cppBand(cost / newly)];
     if (band > BAND_RANK.amber) continue;
-    const score = newly / (preview.cabinetCost + preview.buildOutCost + (feeder[node] as number));
+    const score = newly / (cost + (feeder[node] as number));
     candidates.push({ node, band, score });
   }
   candidates.sort((x, y) => x.band - y.band || y.score - x.score || x.node - y.node);
@@ -472,7 +540,8 @@ function buildProject(state: GameState, send: Send, project: Project): boolean {
 /** One weekly look by the careful operator (shared by SMART and MIXED). */
 function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idleKey: string | null }): void {
   const passings = getService(state).passings;
-  const budget = Math.min(MARKETING_MAX_PER_MONTH, Math.round(opts.marketingPerPassing * passings));
+  // No point advertising while cash cannot connect the customers it brings in.
+  const budget = installsPaused(state) ? 0 : Math.min(MARKETING_MAX_PER_MONTH, Math.round(opts.marketingPerPassing * passings));
   if (budget !== state.sales.marketingPerMonth) send({ type: 'setMarketing', perMonth: budget });
 
   addCapacity(state, send, opts);

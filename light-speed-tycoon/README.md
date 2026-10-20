@@ -32,6 +32,7 @@ src/
     game.ts       newGame / applyCommand / tick
     save.ts       serialize / deserialize, v1 -> v2 migration
     testing/      fixtures for unit tests (incl. frozen schemaVersion 1 saves)
+    tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes
   ui/           HTML/CSS HUD, tools, input, storage
   main.ts       bootstrap

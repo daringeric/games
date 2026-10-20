@@ -99,15 +99,18 @@ describe('segmentsWithinReach', () => {
 describe('coveragePreview', () => {
   it('counts everything in street reach on an empty network', () => {
     const state = makeTestState();
-    const preview = coveragePreview(state, 0);
-    // The whole default grid is within 1,500 ft of the CO corner.
+    // Every segment's nearer end is at most 600 ft from corner (1, 0), so the
+    // whole default grid is in reach of a cabinet there.
+    expect(CABINET_REACH_FT).toBeGreaterThan(600);
+    const preview = coveragePreview(state, 1);
     const all = state.city.segments.map((s) => s.id);
     expect(preview.segments.map((s) => s.segment)).toEqual(all);
     expect(preview.segments.every((s) => !s.connected && s.servedBy === null)).toBe(true);
-    expect(preview.segments.find((s) => s.segment === H(2, 2))!.distanceFt).toBe(480 + 240);
+    expect(preview.segments.find((s) => s.segment === H(2, 2))!.distanceFt).toBe(240 + 240);
+    expect(preview.segments.find((s) => s.segment === V(3, 1))!.distanceFt).toBe(480 + 120);
     const buildOut = state.city.segments.reduce((sum, s) => sum + cheapest(s), 0);
     expect(preview).toMatchObject({
-      node: 0,
+      node: 1,
       reachFt: CABINET_REACH_FT,
       passingsNow: 48,
       passingsFuture: 0,
@@ -200,7 +203,8 @@ describe('coveragePreview', () => {
     // Rock makes underground dear, so poled streets go aerial; unpoled ones must bore.
     for (const id of [H(0, 0), V(0, 0)]) city.segments[id] = { ...city.segments[id]!, hasPoles: false };
     const state = makeTestState(city);
-    const preview = coveragePreview(state, 0);
+    // From corner (1, 0) the whole grid is in reach (see above).
+    const preview = coveragePreview(state, 1);
     const expected = state.city.segments.reduce((sum, s) => sum + cheapest(s), 0);
     expect(preview.buildOutCost).toBe(expected);
     // The unpoled street can only be bored.
@@ -208,7 +212,7 @@ describe('coveragePreview', () => {
     expect(cheapest(state.city.segments[H(0, 0)]!)).toBe(bored);
     // A span in any stage takes its segment out of the build-out.
     addSpan(state, H(0, 0), 'permitting');
-    expect(coveragePreview(state, 0).buildOutCost).toBe(expected - bored);
+    expect(coveragePreview(state, 1).buildOutCost).toBe(expected - bored);
   });
 
   it('gives no projected CPP when nothing new would be covered', () => {
