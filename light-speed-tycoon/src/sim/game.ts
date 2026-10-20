@@ -16,7 +16,7 @@ import {
   removeSpan,
 } from './network';
 import { deriveSeed, withRng } from './rng';
-import { newSales, setMarketing, setPricing, stepSales } from './sales';
+import { accrueDay, newSales, setMarketing, setPricing, stepSales } from './sales';
 import type { CableMethod, City, Command, CommandResult, GameState, TierSetting } from './types';
 
 export interface NewGameOptions {
@@ -130,6 +130,9 @@ function describeType(type: unknown): string {
 /**
  * Advance one day. Does nothing once the game is over (the day stops
  * advancing). Otherwise, in order:
+ *   on day 0 only: accrue day 0's billing (sales.accrueDay) at the settings
+ *     in effect as the day ends, so commands sent on day 0 count and the first
+ *     month bills all of its days (day 0 gets no sales step otherwise)
  *   closing = the new day is the 1st of a month; if so take the passings as
  *     they stood at the end of the ended month (parcels appear by day)
  *   day += 1
@@ -138,10 +141,12 @@ function describeType(type: unknown): string {
  *   advanceNetwork
  *   stepSales for the new day (sales stream)
  * A span that goes live on the 1st, or a lot that appears that day, belongs to
- * the new month. Day 0 never gets a sales step.
+ * the new month. Day 0 never gets a sales step (no signups or churn), only its
+ * accruals.
  */
 export function tick(state: GameState): void {
   if (state.gameOver) return;
+  if (state.day === 0) accrueDay(state);
   const closing = isFirstOfMonth(state.day + 1);
   // Parcels appear by day, so take passings before the day moves on.
   const passings = closing ? getService(state).passings : 0;

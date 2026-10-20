@@ -20,6 +20,8 @@ export interface ReachShade {
   t: number;
   /** Another active cabinet already serves it (drawn as a muted hatch). */
   elsewhere: boolean;
+  /** A cabinet here would light it on today's live cable (drawn solid); the rest need cable first. */
+  lit: boolean;
 }
 
 /** One existing cabinet's coverage, shown while the cabinet tool is active. */
@@ -172,11 +174,16 @@ export class OverlayLayer {
     }
   }
 
-  /** In-reach streets shaded strongest near the cabinet; streets another cabinet serves get a muted hatch. */
+  /**
+   * In-reach streets shaded strongest near the cabinet; streets it would light
+   * today drawn solid with a glowing centre line; streets another cabinet
+   * serves get a muted hatch.
+   */
   private drawReach(city: City, reach: readonly ReachShade[]): void {
     const g = this.lines;
     const { road, coverage: style } = this.theme;
     const bands = new Map<string, Line[]>();
+    const lit = new Map<StreetClass, Line[]>();
     const hatch: Line[] = [];
     for (const r of reach) {
       const seg = city.segments[r.id];
@@ -184,6 +191,12 @@ export class OverlayLayer {
       const line = segmentLine(city, seg, this.theme);
       if (r.elsewhere) {
         addHatch(hatch, line, road.width[seg.streetClass] / 2 + 1, 7);
+        continue;
+      }
+      if (r.lit) {
+        let list = lit.get(seg.streetClass);
+        if (!list) lit.set(seg.streetClass, (list = []));
+        list.push(line);
         continue;
       }
       const band = Math.min(REACH_BANDS - 1, Math.max(0, Math.floor(r.t * REACH_BANDS)));
@@ -197,6 +210,11 @@ export class OverlayLayer {
       for (const cls of CLASSES) {
         strokeLines(g, bands.get(`${band}|${cls}`) ?? [], { width: road.width[cls] + 4, color: style.reach, alpha, cap: 'butt' });
       }
+    }
+    for (const cls of CLASSES) {
+      const lines = lit.get(cls) ?? [];
+      strokeLines(g, lines, { width: road.width[cls] + 4, color: style.litToday, alpha: style.litTodayAlpha, cap: 'butt' });
+      strokeLines(g, lines, { width: 2.4, color: style.litGlow, alpha: 0.95, cap: 'round' });
     }
     strokeLines(g, hatch, { width: 2, color: style.elsewhere, alpha: 0.8, cap: 'round' });
   }

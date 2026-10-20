@@ -163,10 +163,14 @@ export interface Theme {
   rock: { stipple: string; alpha: number; strong: string; strongAlpha: number };
   /** Cabinet tool shading: placement preview and existing cabinets' coverage. */
   coverage: {
-    /** In-reach streets of a planned cabinet, strongest near it. */
+    /** In-reach streets of a planned cabinet (once cabled), strongest near it. */
     reach: string;
     reachAlphaNear: number;
     reachAlphaFar: number;
+    /** Streets a planned cabinet would light on today's cable: a solid band and a glowing centre line. */
+    litToday: string;
+    litTodayAlpha: number;
+    litGlow: string;
     /** Streets another cabinet already serves: a muted hatch. */
     elsewhere: string;
     /** Existing cabinets' lit streets, one tint per cabinet (cycled). */
@@ -351,9 +355,14 @@ export const toyTown: Theme = {
   },
   rock: { stipple: '#B9A88A', alpha: 0.55, strong: '#7D6A4E', strongAlpha: 0.9 },
   coverage: {
-    reach: '#2563EB',
+    // Toy Town teal (the CO and cabinet family), deep enough to read over the
+    // cream roads and the pale lawns at the far band's alpha.
+    reach: '#119384',
     reachAlphaNear: 0.62,
-    reachAlphaFar: 0.18,
+    reachAlphaFar: 0.22,
+    litToday: '#0A5C52',
+    litTodayAlpha: 0.78,
+    litGlow: '#7CF0DF',
     elsewhere: '#8C99A8',
     tints: ['#0EA5A0', '#A855F7', '#F59E0B', '#EC4899', '#65A30D', '#F97316'],
     tintAlpha: 0.42,

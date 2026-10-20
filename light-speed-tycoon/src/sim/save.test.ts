@@ -123,6 +123,32 @@ describe('serialize / deserialize', () => {
     expect(state.day).toBeGreaterThan(save.day);
   });
 
+  it('upgrades a round-2 save from before installs had their own notices', () => {
+    const state = playedGame();
+    const save: Save = JSON.parse(serialize(state));
+    // The early round-2 shape: no flag, and install notices posted as cash warnings.
+    delete save.sales.installsPaused;
+    const at = save.nextNoticeId;
+    save.notices.push(
+      { id: at, day: save.day, kind: 'insolvencyWarning', message: 'Installs paused: cash is short', cabinet: null, milestone: null },
+      { id: at + 1, day: save.day, kind: 'insolvencyWarning', message: 'Installs resumed: cash is back', cabinet: null, milestone: null },
+      { id: at + 2, day: save.day, kind: 'insolvencyWarning', message: 'Installs paused: short again', cabinet: null, milestone: null },
+      { id: at + 3, day: save.day, kind: 'insolvencyWarning', message: 'Cash is below zero', cabinet: null, milestone: null },
+    );
+    save.nextNoticeId = at + 4;
+    const loaded = deserialize(JSON.stringify(save));
+    expect(loaded.sales.installsPaused).toBe(true);
+    expect(loaded.notices.slice(-4).map((n) => n.kind)).toEqual(['installsPaused', 'installsResumed', 'installsPaused', 'insolvencyWarning']);
+    // Same key order as a game that never had the old shape.
+    expect(Object.keys(loaded.sales)).toEqual(Object.keys(state.sales));
+    expect(serialize(deserialize(serialize(loaded)))).toBe(serialize(loaded));
+
+    // With no install notices left in the log, installs are taken as running.
+    const quiet: Save = JSON.parse(serialize(state));
+    delete quiet.sales.installsPaused;
+    expect(deserialize(JSON.stringify(quiet)).sales).toEqual(state.sales);
+  });
+
   it('writes plain JSON', () => {
     const state = playedGame();
     expect(JSON.parse(serialize(state))).toEqual(state);
@@ -375,6 +401,8 @@ describe('deserialize errors', () => {
     ['negative connects', (s) => (s.sales.connectsTotal = -1), /sales\.connectsTotal should be an integer >= 0, got -1/],
     ['full cabinets out of order', (s) => (s.sales.fullCabinets = [2, 1]), /sales\.fullCabinets\[1\] should be greater than the entry before it \(2\), got 1/],
     ['a full cabinet id never issued', (s) => (s.sales.fullCabinets = [s.nextId]), /sales\.fullCabinets\[0\] should be an integer in 1\.\./],
+    ['a string installs-paused flag', (s) => (s.sales.installsPaused = 'yes'), /sales\.installsPaused should be true or false, got "yes"/],
+    ['a null installs-paused flag', (s) => (s.sales.installsPaused = null), /sales\.installsPaused should be true or false, got null/],
     ['missing month accrual', (s) => delete s.sales.month, /sales\.month should be an object, got nothing/],
     ['negative revenue accrual', (s) => (s.sales.month.revenueDollarDays = -1), /sales\.month\.revenueDollarDays should be an integer >= 0, got -1/],
     ['fractional marketing accrual', (s) => (s.sales.month.marketingDollarDays = 1.5), /sales\.month\.marketingDollarDays should be an integer >= 0/],
@@ -555,5 +583,40 @@ describe('schemaVersion 1 saves', () => {
     const v1: Save = JSON.parse(v1Fixture('v1-grid'));
     v1.network.spans[0].segment = 999;
     expectSaveError(JSON.stringify(v1), /network\.spans\[0\]\.segment should be an integer in 0\.\.16, got 999/);
+  });
+});
+
+describe('schemaVersion 1 saves under the round-2 cabinet reach', () => {
+  /** The frozen round-1 town with every street cabled live from the cabinets it already has. */
+  function v1TownFullyCabled(): Save {
+    const v1: Save = JSON.parse(v1Fixture('v1-town'));
+    const cabled = new Set(v1.network.spans.map((s: Save) => s.segment));
+    for (const seg of v1.city.segments) {
+      if (cabled.has(seg.id)) continue;
+      v1.network.spans.push({ id: v1.nextId++, segment: seg.id, method: 'underground', stage: 'live', stageDaysLeft: 0, constructDays: 1, cost: 0, orderedDay: 0, liveDay: 0 });
+    }
+    for (const s of v1.network.spans) Object.assign(s, { stage: 'live', stageDaysLeft: 0, liveDay: s.liveDay ?? 0 });
+    expect(v1.network.cabinets.some((c: Save) => c.stage === 'live')).toBe(true);
+    v1.network.version++;
+    return v1;
+  }
+
+  it('explains, once, the passings a migrated town loses to the new reach', () => {
+    const state = deserialize(JSON.stringify(v1TownFullyCabled()));
+    const lost = state.notices.filter((n) => n.kind === 'rulesUpdated');
+    expect(lost).toHaveLength(1);
+    expect(lost[0]?.message).toMatch(/Cabinets changed in this version: each now lights streets within [\d,]+ ft/);
+    const [, out, of] = /so ([\d,]+) of your ([\d,]+) passings are out of reach/.exec(lost[0]?.message ?? '') ?? [];
+    const passedNow = getService(state).passings;
+    expect(Number(of?.replace(/,/g, '')) - Number(out?.replace(/,/g, ''))).toBe(passedNow);
+    expect(Number(out?.replace(/,/g, ''))).toBeGreaterThan(0);
+
+    // Saving and loading the migrated game doesn't repeat it.
+    const again = deserialize(serialize(state));
+    expect(again.notices.filter((n) => n.kind === 'rulesUpdated')).toHaveLength(1);
+  });
+
+  it.each(['v1-grid', 'v1-town'] as const)('says nothing when the frozen %s save keeps all its passings', (name) => {
+    expect(deserialize(v1Fixture(name)).notices).toEqual([]);
   });
 });

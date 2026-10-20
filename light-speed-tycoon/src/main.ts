@@ -142,6 +142,26 @@ async function boot(): Promise<void> {
   publishHudBottom();
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(publishHudBottom).observe(hud.root);
 
+  // Toasts keep clear of the report panel (it grows when opened or when a month closes) and the toolbar.
+  const box = (e: HTMLElement) => {
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 ? { left: r.left, top: r.top, right: r.right, bottom: r.bottom } : null;
+  };
+  const placeToasts = () =>
+    toasts.keepClear({
+      viewW: window.innerWidth,
+      viewH: window.innerHeight,
+      hudBottom: hud.root.getBoundingClientRect().bottom,
+      panel: box(panel.root),
+      toolbar: box(toolbar.root),
+    });
+  placeToasts();
+  window.addEventListener('resize', placeToasts);
+  if (typeof ResizeObserver !== 'undefined') {
+    const watch = new ResizeObserver(placeToasts);
+    for (const el of [panel.root, toolbar.root, hud.root]) watch.observe(el);
+  }
+
   const autosave = () => writeSave(autosaveKey, session.state);
   /**
    * Put a new, loaded or imported game in play; false if it can't be shown, in

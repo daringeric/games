@@ -6,6 +6,7 @@ import {
   CABINET_PERMIT_DAYS,
   INSOLVENCY_GRACE_MONTHS,
   MARKETING_DEFAULT_PER_MONTH,
+  MARKETING_MAX_PER_MONTH,
   OLT_START_CARDS,
   OLT_START_PON_PORTS,
   OVERHEAD_PER_MONTH,
@@ -20,8 +21,8 @@ import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
-import { deriveSeed, Rng } from './rng';
-import { defaultPricing, newSales } from './sales';
+import { deriveSeed, Rng, withRng } from './rng';
+import { defaultPricing, newSales, stepSales } from './sales';
 import { addLivePlant, makeGridCity } from './testing/fixtures';
 import type { City, Command, GameState, MonthlyReport } from './types';
 
@@ -380,8 +381,8 @@ describe('tick and runDays', () => {
 
     tick(state);
     expect(state.day).toBe(31);
-    // Day 0 gets no sales step, so January's marketing accrues for 30 of its 31 days.
-    const marketing = Math.round((MARKETING_DEFAULT_PER_MONTH * 30) / 31);
+    // January bills all 31 of its days: day 0 accrues with the first tick.
+    const marketing = MARKETING_DEFAULT_PER_MONTH;
     const net = -cable - CABINET_PRICE - OVERHEAD_PER_MONTH - marketing;
     expect(state.finance.reports).toEqual([
       {
@@ -543,15 +544,42 @@ function nearlyBroke(): GameState {
 }
 
 describe('the daily tick, round 2', () => {
-  it('runs no sales step on day 0: the first step is day 1', () => {
+  it('runs no sales step on day 0, but bills day 0 with the first tick: the first step is day 1', () => {
     const state = game();
     addLivePlant(state);
-    const before = structuredClone(state.sales);
+    state.sales.marketingPerMonth = MARKETING_MAX_PER_MONTH;
     expect(state.sales.month.marketingDollarDays).toBe(0);
+    // Days 1..30's sales steps alone, run by hand on a copy.
+    const stepOnly = structuredClone(state);
+    for (let day = 1; day <= 30; day++) {
+      stepOnly.day = day;
+      withRng(stepOnly, 'sales', (rng) => stepSales(stepOnly, rng));
+    }
+    expect(stepOnly.sales.accounts.length).toBeGreaterThan(0);
+
     tick(state);
     expect(state.day).toBe(1);
-    expect(state.sales.month.marketingDollarDays).toBe(state.sales.marketingPerMonth);
-    expect(before.month.marketingDollarDays).toBe(0);
+    // Day 0's accrual and day 1's step: two days of the budget.
+    expect(state.sales.month.marketingDollarDays).toBe(2 * state.sales.marketingPerMonth);
+    runDays(state, 29);
+    // The same signups and draws as the steps alone: day 0 adds only its accruals.
+    expect(state.sales.accounts).toEqual(stepOnly.sales.accounts);
+    expect(state.rng.sales).toBe(stepOnly.rng.sales);
+    expect(state.sales.month.marketingDollarDays - stepOnly.sales.month.marketingDollarDays).toBe(state.sales.marketingPerMonth);
+  });
+
+  it('bills every day of the first January, day 0 included, at the budget set on day 0', () => {
+    const state = newGame(5);
+    runDays(state, 31);
+    expect(state.finance.reports[0]!.totals.marketing).toBe(-MARKETING_DEFAULT_PER_MONTH);
+    runDays(state, 28);
+    expect(state.finance.reports[1]!.totals.marketing).toBe(-MARKETING_DEFAULT_PER_MONTH);
+
+    const loud = newGame(5);
+    const budget = 31 * MARKETING_DEFAULT_PER_MONTH;
+    expect(applyCommand(loud, { type: 'setMarketing', perMonth: budget })).toEqual({ ok: true, cost: 0 });
+    runDays(loud, 31);
+    expect(loud.finance.reports[0]!.totals.marketing).toBe(-budget);
   });
 
   it('closes the month before the new day\'s network progress and sales', () => {
@@ -559,7 +587,7 @@ describe('the daily tick, round 2', () => {
     addLivePlant(state);
     runDays(state, 30);
     const accrued = state.sales.month.marketingDollarDays;
-    expect(accrued).toBe(30 * state.sales.marketingPerMonth);
+    expect(accrued).toBe(31 * state.sales.marketingPerMonth);
     tick(state); // Feb 1: close January, then step Feb 1
     expect(state.finance.reports[0]!.totals.marketing).toBe(-Math.round(accrued / 31));
     expect(state.sales.month.marketingDollarDays).toBe(state.sales.marketingPerMonth);

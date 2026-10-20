@@ -177,6 +177,61 @@ for (const layout of LAYOUTS) {
   });
 }
 
+// Short landscape screens: toasts must never cover the monthly report panel.
+const SHORT_LANDSCAPES = [
+  { name: 'small landscape phone', width: 740, height: 360 },
+  { name: 'iPhone landscape', width: 844, height: 390 },
+  { name: 'large landscape phone', width: 932, height: 430 },
+  { name: 'short laptop window', width: 1100, height: 480 },
+  { name: 'phone portrait', width: 390, height: 844 },
+];
+
+for (const layout of SHORT_LANDSCAPES) {
+  test.describe(`${layout.name} (${layout.width}x${layout.height}) toasts`, () => {
+    test.use({ viewport: { width: layout.width, height: layout.height }, hasTouch: true });
+
+    test('stay clear of the report panel, collapsed or opened', async ({ page }) => {
+      await open(page, '/?seed=12345');
+      await page.evaluate(() => document.fonts.ready);
+      await page.getByRole('button', { name: 'Got it' }).tap();
+      const overlaps = () =>
+        page.evaluate(() => {
+          const panel = document.querySelector('.panel')!.getBoundingClientRect();
+          const out: string[] = [];
+          for (const toast of document.querySelectorAll<HTMLElement>('.toast')) {
+            const t = toast.getBoundingClientRect();
+            const clear = t.right <= panel.left || t.left >= panel.right || t.bottom <= panel.top || t.top >= panel.bottom;
+            if (!clear) out.push(`toast [${Math.round(t.left)}, ${Math.round(t.top)}, ${Math.round(t.right)}, ${Math.round(t.bottom)}] over panel [${Math.round(panel.left)}, ${Math.round(panel.top)}, ${Math.round(panel.right)}, ${Math.round(panel.bottom)}]`);
+            if (t.top < 0) out.push(`toast off the top at ${Math.round(t.top)}`);
+          }
+          // The newest toast is always in full view (layout boxes: the slide-in animation aside).
+          const newest = document.querySelector<HTMLElement>('.toast:last-child');
+          const column = document.querySelector<HTMLElement>('.toasts')!;
+          if (newest && (newest.offsetTop < 0 || newest.offsetTop + newest.offsetHeight > column.clientHeight)) {
+            out.push(`newest toast clipped: ${newest.offsetTop}..${newest.offsetTop + newest.offsetHeight} in 0..${column.clientHeight}`);
+          }
+          return out;
+        });
+      // A month close (with its report in the panel) and a save: two toasts at once.
+      await page.evaluate(() => window.__lst!.tick(31));
+      await page.getByRole('button', { name: 'Menu' }).tap();
+      await page.getByRole('menuitem', { name: /Save/ }).first().tap();
+      await expect(page.locator('.toast')).not.toHaveCount(0);
+      // Let the slide-in animation finish.
+      await page.waitForTimeout(400);
+      expect(await overlaps()).toEqual([]);
+
+      // Opened, the panel grows; toasts move with it.
+      await page.locator('.panel-toggle').tap();
+      await expect(page.locator('.panel')).toHaveClass(/expanded/);
+      await page.evaluate(() => window.__lst!.tick(28));
+      await expect(page.locator('.toast').last()).toContainText('closed');
+      await page.waitForTimeout(400);
+      expect(await overlaps()).toEqual([]);
+    });
+  });
+}
+
 test('a ?seed link keeps its own progress and never replaces the main game', async ({ page }) => {
   test.setTimeout(90_000);
   // The main game, played to a month close (which autosaves it).

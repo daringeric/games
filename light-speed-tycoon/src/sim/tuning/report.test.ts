@@ -78,7 +78,7 @@ describe('balance report', () => {
         const facts = townFacts(city);
         const buildOut = townBuildOut(city);
         const probes = cppProbes(seed);
-        const smart = runBot(seed, smartBot(), MONTHS);
+        const smart = runBot(seed, smartBot(), MONTHS, { clock: () => performance.now() });
         const careless = runBot(seed, carelessBot, Math.min(36, MONTHS));
         const idle = runBot(seed, idleBot, Math.min(24, MONTHS));
         const k36 = smart.kpis[35];

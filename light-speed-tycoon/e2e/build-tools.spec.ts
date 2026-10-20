@@ -181,6 +181,65 @@ test('clicking the CO opens the OLT panel, which adds line cards', async ({ page
   expect(errors).toEqual([]);
 });
 
+test('the OLT panel keeps focus, presses and its scrolled cabinet list while the days go by', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await page.getByRole('button', { name: 'Got it' }).click();
+  // A dozen cabinets (one PON port each), so the panel's list scrolls.
+  const placed = await page.evaluate(() => {
+    const lst = window.__lst!;
+    const { city } = lst.getState();
+    let n = 0;
+    for (const node of city.nodes) {
+      if (n >= 12) break;
+      if (node.id !== city.coNode && lst.dispatch({ type: 'placeCabinet', node: node.id }).ok) n++;
+    }
+    return n;
+  });
+  expect(placed).toBe(12);
+  const co = await page.evaluate(() => window.__lst!.getState().city.coNode);
+  const p = await nodeOnScreen(page, co);
+  await page.keyboard.press('i');
+  await page.mouse.click(p.x, p.y);
+  const panel = page.getByTestId('olt-panel');
+  await expect(panel).toBeVisible();
+  const cards = () => page.evaluate(() => window.__lst!.getState().network.olt.cards);
+  const day = () => page.evaluate(() => window.__lst!.getState().day);
+
+  // Keyboard: focus the button, let days pass with the clock running, then press Enter.
+  const button = panel.getByTestId('olt-add-card');
+  await button.focus();
+  const startDay = await day();
+  await page.evaluate(() => window.__lst!.setSpeed(1));
+  await expect.poll(day, { timeout: 15_000 }).toBeGreaterThanOrEqual(startDay + 2);
+  await page.evaluate(() => window.__lst!.setSpeed(0));
+  await expect(button).toBeFocused();
+  const before = await cards();
+  await page.keyboard.press('Enter');
+  await expect.poll(cards).toBe(before + 1);
+  // Still the same button, still focused after it acted.
+  await expect(button).toBeFocused();
+
+  // Mouse: a press and release that straddle a new day still click.
+  const box = (await button.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => window.__lst!.tick(1));
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await page.mouse.up();
+  await expect.poll(cards).toBe(before + 2);
+
+  // The cabinet list keeps its scroll position as days go by.
+  const list = panel.locator('.olt-cabinets');
+  await list.evaluate((el) => (el.scrollTop = 120));
+  const scrolled = await list.evaluate((el) => el.scrollTop);
+  expect(scrolled).toBeGreaterThan(0);
+  await page.evaluate(() => window.__lst!.tick(1));
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+  expect(await list.evaluate((el) => el.scrollTop)).toBe(scrolled);
+  expect(errors).toEqual([]);
+});
+
 test('the cost overlay switch flips with a click or the O key', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
@@ -201,8 +260,121 @@ test('the cost overlay switch flips with a click or the O key', async ({ page })
   expect(errors).toEqual([]);
 });
 
+/** Screen boxes of the floating card, its itemized amounts, the HUD and the toolbar. */
+function layout(page: Page): Promise<{
+  card: { left: number; top: number; right: number; bottom: number; scrollWidth: number; clientWidth: number; compact: boolean } | null;
+  amounts: number[];
+  hud: { bottom: number };
+  toolbar: { top: number };
+}> {
+  return page.evaluate(() => {
+    const card = document.querySelector<HTMLElement>('.float-card');
+    const box = card && !card.hidden ? card.getBoundingClientRect() : null;
+    const amounts = card ? [...card.querySelectorAll('.quote-amount')].map((e) => e.getBoundingClientRect().right) : [];
+    return {
+      card: box
+        ? { left: box.left, top: box.top, right: box.right, bottom: box.bottom, scrollWidth: card!.scrollWidth, clientWidth: card!.clientWidth, compact: card!.classList.contains('compact') }
+        : null,
+      amounts,
+      hud: { bottom: document.querySelector('.hud')!.getBoundingClientRect().bottom },
+      toolbar: { top: document.querySelector('.toolbar')!.getBoundingClientRect().top },
+    };
+  });
+}
+
+/** The segment joining two corners. */
+function segmentBetween(page: Page, a: number, b: number): Promise<number> {
+  return page.evaluate(
+    ([a, b]) => window.__lst!.getState().city.segments.find((s) => (s.a === a && s.b === b) || (s.a === b && s.b === a))!.id,
+    [a, b] as const,
+  );
+}
+
+test.describe('drawing on a wide screen', () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test('a drag along one street orders that street, not a detour round a nearer corner on the next street', async ({ page }) => {
+    const errors = watchErrors(page);
+    await open(page, '/?seed=1');
+    await page.getByRole('button', { name: 'Got it' }).click();
+    await page.keyboard.press('a');
+    // Water St, 420 ft from node 104 to 105: a Hawthorn Ave corner is nearer the pointer a third of the way along.
+    const water = await segmentBetween(page, 104, 105);
+    const [a, b] = await Promise.all([nodeOnScreen(page, 104), nodeOnScreen(page, 105)]);
+    const before = await snapshot(page);
+    await page.mouse.move(a.x, a.y);
+    await page.mouse.down();
+    await page.mouse.move(a.x + (b.x - a.x) * 0.3, a.y + (b.y - a.y) * 0.3, { steps: 12 });
+    await expect(page.locator('.float-card')).toContainText('Drag along the streets');
+    await page.mouse.move(b.x, b.y, { steps: 28 });
+    await expect(page.locator('.float-card')).toContainText('1 span');
+    await page.mouse.up();
+    await expect.poll(async () => (await snapshot(page)).spans.length).toBe(before.spans.length + 1);
+    expect((await snapshot(page)).spans.slice(before.spans.length).map((s) => s.segment)).toEqual([water]);
+    expect(errors).toEqual([]);
+  });
+
+  test('itemized quote amounts stay inside the card', async ({ page }) => {
+    const errors = watchErrors(page);
+    await open(page, '/?seed=1');
+    await page.evaluate(() => document.fonts.ready);
+    await page.getByRole('button', { name: 'Got it' }).click();
+    await page.keyboard.press('a');
+    const points = await Promise.all([143, 142, 141, 140].map((n) => nodeOnScreen(page, n)));
+    await page.mouse.move(points[0]!.x, points[0]!.y);
+    await page.mouse.down();
+    for (const p of points.slice(1)) await page.mouse.move(p.x, p.y, { steps: 8 });
+    await expect(page.locator('.float-card .quote-lines')).toContainText('Pole attachment application');
+    const { card, amounts } = await layout(page);
+    expect(amounts.length).toBeGreaterThanOrEqual(3);
+    for (const right of amounts) expect(right).toBeLessThanOrEqual(card!.right);
+    expect(card!.scrollWidth).toBeLessThanOrEqual(card!.clientWidth);
+    await page.keyboard.press('Escape');
+    await page.mouse.up();
+    expect(errors).toEqual([]);
+  });
+});
+
 test.describe('on a touch phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+  test('the quote card stays off the finger drawing a run, and off the HUD and toolbar', async ({ page }) => {
+    const errors = watchErrors(page);
+    await open(page, '/?seed=1');
+    await page.getByRole('button', { name: 'Got it' }).tap();
+    await page.getByRole('button', { name: 'Aerial cable (A)' }).tap();
+    const cdp = await page.context().newCDPSession(page);
+    // East from the CO along the street, one corner and then a second.
+    const corners = await page.evaluate(() => {
+      const { city } = window.__lst!.getState();
+      const east = (id: number) => {
+        const n = city.nodes[id]!;
+        const seg = city.segments.find((s) => (s.a === id || s.b === id) && city.nodes[s.a === id ? s.b : s.a]!.y === n.y && city.nodes[s.a === id ? s.b : s.a]!.x > n.x)!;
+        return seg.a === id ? seg.b : seg.a;
+      };
+      const first = east(city.coNode);
+      return [city.coNode, first, east(first)];
+    });
+    const points = await Promise.all(corners.map((n) => nodeOnScreen(page, n)));
+    await touch(cdp, 'touchStart', [points[0]!]);
+    let finger = points[0]!;
+    for (const [from, to] of [[points[0]!, points[1]!], [points[1]!, points[2]!]] as const) {
+      for (let i = 1; i <= 10; i++) {
+        finger = { x: from.x + ((to.x - from.x) * i) / 10, y: from.y + ((to.y - from.y) * i) / 10 };
+        await touch(cdp, 'touchMove', [finger]);
+      }
+      await expect(page.locator('.float-card')).toContainText('two fingers cancel');
+      const { card, hud, toolbar } = await layout(page);
+      const covered = card!.left <= finger.x && finger.x <= card!.right && card!.top <= finger.y && finger.y <= card!.bottom;
+      expect(covered, `card ${JSON.stringify(card)} over the finger at ${finger.x}, ${finger.y}`).toBe(false);
+      expect(card!.top).toBeGreaterThanOrEqual(hud.bottom);
+      expect(card!.bottom).toBeLessThanOrEqual(toolbar.top);
+    }
+    // A second finger cancels rather than ordering.
+    await touch(cdp, 'touchStart', [finger, { x: finger.x + 40, y: finger.y }]);
+    await touch(cdp, 'touchEnd', []);
+    expect(errors).toEqual([]);
+  });
 
   test('a one-finger drag from a corner orders a route; a pinch zooms and orders nothing', async ({ page }) => {
     const errors = watchErrors(page);

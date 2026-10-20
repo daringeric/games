@@ -819,6 +819,8 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 8px;
+  /* main.ts moves the column clear of the report panel (Toasts.keepClear),
+     dropping the oldest toasts when the stack would reach the HUD. */
   width: max-content;
   max-width: min(520px, calc(100vw - 32px));
   transform: translateX(-50%);
@@ -1045,7 +1047,8 @@ body {
     bottom: 84px;
     left: 8px;
     width: auto;
-    max-height: calc(100vh - var(--hud-bottom, 120px) - 100px);
+    /* Opened, it leaves a toast's height free under the HUD (toasts sit above it). */
+    max-height: calc(100vh - var(--hud-bottom, 120px) - 100px - 60px);
     padding: 6px 12px 8px;
   }
 

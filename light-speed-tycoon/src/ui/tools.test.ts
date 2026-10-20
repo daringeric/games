@@ -301,6 +301,7 @@ describe('cabinet tool', () => {
     expect(row(view.card, 'Passings')).toBe(`${formatNumber(preview.passingsNow)} now`);
     expect(row(view.card, 'Already served')).toBe(formatNumber(preview.passingsServedElsewhere));
     expect(row(view.card, 'Passable today')).toBe(formatNumber(preview.passingsPassableToday));
+    expect(view.card?.rows.find((r) => r.label === 'Cable to finish')).toMatchObject({ value: formatMoney(preview.buildOutCost), sub: 'incl. order fees' });
     const cpp = view.card?.rows.find((r) => r.label === 'Cost per passing');
     expect(cpp?.value).toBe(formatMoney(preview.projectedCpp!));
     expect(cpp?.sub).toBe(`projected, target ${formatMoney(CPP_TARGET)}`);
@@ -330,13 +331,36 @@ describe('cabinet tool', () => {
     const elsewhere = preview.segments.filter((s) => s.servedBy !== null).map((s) => s.segment);
     expect(elsewhere.length).toBeGreaterThan(0);
     expect(view.overlay.reach?.filter((r) => r.elsewhere).map((r) => r.id)).toEqual(elsewhere);
+    // Solid shading only where a cabinet here would light the street today (along live cable, not served elsewhere).
+    const litToday = preview.segments.filter((s) => s.litOnPlacement && s.servedBy === null).map((s) => s.segment);
+    expect(view.overlay.reach?.filter((r) => r.lit).map((r) => r.id)).toEqual(litToday);
+    // A cabinet here would take 1st St's second block over (0 ft against 240 ft), but it is already passed.
+    expect(preview.segments.find((s) => s.segment === 1)).toMatchObject({ litOnPlacement: true, servedBy: cabinet.id });
+    expect(litToday).not.toContain(1);
     expect(row(view.card, 'Already served')).toBe(formatNumber(preview.passingsServedElsewhere));
+    expect(row(view.card, 'Passable today')).toBe(formatNumber(preview.passingsPassableToday));
     expect(view.overlay.coverage).toEqual([
       { cabinet: cabinet.id, lit: service.cabinetCoverage.get(cabinet.id)!.segments, reach: expect.arrayContaining([0, 1, 9]) },
     ]);
     // The coverage stays up while the pointer is off the map.
     tools.clearHover();
     expect(tools.view(state).overlay.coverage).toHaveLength(1);
+  });
+
+  it('refreshes the existing coverage shading as cabinets are placed and streets light, on the same game state', () => {
+    const state = game();
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    expect(tools.view(state).overlay.coverage).toEqual([]);
+    expect(applyCommand(state, { type: 'placeCabinet', node: 0 }).ok).toBe(true);
+    const cabinet = state.network.cabinets[0]!;
+    expect(tools.view(state).overlay.coverage?.map((c) => c.cabinet)).toEqual([cabinet.id]);
+    expect(tools.view(state).overlay.coverage?.[0]?.lit).toEqual([]);
+    expect(applyCommand(state, { type: 'layCable', segments: [0, 1], method: 'underground' }).ok).toBe(true);
+    runDays(state, 120);
+    const lit = getService(state).cabinetCoverage.get(cabinet.id)!.segments;
+    expect(lit.length).toBeGreaterThan(0);
+    expect(tools.view(state).overlay.coverage?.[0]?.lit).toEqual(lit);
   });
 
   it('adds a splitter to an existing cabinet', () => {

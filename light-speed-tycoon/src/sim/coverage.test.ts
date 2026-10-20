@@ -3,10 +3,10 @@ import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, S
 import { coveragePreview, segmentsWithinReach } from './coverage';
 import { newGame } from './game';
 import { cppBand } from './metrics';
-import { getService, spanCharges } from './network';
+import { getService, orderFees, quoteCable, spanCharges } from './network';
 import { parcelsServedBy } from './streets';
 import { makeGridCity, makeTestState } from './testing/fixtures';
-import type { BuildStage, City, CoveragePreview, GameState, SegmentId, StreetSegment } from './types';
+import type { BuildStage, CableMethod, City, CoveragePreview, GameState, SegmentId, StreetSegment } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
 // Horizontal segment (i, j) = j * 3 + i (240 ft); vertical (i, j) = 9 + j * 4 + i (120 ft).
@@ -53,6 +53,20 @@ function addCabinet(state: GameState, node: number, stage: BuildStage = 'live'):
 function cheapest(segment: StreetSegment): number {
   const underground = spanCharges(segment, 'underground').total;
   return segment.hasPoles ? Math.min(underground, spanCharges(segment, 'aerial').total) : underground;
+}
+
+/** Build-out per the CoveragePreview docs: the cheapest cable per segment plus one order's fees per method used. */
+function buildOut(state: GameState, segments: readonly SegmentId[]): number {
+  const methods = new Set<CableMethod>();
+  let total = 0;
+  for (const id of segments) {
+    const segment = state.city.segments[id]!;
+    const cost = cheapest(segment);
+    total += cost;
+    methods.add(segment.hasPoles && cost === spanCharges(segment, 'aerial').total ? 'aerial' : 'underground');
+  }
+  for (const method of methods) total += orderFees(method);
+  return total;
 }
 
 function units(state: GameState, segments: readonly SegmentId[]): number {
@@ -108,7 +122,11 @@ describe('coveragePreview', () => {
     expect(preview.segments.every((s) => !s.connected && s.servedBy === null)).toBe(true);
     expect(preview.segments.find((s) => s.segment === H(2, 2))!.distanceFt).toBe(240 + 240);
     expect(preview.segments.find((s) => s.segment === V(3, 1))!.distanceFt).toBe(480 + 120);
-    const buildOut = state.city.segments.reduce((sum, s) => sum + cheapest(s), 0);
+    const all48 = buildOut(state, all);
+    // A cable order's engineering and permit fees are part of the build-out, as a cable quote charges them.
+    expect(all48).toBe(state.city.segments.reduce((sum, s) => sum + cheapest(s), 0) + orderFees('aerial'));
+    // The same money a cable quote for the whole build-out asks.
+    expect(quoteCable(state, all, 'aerial').cost).toBe(all48);
     expect(preview).toMatchObject({
       node: 1,
       reachFt: CABINET_REACH_FT,
@@ -117,9 +135,9 @@ describe('coveragePreview', () => {
       passingsServedElsewhere: 0,
       passingsPassableToday: 0,
       cabinetCost: CABINET_PRICE,
-      buildOutCost: buildOut,
-      projectedCpp: (CABINET_PRICE + buildOut) / 48,
-      projectedCppBand: cppBand((CABINET_PRICE + buildOut) / 48),
+      buildOutCost: all48,
+      projectedCpp: (CABINET_PRICE + all48) / 48,
+      projectedCppBand: cppBand((CABINET_PRICE + all48) / 48),
       ports: PORTS,
     });
   });
@@ -158,16 +176,37 @@ describe('coveragePreview', () => {
     const co = addCabinet(state, 0);
 
     const at1 = coveragePreview(state, 1);
-    expect(at1.segments.find((s) => s.segment === H(0, 0))).toEqual({ segment: H(0, 0), distanceFt: 0, connected: true, servedBy: co });
-    expect(at1.segments.find((s) => s.segment === H(1, 0))).toEqual({ segment: H(1, 0), distanceFt: 0, connected: true, servedBy: null });
+    // A cabinet at node 1 would tie the CO cabinet on the first segment (both 0 ft): the older one keeps it.
+    expect(at1.segments.find((s) => s.segment === H(0, 0))).toEqual({ segment: H(0, 0), distanceFt: 0, connected: true, litOnPlacement: false, servedBy: co });
+    expect(at1.segments.find((s) => s.segment === H(1, 0))).toEqual({ segment: H(1, 0), distanceFt: 0, connected: true, litOnPlacement: true, servedBy: null });
     expect(at1.passingsServedElsewhere).toBe(30);
     expect(at1.passingsPassableToday).toBe(30);
     const inReach = at1.segments.map((s) => s.segment);
     expect(at1.passingsNow).toBe(units(state, inReach));
     // Only uncabled streets count toward the build-out.
     const uncabled = inReach.filter((s) => s !== H(0, 0) && s !== H(1, 0));
-    expect(at1.buildOutCost).toBe(uncabled.reduce((sum, s) => sum + cheapest(state.city.segments[s]!), 0));
+    expect(at1.buildOutCost).toBe(buildOut(state, uncabled));
     expect(at1.projectedCpp).toBe((CABINET_PRICE + at1.buildOutCost) / (at1.passingsNow - 30));
+  });
+
+  it('counts as passable today only streets a cabinet here would light along today\'s cable', () => {
+    // One row of 360 ft blocks, CO at (0, 1). Live cable runs as a U from the CO:
+    // up A Ave to node 0 and out along 1st St to node 1, and along 2nd St to node 7
+    // and up C Ave to node 2. 1st St's first block is 360 ft from node 2 along the
+    // street, but 960 ft round the U along the cable: a cabinet at node 2 cannot light it.
+    const city = makeGridCity({ cols: 4, rows: 1, blockW: 6, blockH: 2, coAt: [0, 1] });
+    const state = makeTestState(city);
+    for (const s of [8, 0, 4, 5, 10]) addSpan(state, s);
+    const preview = coveragePreview(state, 2);
+    expect(preview.segments.find((s) => s.segment === 0)).toEqual({ segment: 0, distanceFt: 360, connected: true, litOnPlacement: false, servedBy: null });
+    expect(preview.segments.filter((s) => s.litOnPlacement).map((s) => s.segment)).toEqual([4, 5, 10]);
+
+    // What actually happens once a live cabinet stands there.
+    const cabinet = addCabinet(state, 2);
+    const service = getService(state);
+    expect(service.cabinetCoverage.get(cabinet)!.segments).toEqual([4, 5, 10]);
+    expect(preview.passingsPassableToday).toBe(service.passings);
+    expect(preview.passingsPassableToday).toBe(units(state, [4, 5, 10]));
   });
 
   it('counts streets a cabinet still being built will serve as served elsewhere', () => {
@@ -179,7 +218,7 @@ describe('coveragePreview', () => {
     expect(getService(state).litSegments.size).toBe(0);
     const at1 = coveragePreview(state, 1);
     // Once built, the CO cabinet serves 1st St's first segment; the second is beyond its reach.
-    expect(at1.segments.find((s) => s.segment === H(0, 0))).toEqual({ segment: H(0, 0), distanceFt: 0, connected: false, servedBy: planned });
+    expect(at1.segments.find((s) => s.segment === H(0, 0))).toEqual({ segment: H(0, 0), distanceFt: 0, connected: false, litOnPlacement: false, servedBy: planned });
     expect(at1.segments.find((s) => s.segment === H(1, 0))).toMatchObject({ connected: false, servedBy: null });
     expect(at1.passingsServedElsewhere).toBe(30);
     expect(at1.passingsPassableToday).toBe(0);
@@ -205,7 +244,9 @@ describe('coveragePreview', () => {
     const state = makeTestState(city);
     // From corner (1, 0) the whole grid is in reach (see above).
     const preview = coveragePreview(state, 1);
-    const expected = state.city.segments.reduce((sum, s) => sum + cheapest(s), 0);
+    const expected = buildOut(state, state.city.segments.map((s) => s.id));
+    // Both methods are needed, so both kinds of order pay their fees.
+    expect(expected).toBe(state.city.segments.reduce((sum, s) => sum + cheapest(s), 0) + orderFees('aerial') + orderFees('underground'));
     expect(preview.buildOutCost).toBe(expected);
     // The unpoled street can only be bored.
     const bored = spanCharges(state.city.segments[H(0, 0)]!, 'underground').total;

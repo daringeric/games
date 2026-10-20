@@ -79,7 +79,7 @@ function cached<T extends RunResult | CppProbes>(key: string, make: () => T): T 
   return value;
 }
 
-const smart = (seed: number) => cached(`smart:${seed}`, () => runBot(seed, smartBot(), SMART_MONTHS));
+const smart = (seed: number) => cached(`smart:${seed}`, () => runBot(seed, smartBot(), SMART_MONTHS, { clock: () => performance.now() }));
 const careless = (seed: number) => cached(`careless:${seed}`, () => runBot(seed, carelessBot, CARELESS_MONTHS));
 const idle = (seed: number) => cached(`idle:${seed}`, () => runBot(seed, idleBot, IDLE_SURVIVES_MONTHS));
 const probes = (seed: number) => cached(`probes:${seed}`, () => cppProbes(seed));

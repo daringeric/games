@@ -51,7 +51,7 @@ export interface RunResult {
   /** 1-based month in which each command type first succeeded. */
   firstMonth: Record<string, number>;
   rejected: number;
-  /** Wall-clock milliseconds the run took. */
+  /** Milliseconds the run took by opts.clock (0 without one: the sim never reads a clock itself). */
   ms: number;
 }
 
@@ -62,6 +62,11 @@ export interface RunOptions {
   afterTick?: (state: GameState) => void;
   /** Called after every command the bot sends, with the cash before it. */
   afterCommand?: (state: GameState, cmd: Command, result: CommandResult, cashBefore: number) => void;
+  /**
+   * A millisecond clock to time the run with (tests pass performance.now).
+   * Nothing under src/sim reads a clock itself (README purity rule).
+   */
+  clock?: () => number;
 }
 
 /**
@@ -70,7 +75,7 @@ export interface RunOptions {
  * BOT_INTERVAL_DAYS days, before that day's tick.
  */
 export function runBot(seed: number, makeBot: BotFactory, months: number, opts: RunOptions = {}): RunResult {
-  const started = performance.now();
+  const started = opts.clock?.() ?? 0;
   const state = opts.state ?? newGame(seed);
   const bot = makeBot(seed);
   const commands: Record<string, number> = {};
@@ -111,7 +116,7 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     commands,
     firstMonth,
     rejected,
-    ms: performance.now() - started,
+    ms: opts.clock ? opts.clock() - started : 0,
   };
 }
 

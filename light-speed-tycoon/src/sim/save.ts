@@ -7,9 +7,13 @@
 // Owner after the round-2 contract: sim-economy workstream (migration tests
 // against the frozen v1 fixtures in testing/, new corruption cases, review).
 
-import { OLT_MAX_CARDS, OLT_PORTS_PER_CARD, START_YEAR } from './balance';
+import { CABINET_REACH_FT, OLT_MAX_CARDS, OLT_PORTS_PER_CARD, START_YEAR } from './balance';
+import { groupThousands } from './finance';
+import { getService } from './network';
+import { postNotice } from './notices';
 import { deriveSeed } from './rng';
-import { newSales } from './sales';
+import { otherEnd, segmentsAtNode } from './streets';
+import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales } from './sales';
 import type {
   BuildStage,
   CableMethod,
@@ -79,6 +83,7 @@ export function deserialize(json: string): GameState {
     checkState(raw, 1);
     const migrated = migrateV1toV2(raw);
     checkState(migrated as unknown as Json, 2);
+    noteReachChange(migrated);
     return migrated;
   }
   if (raw.schemaVersion !== SCHEMA_VERSION) {
@@ -86,8 +91,42 @@ export function deserialize(json: string): GameState {
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
+  upgradeEarlyV2(raw);
   checkState(raw, 2);
   return raw as unknown as GameState;
+}
+
+/**
+ * Bring a schemaVersion 2 save written before installs had their own notice
+ * kinds up to date, in place (no version bump: the change only adds a field
+ * that can be derived). Such a save has no sales.installsPaused and posted its
+ * install pause/resume notices as 'insolvencyWarning' told apart by message
+ * prefix: those notices get the 'installsPaused' / 'installsResumed' kinds,
+ * and installsPaused is true when the newest of them still in the log is a
+ * pause. Anything else is left for checkState to judge.
+ */
+function upgradeEarlyV2(save: Json): void {
+  const sales = save.sales;
+  if (!isRecord(sales) || 'installsPaused' in sales) return;
+  let paused = false;
+  if (Array.isArray(save.notices)) {
+    for (const notice of save.notices) {
+      if (!isRecord(notice) || notice.kind !== 'insolvencyWarning' || typeof notice.message !== 'string') continue;
+      if (notice.message.startsWith(INSTALLS_PAUSED_PREFIX)) {
+        notice.kind = 'installsPaused';
+        paused = true;
+      } else if (notice.message.startsWith(INSTALLS_RESUMED_PREFIX)) {
+        notice.kind = 'installsResumed';
+        paused = false;
+      }
+    }
+  }
+  // Keep newSales' key order (installsPaused right after fullCabinets), so the save hashes like a fresh one.
+  const entries = Object.entries(sales);
+  const at = entries.findIndex(([key]) => key === 'fullCabinets');
+  entries.splice(at < 0 ? entries.length : at + 1, 0, ['installsPaused', paused]);
+  for (const key of Object.keys(sales)) delete sales[key];
+  Object.assign(sales, Object.fromEntries(entries));
 }
 
 /** Short stable hash (FNV-1a, hex) of serialize(state); used by determinism tests. */
@@ -179,6 +218,49 @@ export function migrateV1toV2(v1: Record<string, unknown>): GameState {
   };
 }
 
+/**
+ * Round 1 lit every street on CO-connected cable once any cabinet stood on it;
+ * round 2 lights only streets within CABINET_REACH_FT of a cabinet. A migrated
+ * town can lose most of its passings on load, so say why instead of leaving
+ * the player to find the network dark.
+ */
+function noteReachChange(state: GameState): void {
+  const before = roundOnePassings(state);
+  const after = getService(state).passings;
+  if (after >= before) return;
+  postNotice(
+    state,
+    'rulesUpdated',
+    `Cabinets changed in this version: each now lights streets within ${groupThousands(CABINET_REACH_FT)} ft of it along its cable, ` +
+      `so ${groupThousands(before - after)} of your ${groupThousands(before)} passings are out of reach. Add cabinets closer to them to light them again.`,
+  );
+}
+
+/** Units passed under the round-1 rule: existing parcels on live cable joined to the CO, once a live cabinet stands on that cable. */
+function roundOnePassings(state: GameState): number {
+  const { city, network } = state;
+  const live = new Set(network.spans.filter((s) => s.stage === 'live').map((s) => s.segment));
+  const reached = new Set<number>([city.coNode]);
+  const connected = new Set<number>();
+  const queue = [city.coNode];
+  for (let node = queue.pop(); node !== undefined; node = queue.pop()) {
+    for (const id of segmentsAtNode(city, node)) {
+      const segment = city.segments[id];
+      if (!segment || !live.has(id) || connected.has(id)) continue;
+      connected.add(id);
+      const next = otherEnd(segment, node);
+      if (!reached.has(next)) {
+        reached.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  if (!network.cabinets.some((c) => c.stage === 'live' && reached.has(c.node))) return 0;
+  let units = 0;
+  for (const p of city.parcels) if (p.appearsDay <= state.day && connected.has(p.segment)) units += p.units;
+  return units;
+}
+
 /** The v1 shape, as far as the migration reads it (already validated by checkState(_, 1)). */
 interface V1State {
   seed: number;
@@ -233,6 +315,9 @@ const NOTICE_KINDS = members<NoticeKind>({
   serviceLost: true,
   oltFull: true,
   insolvencyWarning: true,
+  installsPaused: true,
+  installsResumed: true,
+  rulesUpdated: true,
   gameOver: true,
   milestone: true,
 });
@@ -611,6 +696,7 @@ function checkSales(sales: Json, ctx: Context): void {
   int(sales.connectsTotal, 'sales.connectsTotal', 0);
   const full = list(sales.fullCabinets, 'sales.fullCabinets').map((value, i) => int(value, `sales.fullCabinets[${i}]`, 1, nextId - 1));
   ascending(full, 'sales.fullCabinets');
+  bool(sales.installsPaused, 'sales.installsPaused');
 
   const month = obj(sales.month, 'sales.month');
   for (const field of ['revenueDollarDays', 'marketingDollarDays', 'subscriberUnitDays', 'grossAdds', 'lostService'] as const) {

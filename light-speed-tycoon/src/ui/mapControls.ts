@@ -218,6 +218,16 @@ export class MapControls {
     if (this.legend.style.top !== top) this.legend.style.top = top;
   }
 
+  /** The band the floating card may use: under the HUD, and above the toolbar when it runs along the bottom (phones). */
+  private cardSafeArea(): { top: number; bottom: number } {
+    const viewH = window.innerHeight;
+    const hud = document.querySelector('.hud')?.getBoundingClientRect();
+    const bar = this.toolbar.root.getBoundingClientRect();
+    const top = hud && hud.height > 0 ? hud.bottom + 8 : 0;
+    const bottom = bar.height > 0 && bar.top > viewH / 2 ? bar.top - 8 : viewH;
+    return { top, bottom };
+  }
+
   /** A new or loaded game replaced the old one: drop any run in progress and close map panels. */
   reset(): void {
     this.tools.cancel();
@@ -231,7 +241,7 @@ export class MapControls {
     const view = this.tools.view(state);
     this.deps.scene.setOverlay(view.overlay);
     const { pointer } = this;
-    this.card.render(pointer.onMap ? view.card : null, pointer.x, pointer.y, window.innerWidth, window.innerHeight);
+    this.card.render(pointer.onMap ? view.card : null, pointer.x, pointer.y, window.innerWidth, window.innerHeight, this.cardSafeArea());
     this.olt.update(state);
     this.placeLegend();
   }

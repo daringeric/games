@@ -47,5 +47,5 @@ e2e/            Playwright tests
 - **Units:** feet, whole dollars, days. Day 0 is Jan 1, 2027.
 - **IDs:** nodes, segments and parcels have `id === index`. Spans and cabinets draw from `state.nextId`.
 - **Render reads, never writes.** Renderers take state and draw it. Input handlers turn pointer events into `Command`s.
-- **Deterministic math.** The sim uses arithmetic and `Math.sqrt` only (no `Math.pow`/`log`/`exp`/trig), so a seed and a command log replay identically on every engine.
+- **Deterministic math.** The sim uses arithmetic and `Math.sqrt` only (no `Math.pow`/`log`/`exp`/trig, no `**`), so a seed and a command log replay identically on every engine. `src/sim/purity.test.ts` scans the sim sources for this and the purity rule above.
 - **Balance is symbolic.** Tests reference `balance.ts` constants (or quote results), never literal dollar amounts, so tuning never breaks them.

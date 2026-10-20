@@ -20,8 +20,9 @@
 //   MDU_PORTS_PER_BUILDING port(s) and adding units to it needs no new port.
 // - Installs pause while cash cannot cover the next install: the unit is not
 //   connected and its demand simply waits (the take-rate gap is unchanged), so
-//   signups resume on their own once cash recovers. One notice is raised when
-//   installs pause and one when they resume (see INSTALL_NOTICE_KIND).
+//   signups resume on their own once cash recovers. One 'installsPaused'
+//   notice is raised when installs pause and one 'installsResumed' when they
+//   resume; Sales.installsPaused remembers which (the notice log is capped).
 
 import {
   CHURN_MONTHLY_BASE,
@@ -73,7 +74,7 @@ import type {
   CommandResult,
   GameState,
   MonthAccrual,
-  NoticeKind,
+  Parcel,
   ParcelKind,
   Pricing,
   Sales,
@@ -87,13 +88,7 @@ import type {
 export const TIER_IDS: readonly TierId[] = TIER_DEFAULTS.map((t) => t.id);
 
 
-/**
- * Notice kind used for the "installs paused" / "installs resumed" notices.
- * NoticeKind has no dedicated kinds for them yet (types.ts is frozen this
- * round), so they ride on the cash-trouble kind and are told apart by their
- * message prefixes below.
- */
-export const INSTALL_NOTICE_KIND: NoticeKind = 'insolvencyWarning';
+/** How the install pause and resume notices begin (their kinds are 'installsPaused' and 'installsResumed'). */
 export const INSTALLS_PAUSED_PREFIX = 'Installs paused';
 export const INSTALLS_RESUMED_PREFIX = 'Installs resumed';
 
@@ -125,6 +120,7 @@ export function newSales(): Sales {
     routerParcels: [],
     connectsTotal: 0,
     fullCabinets: [],
+    installsPaused: false,
     month: emptyMonthAccrual(),
   };
 }
@@ -156,12 +152,27 @@ const POPULARITY: Readonly<Record<TierId, number>> = Object.fromEntries(
 /** The incumbent's offer scored by the same value formula: every ratio is 1. */
 const INCUMBENT_VALUE = TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - TAKE_PRICE_WEIGHT;
 
-/** A tier's value to a household (balance.ts take-rate model). */
-function tierValue(tier: Tier): number {
+/**
+ * How a building kind's price compares with a household's, relative to the
+ * incumbent's offer to it: businesses pay tier price x smbMultiplier and
+ * compare it with the incumbent's business price, INCUMBENT_PRICE x
+ * SMB_MULTIPLIER_DEFAULT, so their price ratio is the household one times
+ * smbMultiplier / SMB_MULTIPLIER_DEFAULT (exactly 1 at the default). Homes and
+ * apartments pay the household price: 1.
+ */
+function priceFactor(pricing: Pricing, kind: ParcelKind): number {
+  return kind === 'smb' ? pricing.smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
+}
+
+/**
+ * A tier's value to a customer whose price ratio is `factor` x the household
+ * one (balance.ts take-rate model; factor 1 for a household).
+ */
+function tierValue(tier: Tier, factor = 1): number {
   return (
     TAKE_SPEED_WEIGHT * Math.min(tier.downMbps / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP) +
     TAKE_UPLOAD_WEIGHT * Math.min(tier.upMbps / INCUMBENT_UP_MBPS, TAKE_UPLOAD_RATIO_CAP) -
-    (TAKE_PRICE_WEIGHT * tier.price) / INCUMBENT_PRICE
+    ((TAKE_PRICE_WEIGHT * tier.price) / INCUMBENT_PRICE) * factor
   );
 }
 
@@ -173,13 +184,15 @@ function clamp(value: number, min: number, max: number): number {
  * Target take rate (0..1) for a building kind under the given pricing, from the
  * model documented in balance.ts: the best offered tier's value against the
  * incumbent, clamped to TAKE_RATE_MIN..TAKE_RATE_MAX, times
- * TAKE_RATE_KIND_FACTOR[kind]. With no tier offered (impossible via setPricing)
- * returns 0.
+ * TAKE_RATE_KIND_FACTOR[kind]. Businesses value a tier at the price they pay
+ * (see priceFactor), so a higher smbMultiplier lowers their take rate. With no
+ * tier offered (impossible via setPricing) returns 0.
  */
 export function targetTakeRate(pricing: Pricing, kind: ParcelKind): number {
+  const factor = priceFactor(pricing, kind);
   let best = -Infinity;
   for (const tier of pricing.tiers) {
-    if (tier.offered) best = Math.max(best, tierValue(tier) - INCUMBENT_VALUE);
+    if (tier.offered) best = Math.max(best, tierValue(tier, factor) - INCUMBENT_VALUE);
   }
   if (best === -Infinity) return 0;
   return clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * best, TAKE_RATE_MIN, TAKE_RATE_MAX) * TAKE_RATE_KIND_FACTOR[kind];
@@ -192,19 +205,21 @@ function zeroTiers(): Record<TierId, number> {
 }
 
 /**
- * Share of new signups choosing each tier (sums to 1 over offered tiers, 0 for
- * unoffered). Weight per offered tier = popularity_t x max(0, value_t -
- * incumbent value) (see balance.ts); if every weight is 0, offered tiers split
- * evenly.
+ * Share of new signups of a building kind (default: households) choosing each
+ * tier (sums to 1 over offered tiers, 0 for unoffered). Weight per offered
+ * tier = popularity_t x max(0, value_t - incumbent value) (see balance.ts),
+ * valued at the price that kind pays; if every weight is 0, offered tiers
+ * split evenly.
  */
-export function tierMix(pricing: Pricing): Record<TierId, number> {
+export function tierMix(pricing: Pricing, kind: ParcelKind = 'home'): Record<TierId, number> {
+  const factor = priceFactor(pricing, kind);
   const mix = zeroTiers();
   let total = 0;
   let offered = 0;
   for (const tier of pricing.tiers) {
     if (!tier.offered) continue;
     offered++;
-    const weight = (POPULARITY[tier.id] ?? 0) * Math.max(0, tierValue(tier) - INCUMBENT_VALUE);
+    const weight = (POPULARITY[tier.id] ?? 0) * Math.max(0, tierValue(tier, factor) - INCUMBENT_VALUE);
     mix[tier.id] = weight;
     total += weight;
   }
@@ -359,50 +374,122 @@ function cabinetPlace(state: GameState, cabinetId: CabinetId): string | null {
   return cabinet ? cornerName(state.city, cabinet.node) : null;
 }
 
+/** What serviceChanges reads from a network: ServiceSnapshot, or a removal quote's "what if". */
+export type ServiceView = Pick<ServiceSnapshot, 'activeCabinets' | 'segmentCabinets'>;
+
+/** Why an account loses service: its street went dark, or every cabinet still reaching it is out of ports. */
+export type LostServiceReason = 'dark' | 'noPort';
+
+/** What step 1 of stepSales does to the accounts on a network (see serviceChanges). */
+export interface ServiceChanges {
+  /** Index into Sales.accounts -> the cabinet it moves to. */
+  moves: Map<number, CabinetId>;
+  /** Accounts that lose service, ascending by index. */
+  drops: { index: number; reason: LostServiceReason }[];
+}
+
 /**
- * Step 1 of stepSales: drop every account whose parcel is no longer passed or
- * whose cabinet is no longer active, and tell the player once per cabinet.
+ * Who keeps service on the network `view` describes (pure; step 1 of
+ * stepSales and the removal quotes both use it). For each account, ascending:
+ * - its parcel no longer exists or its street is not lit: dropped ('dark');
+ * - its own cabinet is active and reaches the street (in segmentCabinets): kept;
+ * - otherwise it needs another cabinet. After every kept account has taken its
+ *   ports, those accounts (ascending) move to the first cabinet in their
+ *   street's segmentCabinets (nearest first) with free ports for them, or are
+ *   dropped ('noPort').
+ * Free ports = cabinetPortCapacity minus the ports of accounts kept on or moved to it.
  */
-function dropLostService(state: GameState, service: ServiceSnapshot): void {
-  const { sales, city, day } = state;
-  const accounts = sales.accounts;
-  let kept: Account[] | null = null;
-  let lost: Map<CabinetId, number> | null = null;
+export function serviceChanges(state: GameState, view: ServiceView): ServiceChanges {
+  const { city, day, network } = state;
+  const accounts = state.sales.accounts;
+  const moves = new Map<number, CabinetId>();
+  const drops: ServiceChanges['drops'] = [];
+  const used = new Map<CabinetId, number>();
+  const homeless: number[] = [];
   for (let i = 0; i < accounts.length; i++) {
     const account = accounts[i] as Account;
     const parcel = city.parcels[account.parcel];
-    // Equivalent to membership in service.passedParcels (an existing parcel on a lit segment).
-    const passed = parcel !== undefined && parcel.appearsDay <= day && service.litSegments.has(parcel.segment);
-    if (passed && service.activeCabinets.has(account.cabinet)) {
-      kept?.push(account);
-      continue;
-    }
-    kept ??= accounts.slice(0, i);
-    lost ??= new Map();
-    lost.set(account.cabinet, (lost.get(account.cabinet) ?? 0) + accountUnits(account));
+    const reachers = parcel !== undefined && parcel.appearsDay <= day ? view.segmentCabinets.get(parcel.segment) : undefined;
+    if (!reachers || reachers.length === 0) drops.push({ index: i, reason: 'dark' });
+    else if (view.activeCabinets.has(account.cabinet) && reachers.includes(account.cabinet)) {
+      used.set(account.cabinet, (used.get(account.cabinet) ?? 0) + accountPorts(state, account));
+    } else homeless.push(i);
   }
-  if (!kept || !lost) return;
-  sales.accounts = kept;
-  for (const [cabinet, units] of [...lost].sort(([a], [b]) => a - b)) {
+  if (homeless.length > 0) {
+    const capacity = new Map<CabinetId, number>();
+    for (const cabinet of network.cabinets) capacity.set(cabinet.id, cabinetPortCapacity(cabinet));
+    for (const i of homeless) {
+      const account = accounts[i] as Account;
+      const parcel = city.parcels[account.parcel] as Parcel;
+      const ports = accountPorts(state, account);
+      const to = view.segmentCabinets.get(parcel.segment)?.find((c) => (capacity.get(c) ?? 0) - (used.get(c) ?? 0) >= ports);
+      if (to === undefined) {
+        drops.push({ index: i, reason: 'noPort' });
+        continue;
+      }
+      moves.set(i, to);
+      used.set(to, (used.get(to) ?? 0) + ports);
+    }
+    drops.sort((a, b) => a.index - b.index);
+  }
+  return { moves, drops };
+}
+
+/**
+ * Step 1 of stepSales: apply serviceChanges on today's service. Moved
+ * accounts change cabinet quietly (the subscriber keeps service); dropped ones
+ * are removed, added to month.lostService, and the player is told once per
+ * (cabinet, reason).
+ */
+function applyServiceChanges(state: GameState, service: ServiceSnapshot): void {
+  const { sales } = state;
+  const { moves, drops } = serviceChanges(state, service);
+  for (const [index, cabinet] of moves) (sales.accounts[index] as Account).cabinet = cabinet;
+  if (drops.length === 0) return;
+  const lost = new Map<string, { cabinet: CabinetId; reason: LostServiceReason; units: number }>();
+  const dropped = new Set<number>();
+  for (const { index, reason } of drops) {
+    const account = sales.accounts[index] as Account;
+    dropped.add(index);
+    const key = `${account.cabinet}|${reason}`;
+    const entry = lost.get(key) ?? { cabinet: account.cabinet, reason, units: 0 };
+    entry.units += accountUnits(account);
+    lost.set(key, entry);
+  }
+  sales.accounts = sales.accounts.filter((_, i) => !dropped.has(i));
+  const order = [...lost.values()].sort((a, b) => a.cabinet - b.cabinet || (a.reason === b.reason ? 0 : a.reason === 'dark' ? -1 : 1));
+  for (const { cabinet, reason, units } of order) {
     sales.month.lostService += units;
     const place = cabinetPlace(state, cabinet);
     const who = plural(units, 'subscriber', 'subscribers');
+    const why =
+      reason === 'noPort'
+        ? 'no cabinet in reach of their street has a free port (add a splitter).'
+        : place
+          ? 'their cable or cabinet is no longer connected.'
+          : 'their cabinet was removed.';
     const message = place
-      ? `${who} lost service at ${place}: their cable or cabinet is no longer connected.`
-      : `${who} lost service: their cabinet was removed.`;
+      ? `${who} lost service at ${place}: ${why}`
+      : reason === 'noPort'
+        ? `${who} lost service: their cabinet was removed and ${why}`
+        : `${who} lost service: ${why}`;
     postNotice(state, 'serviceLost', message, { cabinet });
   }
 }
 
-/** Whether the newest install pause/resume notice still in the log is a pause. */
+/**
+ * A cabinet already listed in Sales.fullCabinets stays listed while the demand
+ * waiting on it is expected to take every one of its free ports within this
+ * many days at today's signup ramp. Ports that churn frees at a month close are
+ * soon taken again, so a busy full cabinet does not drop out of the list and
+ * announce itself again; a cabinet whose free ports would last longer than
+ * this (a splitter was added, subscribers left) is not turning anyone away.
+ */
+export const FULL_HOLD_DAYS = 30;
+
+/** Whether installs are paused for lack of cash (Sales.installsPaused). */
 export function installsPaused(state: GameState): boolean {
-  for (let i = state.notices.length - 1; i >= 0; i--) {
-    const notice = state.notices[i];
-    if (!notice || notice.kind !== INSTALL_NOTICE_KIND) continue;
-    if (notice.message.startsWith(INSTALLS_PAUSED_PREFIX)) return true;
-    if (notice.message.startsWith(INSTALLS_RESUMED_PREFIX)) return false;
-  }
-  return false;
+  return state.sales.installsPaused;
 }
 
 interface InstallTally {
@@ -465,11 +552,13 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  * One day of sales, run by tick() after advanceNetwork for the new state.day
  * (never for day 0, never after game over). In order:
  *
- * 1. Lost service: drop every account whose parcel is no longer passed
- *    (getService(state).passedParcels) or whose cabinet is not an active
- *    cabinet any more; add its units to month.lostService. If any were
- *    dropped, post one 'serviceLost' notice per affected cabinet
- *    ("N subscribers lost service at <corner>").
+ * 1. Service check (serviceChanges on getService(state)): an account whose
+ *    own cabinet is no longer active or no longer reaches its street moves to
+ *    the nearest active cabinet that reaches it and has a free port; one whose
+ *    parcel is no longer passed, or that no such cabinet can take, is dropped
+ *    and its units added to month.lostService. If any were dropped, post one
+ *    'serviceLost' notice per affected cabinet and reason ("N subscribers lost
+ *    service at <corner>: ...").
  * 2. Signups: for each lit segment (ascending), with passed parcels P on it
  *    and serving cabinet C (service.servingCabinet):
  *      target = ceil(sum over P of targetTakeRate(pricing, kind) x units
@@ -484,7 +573,7 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  *               capped at the unsubscribed units on P (skip the draw when gap is 0).
  *    (passings = getService(state).passings; m = marketingPerMonth.)
  *    Each new unit: pick a parcel on the segment weighted by its unsubscribed
- *    units, pick a tier by tierMix (rng), and connect it unless C has no free
+ *    units, pick a tier by tierMix for its kind (rng), and connect it unless C has no free
  *    port (cabinetPortCapacity - ports used; an apartment building that already
  *    has an account needs no new port: its router already holds one); a
  *    blocked unit is not connected and marks C full for today. Next, a unit
@@ -496,25 +585,27 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  *    sales.connectsTotal and month.grossAdds. Install spend posts as at most
  *    one 'install' ledger entry per day (memo like "Installs: 3 homes,
  *    1 business, 2 apartments + 1 building router"). A day that pauses
- *    installs posts an "Installs paused" notice unless they were already
- *    paused; the first day an install connects after a pause posts
- *    "Installs resumed".
- * 3. Accruals for the day (after signups): month.revenueDollarDays += the
- *    monthly rate of every subscribed unit (unitPrice per tier and kind);
- *    month.marketingDollarDays += marketingPerMonth; month.subscriberUnitDays +=
- *    subscribed units.
+ *    installs posts an 'installsPaused' notice and sets Sales.installsPaused
+ *    unless they were already paused; the first day an install connects
+ *    after a pause clears it and posts 'installsResumed'.
+ * 3. Accruals for the day (after signups, accrueDay): month.revenueDollarDays
+ *    += the monthly rate of every subscribed unit (unitPrice per tier and
+ *    kind); month.marketingDollarDays += marketingPerMonth;
+ *    month.subscriberUnitDays += subscribed units.
  * 4. fullCabinets := cabinets marked full today (sorted); post a 'cabinetFull'
  *    notice for each cabinet not in the previous list. Besides a blocked
  *    unit, a cabinet is marked full when demand left waiting on its segments
  *    (min(gap left, ports its open parcels without an account would take))
- *    finds no free port for a new account, and a cabinet already listed stays
- *    while that waiting demand exceeds its free ports. Without this, a full
- *    cabinet would drop out of the list on every day nobody happened to try
- *    to sign up (most days on a small area) and re-announce itself.
+ *    finds no free port for a new account (without this, a full cabinet would
+ *    drop out of the list on every day nobody happened to try to sign up, most
+ *    days on a small area, and re-announce itself). A cabinet already listed
+ *    also stays while that waiting demand, at today's ramp, would take all
+ *    its free ports within FULL_HOLD_DAYS. addSplitter takes a cabinet off
+ *    the list at once.
  */
 export function stepSales(state: GameState, rng: Rng): void {
   const service = getService(state);
-  dropLostService(state, service);
+  applyServiceChanges(state, service);
 
   const { city, sales, finance, day } = state;
   const parcels = city.parcels;
@@ -525,7 +616,11 @@ export function stepSales(state: GameState, rng: Rng): void {
     mdu: targetTakeRate(pricing, 'mdu'),
     smb: targetTakeRate(pricing, 'smb'),
   };
-  const mix = tierMix(pricing);
+  const mixes: Record<ParcelKind, Record<TierId, number>> = {
+    home: tierMix(pricing, 'home'),
+    mdu: tierMix(pricing, 'mdu'),
+    smb: tierMix(pricing, 'smb'),
+  };
   const m = sales.marketingPerMonth;
   const ramp = SIGNUP_RAMP_PER_DAY * (1 + marketingBoost(m, service.passings));
 
@@ -549,9 +644,10 @@ export function stepSales(state: GameState, rng: Rng): void {
   };
   const routers = new Set(sales.routerParcels);
   const fullToday = new Set<CabinetId>();
-  // Per serving cabinet: ports its remaining demand could still take today,
-  // and the fewest ports any one waiting new account needs.
-  const portDemand = new Map<CabinetId, number>();
+  // Per serving cabinet: new-port signups its waiting demand is expected to
+  // make per day (at today's ramp), and the fewest ports any one waiting new
+  // account needs.
+  const portDemandPerDay = new Map<CabinetId, number>();
   const minNewPorts = new Map<CabinetId, number>();
   const tally: InstallTally = { home: 0, smb: 0, mdu: 0, routers: 0 };
   let spend = 0;
@@ -611,7 +707,7 @@ export function stepSales(state: GameState, rng: Rng): void {
         if (r < free) break;
         r -= free;
       }
-      const tier = pickTier(mix, rng);
+      const tier = pickTier(mixes[parcels[chosen]?.kind ?? 'home'], rng);
       if (chosen < 0 || tier === null) continue;
       const parcel = parcels[chosen]!;
       const existing = accountAt[chosen] as number;
@@ -661,7 +757,7 @@ export function stepSales(state: GameState, rng: Rng): void {
     // Demand still waiting here that needs new ports on the server.
     const waiting = Math.min(gap - connectedHere, newPorts - portsTakenHere);
     if (waiting > 0) {
-      portDemand.set(server, (portDemand.get(server) ?? 0) + waiting);
+      portDemandPerDay.set(server, (portDemandPerDay.get(server) ?? 0) + waiting * ramp);
       minNewPorts.set(server, Math.min(minNewPorts.get(server) ?? Infinity, fewestPorts));
     }
   }
@@ -671,32 +767,33 @@ export function stepSales(state: GameState, rng: Rng): void {
   if (spend > 0) postEntry(state, 'install', -spend, installMemo(tally));
 
   if (cashBlockedCost !== null) {
-    if (!installsPaused(state)) {
+    if (!sales.installsPaused) {
+      sales.installsPaused = true;
       postNotice(
         state,
-        INSTALL_NOTICE_KIND,
+        'installsPaused',
         `${INSTALLS_PAUSED_PREFIX}: cash can't cover the next install (${formatMoney(cashBlockedCost)}). ` +
           'New customers will wait and be connected once cash recovers.',
       );
     }
-  } else if (connected > 0 && installsPaused(state)) {
-    postNotice(state, INSTALL_NOTICE_KIND, `${INSTALLS_RESUMED_PREFIX}: cash covers installs again, and waiting customers are being connected.`);
+  } else if (connected > 0 && sales.installsPaused) {
+    sales.installsPaused = false;
+    postNotice(state, 'installsResumed', `${INSTALLS_RESUMED_PREFIX}: cash covers installs again, and waiting customers are being connected.`);
   }
 
   // 3. Accruals, after today's signups.
-  const { rate, units } = billableRate(state);
-  sales.month.revenueDollarDays += rate;
-  sales.month.marketingDollarDays += m;
-  sales.month.subscriberUnitDays += units;
+  accrueDay(state);
 
   // 4. Cabinets turning signups away: a cabinet becomes full when it has no
-  // room for a waiting new account, and stays full while the demand waiting
-  // on it needs more ports than it has free (so a port freed by churn does not
-  // make it flicker out of the list and announce itself again).
+  // room for a waiting new account, and stays full while its waiting demand
+  // would take every free port within FULL_HOLD_DAYS (so a port freed by churn
+  // does not make it flicker out of the list and announce itself again, while
+  // a new splitter's ports do take it off).
   const previous = new Set(sales.fullCabinets);
-  for (const [cabinetId, demand] of portDemand) {
+  for (const [cabinetId, perDay] of portDemandPerDay) {
     const free = freePorts(cabinetId);
-    const full = previous.has(cabinetId) ? demand > free : free < (minNewPorts.get(cabinetId) ?? 1);
+    const noRoom = free < (minNewPorts.get(cabinetId) ?? 1);
+    const full = noRoom || (previous.has(cabinetId) && perDay * FULL_HOLD_DAYS >= free);
     if (full) fullToday.add(cabinetId);
   }
   sales.fullCabinets = [...fullToday].sort((a, b) => a - b);
@@ -707,6 +804,21 @@ export function stepSales(state: GameState, rng: Rng): void {
       cabinet: cabinetId,
     });
   }
+}
+
+/**
+ * One day's billing accruals at today's settings: month.revenueDollarDays +=
+ * the monthly rate of every subscribed unit, month.marketingDollarDays +=
+ * marketingPerMonth, month.subscriberUnitDays += subscribed units. Step 3 of
+ * stepSales; tick() also runs it for day 0, which gets no sales step, so the
+ * first month bills every one of its days.
+ */
+export function accrueDay(state: GameState): void {
+  const { sales } = state;
+  const { rate, units } = billableRate(state);
+  sales.month.revenueDollarDays += rate;
+  sales.month.marketingDollarDays += sales.marketingPerMonth;
+  sales.month.subscriberUnitDays += units;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,10 +837,16 @@ export interface SalesClose {
   lostService: number;
 }
 
-/** Monthly churn probability for a unit on `tier` at its current household price. */
-export function churnProbability(tier: Tier): number {
+/**
+ * Monthly churn probability for a unit of `kind` on `tier` at the price it
+ * pays: a household's is the tier price against its default price; a
+ * business's is price x smbMultiplier against default price x
+ * SMB_MULTIPLIER_DEFAULT (the same as a household's at the default multiplier).
+ */
+export function churnProbability(tier: Tier, kind: ParcelKind = 'home', smbMultiplier: number = SMB_MULTIPLIER_DEFAULT): number {
   const base = DEFAULT_PRICE[tier.id] ?? tier.price;
-  const over = base > 0 ? Math.max(0, tier.price - base) / base : 0;
+  const factor = kind === 'smb' ? smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
+  const over = base > 0 ? Math.max(0, tier.price * factor - base) / base : 0;
   return Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over));
 }
 
@@ -741,10 +859,11 @@ export function churnProbability(tier: Tier): number {
  * 2. 'marketing' -round(month.marketingDollarDays / daysInMonth) (skip if 0).
  * 3. 'overhead' -round(SUPPORT_COST_PER_SUB_PER_MONTH x month.subscriberUnitDays / daysInMonth) (skip if 0), memo "Customer support".
  * 4. Churn: every subscribed unit (accounts ascending, tiers in TIER_IDS order)
- *    cancels with probability min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE x (1 +
- *    CHURN_PRICE_SENSITIVITY x max(0, price - default price) / default price))
- *    using its tier's household price; accounts left with 0 units are removed
- *    (routers stay in routerParcels).
+ *    cancels with probability churnProbability(tier, kind, smbMultiplier):
+ *    min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE x (1 + CHURN_PRICE_SENSITIVITY
+ *    x max(0, price - default price) / default price)), a business's price and
+ *    default both multiplied (see churnProbability); accounts left with 0
+ *    units are removed (routers stay in routerParcels).
  * 5. Reset `month` to emptyMonthAccrual() and return the figures (subscriber
  *    days, grossAdds and lostService from the accrual before the reset).
  */
@@ -765,15 +884,19 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
   const support = Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * month.subscriberUnitDays) / daysInMonth);
   if (support !== 0) postEntryOn(state, lastDay, 'overhead', -support, 'Customer support');
 
-  const churnP = zeroTiers();
-  for (const tier of sales.pricing.tiers) churnP[tier.id] = churnProbability(tier);
+  const pricing = sales.pricing;
+  const churnP: Record<ParcelKind, Record<TierId, number>> = { home: zeroTiers(), mdu: zeroTiers(), smb: zeroTiers() };
+  for (const tier of pricing.tiers) {
+    for (const kind of ['home', 'mdu', 'smb'] as const) churnP[kind][tier.id] = churnProbability(tier, kind, pricing.smbMultiplier);
+  }
   let churned = 0;
   let emptied = false;
   for (const account of sales.accounts) {
+    const p = churnP[state.city.parcels[account.parcel]?.kind ?? 'home'];
     for (const id of TIER_IDS) {
       const units = account.tierUnits[id];
       let left = units;
-      for (let u = 0; u < units; u++) if (rng.chance(churnP[id])) left--;
+      for (let u = 0; u < units; u++) if (rng.chance(p[id])) left--;
       churned += units - left;
       account.tierUnits[id] = left;
     }

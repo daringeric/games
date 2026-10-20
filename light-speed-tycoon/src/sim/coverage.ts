@@ -6,10 +6,10 @@
 
 import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, SPLITTER_COST } from './balance';
 import { cppBand } from './metrics';
-import { getService, plannedService, spanCharges } from './network';
+import { getService, orderFees, plannedService, segmentsLitByCabinetAt, spanCharges } from './network';
 import { isNodeId, parcelsServedBy, segmentsWithin } from './streets';
 import type { SegmentReach } from './streets';
-import type { City, CoveragePreview, CoverageSegment, GameState, Network, NodeId, StreetSegment } from './types';
+import type { CableMethod, City, CoveragePreview, CoverageSegment, GameState, Network, NodeId, StreetSegment } from './types';
 
 export type { SegmentReach } from './streets';
 
@@ -46,10 +46,12 @@ function emptyPreview(node: NodeId): CoveragePreview {
   };
 }
 
-/** Cheapest buildable cable on a segment before per-order fees: aerial where poled, else underground. */
-function cheapestBuildCost(segment: StreetSegment): number {
+/** Cheapest buildable cable on a segment before per-order fees: aerial where poled (unless boring is cheaper), else underground. */
+function cheapestBuild(segment: StreetSegment): { method: CableMethod; total: number } {
   const underground = spanCharges(segment, 'underground').total;
-  return segment.hasPoles ? Math.min(spanCharges(segment, 'aerial').total, underground) : underground;
+  if (!segment.hasPoles) return { method: 'underground', total: underground };
+  const aerial = spanCharges(segment, 'aerial').total;
+  return aerial <= underground ? { method: 'aerial', total: aerial } : { method: 'underground', total: underground };
 }
 
 interface PreviewCacheEntry {
@@ -66,14 +68,17 @@ const previewCache = new WeakMap<GameState, PreviewCacheEntry>();
 /**
  * What a cabinet at `node` could cover, measured along streets with
  * CABINET_REACH_FT (cable not required). See CoveragePreview for every field.
- * Uses getService(state) for `connected` (live cable today) and
+ * Uses getService(state) for `connected` (live cable today),
+ * network.segmentsLitByCabinetAt for `litOnPlacement` (the real coverage rule,
+ * along today's live cable, against today's active cabinets) and
  * plannedService(state) for `servedBy`: the cabinet that will serve the
  * segment once everything already ordered is built, so a cabinet still
  * permitting or under construction counts too (a cabinet already at `node`
  * never counts as "elsewhere"). The cabinet's list price for
  * cabinetCost (CABINET_COST + CABINET_START_SPLITTERS x SPLITTER_COST, or 0
  * when a cabinet already stands at `node`; cash and PON ports are not checked
- * here), and per-segment cheapest cable charges (network.spanCharges) for
+ * here), and per-segment cheapest cable charges (network.spanCharges) plus the
+ * per-order fees (network.orderFees) of one order per method used for
  * buildOutCost. Parcels count by Parcel.segment only. An invalid node returns
  * an empty preview (no segments, zero counts and costs, null CPP). Memoized per
  * (state, network.version, day, node). Treat the result as read-only.
@@ -96,15 +101,18 @@ export function coveragePreview(state: GameState, node: NodeId): CoveragePreview
   const planned = plannedService(state);
   const here = network.cabinets.find((c) => c.node === node);
   const cabled = new Set(network.spans.map((s) => s.segment));
+  const litHere = segmentsLitByCabinetAt(state, node);
+  const methods = new Set<CableMethod>();
   const preview = emptyPreview(node);
   preview.cabinetCost = here ? 0 : CABINET_COST + CABINET_START_SPLITTERS * SPLITTER_COST;
   preview.ports = CABINET_START_SPLITTERS * SPLIT_RATIO;
 
   for (const { segment, distanceFt } of segmentsWithin(city, node, CABINET_REACH_FT)) {
     const connected = service.connectedSegments.has(segment);
+    const litOnPlacement = litHere.has(segment);
     const server = planned.servingCabinet.get(segment);
     const servedBy = server === undefined || server === here?.id ? null : server;
-    const entry: CoverageSegment = { segment, distanceFt, connected, servedBy };
+    const entry: CoverageSegment = { segment, distanceFt, connected, litOnPlacement, servedBy };
     preview.segments.push(entry);
 
     for (const pid of parcelsServedBy(city, segment)) {
@@ -116,10 +124,16 @@ export function coveragePreview(state: GameState, node: NodeId): CoveragePreview
       }
       preview.passingsNow += parcel.units;
       if (servedBy !== null) preview.passingsServedElsewhere += parcel.units;
-      else if (connected) preview.passingsPassableToday += parcel.units;
+      else if (litOnPlacement) preview.passingsPassableToday += parcel.units;
     }
-    if (!cabled.has(segment)) preview.buildOutCost += cheapestBuildCost(city.segments[segment] as StreetSegment);
+    if (!cabled.has(segment)) {
+      const build = cheapestBuild(city.segments[segment] as StreetSegment);
+      preview.buildOutCost += build.total;
+      methods.add(build.method);
+    }
   }
+  // Engineering and the right-of-way application, as a cable quote charges them.
+  for (const method of methods) preview.buildOutCost += orderFees(method);
 
   const newlyCovered = preview.passingsNow - preview.passingsServedElsewhere;
   if (newlyCovered > 0) {

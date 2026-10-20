@@ -82,7 +82,8 @@ import { canAfford, formatMoney, groupThousands, postEntry } from './finance';
 import { cppBand } from './metrics';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
-import { accountUnits } from './sales';
+import { accountUnits, serviceChanges } from './sales';
+import type { ServiceView } from './sales';
 import {
   cornerName,
   isNodeId,
@@ -299,6 +300,8 @@ interface Reach {
   active: CabinetId[];
   /** Lit segment -> nearest active cabinet and its cable distance, ascending by segment id. */
   serving: Map<SegmentId, { cabinet: CabinetId; distanceFt: number }>;
+  /** Lit segment -> every active cabinet within reach of it, nearest first (ties -> lower id). */
+  reachers: Map<SegmentId, CabinetId[]>;
 }
 
 /**
@@ -336,6 +339,7 @@ function computeReach(
     .sort((a, b) => a.id - b.id);
 
   const best = new Map<SegmentId, { cabinet: CabinetId; distanceFt: number }>();
+  const within = new Map<SegmentId, { cabinet: CabinetId; distanceFt: number }[]>();
   if (connected.size > 0) {
     const onCable = (seg: StreetSegment) => connected.has(seg.id);
     for (const cabinet of active) {
@@ -343,11 +347,25 @@ function computeReach(
         const current = best.get(segment);
         // Cabinets come in ascending id order, so a tie keeps the lower id.
         if (!current || distanceFt < current.distanceFt) best.set(segment, { cabinet: cabinet.id, distanceFt });
+        let list = within.get(segment);
+        if (!list) within.set(segment, (list = []));
+        list.push({ cabinet: cabinet.id, distanceFt });
       }
     }
   }
   const serving = new Map([...best].sort((a, b) => a[0] - b[0]));
-  return { connected, reached, active: active.map((c) => c.id), serving };
+  const reachers = new Map<SegmentId, CabinetId[]>();
+  for (const segment of serving.keys()) {
+    // Stable sort over ascending ids: equal distances keep the lower id first.
+    const list = (within.get(segment) ?? []).sort((a, b) => a.distanceFt - b.distanceFt);
+    reachers.set(segment, list.map((r) => r.cabinet));
+  }
+  return { connected, reached, active: active.map((c) => c.id), serving, reachers };
+}
+
+/** What sales.serviceChanges needs from a network's reach. */
+function serviceView(reach: Reach): ServiceView {
+  return { activeCabinets: new Set(reach.active), segmentCabinets: reach.reachers };
 }
 
 // ---------------------------------------------------------------------------
@@ -638,14 +656,30 @@ function reachWithoutSpan(state: GameState, span: SpanId): Reach {
   return reach;
 }
 
+// The last "network without this cabinet" per state: hovering one cabinet is free.
+const cabinetRemovalCache = new WeakMap<GameState, { network: Network; version: number; cabinet: CabinetId; reach: Reach }>();
+
+/** The coverage rule on the live network minus one cabinet (memoized per state, network version and cabinet). */
+function reachWithoutCabinet(state: GameState, cabinet: CabinetId): Reach {
+  const { network } = state;
+  const cached = cabinetRemovalCache.get(state);
+  if (cached && cached.network === network && cached.version === network.version && cached.cabinet === cabinet) return cached.reach;
+  const live = new Set<SegmentId>();
+  for (const s of network.spans) if (s.stage === 'live') live.add(s.segment);
+  const reach = computeReach(state.city, live, network.cabinets.filter((c) => c.stage === 'live' && c.id !== cabinet));
+  cabinetRemovalCache.set(state, { network, version: network.version, cabinet, reach });
+  return reach;
+}
+
 /**
  * Estimate removing a span without changing state: the refund (while
  * permitting) and, for a live span, who loses service. Removing live cable
  * can cut off more than its own street: everything beyond it that no longer
- * connects to the CO, or that falls out of its cabinet's reach, goes dark. A
- * subscriber is affected when their street would no longer be lit or their
- * cabinet would no longer be active (sales.stepSales drops them next day).
- * Only blocker: unknown span ("Unknown cable span: 7").
+ * connects to the CO, or that falls out of every cabinet's reach, goes dark. A
+ * subscriber is affected when the next daily step (sales.serviceChanges) would
+ * drop them with the span gone but not with it: their street no longer lit,
+ * or their cabinet no longer reaching it and no other cabinet in reach with a
+ * free port to take them. Only blocker: unknown span ("Unknown cable span: 7").
  */
 export function quoteRemoveSpan(state: GameState, span: SpanId): RemoveSpanQuote {
   const target = state.network.spans.find((s) => s.id === span);
@@ -663,14 +697,8 @@ export function quoteRemoveSpan(state: GameState, span: SpanId): RemoveSpanQuote
 
   const { city, day } = state;
   const after = reachWithoutSpan(state, span);
-  const active = new Set(after.active);
-  for (const account of state.sales.accounts) {
-    const parcel = city.parcels[account.parcel];
-    if (!parcel || !after.serving.has(parcel.segment) || !active.has(account.cabinet)) {
-      quote.subscribersAffected += accountUnits(account);
-    }
-  }
   const service = getService(state);
+  quote.subscribersAffected = newlyDroppedUnits(state, service, serviceView(after));
   let passingsAfter = 0;
   for (const pid of service.passedParcels) {
     const parcel = city.parcels[pid];
@@ -843,9 +871,10 @@ export function quoteSplitter(state: GameState, cabinet: CabinetId): SplitterQuo
 /**
  * addSplitter command: if quoteSplitter is ok, splitters += 1, cabinet.cost +=
  * SPLITTER_COST, capex.osp += SPLITTER_COST, post 'equipment' -SPLITTER_COST
- * ("Splitter added at <corner> (2 x 1:32)"), network.version++, and an
- * 'oltFull' notice if that used the last free PON port. Otherwise reject with
- * the reasons joined by "; " and change nothing.
+ * ("Splitter added at <corner> (2 x 1:32)"), network.version++, take the
+ * cabinet off Sales.fullCabinets, and an 'oltFull' notice if that used the
+ * last free PON port. Otherwise reject with the reasons joined by "; " and
+ * change nothing.
  */
 export function addSplitter(state: GameState, cabinet: CabinetId): CommandResult {
   const quote = quoteSplitter(state, cabinet);
@@ -855,6 +884,11 @@ export function addSplitter(state: GameState, cabinet: CabinetId): CommandResult
   target.splitters += 1;
   target.cost += SPLITTER_COST;
   state.network.version++;
+  // It has SPLIT_RATIO free ports now: no longer turning signups away (stepSales
+  // lists it again, with a new notice, when those run out).
+  if (state.sales.fullCabinets.includes(cabinet)) {
+    state.sales.fullCabinets = state.sales.fullCabinets.filter((id) => id !== cabinet);
+  }
   state.finance.capex.osp += SPLITTER_COST;
   postEntry(
     state,
@@ -867,9 +901,26 @@ export function addSplitter(state: GameState, cabinet: CabinetId): CommandResult
 }
 
 /**
+ * Units the next daily step would drop on the network `after` that it would
+ * not drop on today's (`now`), plus those on `onCabinet` that it drops either
+ * way (sales.serviceChanges decides both).
+ */
+function newlyDroppedUnits(state: GameState, now: ServiceView, after: ServiceView, onCabinet?: CabinetId): number {
+  const doomed = new Set(serviceChanges(state, now).drops.map((d) => d.index));
+  let units = 0;
+  for (const { index } of serviceChanges(state, after).drops) {
+    const account = state.sales.accounts[index];
+    if (account && (!doomed.has(index) || account.cabinet === onCabinet)) units += accountUnits(account);
+  }
+  return units;
+}
+
+/**
  * Estimate removing a cabinet: refund = round(cost x CABINET_CANCEL_REFUND)
  * while permitting, else 0; ponPortsFreed = its splitters;
- * subscribersAffected = units on accounts whose cabinet is this one. Only
+ * subscribersAffected = units the next daily step would drop without it
+ * (sales.serviceChanges): its subscribers that no other active cabinet in
+ * reach of their street has a free port for (the others move there). Only
  * blocker: unknown cabinet ("Unknown cabinet: 7").
  */
 export function quoteRemoveCabinet(state: GameState, cabinet: CabinetId): RemoveCabinetQuote {
@@ -878,10 +929,8 @@ export function quoteRemoveCabinet(state: GameState, cabinet: CabinetId): Remove
     const reasons = [`Unknown cabinet: ${String(cabinet)}`];
     return { ok: false, reasons, refund: 0, ponPortsFreed: 0, subscribersAffected: 0 };
   }
-  let subscribersAffected = 0;
-  for (const account of state.sales.accounts) {
-    if (account.cabinet === target.id) subscribersAffected += accountUnits(account);
-  }
+  const subscribersAffected =
+    state.sales.accounts.length > 0 ? newlyDroppedUnits(state, getService(state), serviceView(reachWithoutCabinet(state, target.id)), target.id) : 0;
   return {
     ok: true,
     reasons: [],
@@ -1030,6 +1079,7 @@ function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
   const litSegments = new Set<SegmentId>();
   const servingCabinet = new Map<SegmentId, CabinetId>();
   const servingDistanceFt = new Map<SegmentId, number>();
+  const segmentCabinets = new Map<SegmentId, readonly CabinetId[]>();
   const cabinetCoverage = new Map<CabinetId, CabinetCoverage>();
   for (const id of reach.active) cabinetCoverage.set(id, { segments: [], parcels: 0, passings: 0 });
   // reach.serving is ascending by segment, so every list below comes out ascending.
@@ -1037,6 +1087,7 @@ function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
     litSegments.add(segment);
     servingCabinet.set(segment, cabinet);
     servingDistanceFt.set(segment, distanceFt);
+    segmentCabinets.set(segment, reach.reachers.get(segment) ?? [cabinet]);
     cabinetCoverage.get(cabinet)?.segments.push(segment);
   }
 
@@ -1065,10 +1116,42 @@ function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
     activeCabinets: new Set(reach.active),
     servingCabinet,
     servingDistanceFt,
+    segmentCabinets,
     cabinetCoverage,
     passedParcels,
     passings,
   };
+}
+
+/**
+ * The lit segments a live cabinet at `node` would serve today: the coverage
+ * rule (computeReach) on today's live cable and active cabinets plus a live
+ * cabinet at `node`, keeping only the segments that cabinet would win. It is
+ * active only when `node` is the CO or touches CO-connected live cable, and it
+ * reaches along that cable (not along streets). It takes the id of the cabinet
+ * already standing at `node`, else the id the next one would get
+ * (state.nextId), so equal-distance ties go to existing cabinets as they will.
+ * Empty for an invalid node. The cabinet placement preview uses it.
+ */
+export function segmentsLitByCabinetAt(state: GameState, node: NodeId): Set<SegmentId> {
+  const { city, network } = state;
+  const out = new Set<SegmentId>();
+  if (!isNodeId(city, node)) return out;
+  const service = getService(state);
+  const connected = service.connectedSegments;
+  const reached = node === city.coNode || segmentsAtNode(city, node).some((id) => connected.has(id));
+  if (!reached || connected.size === 0) return out;
+  const id = network.cabinets.find((c) => c.node === node)?.id ?? state.nextId;
+  const onCable = (seg: StreetSegment) => connected.has(seg.id);
+  for (const { segment, distanceFt } of segmentsWithin(city, node, CABINET_REACH_FT, onCable)) {
+    const server = service.servingCabinet.get(segment);
+    const best = service.servingDistanceFt.get(segment);
+    // Nearest wins, ties to the lower id: the same order computeReach uses.
+    if (server === undefined || best === undefined || server === id || distanceFt < best || (distanceFt === best && id < server)) {
+      out.add(segment);
+    }
+  }
+  return out;
 }
 
 /** Who serves what once everything already ordered is built. */

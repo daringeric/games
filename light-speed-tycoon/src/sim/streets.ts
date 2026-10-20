@@ -315,7 +315,9 @@ export function nearestNode(city: City, x: number, y: number): NodeId {
   let best2 = Infinity;
   searchRings(index, index.nodes, x, y, Infinity, (id) => {
     const n = city.nodes[id] as StreetNode;
-    const d2 = (n.x - x) ** 2 + (n.y - y) ** 2;
+    const ex = n.x - x;
+    const ey = n.y - y;
+    const d2 = ex * ex + ey * ey;
     if (d2 < best2 || (d2 === best2 && id < best)) {
       best = id;
       best2 = d2;
@@ -331,7 +333,9 @@ function segmentDist2(x: number, y: number, ax: number, ay: number, bx: number, 
   const dy = by - ay;
   const len2 = dx * dx + dy * dy;
   const t = len2 === 0 ? 0 : Math.min(1, Math.max(0, ((x - ax) * dx + (y - ay) * dy) / len2));
-  return (ax + t * dx - x) ** 2 + (ay + t * dy - y) ** 2;
+  const ex = ax + t * dx - x;
+  const ey = ay + t * dy - y;
+  return ex * ex + ey * ey;
 }
 
 /**

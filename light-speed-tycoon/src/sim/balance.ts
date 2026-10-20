@@ -172,6 +172,9 @@ export const INCUMBENT_UP_MBPS = 20;
 //   advantage = max over offered tiers of value(t) - incumbent
 //   target    = clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE x advantage, TAKE_RATE_MIN, TAKE_RATE_MAX)
 //               x TAKE_RATE_KIND_FACTOR[kind]
+// Businesses value a tier at the price they pay against the incumbent's
+// business price (INCUMBENT_PRICE x SMB_MULTIPLIER_DEFAULT): their price term
+// is multiplied by smbMultiplier / SMB_MULTIPLIER_DEFAULT (1 at the default).
 // ---------------------------------------------------------------------------
 
 export const TAKE_SPEED_WEIGHT = 0.2;
@@ -214,6 +217,8 @@ export const MARKETING_HALF_SAT_PER_PASSING = 3;
 // Churn (at each month close, per subscribed unit)
 //   p = min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE x (1 + CHURN_PRICE_SENSITIVITY
 //       x max(0, price_t - default price_t) / default price_t))
+// (a business's price_t and default price_t both times its multiplier:
+// smbMultiplier and SMB_MULTIPLIER_DEFAULT).
 // ---------------------------------------------------------------------------
 
 export const CHURN_MONTHLY_BASE = 0.011;

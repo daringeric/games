@@ -594,6 +594,7 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
     id: s.segment,
     t: Math.round((s.distanceFt / preview.reachFt) * 100) / 100,
     elsewhere: s.servedBy !== null,
+    lit: s.servedBy === null && s.litOnPlacement,
   }));
   return {
     overlay: { snap: node, cabinet: { node, ok: quote.ok }, reach },
@@ -608,7 +609,7 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
         },
         { label: 'Already served', value: formatNumber(preview.passingsServedElsewhere) },
         { label: 'Passable today', value: formatNumber(preview.passingsPassableToday) },
-        { label: 'Cable to finish', value: formatMoney(preview.buildOutCost) },
+        { label: 'Cable to finish', value: formatMoney(preview.buildOutCost), sub: preview.buildOutCost > 0 ? 'incl. order fees' : undefined },
         preview.projectedCpp === null
           ? { label: 'Cost per passing', value: 'Nothing new to pass', tone: 'muted' }
           : {
@@ -623,7 +624,7 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
       ],
       blockers: quote.reasons,
       hint: quote.ok
-        ? `${touch ? 'Tap again' : 'Click'} to place. It serves streets within ${formatFeet(preview.reachFt)} once cable joins it to the CO.`
+        ? `${touch ? 'Tap again' : 'Click'} to place. It lights streets within ${formatFeet(preview.reachFt)} along cable joined to the CO: solid streets light today, shaded ones once cabled.`
         : undefined,
     },
   };

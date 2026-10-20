@@ -25,6 +25,7 @@ import {
   PERMIT_FEE_UNDERGROUND,
   POLE_RENT_PER_POLE_PER_MONTH,
   SMB_MULTIPLIER_MAX,
+  SMB_MULTIPLIER_MIN,
   SPLITTER_COST,
   SUPPORT_COST_PER_SUB_PER_MONTH,
   TIER_PRICE_MAX,
@@ -46,7 +47,7 @@ import { debugHookEnabled, searchWithoutSeed } from './debugHook';
 import { formatFeet, formatMoney, formatPerFt, formatPercent, formatSignedMoney, plural } from './format';
 import { cppStatus, overdraftStatus, ponStatus, runwayHint } from './hud';
 import { milestoneRows } from './milestonesPanel';
-import { noticeTone } from './overlays';
+import { noticeTone, toastLayout } from './overlays';
 import { monthClosedMessage, reportRows, subscriberMovements } from './panel';
 import type { ReportRow } from './panel';
 import { boostHint, draftFrom, incumbentOffer, parseNumberField, pricingPreview } from './pricingPanel';
@@ -227,6 +228,15 @@ describe('pricing preview', () => {
     expect(p.boost).toBe(marketingBoost(2_500, 800));
     // A cheaper gig tier raises the target take rate.
     expect(p.takeRate!.home).toBeGreaterThan(targetTakeRate(pricing, 'home'));
+  });
+
+  it('lowers the business take rate as the business multiplier rises, leaving households alone', () => {
+    const at = (m: number) => pricingPreview(pricing, draft((x) => (x.smbMultiplier = m)), 100).takeRate!;
+    const low = at(SMB_MULTIPLIER_MIN);
+    const high = at(SMB_MULTIPLIER_MAX);
+    expect(high.smb).toBeLessThan(low.smb);
+    expect(high.home).toBe(low.home);
+    expect(high.mdu).toBe(low.mdu);
   });
 
   it('flags an out-of-range or missing price and previews nothing for the tiers', () => {
@@ -442,9 +452,39 @@ describe('notice tones', () => {
     expect(noticeTone(notice('gameOver'))).toBe('err');
   });
 
-  it('tells install pauses (trouble) from resumes (good news)', () => {
-    expect(noticeTone(notice('insolvencyWarning', `${INSTALLS_PAUSED_PREFIX}: cash is short`))).toBe('warn');
-    expect(noticeTone(notice('insolvencyWarning', `${INSTALLS_RESUMED_PREFIX}: cash is back`))).toBe('ok');
+  it('tells install pauses (trouble) from resumes (good news) by kind, not by wording', () => {
+    expect(noticeTone(notice('installsPaused', `${INSTALLS_PAUSED_PREFIX}: cash is short`))).toBe('warn');
+    expect(noticeTone(notice('installsResumed', `${INSTALLS_RESUMED_PREFIX}: cash is back`))).toBe('ok');
+    expect(noticeTone(notice('installsResumed', 'Back in business'))).toBe('ok');
+    // A cash warning is a warning whatever it says.
+    expect(noticeTone(notice('insolvencyWarning', `${INSTALLS_RESUMED_PREFIX}: cash is back`))).toBe('warn');
+  });
+});
+
+describe('toast layout', () => {
+  const box = (left: number, top: number, right: number, bottom: number) => ({ left, top, right, bottom });
+
+  it('keeps the stylesheet spot when nothing is under the toast column', () => {
+    // Desktop: report panel bottom-right, toolbar down the left.
+    const layout = toastLayout({ viewW: 1440, viewH: 900, baseBottom: 18, hudBottom: 120, panel: box(1128, 600, 1428, 888), toolbar: box(12, 300, 78, 600) });
+    expect(layout).toEqual({ center: null, maxWidth: null, bottom: 18, maxHeight: 900 - 18 - 120 - 10 });
+  });
+
+  it('moves beside the report panel when there is room between it and the toolbar', () => {
+    // 932 x 430: the centred column would reach over the panel.
+    const panel = box(620, 281, 920, 418);
+    const layout = toastLayout({ viewW: 932, viewH: 430, baseBottom: 18, hudBottom: 110, panel, toolbar: box(12, 60, 78, 400) });
+    expect(layout.bottom).toBe(18);
+    expect(layout.center! + layout.maxWidth! / 2).toBeLessThanOrEqual(panel.left);
+    expect(layout.center! - layout.maxWidth! / 2).toBeGreaterThanOrEqual(78);
+  });
+
+  it('stacks above a full-width panel and toolbar on phones, no higher than the HUD', () => {
+    const panel = box(8, 227, 732, 276);
+    const layout = toastLayout({ viewW: 740, viewH: 360, baseBottom: 136, hudBottom: 100, panel, toolbar: box(190, 290, 550, 352) });
+    expect(layout.center).toBeNull();
+    expect(360 - layout.bottom).toBeLessThanOrEqual(panel.top);
+    expect(layout.maxHeight).toBe(360 - layout.bottom - 100 - 10);
   });
 });
 

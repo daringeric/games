@@ -92,7 +92,7 @@ export function pricingPreview(base: Pricing, draft: PricingDraft, passings: num
   if (!marketingOk) problems.push(`Marketing must be a whole number from $0 to ${formatMoney(MARKETING_MAX_PER_MONTH)} a month`);
 
   const boost = marketingOk ? marketingBoost(m, passings) : null;
-  // Take rates and the mix depend only on the tiers.
+  // Take rates and the mix need valid tiers (the business take rate also follows the multiplier).
   if (tierProblems.length > 0) return { valid: false, problems, takeRate: null, mix: null, smbPrices: null, boost };
 
   const pricing: Pricing = {

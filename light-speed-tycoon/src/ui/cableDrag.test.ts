@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { newGame } from '../sim/game';
+import { segmentBetween } from '../sim/streets';
+import { TUNING_SEEDS } from '../sim/tuning/harness';
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { GameState } from '../sim/types';
 import { CableDrag, routeThrough } from './cableDrag';
@@ -44,6 +46,70 @@ describe('CableDrag', () => {
     // Around the first block and on along 1st St again.
     for (const node of [1, 5, 4, 0, 1, 2]) drag.visit(node);
     expect(drag.route(state)).toEqual([0, 10, 3, 9, 1]);
+  });
+});
+
+describe('CableDrag on a generated town', () => {
+  /** Drag the pointer in a straight line from one corner to another in `steps` moves. */
+  function dragAlong(state: GameState, drag: CableDrag, from: number, to: number, steps = 40): void {
+    const a = state.city.nodes[from]!;
+    const b = state.city.nodes[to]!;
+    for (let i = 1; i <= steps; i++) drag.moveTo(state.city, a.x + ((b.x - a.x) * i) / steps, a.y + ((b.y - a.y) * i) / steps);
+  }
+
+  it('keeps to the street being dragged when a corner on a parallel street is nearer', () => {
+    // Seed 1: Water St runs 420 ft from node 104 to node 105; a Hawthorn Ave corner
+    // two cells north is nearer to the pointer than either end at a third of the way.
+    const state = newGame(1);
+    const segment = segmentBetween(state.city, 104, 105)!;
+    expect(state.city.segments[segment]!.name).toBe('Water St');
+    for (const method of ['aerial', 'underground'] as const) {
+      const drag = new CableDrag(method, 104);
+      const a = state.city.nodes[104]!;
+      const b = state.city.nodes[105]!;
+      for (let i = 1; i <= 40; i++) {
+        drag.moveTo(state.city, a.x + ((b.x - a.x) * i) / 40, a.y + ((b.y - a.y) * i) / 40);
+        // Never a corner off Water St.
+        expect([[104], [104, 105]]).toContainEqual([...drag.corners]);
+      }
+      expect(drag.route(state)).toEqual([segment]);
+    }
+  });
+
+  it.each(TUNING_SEEDS)('draws exactly the dragged street for every single-street drag, both ways, on town %i', (seed) => {
+    const state = newGame(seed);
+    const wrong: string[] = [];
+    for (const seg of state.city.segments) {
+      for (const [from, to] of [[seg.a, seg.b], [seg.b, seg.a]] as const) {
+        const drag = new CableDrag('underground', from);
+        dragAlong(state, drag, from, to);
+        const route = drag.route(state);
+        if (route?.length !== 1 || route[0] !== seg.id) wrong.push(`${from}->${to}: ${JSON.stringify(route)}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  it('follows a street across several corners in one drag', () => {
+    // Seed 1: Main St west from the CO (143) through 142 to 141, all poled.
+    const state = newGame(1);
+    expect(state.city.coNode).toBe(143);
+    const first = segmentBetween(state.city, 143, 142)!;
+    const second = segmentBetween(state.city, 142, 141)!;
+    const drag = new CableDrag('aerial', 143);
+    dragAlong(state, drag, 143, 142);
+    dragAlong(state, drag, 142, 141);
+    expect(drag.corners).toEqual([143, 142, 141]);
+    expect(drag.route(state)).toEqual([first, second]);
+  });
+
+  it('still jumps to a corner the pointer cuts across to, and routes the streets between', () => {
+    const state = game();
+    const drag = new CableDrag('underground', 0);
+    // Diagonally across the first block to the corner at (4, 2).
+    for (let i = 1; i <= 20; i++) drag.moveTo(state.city, (4 * i) / 20, (2 * i) / 20);
+    expect(drag.last).toBe(5);
+    expect(drag.route(state)).toHaveLength(2);
   });
 });
 

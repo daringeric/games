@@ -14,10 +14,13 @@ import {
   MARKETING_MAX_PER_MONTH,
   MDU_PORTS_PER_BUILDING,
   MDU_ROUTER_COST,
+  NOTICE_LOG_MAX,
   OVERHEAD_PER_MONTH,
+  SMB_MULTIPLIER_DEFAULT,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
   SPLIT_RATIO,
+  SPLITTER_COST,
   START_CASH,
   SUPPORT_COST_PER_SUB_PER_MONTH,
   TAKE_PRICE_WEIGHT,
@@ -35,16 +38,17 @@ import {
   TIER_PRICE_MIN,
 } from './balance';
 import { applyCommand, newGame, runDays } from './game';
-import { getService } from './network';
+import { getService, quoteRemoveCabinet, quoteRemoveSpan } from './network';
+import { postNotice } from './notices';
 import { withRng } from './rng';
 import {
   accountPorts,
   accountUnits,
+  cabinetPortCapacity,
   cabinetPortsUsed,
   churnProbability,
   closeSalesMonth,
   defaultPricing,
-  INSTALL_NOTICE_KIND,
   INSTALLS_PAUSED_PREFIX,
   INSTALLS_RESUMED_PREFIX,
   installCost,
@@ -197,10 +201,40 @@ describe('targetTakeRate', () => {
     const pricing = pricingWith({}, { fiber500: false, fiber1g: false, fiber2g: false });
     expect(targetTakeRate(pricing, 'home')).toBe(0);
   });
+
+  it('prices businesses out as the business multiplier rises, and leaves households alone', () => {
+    const at = (smbMultiplier: number): Pricing => ({ ...defaultPricing(), smbMultiplier });
+    const rates: number[] = [];
+    for (let m = SMB_MULTIPLIER_MIN; m <= SMB_MULTIPLIER_MAX; m += 0.5) {
+      rates.push(targetTakeRate(at(m), 'smb'));
+      expect(targetTakeRate(at(m), 'home')).toBe(targetTakeRate(defaultPricing(), 'home'));
+      expect(targetTakeRate(at(m), 'mdu')).toBe(targetTakeRate(defaultPricing(), 'mdu'));
+    }
+    for (let i = 1; i < rates.length; i++) expect(rates[i]).toBeLessThan(rates[i - 1]!);
+    // At the default multiplier a business values a tier exactly as a household does.
+    expect(targetTakeRate(at(SMB_MULTIPLIER_DEFAULT), 'smb')).toBe(targetTakeRate(defaultPricing(), 'smb'));
+    expect(targetTakeRate(defaultPricing(), 'smb')).toBeCloseTo(targetTakeRate(defaultPricing(), 'home') * TAKE_RATE_KIND_FACTOR.smb, 12);
+    // Below it, businesses sign up more readily.
+    expect(targetTakeRate(at(SMB_MULTIPLIER_MIN), 'smb')).toBeGreaterThan(targetTakeRate(defaultPricing(), 'smb'));
+  });
 });
 
 describe('tierMix', () => {
   const sum = (mix: Record<TierId, number>) => TIER_IDS.reduce((s, id) => s + mix[id], 0);
+
+  it('mixes business signups on the price they pay', () => {
+    const pricing = defaultPricing();
+    expect(tierMix(pricing, 'smb')).toEqual(tierMix(pricing));
+    expect(tierMix(pricing, 'mdu')).toEqual(tierMix(pricing));
+    // Dearer business prices push businesses from the dearest tier toward the cheapest.
+    // (A little dearer: far enough up, no tier beats the incumbent and offered tiers split evenly.)
+    const dearer = SMB_MULTIPLIER_DEFAULT * 1.25;
+    const dear = tierMix({ ...pricing, smbMultiplier: dearer }, 'smb');
+    expect(sum(dear)).toBeCloseTo(1, 12);
+    expect(dear.fiber500).toBeGreaterThan(tierMix(pricing).fiber500);
+    expect(dear.fiber2g).toBeLessThan(tierMix(pricing).fiber2g);
+    expect(tierMix({ ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX })).toEqual(tierMix(pricing));
+  });
 
   it('splits signups over offered tiers by popularity x advantage', () => {
     const pricing = defaultPricing();
@@ -471,6 +505,35 @@ describe('splitter ports', () => {
     expect(state.notices.filter((n) => n.kind === 'cabinetFull')).toHaveLength(1);
   });
 
+  it('drops a full cabinet from the list when one splitter is added, and announces it again when it really fills', () => {
+    // 192 homes: the street gap is far larger than the 32 ports one more splitter adds.
+    const city = makeGridCity({ cols: 4, rows: 4, blockW: 6, coAt: [2, 2] });
+    const { state, cabinet } = litTown({ city, splitters: 1, marketing: LOUD });
+    const free = () => cabinetPortCapacity(state.network.cabinets[0]!) - (cabinetPortsUsed(state).get(cabinet) ?? 0);
+    for (let d = 0; d < 365 && !state.sales.fullCabinets.includes(cabinet); d++) runDays(state, 1);
+    expect(state.sales.fullCabinets).toEqual([cabinet]);
+    expect(noticesOf(state, 'cabinetFull')).toBe(1);
+
+    expect(applyCommand(state, { type: 'addSplitter', cabinet })).toEqual({ ok: true, cost: SPLITTER_COST });
+    // The player answered: the cabinet has free ports and is no longer turning anyone away.
+    expect(state.sales.fullCabinets).toEqual([]);
+    runDays(state, 1);
+    expect(free()).toBeGreaterThan(SPLIT_RATIO / 2);
+    expect(state.sales.fullCabinets).toEqual([]);
+
+    // It is listed again only once its ports really run out, with a second notice.
+    let relisted = -1;
+    for (let d = 0; d < 3 * 365 && relisted < 0; d++) {
+      runDays(state, 1);
+      if (state.sales.fullCabinets.includes(cabinet)) relisted = state.day;
+      else expect(free()).toBeGreaterThan(0);
+    }
+    expect(relisted).toBeGreaterThan(0);
+    expect(free()).toBe(0);
+    expect(noticesOf(state, 'cabinetFull')).toBe(2);
+    expect(state.notices.filter((n) => n.kind === 'cabinetFull').at(-1)).toMatchObject({ day: relisted, cabinet });
+  });
+
   it('lets an apartment building add units on its router port while the cabinet turns new accounts away', () => {
     const city = makeGridCity({ cols: 1, rows: 1, blockW: 4, blockH: 2, parcelKinds: (p) => (p.id === 0 ? { kind: 'mdu', units: 48 } : undefined) });
     const { state, cabinet } = litTown({ city, splitters: 0, marketing: LOUD });
@@ -552,6 +615,68 @@ describe('lost service', () => {
     expect(state.notices.filter((n) => n.kind === 'serviceLost').map((n) => n.cabinet)).toEqual([cabinet]);
   });
 
+  describe('when their cabinet no longer reaches them', () => {
+    // One row of four 240 ft blocks, CO at node 0 with cabinet A; cabinet B at node 4,
+    // the far end of 1st St. Cable on both streets, A Ave (8) and E Ave (12): a ring.
+    // 1st St's second block (segment 1) is 240 ft from A and 480 ft from B, so A
+    // serves it; cut 1st St's first block (segment 0) and A's way round the ring is
+    // 1,680 ft, out of reach, while B still lights it.
+    function ring(bSplitters = 1): { state: GameState; a: CabinetId; b: CabinetId; parcel: number; cut: number } {
+      const city = makeGridCity({ cols: 4, rows: 1, blockW: 4, blockH: 2, coAt: [0, 0] });
+      const state = makeTestState(city);
+      const a = addLivePlant(state, { segments: [0, 1, 2, 3, 4, 5, 6, 7, 8, 12] }) as CabinetId;
+      const b = addLivePlant(state, { segments: [], node: 4, splitters: bSplitters }) as CabinetId;
+      state.sales.marketingPerMonth = 0;
+      state.finance.cash = START_CASH * 10;
+      const parcel = state.city.parcels.find((p) => p.segment === 1)!.id;
+      state.sales.accounts = [account(parcel, a, { fiber1g: 1 })];
+      expect(getService(state).servingCabinet.get(1)).toBe(a);
+      expect(getService(state).segmentCabinets.get(1)).toEqual([a, b]);
+      const cut = state.network.spans.find((s) => s.segment === 0)!.id;
+      return { state, a, b, parcel, cut };
+    }
+
+    it('moves them to a cabinet that does, so removing that one later is quoted and blamed right', () => {
+      const { state, a, b, cut } = ring();
+      // B can take them, so cutting the cable costs nobody service.
+      expect(quoteRemoveSpan(state, cut).subscribersAffected).toBe(0);
+      expect(applyCommand(state, { type: 'removeSpan', span: cut }).ok).toBe(true);
+      step(state);
+      const service = getService(state);
+      expect(service.cabinetCoverage.get(a)!.segments).not.toContain(1);
+      expect(service.servingCabinet.get(1)).toBe(b);
+      expect(service.segmentCabinets.get(1)).toEqual([b]);
+      expect(state.sales.accounts.map((acc) => acc.cabinet)).toEqual([b]);
+      expect(state.sales.month.lostService).toBe(0);
+      expect(noticesOf(state, 'serviceLost')).toBe(0);
+
+      // B now carries them: removing B is quoted as costing them service, and the notice names B.
+      expect(quoteRemoveCabinet(state, b).subscribersAffected).toBe(1);
+      expect(quoteRemoveCabinet(state, a).subscribersAffected).toBe(0);
+      expect(applyCommand(state, { type: 'removeCabinet', cabinet: b }).ok).toBe(true);
+      step(state);
+      expect(state.sales.accounts).toEqual([]);
+      expect(state.sales.month.lostService).toBe(1);
+      const notices = state.notices.filter((n) => n.kind === 'serviceLost');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ cabinet: b });
+      expect(notices[0]!.message).toMatch(/their cabinet was removed/);
+    });
+
+    it('drops them with a notice when no cabinet that reaches them has a free port, and quotes it', () => {
+      const { state, a, cut } = ring(0);
+      expect(quoteRemoveSpan(state, cut).subscribersAffected).toBe(1);
+      expect(applyCommand(state, { type: 'removeSpan', span: cut }).ok).toBe(true);
+      step(state);
+      expect(state.sales.accounts).toEqual([]);
+      expect(state.sales.month.lostService).toBe(1);
+      const notices = state.notices.filter((n) => n.kind === 'serviceLost');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ cabinet: a });
+      expect(notices[0]!.message).toMatch(/^1 subscriber lost service at .*: no cabinet in reach of their street has a free port/);
+    });
+  });
+
   it('keeps existing subscribers on the cabinet they connected to', () => {
     const { state, cabinet } = litTown({ marketing: 0 });
     // A second active cabinet that does not serve the street: accounts stay where they are.
@@ -572,21 +697,67 @@ describe('installs and cash', () => {
     expect(state.sales.accounts).toEqual([]);
     expect(state.finance.monthToDate.filter((e) => e.category === 'install')).toEqual([]);
     expect(state.finance.cash).toBe(INSTALL_COST_HOME - 1);
-    expect(noticesOf(state, INSTALL_NOTICE_KIND, INSTALLS_PAUSED_PREFIX)).toBe(1);
-    expect(noticesOf(state, INSTALL_NOTICE_KIND, INSTALLS_RESUMED_PREFIX)).toBe(0);
+    expect(noticesOf(state, 'installsPaused', INSTALLS_PAUSED_PREFIX)).toBe(1);
+    expect(noticesOf(state, 'installsResumed')).toBe(0);
+    // Their own kinds: nothing rides on the insolvency warning any more.
+    expect(noticesOf(state, 'insolvencyWarning')).toBe(0);
+    expect(state.sales.installsPaused).toBe(true);
     expect(installsPaused(state)).toBe(true);
-    const paused = state.notices.find((n) => n.message.startsWith(INSTALLS_PAUSED_PREFIX))!;
+    const paused = state.notices.find((n) => n.kind === 'installsPaused')!;
     expect(paused).toMatchObject({ cabinet: null, milestone: null });
 
     // The demand waited: with cash back, signups come at once.
     state.finance.cash = 1_000_000;
     step(state, 5);
     expect(subscriberUnits(state)).toBeGreaterThan(0);
-    expect(noticesOf(state, INSTALL_NOTICE_KIND, INSTALLS_RESUMED_PREFIX)).toBe(1);
+    expect(noticesOf(state, 'installsResumed', INSTALLS_RESUMED_PREFIX)).toBe(1);
+    expect(state.sales.installsPaused).toBe(false);
     expect(installsPaused(state)).toBe(false);
     step(state, 30);
-    expect(noticesOf(state, INSTALL_NOTICE_KIND, INSTALLS_PAUSED_PREFIX)).toBe(1);
-    expect(noticesOf(state, INSTALL_NOTICE_KIND, INSTALLS_RESUMED_PREFIX)).toBe(1);
+    expect(noticesOf(state, 'installsPaused')).toBe(1);
+    expect(noticesOf(state, 'installsResumed')).toBe(1);
+  });
+
+  it('never lets a busy day of installs overdraw cash, counting the day\'s earlier installs', () => {
+    // A whole generated town lit at once from a roomy CO cabinet, at full marketing:
+    // some days want more installs than cash for two homes covers.
+    const state = newGame(2027);
+    addLivePlant(state, { splitters: 8 });
+    state.sales.marketingPerMonth = MARKETING_MAX_PER_MONTH;
+    const covered = 2;
+    let busyDays = 0;
+    let pausedDays = 0;
+    for (let d = 0; d < 365; d++) {
+      state.finance.cash = covered * INSTALL_COST_HOME + 10;
+      const connects = state.sales.connectsTotal;
+      step(state);
+      expect(state.finance.cash, `day ${state.day}`).toBeGreaterThanOrEqual(0);
+      if (state.sales.connectsTotal - connects >= covered) busyDays++;
+      if (state.sales.installsPaused) pausedDays++;
+    }
+    // The cap really bound: days that filled the cash, and installs left waiting.
+    expect(busyDays).toBeGreaterThan(0);
+    expect(pausedDays).toBeGreaterThan(0);
+    expect(noticesOf(state, 'installsPaused')).toBeGreaterThan(0);
+  });
+
+  it('remembers a pause after its notice has left the capped notice log', () => {
+    const { state } = litTown({ marketing: LOUD });
+    state.finance.cash = INSTALL_COST_HOME - 1;
+    step(state, 10);
+    expect(noticesOf(state, 'installsPaused')).toBe(1);
+    // A flood of other news pushes the pause notice out of the log.
+    for (let i = 0; i < NOTICE_LOG_MAX + 5; i++) postNotice(state, 'oltFull', `news ${i}`);
+    expect(noticesOf(state, 'installsPaused')).toBe(0);
+    step(state, 10);
+    // Still paused: no second "paused" notice.
+    expect(noticesOf(state, 'installsPaused')).toBe(0);
+    expect(installsPaused(state)).toBe(true);
+    state.finance.cash = 1_000_000;
+    step(state, 5);
+    // And the resume is still announced.
+    expect(noticesOf(state, 'installsResumed')).toBe(1);
+    expect(installsPaused(state)).toBe(false);
   });
 
   it('never lets installs take cash below zero', () => {
@@ -645,18 +816,19 @@ describe('accruals and billing', () => {
     runDays(state, 31);
     const rate = unitPrice(state.sales.pricing, 'fiber500', 'smb');
     expect(rate).toBe(Math.round(state.sales.pricing.tiers[0]!.price * 2.25));
-    expect(state.finance.reports[0]!.totals.revenue).toBe(Math.round((rate * 30) / 31));
+    // Subscribed from day 0: January bills all 31 of its days.
+    expect(state.finance.reports[0]!.totals.revenue).toBe(rate);
   });
 
   it('accrues marketing per day, so a mid-month budget change counts from the next day', () => {
     const state = makeTestState(TOWN);
     const m1 = state.sales.marketingPerMonth;
-    runDays(state, 15);
-    expect(state.sales.month.marketingDollarDays).toBe(m1 * 15);
+    runDays(state, 15); // days 0..15 at m1 (day 0 accrues with the first tick)
+    expect(state.sales.month.marketingDollarDays).toBe(m1 * 16);
     const m2 = m1 + 3_000;
     expect(applyCommand(state, { type: 'setMarketing', perMonth: m2 })).toEqual({ ok: true, cost: 0 });
     runDays(state, 16); // Feb 1 close: days 16..30 at m2
-    expect(state.finance.reports[0]!.totals.marketing).toBe(-Math.round((m1 * 15 + m2 * 15) / 31));
+    expect(state.finance.reports[0]!.totals.marketing).toBe(-Math.round((m1 * 16 + m2 * 15) / 31));
     expect(state.sales.month.marketingDollarDays).toBe(m2);
   });
 
@@ -727,6 +899,32 @@ describe('churn', () => {
       expect(churnProbability(higher)).toBeCloseTo(Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over)), 12);
       expect(churnProbability({ ...tier, price: 1_000_000 })).toBe(CHURN_MONTHLY_MAX);
     }
+  });
+
+  it('churns businesses on the price they pay: more above the default multiplier, the same at it', () => {
+    for (const tier of defaultPricing().tiers) {
+      expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_DEFAULT)).toBe(churnProbability(tier));
+      expect(churnProbability(tier, 'home', SMB_MULTIPLIER_MAX)).toBe(churnProbability(tier));
+      const over = SMB_MULTIPLIER_MAX / SMB_MULTIPLIER_DEFAULT - 1;
+      expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MAX)).toBeCloseTo(
+        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over)),
+        12,
+      );
+      expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MIN)).toBe(churnProbability(tier));
+    }
+  });
+
+  it('cancels more businesses at a higher business multiplier', () => {
+    const city = makeGridCity({ cols: 4, rows: 4, parcelKinds: () => ({ kind: 'smb', units: 1 }) });
+    const churned = (smbMultiplier: number): number => {
+      const state = makeTestState(city, { rngSales: 99 });
+      state.sales.accounts = city.parcels.map((p) => account(p.id, 1, { fiber1g: 1 }));
+      state.sales.pricing.smbMultiplier = smbMultiplier;
+      let total = 0;
+      for (let m = 0; m < 12 && state.sales.accounts.length > 0; m++) total += withRng(state, 'sales', (rng) => closeSalesMonth(state, rng, 30, 0)).churned;
+      return total;
+    };
+    expect(churned(SMB_MULTIPLIER_MAX)).toBeGreaterThan(churned(SMB_MULTIPLIER_DEFAULT) * 1.5);
   });
 
   it('cancels more subscribers at higher prices', () => {

@@ -28,6 +28,16 @@
   max-width: 340px;
 }
 
+/* Compact: when the full card can't sit clear of the pointer (a finger drawing
+   cable on a phone), only the title, the first figures and any blockers show. */
+.float-card.compact .quote-lines,
+.float-card.compact .card-warnings,
+.float-card.compact .card-note,
+.float-card.compact .hint-line,
+.float-card.compact .row:nth-child(n + 4) {
+  display: none;
+}
+
 .quote-lines {
   width: 100%;
   margin: 0 0 6px;
@@ -42,6 +52,12 @@
   padding: 1px 0;
   vertical-align: baseline;
   white-space: nowrap;
+}
+
+/* The quantity x rate detail wraps when a long label leaves it no room, so
+   the amounts always stay inside the card. */
+.quote-lines td.quote-detail {
+  white-space: normal;
 }
 
 .quote-lines th {

@@ -360,7 +360,13 @@ export interface Pricing {
  */
 export interface Account {
   parcel: ParcelId;
-  /** Cabinet whose splitter ports these units occupy (fixed at connect; never re-homed). */
+  /**
+   * Cabinet whose splitter ports these units occupy: the street's serving
+   * cabinet at connect. It stays while that cabinet is active and reaches the
+   * street along connected cable; when it no longer does, the next daily step
+   * moves the account to the nearest active cabinet that reaches the street
+   * and has a free port, or drops it (sales.serviceChanges).
+   */
   cabinet: CabinetId;
   /**
    * Subscribed units per tier (non-negative integers). Total >= 1 and
@@ -404,11 +410,20 @@ export interface Sales {
   /** Lifetime units connected (sum of all gross adds). Denominator of cost per connection. */
   connectsTotal: number;
   /**
-   * Cabinets that turned away at least one signup on the latest daily step
-   * because every splitter port was taken. Sorted ascending, unique. A cabinet
-   * newly entering this list posts a 'cabinetFull' notice.
+   * Cabinets turning signups away: on the latest daily step a waiting new
+   * account found no free splitter port, or (already listed) the demand
+   * waiting on it would take every free port within sales.FULL_HOLD_DAYS.
+   * addSplitter takes a cabinet off the list. Sorted ascending, unique. A
+   * cabinet newly entering this list posts a 'cabinetFull' notice.
    */
   fullCabinets: CabinetId[];
+  /**
+   * Installs are paused: on the latest day an install was due, cash could not
+   * cover it. Set by the step that posts 'installsPaused'; cleared by the
+   * first step after it that connects an install, which posts
+   * 'installsResumed'. (Saves written before this field derive it on load.)
+   */
+  installsPaused: boolean;
   month: MonthAccrual;
 }
 
@@ -436,6 +451,9 @@ export type NoticeKind =
   | 'serviceLost' // subscribers were disconnected because their cable or cabinet went away
   | 'oltFull' // a successful placeCabinet/addSplitter just used the OLT's last free PON port
   | 'insolvencyWarning' // a month closed with cash < 0
+  | 'installsPaused' // cash could not cover the next install; new customers wait (Sales.installsPaused set)
+  | 'installsResumed' // an install connected again after a pause (Sales.installsPaused cleared)
+  | 'rulesUpdated' // an older save loaded under rules that changed what it gets (e.g. cabinet reach)
   | 'gameOver'
   | 'milestone';
 
@@ -636,7 +654,11 @@ export interface RemoveCabinetQuote {
   refund: number;
   /** OLT PON ports freed (its splitters). */
   ponPortsFreed: number;
-  /** Subscriber units on this cabinet who would lose service. */
+  /**
+   * Subscriber units who would lose service at the next daily step: those on
+   * this cabinet that no other active cabinet in reach of their street has a
+   * free port for (the rest move to such a cabinet).
+   */
   subscribersAffected: number;
 }
 
@@ -647,8 +669,10 @@ export interface RemoveSpanQuote {
   refund: number;
   /**
    * Subscriber units who would lose service at the next daily step: on this
-   * street, or cut off from the CO or from their cabinet's reach downstream of
-   * it. 0 unless the span is live.
+   * street, or downstream of it and cut off from the CO or from every
+   * cabinet's reach (a subscriber whose own cabinet no longer reaches them
+   * moves to another cabinet in reach with a free port instead, if there is
+   * one). 0 unless the span is live.
    */
   subscribersAffected: number;
   /** Units passed today that would no longer be passed (this street and everything cut off beyond it). */
@@ -668,8 +692,17 @@ export interface CoverageSegment {
   segment: SegmentId;
   /** Street distance (ft) from the preview node to the segment's nearer endpoint; < CABINET_REACH_FT. */
   distanceFt: number;
-  /** Has live cable connected to the CO today (lit the moment a cabinet here is live). */
+  /**
+   * Has live cable connected to the CO today. Being connected is not enough to
+   * be lit by a cabinet here: see litOnPlacement.
+   */
   connected: boolean;
+  /**
+   * A live cabinet here would light and serve it today: connected, within
+   * CABINET_REACH_FT of this corner along today's live cable (which can be
+   * longer than the street distance), and nearer than any active cabinet.
+   */
+  litOnPlacement: boolean;
   /**
    * Cabinet (other than one at the preview node) that serves it once
    * everything already ordered is built (live cabinets today included, and
@@ -680,7 +713,9 @@ export interface CoverageSegment {
 
 /**
  * What a cabinet at `node` could cover, measured along streets (cable not
- * required): the shading and count card of the cabinet tool.
+ * required): the shading and count card of the cabinet tool. The street reach
+ * is what it could serve once cable joins it; litOnPlacement and
+ * passingsPassableToday are what it would serve on today's live cable.
  */
 export interface CoveragePreview {
   node: NodeId;
@@ -693,14 +728,16 @@ export interface CoveragePreview {
   passingsFuture: number;
   /** Of passingsNow: on segments another cabinet serves, or will once what is already ordered is built (servedBy). */
   passingsServedElsewhere: number;
-  /** Of passingsNow, not served elsewhere: on connected segments, so passed as soon as this cabinet is live and CO-connected. */
+  /** Of passingsNow, not served elsewhere: on litOnPlacement segments, so passed as soon as this cabinet is live. */
   passingsPassableToday: number;
   /** Price of a cabinet here (0 when one already stands here). */
   cabinetCost: number;
   /**
    * Estimated cable cost to cable every in-reach segment that has no span yet:
    * per segment the cheaper buildable method (aerial where poled, else
-   * underground) including rock and make-ready, excluding per-order fees.
+   * underground) including rock and make-ready, plus the per-order fees
+   * (engineering and right-of-way application) of one order per method used,
+   * as a cable quote charges them.
    */
   buildOutCost: number;
   /** (cabinetCost + buildOutCost) / (passingsNow - passingsServedElsewhere); null when that is <= 0. Marginal, not lifetime. */
@@ -745,6 +782,13 @@ export interface ServiceSnapshot {
   servingCabinet: Map<SegmentId, CabinetId>;
   /** For each lit segment, that cabinet's cable distance (ft) to the segment's nearer endpoint. */
   servingDistanceFt: Map<SegmentId, number>;
+  /**
+   * For each lit segment, every active cabinet within CABINET_REACH_FT of it
+   * along connected cable, nearest first (ties -> lower id); the first is its
+   * servingCabinet. A subscriber stays on its own cabinet while that cabinet is
+   * in this list (sales.serviceChanges).
+   */
+  segmentCabinets: Map<SegmentId, readonly CabinetId[]>;
   /** Per active cabinet (every active cabinet has an entry, possibly empty). */
   cabinetCoverage: Map<CabinetId, CabinetCoverage>;
   /** Parcels that exist (appearsDay <= day) and are served by a lit segment (Parcel.segment only), ascending. */
