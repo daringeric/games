@@ -22,8 +22,22 @@
 // Month close (finance.closeMonth, right after sales.closeSalesMonth, which
 // charges outage churn for the month's days in Weather.cutOff):
 //   closeWeatherMonth(state)
+//
+// Round 4b (storms-balance workstream): storms favour exposed streets (rural
+// streets, wooded streets, the map's edges: segmentExposure, deterministic
+// from the city), both where they center (stormCenterWeights) and how much
+// they damage; stormRisk counts both exactly, preferredMethod judges a
+// street's method over its lifetime with it, and the map has an exposure
+// overlay (cityExposure, exposureBand). Fair comparisons: the weather
+// stream draws the same each day whatever the plant (the storm chance; for a
+// storm its center, radius, severity and a storm seed; a dig-in seed for the
+// day), and each storm's damage rolls and outage lengths, and each day's
+// dig-ins, come from sub-streams derived from those seeds, the storm id or
+// the day, and the street (stormSubSeed, digInSubSeed): two plants on one
+// seed see the same storms, and a street cabled in both gets the same rolls.
 
 import {
+  BUILD_METHOD_HORIZON_YEARS,
   DIG_INS_PER_MILE_PER_YEAR,
   OUTAGE_CHURN_BASE,
   OUTAGE_CHURN_MAX,
@@ -32,12 +46,22 @@ import {
   OUTAGE_DAYS_AERIAL_MIN,
   OUTAGE_DAYS_UNDERGROUND_MAX,
   OUTAGE_DAYS_UNDERGROUND_MIN,
+  POLE_RENT_PER_POLE_PER_MONTH,
   REPAIR_BASE_AERIAL,
   REPAIR_BASE_UNDERGROUND,
   REPAIR_PER_FT_AERIAL,
   REPAIR_PER_FT_UNDERGROUND,
   STORM_AERIAL_DAMAGE_CHANCE,
+  STORM_CENTER_EXPOSURE_WEIGHT,
+  STORM_CENTER_OPEN_FT,
+  STORM_CENTER_REACH_CELLS,
   STORM_CHANCE_PER_DAY,
+  STORM_EXPOSURE_EDGE,
+  STORM_EXPOSURE_EDGE_CELLS,
+  STORM_EXPOSURE_EXPOSED,
+  STORM_EXPOSURE_MODERATE,
+  STORM_EXPOSURE_WOODED,
+  STORM_EXPOSURE_ZONE,
   STORM_LOG_DAYS,
   STORM_RADIUS_MAX,
   STORM_RADIUS_MIN,
@@ -46,16 +70,18 @@ import {
   STORM_UNDERGROUND_DAMAGE_CHANCE,
 } from './balance';
 import { formatMoney, groupThousands, postEntry } from './finance';
-import { getService, outageService } from './network';
+import { getService, outageService, spanCharges } from './network';
 import { postNotice } from './notices';
-import type { Rng } from './rng';
+import { Rng, deriveSeed } from './rng';
 import { accountUnits } from './sales';
-import { cornerName } from './streets';
+import { cornerName, polesOnSegment } from './streets';
+import { woodedAt } from './terrain';
 import type {
   AccountOutage,
   CableMethod,
   CableSpan,
   City,
+  ExposureBand,
   GameState,
   NodeId,
   ParcelId,
@@ -95,6 +121,15 @@ export function newWeather(): Weather {
 }
 
 /**
+ * Where a storm's or a day's draws for one street come from: an Rng on the
+ * seed derived for that street (stormSubSeed, digInSubSeed). The game uses a
+ * fresh Rng on it; tests may hand out their own.
+ */
+export type SubStream = (seed: number) => Rng;
+
+const freshRng: SubStream = (seed) => new Rng(seed);
+
+/**
  * One day of weather for the new state.day (game.tick, after advanceNetwork,
  * before stepSales; never on day 0 or after game over). In order:
  * 1. Repairs: every span with an outage counts daysLeft down by 1; one that
@@ -103,26 +138,31 @@ export function newWeather(): Weather {
  *    ("Repairs finished on Elm St and 2 more streets: 37 subscribers have
  *    service again after 4 days."). Storms older than STORM_LOG_DAYS leave
  *    the log.
- * 2. Storms: from STORM_START_DAY, with probability STORM_CHANCE_PER_DAY a
- *    storm hits: center (rng.int over the map's lattice), radius
- *    STORM_RADIUS_MIN..STORM_RADIUS_MAX, severity 1..STORM_SEVERITY_MAX. Each
- *    live span without an outage whose segment midpoint is within the radius
- *    is damaged with probability severity x STORM_AERIAL_DAMAGE_CHANCE
- *    (aerial; a span being converted is still aerial) or severity x
- *    STORM_UNDERGROUND_DAMAGE_CHANCE (underground), drawing its days out
- *    right after a hit. Damage: outage = { cause: 'storm', storm: id,
- *    startDay: day, daysLeft: rng.int(OUTAGE_DAYS_<method>_MIN, _MAX),
- *    repairCost: repairCost(segment, method) }, one 'repair' ledger entry for
+ * 2. Storms: from STORM_START_DAY, with probability STORM_CHANCE_PER_DAY
+ *    (rng.chance) a storm hits: center pickStormCenter(city, rng.next()) (a
+ *    lattice point drawn by stormCenterWeights: exposed areas more often),
+ *    radius rng.int(STORM_RADIUS_MIN, STORM_RADIUS_MAX), severity
+ *    rng.int(1, STORM_SEVERITY_MAX), its seed drawSeed(rng), id
+ *    weather.nextStormId: the weather stream draws the same whatever the
+ *    plant. Each live span without an outage whose segment midpoint is within
+ *    the radius is damaged with probability stormDamageChance(method,
+ *    severity, its street's exposure) (a span being converted is still
+ *    aerial), drawn from subStream(stormSubSeed(storm seed, id, segment)),
+ *    which then draws its days out after a hit. Damage: outage = { cause:
+ *    'storm', storm: id, startDay: day, daysLeft:
+ *    int(OUTAGE_DAYS_<method>_MIN, _MAX), repairCost: repairCost(segment,
+ *    method) }, one 'repair' ledger entry for
  *    the storm's total, network.version bumped and one 'storm' notice naming
  *    the area (the corner nearest its center), spans down, subscribers cut
  *    off, the repair cost and how long. The Storm is appended to
  *    weather.storms either way: one that damages nothing is logged (the map
  *    shows it) but posts no notice.
- * 3. Dig-ins: from STORM_START_DAY, each live underground span without an
- *    outage is cut with probability lengthFt / 5,280 x
- *    DIG_INS_PER_MILE_PER_YEAR / 365 (one draw per span, then its days out;
- *    cause 'digIn', storm null), each posting a 'repair' entry and a 'digIn'
- *    notice.
+ * 3. Dig-ins: from STORM_START_DAY, the day's seed drawSeed(rng) (drawn
+ *    every day, plant or not); each live underground span without an outage
+ *    is cut with probability lengthFt / 5,280 x DIG_INS_PER_MILE_PER_YEAR /
+ *    365, drawn (then its days out) from subStream(digInSubSeed(day seed,
+ *    state.day, segment)); cause 'digIn', storm null, each posting a
+ *    'repair' entry and a 'digIn' notice.
  * 4. Month accrual: every segment in getService(state).interruptedSegments
  *    adds 1 to its WeatherMonth.segmentOutageDays entry (sorted, one per
  *    segment); every account cut off today (network.outageService: an
@@ -134,14 +174,53 @@ export function newWeather(): Weather {
  *    charged), as are entries of parcels with no account any more. Storms,
  *    spansDamaged and repairs counted up as they happen above.
  */
-export function stepWeather(state: GameState, rng: Rng): void {
+export function stepWeather(state: GameState, rng: Rng, subStream: SubStream = freshRng): void {
   repairSpans(state);
   dropOldStorms(state);
   if (state.day >= STORM_START_DAY) {
-    if (rng.chance(STORM_CHANCE_PER_DAY)) stormHits(state, rng);
-    digIns(state, rng);
+    if (rng.chance(STORM_CHANCE_PER_DAY)) stormHits(state, rng, subStream);
+    digIns(state, drawSeed(rng), subStream);
   }
   accrueOutages(state);
+}
+
+/** Labels of the weather sub-streams (deriveSeed): a storm's, a day's dig-ins, and one street's under either. */
+const SUB_STREAM = { storm: 'storm ', digIn: 'digIn ', street: 'street ' } as const;
+
+/** A uint32 seed drawn from the weather stream (one draw). */
+function drawSeed(rng: Rng): number {
+  return Math.floor(rng.next() * 4294967296) >>> 0;
+}
+
+/** The base of storm `storm`'s draws, from the seed the weather stream drew for it. */
+function stormSeedOf(seed: number, storm: number): number {
+  return deriveSeed(seed, `${SUB_STREAM.storm}${storm}`);
+}
+
+/** The base of day `day`'s dig-in draws, from the seed the weather stream drew for the day. */
+function digInSeedOf(seed: number, day: number): number {
+  return deriveSeed(seed, `${SUB_STREAM.digIn}${day}`);
+}
+
+/** The seed of one street's draws under a storm or on a day: derived from the storm's or day's seed and the segment. */
+function streetSeed(base: number, segment: SegmentId): number {
+  return deriveSeed(base, `${SUB_STREAM.street}${segment}`);
+}
+
+/**
+ * The seed of storm `storm`'s draws on street `segment` (its damage roll,
+ * then its days out after a hit): from the storm's seed (drawn from the
+ * weather stream, which draws the same whatever the plant), the storm id and
+ * the street alone, so every plant on one game seed rolls the same for that
+ * street.
+ */
+export function stormSubSeed(seed: number, storm: number, segment: SegmentId): number {
+  return streetSeed(stormSeedOf(seed, storm), segment);
+}
+
+/** The seed of day `day`'s dig-in draw on street `segment` (then its days out): from the day's seed (drawn from the weather stream), the day and the street alone. */
+export function digInSubSeed(seed: number, day: number, segment: SegmentId): number {
+  return streetSeed(digInSeedOf(seed, day), segment);
 }
 
 /** What the weather part of a month close counted (the month's totals before the reset). */
@@ -277,28 +356,51 @@ function damageChance(method: CableMethod): number {
   return method === 'aerial' ? STORM_AERIAL_DAMAGE_CHANCE : STORM_UNDERGROUND_DAMAGE_CHANCE;
 }
 
-/** The chance a storm that covers a span damages it, averaged over the uniform severities 1..STORM_SEVERITY_MAX. */
-function expectedDamageChance(method: CableMethod): number {
+/**
+ * The chance a storm of `severity` that covers a span of `method` damages it
+ * on a street of storm exposure `exposure` (segmentExposure):
+ * min(1, severity x STORM_<method>_DAMAGE_CHANCE x exposure).
+ */
+export function stormDamageChance(method: CableMethod, severity: number, exposure: number): number {
+  return Math.min(1, severity * damageChance(method) * Math.max(0, exposure));
+}
+
+/** stormDamageChance averaged over the uniform severities 1..STORM_SEVERITY_MAX. */
+function expectedDamageChance(method: CableMethod, exposure: number): number {
   let sum = 0;
   let n = 0;
   for (let severity = 1; severity <= STORM_SEVERITY_MAX; severity++) {
-    sum += Math.min(1, severity * damageChance(method));
+    sum += stormDamageChance(method, severity, exposure);
     n++;
   }
   return n > 0 ? sum / n : 0;
 }
 
+/** Storm-center weights as column sums (cityStormCenters): what stormCoverage needs to weigh centers. */
+export interface StormCenterMass {
+  /** prefix[x * (height + 2) + y]: the summed weights of lattice points (x, 0..y - 1). */
+  prefix: Float64Array;
+  /** All the weights together (> 0). */
+  total: number;
+}
+
 /**
  * The chance a storm's area covers the point (mx2 / 2, my2 / 2) of a
- * width x height map: storms center on a uniform lattice point (0..width,
- * 0..height) with a uniform whole radius STORM_RADIUS_MIN..MAX, and cover
- * the point when it lies within the radius (the test stepWeather applies).
- * Exact: per radius, the lattice points within it, counted column by column
- * in doubled coordinates (so half-cell midpoints stay integers).
+ * width x height map: storms center on a lattice point (0..width,
+ * 0..height), each with probability its weight / the total (`centers`;
+ * uniform when absent, as round 4), with a uniform whole radius
+ * STORM_RADIUS_MIN..MAX, and cover the point when it lies within the radius
+ * (the test stepWeather applies). Exact: per radius, the lattice points
+ * within it, summed column by column in doubled coordinates (so half-cell
+ * midpoints stay integers): counted when uniform, by column sums when
+ * weighted.
  */
-export function stormCoverage(width: number, height: number, mx2: number, my2: number): number {
+export function stormCoverage(width: number, height: number, mx2: number, my2: number, centers?: StormCenterMass): number {
   const lattice = (width + 1) * (height + 1);
   if (!(lattice > 0)) return 0;
+  const mass = centers ? centers.total : lattice;
+  if (!(mass > 0)) return 0;
+  const stride = height + 2;
   let total = 0;
   let radii = 0;
   for (let r = STORM_RADIUS_MIN; r <= STORM_RADIUS_MAX; r++) {
@@ -317,36 +419,293 @@ export function stormCoverage(width: number, height: number, mx2: number, my2: n
       while (k * k > room) k--;
       const lo = Math.max(0, Math.ceil((my2 - k) / 2));
       const hi = Math.min(height, Math.floor((my2 + k) / 2));
-      if (hi >= lo) count += hi - lo + 1;
+      if (hi < lo) continue;
+      if (centers) count += (centers.prefix[cx * stride + hi + 1] ?? 0) - (centers.prefix[cx * stride + lo] ?? 0);
+      else count += hi - lo + 1;
     }
-    total += count / lattice;
+    total += count / mass;
   }
-  return radii > 0 ? total / radii : 0;
+  return radii > 0 ? Math.max(0, total / radii) : 0;
+}
+
+/** A city's storm centers: everything stormHits and stormRisk need, precomputed once per city. */
+interface StormCenters extends StormCenterMass {
+  /** Lattice point (x, y)'s exposure at y * (width + 1) + x (pointExposure). */
+  exposure: Float64Array;
+  /** Its weight (stormCenterWeights). */
+  weights: Float64Array;
+  /** cumulative[i]: weights[0] + ... + weights[i]. */
+  cumulative: Float64Array;
+  /** stormCoverage with these weights at doubled midpoints (key mx2 * (2 x height + 1) + my2), filled on demand. */
+  coverage: Map<number, number>;
+}
+
+const centersCache = new WeakMap<City, StormCenters>();
+
+/**
+ * Storm centers of `city`, memoized per city. A lattice point's exposure is
+ * the mean of the exposures (cityExposure) of the streets whose midpoints lie
+ * within STORM_CENTER_REACH_CELLS of it, each weighted by its length x
+ * (1 - d² / reach²) (nearer and longer streets count more), together with
+ * STORM_CENTER_OPEN_FT feet at the town's mean exposure (cityMeanExposure):
+ * open country, with no street that close, rates as an average street, so
+ * storms keep round 4's share of the town overall, and within it sheltered
+ * downtown blocks draw them less and exposed rural edges and wooded streets
+ * more. Its weight is max(0, 1 + STORM_CENTER_EXPOSURE_WEIGHT x
+ * (exposure - 1)) (all 1 if that leaves nothing).
+ */
+function cityStormCenters(city: City): StormCenters {
+  const cached = centersCache.get(city);
+  if (cached) return cached;
+  const w1 = city.width + 1;
+  const h1 = city.height + 1;
+  const n = Math.max(0, w1 * h1);
+  const sum = new Float64Array(n);
+  const mass = new Float64Array(n);
+  const exposures = cityExposure(city);
+  const reach = STORM_CENTER_REACH_CELLS > 0 ? STORM_CENTER_REACH_CELLS : 1;
+  // Doubled coordinates: midpoints may sit on half cells.
+  const reach2 = 4 * reach * reach;
+  for (const seg of city.segments) {
+    const a = city.nodes[seg.a];
+    const b = city.nodes[seg.b];
+    if (!a || !b || !(seg.lengthFt > 0)) continue;
+    const mx2 = a.x + b.x;
+    const my2 = a.y + b.y;
+    const e = exposures[seg.id] ?? 1;
+    const x0 = Math.max(0, Math.ceil((mx2 - 2 * reach) / 2));
+    const x1 = Math.min(city.width, Math.floor((mx2 + 2 * reach) / 2));
+    const y0 = Math.max(0, Math.ceil((my2 - 2 * reach) / 2));
+    const y1 = Math.min(city.height, Math.floor((my2 + 2 * reach) / 2));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const dx = 2 * x - mx2;
+        const dy = 2 * y - my2;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= reach2) continue;
+        const w = seg.lengthFt * (1 - d2 / reach2);
+        sum[y * w1 + x] = (sum[y * w1 + x] ?? 0) + w * e;
+        mass[y * w1 + x] = (mass[y * w1 + x] ?? 0) + w;
+      }
+    }
+  }
+  const exposure = new Float64Array(n);
+  const weights = new Float64Array(n);
+  const open = cityMeanExposure(city);
+  const prior = Math.max(0, STORM_CENTER_OPEN_FT);
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const m = (mass[i] ?? 0) + prior;
+    const e = m > 0 ? ((sum[i] ?? 0) + prior * open) / m : open;
+    exposure[i] = e;
+    const w = Math.max(0, 1 + STORM_CENTER_EXPOSURE_WEIGHT * (e - 1));
+    weights[i] = w;
+    total += w;
+  }
+  if (!(total > 0)) {
+    weights.fill(1);
+    total = n;
+  }
+  const cumulative = new Float64Array(n);
+  let run = 0;
+  for (let i = 0; i < n; i++) {
+    run += weights[i] ?? 0;
+    cumulative[i] = run;
+  }
+  const stride = city.height + 2;
+  const prefix = new Float64Array(w1 * stride);
+  for (let x = 0; x < w1; x++) {
+    let col = 0;
+    for (let y = 0; y < h1; y++) {
+      col += weights[y * w1 + x] ?? 0;
+      prefix[x * stride + y + 1] = col;
+    }
+  }
+  const centers: StormCenters = { exposure, weights, cumulative, prefix, total: n > 0 ? run : 0, coverage: new Map() };
+  centersCache.set(city, centers);
+  return centers;
+}
+
+/**
+ * How exposed the map around lattice point (x, y) of `city` is, for drawing
+ * storm centers (see cityStormCenters): 1 off the lattice. Pure, memoized
+ * per city.
+ */
+export function pointExposure(city: City, x: number, y: number): number {
+  if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > city.width || y > city.height) return 1;
+  return cityStormCenters(city).exposure[y * (city.width + 1) + x] ?? 1;
+}
+
+/** The weight of every lattice point of `city` as a storm center, at y * (width + 1) + x (cityStormCenters; read-only). */
+export function stormCenterWeights(city: City): Readonly<Float64Array> {
+  return cityStormCenters(city).weights;
+}
+
+/**
+ * The storm center a uniform draw `u` in [0, 1) picks on `city`: the lattice
+ * point whose share of the cumulative weights (stormCenterWeights, row by
+ * row) holds u x the total, so each point comes up with probability its
+ * weight / the total, and never one of weight 0.
+ */
+export function pickStormCenter(city: City, u: number): { x: number; y: number } {
+  const { cumulative, total } = cityStormCenters(city);
+  const n = cumulative.length;
+  if (n === 0) return { x: 0, y: 0 };
+  const target = Math.max(0, Math.min(1, u)) * total;
+  // First index whose running total passes the target.
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((cumulative[mid] ?? 0) > target) hi = mid;
+    else lo = mid + 1;
+  }
+  const w1 = city.width + 1;
+  return { x: lo % w1, y: Math.floor(lo / w1) };
+}
+
+/**
+ * The chance a storm's area covers the point (mx2 / 2, my2 / 2) of `city`,
+ * its centers drawn as stormHits draws them (stormCoverage with the city's
+ * storm-center weights), memoized per city and point.
+ */
+export function cityStormCoverage(city: City, mx2: number, my2: number): number {
+  const centers = cityStormCenters(city);
+  const key = mx2 * (2 * city.height + 1) + my2;
+  let coverage = centers.coverage.get(key);
+  if (coverage === undefined) {
+    coverage = stormCoverage(city.width, city.height, mx2, my2, centers);
+    centers.coverage.set(key, coverage);
+  }
+  return coverage;
 }
 
 /**
  * Expected yearly exposure of a span of `method` on `segment` from
- * STORM_START_DAY on: outages a year (365 x STORM_CHANCE_PER_DAY storms x
- * the chance a storm's area covers the segment's midpoint, stormCoverage, x
- * the method's damage chance averaged over the severities, plus
- * lengthFt / 5,280 x DIG_INS_PER_MILE_PER_YEAR dig-ins for underground),
- * their repair cost (repairCost each) and days out (meanOutageDays each).
- * Used by quote cards ("about $X a year in storm repairs"), quoteConvert
- * and the advisor. Pure, no rng; an estimate (not rounded).
+ * STORM_START_DAY on, exact for the storm model stepWeather plays: outages a
+ * year (365 x STORM_CHANCE_PER_DAY storms x the chance a storm's area covers
+ * the segment's midpoint, cityStormCoverage (centers weighted by exposure),
+ * x stormDamageChance for the street's exposure (segmentExposure) averaged
+ * over the severities, plus lengthFt / 5,280 x DIG_INS_PER_MILE_PER_YEAR
+ * dig-ins for underground), their repair cost (repairCost each) and days out
+ * (meanOutageDays each). Used by quote cards ("about $X a year in storm
+ * repairs"), quoteConvert, preferredMethod, the advisor and the tuning bots.
+ * Pure, no rng; an estimate (not rounded).
  */
 export function stormRisk(state: GameState, segment: StreetSegment, method: CableMethod): StormRisk {
   const { city } = state;
   const a = city.nodes[segment.a];
   const b = city.nodes[segment.b];
   if (!a || !b) return { outagesPerYear: 0, repairCostPerYear: 0, outageDaysPerYear: 0 };
-  const coverage = stormCoverage(city.width, city.height, a.x + b.x, a.y + b.y);
-  let outages = DAYS_PER_YEAR * STORM_CHANCE_PER_DAY * coverage * expectedDamageChance(method);
+  const coverage = cityStormCoverage(city, a.x + b.x, a.y + b.y);
+  const exposure = city.segments[segment.id] === segment ? (cityExposure(city)[segment.id] ?? 1) : exposureOf(city, segment);
+  let outages = DAYS_PER_YEAR * STORM_CHANCE_PER_DAY * coverage * expectedDamageChance(method, exposure);
   if (method === 'underground') outages += (segment.lengthFt / FT_PER_MILE) * DIG_INS_PER_MILE_PER_YEAR;
   return {
     outagesPerYear: outages,
     repairCostPerYear: outages * repairCost(segment, method),
     outageDaysPerYear: outages * meanOutageDays(method),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Round 4b: storm exposure
+// ---------------------------------------------------------------------------
+
+/**
+ * How exposed the street `segment` of `city` is to storms: a multiplier
+ * (>= 0, mean ~1 over a generated town's street feet: about 1.05-1.15 on the
+ * tuning towns) on the storm damage chance there (stormDamageChance) and on
+ * where storms center (cityStormCenters). Deterministic from the city alone
+ * (never from game state, never stored):
+ * STORM_EXPOSURE_ZONE[zone] x (1 + STORM_EXPOSURE_WOODED x wooded) x
+ * (1 + STORM_EXPOSURE_EDGE x edge), where `wooded` (0..1) is
+ * terrain.woodedAt the street's midpoint (the grove field the map's trees
+ * are drawn from, on the land around it that no lot covers: the streets the
+ * player sees among trees) and `edge` fades from 1 at the map's edge to 0
+ * STORM_EXPOSURE_EDGE_CELLS cells in. Arithmetic only. An unknown segment
+ * returns 1.
+ */
+export function segmentExposure(city: City, segment: SegmentId): number {
+  const seg = city.segments[segment];
+  return seg ? exposureOf(city, seg) : 1;
+}
+
+/** segmentExposure of a street given as a segment (its zone and its ends in `city`). */
+function exposureOf(city: City, seg: StreetSegment): number {
+  const a = city.nodes[seg.a];
+  const b = city.nodes[seg.b];
+  if (!a || !b) return 1;
+  // Doubled coordinates keep the midpoint whole; the edge distance is in cells.
+  const mx2 = a.x + b.x;
+  const my2 = a.y + b.y;
+  const wooded = woodedAt(city, mx2 / 2, my2 / 2);
+  const toEdge = Math.min(mx2, my2, 2 * city.width - mx2, 2 * city.height - my2) / 2;
+  const reach = STORM_EXPOSURE_EDGE_CELLS > 0 ? STORM_EXPOSURE_EDGE_CELLS : 1;
+  const edge = Math.max(0, 1 - toEdge / reach);
+  const zone = STORM_EXPOSURE_ZONE[seg.zone] ?? 1;
+  return Math.max(0, zone * (1 + STORM_EXPOSURE_WOODED * wooded) * (1 + STORM_EXPOSURE_EDGE * edge));
+}
+
+const exposureCache = new WeakMap<City, readonly number[]>();
+const meanCache = new WeakMap<City, number>();
+
+/** The mean exposure of `city`'s streets, weighted by length (1 for a city without streets); memoized per city. */
+export function cityMeanExposure(city: City): number {
+  const cached = meanCache.get(city);
+  if (cached !== undefined) return cached;
+  const exposure = cityExposure(city);
+  let sum = 0;
+  let feet = 0;
+  for (const seg of city.segments) {
+    if (!(seg.lengthFt > 0)) continue;
+    sum += (exposure[seg.id] ?? 1) * seg.lengthFt;
+    feet += seg.lengthFt;
+  }
+  const mean = feet > 0 ? sum / feet : 1;
+  meanCache.set(city, mean);
+  return mean;
+}
+
+/** segmentExposure of every street of `city`, by segment id (memoized per city; treat as read-only). For the overlay and stormRisk. */
+export function cityExposure(city: City): readonly number[] {
+  const cached = exposureCache.get(city);
+  if (cached) return cached;
+  const values = city.segments.map((s) => exposureOf(city, s));
+  exposureCache.set(city, values);
+  return values;
+}
+
+/** The band of an exposure: 'exposed' from STORM_EXPOSURE_EXPOSED, 'moderate' from STORM_EXPOSURE_MODERATE, else 'sheltered'. */
+export function exposureBand(exposure: number): ExposureBand {
+  if (exposure >= STORM_EXPOSURE_EXPOSED) return 'exposed';
+  if (exposure >= STORM_EXPOSURE_MODERATE) return 'moderate';
+  return 'sheltered';
+}
+
+/**
+ * What owning a span of `method` on `segment` costs over
+ * BUILD_METHOD_HORIZON_YEARS: construction (network.spanCharges, make-ready
+ * and rock included; per-order fees left out) + pole rent (aerial) +
+ * stormRisk repairs (the exposure model's, exact). Dollars, not rounded.
+ */
+export function lifetimeMethodCost(state: GameState, segment: StreetSegment, method: CableMethod): number {
+  const years = BUILD_METHOD_HORIZON_YEARS;
+  const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 * years : 0;
+  return spanCharges(segment, method).total + rent + stormRisk(state, segment, method).repairCostPerYear * years;
+}
+
+/**
+ * The method a careful builder would choose for `segment`: the lower
+ * lifetimeMethodCost (ties: aerial), or 'underground' when the street has no
+ * poles. The advisor's expand plan (coverage.buildOutPlan) builds with it,
+ * so once storms favour exposed streets (segmentExposure) its suggestion is
+ * the mixed build (aerial in sheltered blocks, underground where exposed).
+ * Pure. Implemented by the contract.
+ */
+export function preferredMethod(state: GameState, segment: StreetSegment): CableMethod {
+  if (!segment.hasPoles) return 'underground';
+  return lifetimeMethodCost(state, segment, 'aerial') <= lifetimeMethodCost(state, segment, 'underground') ? 'aerial' : 'underground';
 }
 
 /** Spans out of service today, in network.spans order (the map and the briefing). Implemented by the contract. */
@@ -493,15 +852,16 @@ function drawOutageDays(method: CableMethod, rng: Rng): number {
   return Math.max(1, days);
 }
 
-/** Step 2: a storm hits. */
-function stormHits(state: GameState, rng: Rng): void {
+/** Step 2: a storm hits. Its center, radius, severity and seed come from `rng`; each street's damage roll and days out from its own sub-stream. */
+function stormHits(state: GameState, rng: Rng, subStream: SubStream): void {
   const { city, network, weather } = state;
-  const x = rng.int(0, city.width);
-  const y = rng.int(0, city.height);
+  const { x, y } = pickStormCenter(city, rng.next());
   const radius = rng.int(STORM_RADIUS_MIN, STORM_RADIUS_MAX);
   const severity = rng.int(1, STORM_SEVERITY_MAX);
   const id = weather.nextStormId++;
+  const stormSeed = stormSeedOf(drawSeed(rng), id);
   const reach2 = 4 * radius * radius;
+  const exposure = cityExposure(city);
 
   const damage: Damage[] = [];
   for (const span of network.spans) {
@@ -514,8 +874,9 @@ function stormHits(state: GameState, rng: Rng): void {
     const dx = 2 * x - (a.x + b.x);
     const dy = 2 * y - (a.y + b.y);
     if (dx * dx + dy * dy > reach2) continue;
-    if (!rng.chance(severity * damageChance(span.method))) continue;
-    damage.push({ span, daysLeft: drawOutageDays(span.method, rng), repairCost: repairCost(segment, span.method) });
+    const roll = subStream(streetSeed(stormSeed, segment.id));
+    if (!roll.chance(stormDamageChance(span.method, severity, exposure[segment.id] ?? 1))) continue;
+    damage.push({ span, daysLeft: drawOutageDays(span.method, roll), repairCost: repairCost(segment, span.method) });
   }
 
   let total = 0;
@@ -558,17 +919,20 @@ function stormHits(state: GameState, rng: Rng): void {
   );
 }
 
-/** Step 3: excavators cut underground cable. */
-function digIns(state: GameState, rng: Rng): void {
+/** Step 3: excavators cut underground cable. Each street's draw (and days out) from the day's sub-stream for it (`seed`: the day's, from the weather stream). */
+function digIns(state: GameState, seed: number, subStream: SubStream): void {
   const { city, network, weather } = state;
   const perFtPerDay = DIG_INS_PER_MILE_PER_YEAR / FT_PER_MILE / DAYS_PER_YEAR;
+  let daySeed: number | null = null;
   const cuts: Damage[] = [];
   for (const span of network.spans) {
     if (span.stage !== 'live' || span.outage !== null || span.method !== 'underground') continue;
     const segment = city.segments[span.segment];
     if (!segment) continue;
-    if (!rng.chance(segment.lengthFt * perFtPerDay)) continue;
-    cuts.push({ span, daysLeft: drawOutageDays('underground', rng), repairCost: repairCost(segment, 'underground') });
+    daySeed ??= digInSeedOf(seed, state.day);
+    const roll = subStream(streetSeed(daySeed, segment.id));
+    if (!roll.chance(segment.lengthFt * perFtPerDay)) continue;
+    cuts.push({ span, daysLeft: drawOutageDays('underground', roll), repairCost: repairCost(segment, 'underground') });
   }
   for (const cut of cuts) {
     const before = cutOffOn(state, getService(state));

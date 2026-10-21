@@ -108,7 +108,7 @@ import {
   segmentsWithin,
   shortestPath,
 } from './streets';
-import { stormRisk } from './weather';
+import { exposureBand, segmentExposure, stormRisk } from './weather';
 import type {
   Cabinet,
   CabinetCoverage,
@@ -116,10 +116,12 @@ import type {
   CabinetQuote,
   CableMethod,
   CableQuote,
+  CableStormRisk,
   CableSpan,
   City,
   CommandResult,
   ConvertQuote,
+  ExposureBand,
   GameState,
   MakeReadyMemo,
   Network,
@@ -409,6 +411,7 @@ export function quoteCable(state: GameState, segments: readonly SegmentId[], met
     cpp: null,
     cppBand: null,
     wrongSideParcels: [],
+    stormRisk: null,
   };
   // Commands can arrive from saves or replays, so check shapes, not just types.
   if (!isCableMethod(method)) {
@@ -582,9 +585,35 @@ export function quoteCable(state: GameState, segments: readonly SegmentId[], met
     }
   }
   quote.wrongSideParcels = [...wrongSide].sort((a, b) => a - b);
+  quote.stormRisk = cableStormRisk(state, quote.newSegments, method);
 
   quote.ok = reasons.length === 0;
   return quote;
+}
+
+/**
+ * Round 4b: the storm exposure of new cable on `segments` by `method`
+ * (CableQuote.stormRisk): weather.stormRisk summed, the most exposed band
+ * (weather.exposureBand of weather.segmentExposure) and the feet in the
+ * 'exposed' band; null for no segments. Pure. Implemented by the contract.
+ */
+export function cableStormRisk(state: GameState, segments: readonly SegmentId[], method: CableMethod): CableStormRisk | null {
+  const { city } = state;
+  const rank: Record<ExposureBand, number> = { sheltered: 0, moderate: 1, exposed: 2 };
+  let risk: CableStormRisk | null = null;
+  for (const id of segments) {
+    const segment = city.segments[id];
+    if (!segment) continue;
+    const r = stormRisk(state, segment, method);
+    const band = exposureBand(segmentExposure(city, id));
+    risk ??= { method, outagesPerYear: 0, repairCostPerYear: 0, outageDaysPerYear: 0, band: 'sheltered', exposedFt: 0 };
+    risk.outagesPerYear += r.outagesPerYear;
+    risk.repairCostPerYear += r.repairCostPerYear;
+    risk.outageDaysPerYear += r.outageDaysPerYear;
+    if (rank[band] > rank[risk.band]) risk.band = band;
+    if (band === 'exposed') risk.exposedFt += segment.lengthFt;
+  }
+  return risk;
 }
 
 /**
@@ -1402,6 +1431,7 @@ export function quoteConvert(state: GameState, span: SpanId): ConvertQuote {
     constructDays: 0,
     poleRentSaved: 0,
     repairsAvoidedPerYear: 0,
+    exposure: 'sheltered',
   };
   const target = state.network.spans.find((s) => s.id === span);
   const segment = target ? state.city.segments[target.segment] : undefined;
@@ -1455,6 +1485,7 @@ export function quoteConvert(state: GameState, span: SpanId): ConvertQuote {
   const aerial = stormRisk(state, segment, 'aerial').repairCostPerYear;
   const underground = stormRisk(state, segment, 'underground').repairCostPerYear;
   quote.repairsAvoidedPerYear = Math.round(aerial - underground);
+  quote.exposure = exposureBand(segmentExposure(state.city, segment.id));
 
   if (quote.reasons.length === 0 && !canAfford(state, quote.cost)) quote.reasons.push(notEnoughCash(state, quote.cost));
   quote.ok = quote.reasons.length === 0;

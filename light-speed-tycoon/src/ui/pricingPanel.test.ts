@@ -8,6 +8,9 @@ import {
   GRANDFATHER_MONTHS_DEFAULT,
   GRANDFATHER_MONTHS_MAX,
   GRANDFATHER_STEP_SHARE,
+  DEMAND_SEGMENTS,
+  PROMO_QUOTE_MONTHS,
+  RETENTION_PERCENT_OFF,
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
   INCUMBENT_PROMO_DISCOUNT,
@@ -21,6 +24,7 @@ import {
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { applyCommand, newGame } from '../sim/game';
+import { quoteRetention, reviewIncumbent } from '../sim/incumbent';
 import {
   defaultPricing,
   lockEndDay,
@@ -28,6 +32,10 @@ import {
   monthlyRecurringRevenue,
   promoPrice,
   quotePricing,
+  quotePromo,
+  reservationPrice,
+  roughMoney,
+  segmentDemand,
   stepChurnProbability,
   targetTakeRate,
   tierMix,
@@ -49,8 +57,13 @@ import {
   pricingImpact,
   pricingPreview,
   PROMO_DRAFT_START,
+  promoAdviceLine,
   promoHint,
+  retentionButton,
+  retentionLine,
   samePromo,
+  SEGMENT_LABELS,
+  segmentRows,
 } from './pricingPanel';
 import type { PricingDraft } from './pricingPanel';
 
@@ -314,7 +327,7 @@ describe('the incumbent\'s promos in the panel', () => {
     const cabinet = addLivePlant(state) as CabinetId;
     state.day = 100;
     const price = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
-    state.sales.incumbentPromos = [{ cabinet, startDay: 90, endDay: 151, price, quietUntil: 334 }];
+    state.sales.incumbentPromos = [{ cabinet, startDay: 90, endDay: 151, price, quietUntil: 334, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     const d = draftFrom(state.sales.pricing, 1_000);
     const [row] = incumbentRows(state, d);
     const corner = cornerName(state.city, state.network.cabinets[0]!.node);
@@ -325,6 +338,8 @@ describe('the incumbent\'s promos in the panel', () => {
       endDay: 151,
       takeThere: targetTakeRate(state.sales.pricing, 'home', price),
       takeElsewhere: targetTakeRate(state.sales.pricing, 'home'),
+      retention: quoteRetention(state, cabinet),
+      answered: false,
     });
     expect(row!.takeThere).toBeLessThan(row!.takeElsewhere);
     expect(incumbentLine(row!)).toBe(
@@ -336,5 +351,116 @@ describe('the incumbent\'s promos in the panel', () => {
     // Nothing running, nothing listed.
     state.day = 151;
     expect(incumbentRows(state, d)).toEqual([]);
+  });
+});
+
+describe('who signs up (round 4b)', () => {
+  const pricing = defaultPricing();
+
+  it('lists each demand segment\'s share, take rate and favourite tier at the draft prices', () => {
+    const d = draftFrom(pricing, 1_000);
+    const rows = segmentRows(pricing, d)!;
+    const demand = segmentDemand(pricing);
+    expect(rows.map((r) => r.segment)).toEqual(demand.map((seg) => seg.segment));
+    for (const [i, row] of rows.entries()) {
+      const seg = demand[i]!;
+      expect(row).toMatchObject({ segment: seg.segment, label: SEGMENT_LABELS[seg.segment], share: seg.share, takeRate: seg.takeRate, tier: seg.tier, warning: null });
+      const tierName = pricing.tiers.find((t) => t.id === seg.tier)!.name;
+      expect(row.text).toBe(`${SEGMENT_LABELS[seg.segment]} (${formatPercent(seg.share)}): ${formatPercent(seg.takeRate)} sign up, mostly ${tierName}`);
+    }
+    // Invalid tiers: nothing to show.
+    const bad = draftFrom(pricing, 1_000);
+    bad.tiers[0]!.price = Number.NaN;
+    expect(segmentRows(pricing, bad)).toBeNull();
+  });
+
+  it('warns when no plan suits a segment: dropping 500 Mbps loses the price-sensitive households', () => {
+    const d = draftFrom(pricing, 1_000);
+    d.tiers[0]!.offered = false;
+    d.tiers[1]!.offered = false;
+    const value = segmentRows(pricing, d)!.find((r) => r.segment === 'value')!;
+    const share = DEMAND_SEGMENTS.find((seg) => seg.id === 'value')!.share;
+    expect(value.tier).toBeNull();
+    expect(value.warning).toBe(`Price-sensitive households (${formatPercent(share)}) won't sign up: no plan at or under ${formatMoney(reservationPrice('value'))}`);
+    expect(value.text).toBe(value.warning);
+    // Dropping only 500 Mbps: 1 Gig is a little over their reservation, so only a few sign up.
+    const no500 = draftFrom(pricing, 1_000);
+    no500.tiers[0]!.offered = false;
+    const few = segmentRows(pricing, no500)!.find((r) => r.segment === 'value')!;
+    expect(few.tier).toBe('fiber1g');
+    expect(few.warning).toBe(`Price-sensitive households (${formatPercent(share)}): only ${formatPercent(few.takeRate)} sign up: no plan at or under ${formatMoney(reservationPrice('value'))}`);
+    expect(few.takeRate).toBeLessThan(segmentRows(pricing, draftFrom(pricing, 1_000))!.find((r) => r.segment === 'value')!.takeRate / 2);
+    // Mainstream households still find a plan.
+    expect(segmentRows(pricing, no500)!.find((r) => r.segment === 'mainstream')!.warning).toBeNull();
+    // The draft's intro promo counts, as in the take-rate preview.
+    const withPromo = draftFrom(pricing, 1_000);
+    withPromo.promo = { enabled: true, percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS };
+    const rows = segmentRows(pricing, withPromo)!;
+    expect(rows.map((r) => r.takeRate)).toEqual(segmentDemand(pricing, 'home', INCUMBENT_PRICE, draftPromo(withPromo)).map((seg) => seg.takeRate));
+  });
+});
+
+describe('when an intro promo pays (round 4b)', () => {
+  it('shows quotePromo\'s advice and figures for the typed offer, even while it is switched off', () => {
+    const state = makeTestState(makeGridCity({ cols: 4, rows: 4, coAt: [2, 2] }));
+    addLivePlant(state);
+    const d = draftFrom(state.sales.pricing, 1_000);
+    expect(d.promo.enabled).toBe(false);
+    const quote = quotePromo(state, PROMO_DRAFT_START);
+    expect(quote.waitingUnits).toBeGreaterThan(0);
+    const line = promoAdviceLine(state, d);
+    expect(line.startsWith(quote.advice)).toBe(true);
+    expect(line).toContain(
+      `${PROMO_DRAFT_START.percentOff}% off for ${PROMO_DRAFT_START.months} months, over the next ${PROMO_QUOTE_MONTHS} months: ` +
+        (quote.extraSignups < 1 ? 'less than one more signup' : `about ${quote.extraSignups} more signup`),
+    );
+    expect(line).toContain(`${roughMoney(quote.valueGained)} of margin against ${roughMoney(quote.discountCost)} of discounts.`);
+    expect(line).toMatch(/[Pp]ays/);
+    // An offer that is not valid: the general advice.
+    d.promo.percentOff = Number.NaN;
+    expect(promoAdviceLine(state, d)).toBe(quotePromo(state, null).advice);
+    // Nothing once the game is over.
+    state.gameOver = { day: 0, reason: 'insolvent', message: 'Out of cash' };
+    expect(promoAdviceLine(state, draftFrom(state.sales.pricing, 1_000))).toBe('');
+  });
+});
+
+describe('the retention offer in the panel (round 4b)', () => {
+  function contested(): { state: GameState; cabinet: CabinetId } {
+    const state = makeTestState(makeGridCity({ cols: 4, rows: 4, coAt: [2, 2] }));
+    const cabinet = addLivePlant(state, { splitters: 8 }) as CabinetId;
+    state.day = 151; // Jun 1, 2027
+    state.finance.cash = 1_000_000;
+    state.sales.accounts = state.city.parcels.map((p) => ({ parcel: p.id, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] }));
+    reviewIncumbent(state);
+    expect(state.sales.incumbentPromos).toHaveLength(1);
+    return { state, cabinet };
+  }
+
+  it('shows the offer\'s figures and an enabled button, then Answered once sent', () => {
+    const { state, cabinet } = contested();
+    const d = draftFrom(state.sales.pricing, 1_000);
+    const [row] = incumbentRows(state, d);
+    const q = row!.retention;
+    expect(q).toEqual(quoteRetention(state, cabinet));
+    expect(retentionLine(row!)).toBe(
+      `Retention offer: ${RETENTION_PERCENT_OFF}% off for its ${q.units} subscribers until ${formatDate(row!.endDay)} costs about ${roughMoney(q.totalCost)} ` +
+        `(${formatMoney(q.monthlyCost)}/mo) and keeps about ${q.cancellationsAvoided} subscribers who would cancel, worth ${roughMoney(q.valueSaved)}: ` +
+        `${q.pays ? 'it pays' : "it doesn't pay"}.`,
+    );
+    expect(retentionButton(row!)).toEqual({ label: 'Answer with a retention offer', disabled: false, reason: null });
+    expect(applyCommand(state, { type: 'answerIncumbent', cabinet }).ok).toBe(true);
+    const [after] = incumbentRows(state, d);
+    expect(after!.answered).toBe(true);
+    expect(retentionButton(after!)).toEqual({ label: 'Answered', disabled: true, reason: null });
+    expect(retentionLine(after!)).toBe(`Answered: its subscribers pay ${RETENTION_PERCENT_OFF}% less until ${formatDate(after!.endDay)}, which spares them the promo's extra cancellations.`);
+  });
+
+  it('disables the button with the reason when no offer is possible', () => {
+    const { state } = contested();
+    state.sales.accounts = [];
+    const [row] = incumbentRows(state, draftFrom(state.sales.pricing, 1_000));
+    expect(retentionButton(row!)).toEqual({ label: 'Answer with a retention offer', disabled: true, reason: 'Nobody subscribes there yet' });
+    expect(retentionLine(row!)).toBe('No retention offer: Nobody subscribes there yet.');
   });
 });

@@ -223,3 +223,26 @@
     max-height: 58vh;
   }
 }
+
+/* Round 4b (storms-balance): the storm-exposure tone, on a quote card's storm-risk
+   line for exposed aerial cable (the floating card names the class tone-cpp-<tone>),
+   on the inspect card's and the span panel's "Storm exposure" rows, and on the
+   rebuild quote's "Street exposure". The colour is the overlay's exposed band. */
+
+.float-card dd.tone-cpp-exposed,
+.span-facts dd.tone-exposed {
+  color: var(--exposure-exposed);
+  font-weight: 800;
+}
+
+.float-card dd.tone-cpp-exposed::before,
+.span-facts dd.tone-exposed::before {
+  content: '';
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: 0.05em;
+}

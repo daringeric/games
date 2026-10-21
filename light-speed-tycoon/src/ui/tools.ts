@@ -13,7 +13,7 @@ import {
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from '../sim/balance';
 import { activePromoFor } from '../sim/incumbent';
-import { stormRisk } from '../sim/weather';
+import { cityExposure, exposureBand, stormRisk } from '../sim/weather';
 import { coveragePreview, segmentsWithinReach } from '../sim/coverage';
 import {
   cableRoute,
@@ -37,9 +37,11 @@ import type {
   CableMethod,
   CableQuote,
   CableSpan,
+  CableStormRisk,
   Command,
   CommandResult,
   CppBand,
+  ExposureBand,
   GameState,
   NodeId,
   ParcelId,
@@ -71,8 +73,12 @@ export type ToolId = 'inspect' | 'aerial' | 'underground' | 'cabinet' | 'remove'
 export interface CardRow {
   label: string;
   value: string;
-  /** Colors the value: a cost-per-passing band, muted for "nothing to show", negative for money below $0. */
-  tone?: CppBand | 'muted' | 'negative';
+  /**
+   * Colors the value: a cost-per-passing band, muted for "nothing to show",
+   * negative for money below $0, exposed (round 4b) for cable or a street
+   * in the 'exposed' storm band (storms.css).
+   */
+  tone?: CppBand | 'muted' | 'negative' | 'exposed';
   /** Small print after the value, e.g. the cost-per-passing target. */
   sub?: string;
 }
@@ -589,6 +595,37 @@ export function stormRiskText(dollarsPerYear: number): string {
   return dollarsPerYear < 1 ? 'under $1 a year in repairs' : `about ${formatMoney(dollarsPerYear)} a year in repairs`;
 }
 
+/** Round 4b: a storm-exposure band as a word (weather.exposureBand). */
+export const EXPOSURE_LABEL: Record<ExposureBand, string> = { sheltered: 'Sheltered', moderate: 'Moderate', exposed: 'Exposed' };
+
+/** A street's storm-exposure band (weather.exposureBand of weather.cityExposure). */
+export function streetExposure(state: GameState, segment: SegmentId): ExposureBand {
+  return exposureBand(cityExposure(state.city)[segment] ?? 1);
+}
+
+/** "~2.4 days out" / "~12 days out" / "under 0.1 days out" (days out of service a year). */
+export function daysOutText(days: number): string {
+  if (!(days >= 0.1)) return 'under 0.1 days out';
+  if (days < 10) return `~${(Math.round(days * 10) / 10).toFixed(1)} days out`;
+  return `~${formatNumber(Math.round(days))} days out`;
+}
+
+/**
+ * The quote card's storm-risk line for new cable (CableQuote.stormRisk):
+ * aerial "Exposed (480 ft of it): about $1,240 a year in storm repairs,
+ * ~2.4 days out" (the most exposed band among the new streets, and how much
+ * of the run is in the exposed band when not all of it); underground "about
+ * $90 a year in dig-in and washout repairs, ~0.4 days out" (storm exposure
+ * barely touches it).
+ */
+export function stormRiskLine(risk: CableStormRisk, lengthFt: number): string {
+  const repairs = risk.repairCostPerYear < 1 ? 'under $1' : `about ${formatMoney(risk.repairCostPerYear)}`;
+  const days = daysOutText(risk.outageDaysPerYear);
+  if (risk.method === 'underground') return `${repairs} a year in dig-in and washout repairs, ${days}`;
+  const part = risk.band === 'exposed' && risk.exposedFt > 0 && risk.exposedFt < lengthFt ? ` (${formatFeet(risk.exposedFt)} of it)` : '';
+  return `${EXPOSURE_LABEL[risk.band]}${part}: ${repairs} a year in storm repairs, ${days}`;
+}
+
 /**
  * Itemized quote card: charges, total and $/ft, cash after (with `funds`),
  * passings, cost per passing, timing, storm risk and pole rent (with
@@ -619,12 +656,13 @@ export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: str
     },
     { label: 'Build', value: plural(quote.constructDays, 'day') },
   ];
-  if (exposure && quote.newSegments.length > 0) {
-    rows.push({
-      label: 'Storm risk',
-      value: stormRiskText(exposure.repairsPerYear),
-      sub: method === 'aerial' ? `+ ${formatMoney(exposure.poleRentPerMonth)}/mo pole rent` : 'no pole rent',
-    });
+  const risk = quote.stormRisk;
+  if (risk && quote.newSegments.length > 0) {
+    const row: CardRow = { label: 'Storm risk', value: stormRiskLine(risk, quote.lengthFt) };
+    // Exposed aerial plant is the case to think twice about (or build underground).
+    if (risk.method === 'aerial' && risk.band === 'exposed') row.tone = 'exposed';
+    if (exposure) row.sub = method === 'aerial' ? `+ ${formatMoney(exposure.poleRentPerMonth)}/mo pole rent` : 'no pole rent';
+    rows.push(row);
   }
   const warnings: string[] = [];
   if (quote.wrongSideParcels.length > 0) warnings.push(wrongSideWarning(quote.wrongSideParcels.length));
@@ -942,6 +980,7 @@ function inspectView(state: GameState, x: number, y: number, touch: boolean): To
         { label: 'Underground', value: undergroundFt === null ? '–' : `${formatPerFt(undergroundFt)}${s.rock ? ' incl. rock' : ''}` },
         { label: 'Poles', value: poles > 0 ? `${poles}` : 'None (underground only)' },
         { label: 'Ground', value: s.rock ? `Rock (+${formatPerFt(UNDERGROUND_ROCK_SURCHARGE_PER_FT)} underground)` : 'Soil' },
+        exposureRow(state, seg),
         { label: 'Cable', value: cable },
       ];
       const aerialMemo = rememberedPermitDays(state, seg, 'aerial');
@@ -1043,6 +1082,17 @@ function liveSpanRows(state: GameState, span: CableSpan): CardRow[] {
   if (span.method === 'aerial') rows.push({ label: 'Pole rent', value: `${formatMoney(spanPoleRent(state, span))}/mo` });
   if (segment) rows.push({ label: 'Storm risk', value: stormRiskText(stormRisk(state, segment, span.method).repairCostPerYear) });
   return rows;
+}
+
+/** Round 4b: a street's storm-exposure row (the inspect card and the span panel): its band, toned when exposed. */
+export function exposureRow(state: GameState, segment: SegmentId): CardRow {
+  const band = streetExposure(state, segment);
+  const row: CardRow = { label: 'Storm exposure', value: EXPOSURE_LABEL[band] };
+  if (band === 'exposed') {
+    row.tone = 'exposed';
+    row.sub = 'storms hit here more';
+  } else if (band === 'sheltered') row.sub = 'storms hit here less';
+  return row;
 }
 
 function cabinetStatus(cabinet: Cabinet, service: ServiceSnapshot): string {

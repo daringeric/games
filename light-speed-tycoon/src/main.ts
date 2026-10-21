@@ -1,9 +1,10 @@
 // Entry point: boot the game, wire the scene, camera, HUD, map controls and
-// menus, the month-end briefing (round 4), and run the frame loop.
+// menus, the month-end briefing (round 4), the start screen (round 4b), and
+// run the frame loop.
 //
-// Owner: ui-economy workstream. Map interaction (tools, input, map panels)
-// lives behind MapControls (ui-build-tools); this file only places its DOM and
-// calls it each frame.
+// Owner: start-screen workstream (round 4b); ui-economy before. Map
+// interaction (tools, input, map panels) lives behind MapControls
+// (ui-build-tools); this file only places its DOM and calls it each frame.
 
 import './ui/style.css';
 import './ui/mapTools.css';
@@ -12,6 +13,7 @@ import './ui/bank.css';
 import './ui/pricing.css';
 import './ui/storms.css';
 import './ui/briefing.css';
+import './ui/startScreen.css';
 import { Application } from 'pixi.js';
 import { buildBriefing } from './sim/advisor';
 import { MONTH_ABBR, dateOf } from './sim/calendar';
@@ -34,7 +36,7 @@ import {
   startingBriefingSetting,
 } from './ui/briefing';
 import { confirmDialog } from './ui/confirm';
-import { installDebugHook, searchWithoutSeed } from './ui/debugHook';
+import { installDebugHook, searchWithoutSeed, showsFirstLaunchStart } from './ui/debugHook';
 import { el } from './ui/dom';
 import { GameOverDialog } from './ui/gameOverDialog';
 import { Hud } from './ui/hud';
@@ -45,7 +47,9 @@ import { HintCard, Toasts, noticeTone } from './ui/overlays';
 import { ReportPanel, monthClosedMessage, monthClosedTone } from './ui/panel';
 import { PricingPanel } from './ui/pricingPanel';
 import { RateCard } from './ui/rateCard';
-import { GameSession, latestNoticeId } from './ui/session';
+import { GameSession, describeGame, latestNoticeId, replaceTitle } from './ui/session';
+import { StartScreen } from './ui/startScreen';
+import type { StartChoice } from './ui/startScreen';
 import {
   AUTOSAVE_KEY,
   SAVE_KEY,
@@ -76,27 +80,54 @@ interface Opening {
   autosaveKey: string;
   /** The game was resumed from that autosave rather than started fresh. */
   resumed: boolean;
+  /**
+   * Round 4b: there is no game to resume, so `state` is only a preview of the
+   * town on offer (paused, never autosaved) under the start screen; null
+   * when the game starts at once (a resumed game, or a debug page without
+   * ?start=1). `fixedSeed`: a ?seed link, so the town cannot be rerolled.
+   */
+  start: { fixedSeed: boolean } | null;
 }
 
 /**
  * ?seed=N plays that town in an autosave of its own (or in the main one, if
  * that already holds it), so a reload resumes it and visiting a seed link never
- * overwrites the main game. Otherwise resume the main autosave, else start a
- * random town.
+ * overwrites the main game. Otherwise resume the main autosave, else offer a
+ * random town. A town not resumed opens under the start screen (round 4b),
+ * except on debug pages, which start it at once as a Seed-round game with the
+ * default company name unless the URL has ?start=1.
  */
 function openGame(): Opening {
-  const param = new URLSearchParams(window.location.search).get('seed');
+  const search = window.location.search;
+  const showStart = showsFirstLaunchStart(search);
+  const param = new URLSearchParams(search).get('seed');
   if (param !== null && /^\d+$/.test(param)) {
     // newGame keeps the seed as a uint32.
     const seed = Number(param) >>> 0;
     for (const key of [SEED_AUTOSAVE_KEY, AUTOSAVE_KEY]) {
       const saved = readSave(key);
-      if (saved?.seed === seed) return { state: saved, autosaveKey: key, resumed: true };
+      if (saved?.seed === seed) return { state: saved, autosaveKey: key, resumed: true, start: null };
     }
-    return { state: newGame(seed), autosaveKey: SEED_AUTOSAVE_KEY, resumed: false };
+    return { state: newGame(seed), autosaveKey: SEED_AUTOSAVE_KEY, resumed: false, start: showStart ? { fixedSeed: true } : null };
   }
   const saved = readSave(AUTOSAVE_KEY);
-  return { state: saved ?? newGame(randomSeed()), autosaveKey: AUTOSAVE_KEY, resumed: saved !== null };
+  if (saved) return { state: saved, autosaveKey: AUTOSAVE_KEY, resumed: true, start: null };
+  return { state: newGame(randomSeed()), autosaveKey: AUTOSAVE_KEY, resumed: false, start: showStart ? { fixedSeed: false } : null };
+}
+
+/** The name of the town a seed generates (the same town at every difficulty). */
+function townOf(seed: number): string {
+  return newGame(seed).city.name;
+}
+
+/** The game the start screen's choice makes. */
+function gameFor(choice: StartChoice): GameState {
+  return newGame(choice.seed, { difficulty: choice.difficulty, companyName: choice.companyName });
+}
+
+/** The toast that greets a game started from the start screen. */
+function welcome(state: GameState): string {
+  return `${state.company.name} is open for business in ${state.city.name}!`;
 }
 
 /** The autosave this boot resumed, so a failed boot can offer to discard it. */
@@ -152,6 +183,7 @@ async function boot(): Promise<void> {
   const milestones = new MilestonesPanel(() => session.state);
   const rateCard = new RateCard();
   const gameOver = new GameOverDialog();
+  const startScreen = new StartScreen();
   const hud = new Hud(session, { pricing: () => pricing.open(), milestones: () => milestones.open(), bank: () => bank.open() });
   const panel = new ReportPanel();
   const controls = new MapControls({ canvas: app.canvas, camera, theme, scene, session, toasts, hint });
@@ -192,14 +224,30 @@ async function boot(): Promise<void> {
     for (const el of [panel.root, toolbar.root, hud.root]) watch.observe(el);
   }
 
-  const autosave = () => writeSave(autosaveKey, session.state);
+  /** Round 4b: the game in play is only the start screen's preview of a town (never autosaved). */
+  let previewing = false;
+  /**
+   * Round 4b review: while previewing, the HUD's company and cash are the
+   * preview's (the town's default name, the Seed round's purse), not the
+   * company being chosen on the screen in front: hidden until Start.
+   */
+  const setPreviewing = (on: boolean) => {
+    previewing = on;
+    hud.root.classList.toggle('hud-previewing', on);
+  };
+  setPreviewing(opening.start !== null);
+  const autosave = () => {
+    if (!previewing) writeSave(autosaveKey, session.state);
+  };
   /**
    * Put a new, loaded or imported game in play; false if it can't be shown, in
    * which case the current game stays and a toast says why. The game in play
    * becomes the main one: ?seed is dropped (debug=1 stays) so a reload resumes
-   * it from the main autosave.
+   * it from the main autosave. (`keepKey`: a game started under the start
+   * screen at boot keeps the autosave it opened with, so a fresh ?seed link
+   * still never overwrites the main game.)
    */
-  const replaceGame = (state: GameState, message: string): boolean => {
+  const replaceGame = (state: GameState, message: string, keepKey = false): boolean => {
     const previous = session.state;
     try {
       session.replace(state);
@@ -208,22 +256,54 @@ async function boot(): Promise<void> {
       toasts.show(`Could not open that game: ${err instanceof Error ? err.message : String(err)}`, false);
       return false;
     }
-    window.history.replaceState(null, '', `${window.location.pathname}${searchWithoutSeed(window.location.search)}`);
-    autosaveKey = AUTOSAVE_KEY;
+    if (!keepKey) {
+      window.history.replaceState(null, '', `${window.location.pathname}${searchWithoutSeed(window.location.search)}`);
+      autosaveKey = AUTOSAVE_KEY;
+    }
+    setPreviewing(false);
     toasts.show(message, true);
     return true;
   };
+  /**
+   * Round 4b: the start screen for a new game in place of the one in play
+   * (the menu's New game, the game-over dialog). The clock stops while it is
+   * up; Start replaces the game, Esc or Back calls `back` with the game in
+   * play untouched.
+   */
+  const chooseNewGame = (back: () => void) => {
+    session.interrupt();
+    startScreen.open({
+      seed: randomSeed(),
+      townName: townOf,
+      newSeed: randomSeed,
+      onStart: (choice) => {
+        const state = gameFor(choice);
+        if (replaceGame(state, welcome(state))) autosave();
+        else back();
+      },
+      onCancel: back,
+    });
+  };
+  /** The game-over dialog's "Start a new town": the start screen, and back to the dialog if cancelled. */
   const startNewTown = () => {
-    if (replaceGame(newGame(randomSeed()), 'A new town to wire up!')) autosave();
+    gameOver.close();
+    chooseNewGame(() => {
+      session.resume();
+      showGameOver();
+    });
   };
   const loadSave = (saved: GameState) => replaceGame(saved, 'Saved game loaded');
-  /** Ask before anything replaces the town in play; it is autosaved over, so there's no undo. */
-  const confirmReplace = (confirmLabel: string, detail: string) =>
-    confirmDialog({ title: `Replace ${session.state.city.name}?`, detail, confirmLabel });
+  /** Ask before anything replaces the game in play; it is autosaved over, so there's no undo. */
+  const confirmReplace = (confirmLabel: string, detail: string) => confirmDialog({ title: replaceTitle(session.state), detail, confirmLabel });
   const menu = new Menu(hud.menuButton, {
     newGame: () => {
-      void confirmReplace('Start a new town', 'Your current town will be replaced by a fresh one. Save or export first if you want to come back to it.').then((yes) => {
-        if (yes) startNewTown();
+      const current = session.state.company.name;
+      void confirmReplace(
+        'Start a new town',
+        `${current} will be replaced by a new company in a fresh town. Save or export first if you want to come back to it.`,
+      ).then((yes) => {
+        // Back from the start screen: the same game, its clock as it was.
+        if (yes) chooseNewGame(() => session.resume());
       });
     },
     save: () => {
@@ -241,7 +321,7 @@ async function boot(): Promise<void> {
         toasts.show('No saved game yet', false);
         return;
       }
-      void confirmReplace('Load saved game', `Your current town will be replaced by your last save (${saved.city.name}).`).then((yes) => {
+      void confirmReplace('Load saved game', `Your current game will be replaced by your last save: ${describeGame(saved)}.`).then((yes) => {
         if (yes) loadSave(saved);
       });
     },
@@ -249,8 +329,8 @@ async function boot(): Promise<void> {
     importFile: (file) => {
       importSave(file).then(
         (state) =>
-          confirmReplace('Open imported game', `Your current town will be replaced by ${state.city.name} from ${file.name}.`).then((yes) => {
-            if (yes) replaceGame(state, `Imported ${state.city.name}`);
+          confirmReplace('Open imported game', `Your current game will be replaced by ${describeGame(state)} from ${file.name}.`).then((yes) => {
+            if (yes) replaceGame(state, `Imported ${state.company.name} (${state.city.name})`);
           }),
         (err: unknown) => toasts.show(`Could not import: ${err instanceof Error ? err.message : 'unreadable file'}`, false),
       );
@@ -274,7 +354,7 @@ async function boot(): Promise<void> {
     rateCard.close();
     briefing.dismiss();
     if (menu.isOpen) menu.close();
-    gameOver.show(over, session.state.city.name, {
+    gameOver.show(over, session.state.company.name, {
       loadLastSave: hasSave(SAVE_KEY)
         ? () => {
             const saved = readSave(SAVE_KEY);
@@ -345,12 +425,15 @@ async function boot(): Promise<void> {
       showMe(action);
     },
     onStoreFailed: () => toasts.show('Browser storage is unavailable, so that choice lasts until you reload.', 'warn'),
+    // Round 4b: snoozes and the shown-suggestions record go through the session like every command.
+    dispatch: (cmd) => session.dispatch(cmd),
+    rebuild: (span) => buildBriefing(session.state, span),
   });
   /** Pause the game and show a briefing. */
   const openBriefing = (shown: Briefing) => {
     session.interrupt();
     briefingNotices = shown.report.ops?.lastNoticeId ?? latestNoticeId(session.state);
-    briefing.open(shown, session.state.city.name);
+    briefing.open(shown, session.state.company.name);
   };
   /** The menu's "Latest briefing": the last close again, with today's advice and forward look. */
   const reopenBriefing = () => {
@@ -430,6 +513,7 @@ async function boot(): Promise<void> {
     stats: () => ({ ...counters, ...scene.stats() }),
     setBriefing: (setting) => briefingPref.set(setting),
     briefingOpen: () => briefing.isOpen,
+    startScreenOpen: () => startScreen.isOpen,
   });
 
   scene.sync(session.state);
@@ -437,6 +521,38 @@ async function boot(): Promise<void> {
   fitCamera();
   // A game autosaved at the close that ended it opens on its game-over dialog.
   showGameOver();
+
+  // Round 4b: no game to resume. The map behind the start screen shows the
+  // town on offer (a paused preview, never autosaved); Start puts the game in
+  // play on that same seed, so the town seen is the town played.
+  if (opening.start) {
+    /** The last town generated for the screen, so a reroll generates it once for its name and the map. */
+    let preview = session.state;
+    const previewOf = (seed: number) => {
+      if (preview.seed !== seed >>> 0) preview = newGame(seed);
+      return preview;
+    };
+    const fixedSeed = opening.start.fixedSeed;
+    const offerFirstGame = () =>
+      startScreen.open({
+        seed: session.state.seed,
+        townName: (seed) => previewOf(seed).city.name,
+        newSeed: fixedSeed ? undefined : randomSeed,
+        onReroll: (seed) => session.replace(previewOf(seed)),
+        onStart: (choice) => {
+          const state = gameFor(choice);
+          // Nothing to go back to: if the game could not be shown (the toast says why), choose again.
+          if (!replaceGame(state, welcome(state), true)) {
+            offerFirstGame();
+            return;
+          }
+          autosave();
+          hint.show();
+        },
+      });
+    hint.hide();
+    offerFirstGame();
+  }
 
   let last = performance.now();
   const frame = (now: number) => {

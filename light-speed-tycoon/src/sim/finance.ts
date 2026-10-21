@@ -141,6 +141,10 @@ function estimateCloseFlows(state: GameState): CloseFlows {
  * estimate (signups, churn and commands change it). The payment reminder
  * (debt.endDebtDay) and the Bank's next payment compare it with
  * debt.estimateNextDebtService. Pure read, O(accounts + ledger entries).
+ * Round 4b: the billing and support accrued so far are already net of
+ * outage days (sales.accrueDay); the days left are estimated at today's MRR
+ * and subscribers, so an outage under way counts as repaired by then (it
+ * lasts days, and the estimate errs by the few days' credit at most).
  */
 export function estimateCashAtClose(state: GameState): number {
   const f = estimateCloseFlows(state);
@@ -286,6 +290,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
     repairs: weather.repairs,
     incumbentPromos,
     mrr: monthlyRecurringRevenue(state),
+    outageCredits: sales.outageCredits,
   };
   return report;
 }

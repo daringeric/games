@@ -249,22 +249,30 @@ body {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  min-width: 112px;
+  min-width: 150px;
+  /* A long company name is cut short (the tooltip has it whole) rather than widening the bar. */
+  max-width: 240px;
   padding: 0 6px;
   line-height: 1.15;
 }
 
-.hud-town {
+/* Round 4b: the company (primary) on top; the date under it with the town
+   (secondary) beside it. The date line is one line high and wraps: a town that
+   does not fit beside the date drops onto a hidden second line rather than
+   being cut to a few letters. */
+.hud-company {
+  display: block;
+  max-width: 100%;
   overflow: hidden;
-  color: var(--text-2);
-  font-size: 12px;
+  color: var(--text);
+  font-size: 12.5px;
   font-weight: 800;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.hud-town::before {
+.hud-company::before {
   content: '';
   display: inline-block;
   width: 7px;
@@ -274,9 +282,46 @@ body {
   background: var(--accent);
 }
 
+.hud-when-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 6px;
+  max-width: 100%;
+  height: 1.15em;
+  overflow: hidden;
+  font-size: var(--fs-num);
+}
+
+.hud-when-line .hud-date {
+  min-width: 0;
+}
+
+.hud-town {
+  flex: none;
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.hud-town::before {
+  content: '·';
+  margin-right: 6px;
+}
+
 .hud-date {
   font-size: var(--fs-num);
   white-space: nowrap;
+}
+
+/* Round 4b review: behind the first-launch start screen the HUD shows the town
+   on offer, not the company being chosen there: its name and cash stay hidden
+   (the layout kept) until Start. */
+.hud-previewing .hud-company,
+.hud-previewing .hud-cash {
+  visibility: hidden;
 }
 
 .hud-cash {
@@ -992,6 +1037,39 @@ body {
   }
 }
 
+/* Round 4b: wide screens have room for most company names and the town in full. */
+@media (min-width: 1100px) {
+  /* Centred with left: 50%, the bar would shrink to fit the right half of the
+     screen, its narrowest layout; it takes the width its content wants instead
+     (max-width still keeps it on screen). */
+  .hud {
+    width: max-content;
+  }
+
+  .hud-when {
+    min-width: 196px;
+    max-width: 280px;
+  }
+
+  /* Wide screens have room for the town: lay the date line out inline, so its
+     width counts the town too (a wrapping flex line counts only its widest
+     item, which kept the column at its minimum and hid a longer town name).
+     A town that still does not fit drops onto the hidden second line. */
+  .hud-when-line {
+    display: block;
+  }
+
+  .hud-when-line .hud-date,
+  .hud-when-line .hud-town {
+    display: inline-block;
+    white-space: nowrap;
+  }
+
+  .hud-when-line .hud-town {
+    margin-left: 6px;
+  }
+}
+
 /* Wide but short: the overdraft warning takes a row of its own, so the HUD never
    grows wide enough to reach over the toolbar centred down the left side. */
 @media (min-width: 881px) and (max-height: 500px) {
@@ -1042,8 +1120,12 @@ body {
     align-items: center;
   }
 
-  .hud-town {
-    max-width: 100%;
+  .hud-when {
+    max-width: none;
+  }
+
+  .hud-when-line {
+    justify-content: center;
   }
 
   .hud-cash {

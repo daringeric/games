@@ -1,4 +1,5 @@
-// Top bar: speed controls, date, cash (with an overdraft warning), the
+// Top bar: speed controls, the company (round 4b) over the date with the town
+// beside it as a secondary label, cash (with an overdraft warning), the
 // pricing, milestones and bank buttons, the menu, and a row of chips:
 // passings, cost per passing, subscribers, MRR (the monthly run-rate: what
 // subscribers pay per month today; never called ARR, which is the Bank's
@@ -7,7 +8,8 @@
 // frozen line's countdown to the call, and the closes left once called). The
 // debt and covenant chips open the Bank panel.
 //
-// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream (round 4: sim-debt).
+// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream (round 4: sim-debt);
+// the company label: start-screen workstream (round 4b).
 
 import {
   ACCELERATION_CLOSES,
@@ -19,6 +21,7 @@ import {
   INSOLVENCY_GRACE_MONTHS,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
+import { difficultyLevel, isDifficultyId } from '../sim/company';
 import { acceleratedSchedule, closesUntilAcceleration, covenantMetrics, cureOptions, totalDebt } from '../sim/debt';
 import { runwayMonths } from '../sim/finance';
 import { costPerPassing, cppBand } from '../sim/metrics';
@@ -31,6 +34,23 @@ import { formatMoney, formatNumber, formatPercent, plural } from './format';
 import { ICONS } from './icons';
 import { SPEEDS } from './session';
 import type { GameSession, Speed } from './session';
+
+export interface HudIdentity {
+  /** The primary label: the company's name. */
+  company: string;
+  /** The secondary label: the town it is wiring up. */
+  town: string;
+  /** Tooltip: both, and the difficulty it started at. */
+  tip: string;
+}
+
+/** Round 4b: who is playing where, for the HUD's company and town labels. */
+export function hudIdentity(state: GameState): HudIdentity {
+  const { name, difficulty } = state.company;
+  const level = isDifficultyId(difficulty) ? difficultyLevel(difficulty) : null;
+  const started = level ? ` Difficulty: ${level.name} (started with ${formatMoney(level.startCash)}).` : '';
+  return { company: name, town: state.city.name, tip: `${name}, wiring up ${state.city.name}.${started}` };
+}
 
 /** OLT PON ports at or above this share in use turn the HUD chip amber. */
 export const PON_WARN_SHARE = 0.9;
@@ -275,6 +295,8 @@ export class Hud {
   readonly milestonesButton: HTMLButtonElement;
   readonly bankButton: HTMLButtonElement;
   private readonly speedButtons = new Map<Speed, HTMLButtonElement>();
+  private readonly when: HTMLElement;
+  private readonly company: HTMLElement;
   private readonly town: HTMLElement;
   private readonly date: HTMLElement;
   private readonly cash: HTMLElement;
@@ -313,8 +335,11 @@ export class Hud {
       speeds.append(button);
     }
 
-    this.town = el('span', { class: 'hud-town' });
+    this.company = el('span', { class: 'hud-company', attrs: { 'data-testid': 'hud-company' } });
+    this.town = el('span', { class: 'hud-town', attrs: { 'data-testid': 'hud-town' } });
     this.date = el('span', { class: 'hud-date num', attrs: { 'data-testid': 'hud-date' } });
+    // The company on top; the date with the town beside it (the town gives way first when there is no room).
+    this.when = el('div', { class: 'hud-when' }, [this.company, el('span', { class: 'hud-when-line' }, [this.date, this.town])]);
     this.cash = el('span', { class: 'hud-cash num', attrs: { 'data-testid': 'hud-cash' } });
     this.alertText = el('span');
     this.alert = el('span', { class: 'chip chip-alert hud-alert', attrs: { 'data-testid': 'hud-insolvency', role: 'status' } }, [
@@ -396,7 +421,7 @@ export class Hud {
 
     this.root = el('header', { class: 'hud pill-card', attrs: { 'aria-label': 'Game status' } }, [
       speeds,
-      el('div', { class: 'hud-when' }, [this.town, this.date]),
+      this.when,
       this.cash,
       this.alert,
       el('div', { class: 'hud-actions' }, [this.pricingButton, this.milestonesButton, this.bankButton]),
@@ -414,7 +439,13 @@ export class Hud {
       // The clock is frozen once the game is over.
       if (button.disabled !== over) button.disabled = over;
     }
-    setText(this.town, state.city.name);
+    if (this.seen.state !== state) {
+      // Names only change with the game in play.
+      const who = hudIdentity(state);
+      setText(this.company, who.company);
+      setText(this.town, who.town);
+      if (this.when.title !== who.tip) this.when.title = who.tip;
+    }
     setText(this.date, formatDate(state.day));
     setText(this.cash, formatMoney(state.finance.cash));
     this.cash.classList.toggle('negative', state.finance.cash < 0);

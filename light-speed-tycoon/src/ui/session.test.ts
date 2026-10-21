@@ -3,7 +3,8 @@ import { INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
 import { newGame } from '../sim/game';
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { GameOver, MonthlyReport, Notice } from '../sim/types';
-import { GameSession, latestNoticeId } from './session';
+import { formatDate } from '../sim/calendar';
+import { GameSession, describeGame, latestNoticeId, replaceTitle } from './session';
 
 const session = () => new GameSession(newGame(3, { city: makeGridCity() }));
 
@@ -370,5 +371,14 @@ describe('latestNoticeId', () => {
     // Older notices dropped from the log still count as issued.
     state.notices = [];
     expect(latestNoticeId(state)).toBe(4);
+  });
+});
+
+describe('naming the game in play, round 4b', () => {
+  it('titles the replace confirm with the company and describes a game by company, town and date', () => {
+    const state = newGame(3, { city: makeGridCity(), companyName: 'Bramble Light & Wire', difficulty: 'angel' });
+    expect(replaceTitle(state)).toBe('Replace Bramble Light & Wire?');
+    state.day = 64;
+    expect(describeGame(state)).toBe(`Bramble Light & Wire in ${state.city.name} (${formatDate(64)})`);
   });
 });

@@ -8,8 +8,22 @@
 // time budget on a generated town.
 
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// bestIncumbentAnswer is pricing-balance's (a stub answering 'none' until it
+// merges): the incumbentPromo tests drive it, so they hold either way.
+vi.mock('./incumbent', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./incumbent')>();
+  return { ...real, bestIncumbentAnswer: vi.fn(real.bestIncumbentAnswer) };
+});
+
 import {
+  ADVICE_SNOOZE_MONTHS,
+  ADVICE_SNOOZE_URGENT_MONTHS,
+  EXPAND_COVENANT_HEADROOM,
+  EXPAND_RESERVE_MONTHS,
+  INCUMBENT_PROMO_CHURN,
+  CABINET_REACH_FT,
   CABINET_START_SPLITTERS,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
@@ -23,41 +37,60 @@ import {
   OLT_CARD_COST,
   OLT_MAX_CARDS,
   OLT_PORTS_PER_CARD,
+  OVERHEAD_PER_MONTH,
   SPLIT_RATIO,
   SPLITTER_COST,
   STORM_LOG_DAYS,
   TERM_LOAN_MIN,
+  TERM_LOAN_YEARS,
   TIER_DEFAULTS,
   CONVERT_PAYBACK_YEARS,
   MARKETING_PER_PASSING_GOOD,
 } from './balance';
 import {
+  ADVICE_KEY_MAX_LENGTH,
+  ADVICE_KEYS,
   ADVICE_MAX,
   ADVICE_ORDER,
   ADVICE_PRIORITY,
+  ADVICE_SHOWN_MAX,
   advicePlans,
   advise,
+  ADVISOR_MEMORY_MAX,
   ATTENTION_NOTICE_KINDS,
+  briefingBuiltOn,
   buildBriefing,
   closeDayOf,
   COVENANT_RISK_MARGIN,
+  SUGGESTED_BORROWING_HEADROOM,
   EXPAND_CANDIDATES_MAX,
+  EXPAND_MIN_PASSINGS,
+  EXPAND_REACH_MULTIPLE,
   expandCandidates,
+  expectedAreaInstalls,
+  isAdviceKey,
+  isSnoozed,
+  monthlyInstallPace,
+  newAdvisorState,
   nextCloseDay,
   noticeNeedsAttention,
+  plannedInstallPace,
   planFor,
   rankAdvice,
+  repeatOf,
+  rewordRepeat,
   TAKE_RATE_LAG_SHARE,
   TAKE_RATE_MATURE_MONTHS,
   TAKE_RATE_MIN_PACE,
 } from './advisor';
 import type { AdvicePlan } from './advisor';
 import { DAYS_PER_YEAR, formatDate } from './calendar';
-import { coveragePreview } from './coverage';
+import { buildOutPlan } from './coverage';
 import {
   acceleratedSchedule,
   closesUntilAcceleration,
   covenantMetrics,
+  covenantsWithin,
   cureOptions,
   estimateNextDebtService,
   estimateSweep,
@@ -68,29 +101,68 @@ import {
   quoteTermLoan,
   totalDebt,
 } from './debt';
-import { estimateCashAtClose, formatMoney, monthlyBurn, runwayMonths } from './finance';
-import { applyCommand, runDays } from './game';
+import { estimateCashAtClose, formatMoney, monthlyBurn, monthlyPoleRent, runwayMonths } from './finance';
+import { applyCommand, newGame, runDays, tick } from './game';
+import * as incumbent from './incumbent';
 import { incumbentPromoPrice } from './incumbent';
-import { REPAIR_TRAILING_MONTHS } from './metrics';
+import { cppBand, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService, outageImpact, outageService, ponPortsUsed, quoteConvert } from './network';
 import { churnProbability, closeDayAfter, marketingBoost, stateTakeRate, unitsByTier } from './sales';
 import { deserialize, hashState, serialize } from './save';
 import { cornerName } from './streets';
-import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
-import type { Advice, AdviceId, CableSpan, GameState, Notice, TierId } from './types';
-import { outageChurnProbability, repairCost } from './weather';
+import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats } from './testing/fixtures';
+import { advisorFollowerBot, ensureIncumbentPromo, smartBot } from './tuning/bots';
+import { runBot, TUNING_SEEDS } from './tuning/harness';
+import type { Bot } from './tuning/harness';
+import type { Advice, AdviceId, CableSpan, City, Command, GameState, IncumbentAnswer, Notice, TermYears, TierId, Zone } from './types';
+import { exposureBand, outageChurnProbability, repairCost, segmentExposure } from './weather';
+
+const realIncumbent = await vi.importActual<typeof import('./incumbent')>('./incumbent');
+const answerMock = vi.mocked(incumbent.bestIncumbentAnswer);
+afterEach(() => {
+  answerMock.mockImplementation(realIncumbent.bestIncumbentAnswer);
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /** A grid town fully lit from the CO, run long enough to have subscribers and closed months. */
-function litGame(days = 120) {
-  const state = makeTestState(makeGridCity({ cols: 3, rows: 2 }));
+function litGame(days = 120, city: City = makeGridCity({ cols: 3, rows: 2 })) {
+  const state = makeTestState(city);
   addLivePlant(state, { splitters: 4 });
   runDays(state, days);
   return state;
 }
+
+/**
+ * `city` with every street in `zone`, moved `inland` cells in from every map
+ * edge: storm exposure (weather.segmentExposure) is the zone's, raised near
+ * the edge (and on wooded streets, once storms-balance adds that term). Rural
+ * streets come out 'exposed' anywhere; downtown streets well inside the map
+ * never do.
+ */
+function zoned(city: City, zone: Zone, inland = 0): City {
+  for (const segment of city.segments) segment.zone = zone;
+  if (inland > 0) {
+    for (const node of city.nodes) {
+      node.x += inland;
+      node.y += inland;
+    }
+    for (const parcel of city.parcels) {
+      parcel.x += inland;
+      parcel.y += inland;
+    }
+    city.width += 2 * inland;
+    city.height += 2 * inland;
+  }
+  return city;
+}
+
+/** The 3 x 2 grid with rural streets: every street exposed to storms. */
+const ruralGrid = () => zoned(makeGridCity({ cols: 3, rows: 2 }), 'rural');
+/** The 3 x 2 grid downtown, far inside a big map: no street exposed. */
+const shelteredGrid = () => zoned(makeGridCity({ cols: 3, rows: 2 }), 'downtown', 40);
 
 /** A wider grid (64 homes) lit from a cabinet at its center. */
 function centerGame(days: number, marketing?: number) {
@@ -141,7 +213,27 @@ function plan(state: GameState, id: AdviceId): AdvicePlan {
 /** The band a severity's priorities lie in. */
 const BAND = { urgent: [300, 399], important: [200, 299], tip: [100, 199] } as const;
 
+/** Advice.key by rule: the rule id, then its subject (round 4b). */
+const KEY_PATTERN: Record<AdviceId, RegExp> = {
+  paymentShort: /^paymentShort$/,
+  loansCalled: /^loansCalled$/,
+  covenantCure: /^covenantCure$/,
+  frozenSweep: /^frozenSweep$/,
+  cashRunway: /^cashRunway$/,
+  addSplitter: /^addSplitter:cabinet:\d+$/,
+  addOltCard: /^addOltCard$/,
+  outages: /^outages:segment:\d+$/,
+  stormUnderground: /^stormUnderground:span:\d+$/,
+  incumbentPromo: /^incumbentPromo:cabinet:\d+$/,
+  takeRate: /^takeRate$/,
+  pricing: /^pricing:(fiber500|fiber1g|fiber2g)$/,
+  redCpp: /^redCpp$/,
+  expand: /^expand:node:\d+$/,
+};
+
 function expectWellFormed(advice: Advice): void {
+  expect(advice.key).toMatch(KEY_PATTERN[advice.id]);
+  expect(isAdviceKey(advice.key)).toBe(true);
   const [lo, hi] = BAND[advice.severity];
   expect(advice.priority).toBeGreaterThanOrEqual(lo);
   expect(advice.priority).toBeLessThanOrEqual(hi);
@@ -212,6 +304,8 @@ function expectTogetherSafe(state: GameState, plans: readonly AdvicePlan[]): Gam
 
 const advice = (id: AdviceId, priority: number): Advice => ({
   id,
+  key: id,
+  repeat: 0,
   priority,
   severity: priority >= 300 ? 'urgent' : priority >= 200 ? 'important' : 'tip',
   title: id,
@@ -525,15 +619,65 @@ describe('cashRunway', () => {
     expect(runwayMonths(battered)).toBe(Math.floor(30_000 / burn));
   });
 
+  it('lands its financing SUGGESTED_BORROWING_HEADROOM inside the covenants, never just inside them', () => {
+    // Leverage where a loan of two months' burn passes the covenants, but not with the headroom.
+    const state = burning(35_000);
+    const flow = covenantMetrics(state).underwritingCashFlow;
+    state.debt.credit.balance = Math.round(flow * COVENANT_MAX_LEVERAGE * (1 - SUGGESTED_BORROWING_HEADROOM)) - LOAN_ROUNDING;
+    expect(covenantsWithin(covenantMetrics(state), COVENANT_RISK_MARGIN)).toBe(true);
+    // What the rule asks for: two months of burn (at least the fixed costs) beyond the cash above the cushion.
+    const cost = 2 * Math.max(monthlyBurn(state), OVERHEAD_PER_MONTH + state.sales.marketingPerMonth) + Math.max(0, state.finance.cash - fundingHint(state, 0).cushion);
+    expect(['draw', 'term', 'drawAndTerm']).toContain(fundingHint(state, cost).kind);
+    expect(['draw', 'term', 'drawAndTerm']).not.toContain(fundingHint(state, cost, SUGGESTED_BORROWING_HEADROOM).kind);
+    const p = plan(state, 'cashRunway');
+    expect(p.commands).toEqual([]);
+    expect(p.advice.why).toContain('No covenant-safe borrowing covers it');
+    // Where it does borrow, the covenants after it keep the headroom, and the card says so.
+    const roomy = burning(35_000);
+    const q = plan(roomy, 'cashRunway');
+    expect(q.commands.length).toBeGreaterThan(0);
+    expect(q.advice.why).toContain(`at least ${pct(SUGGESTED_BORROWING_HEADROOM)} inside their limits`);
+    const copy = deserialize(serialize(roomy));
+    for (const command of q.commands) expect(applyCommand(copy, command).ok).toBe(true);
+    expect(covenantsWithin(covenantMetrics(copy), SUGGESTED_BORROWING_HEADROOM)).toBe(true);
+    expect(planFor(copy, 'covenantCure')).toBeNull();
+  });
+
+  it('does not borrow to pay old debt with new: past break-even, short of the loan payments it owes', () => {
+    // Operating cash flow positive but below the debt service: the burn is the loans' own payments.
+    const state = withLoan(trading(30_000, 29_500, 2_000), 60_000);
+    const last = state.finance.reports.at(-1)!;
+    last.debt = { ...noDebtStats(state), termBalance: totalDebt(state), annualDebtService: covenantMetrics(state).annualDebtService };
+    const m = covenantMetrics(state);
+    expect(m.annualOperatingCashFlow).toBeGreaterThanOrEqual(0);
+    expect(m.annualOperatingCashFlow).toBeLessThan(m.annualDebtService);
+    const runway = runwayMonths(state);
+    expect(runway).not.toBeNull();
+    expect(runway!).toBeLessThanOrEqual(4);
+    const p = plan(state, 'cashRunway');
+    expect(p.commands).toEqual([]);
+    expect(p.advice.title).toMatch(/^Slow spending: /);
+    expect(p.advice.why).toContain(`Your operating cash flow (${formatMoney(m.annualOperatingCashFlow)} a year) does not cover the ${formatMoney(m.annualDebtService)} a year of loan payments`);
+    expect(p.advice.why).toContain('cannot carry more debt');
+    // Borrowing would have been covenant-safe, with the headroom: it is the debt service that stops it.
+    const cost = 2 * Math.max(monthlyBurn(state), OVERHEAD_PER_MONTH + state.sales.marketingPerMonth);
+    expect(['draw', 'term', 'drawAndTerm']).toContain(fundingHint(state, cost, SUGGESTED_BORROWING_HEADROOM).kind);
+    // A network still short of break-even may borrow to bridge to it.
+    expect(plan(burning(35_000), 'cashRunway').commands.length).toBeGreaterThan(0);
+  });
+
   it('suggests no borrowing once covenantCure has said not to borrow', () => {
     // Burning with a few months of runway, and leverage inside the risk margin of the limit.
     const state = burning(35_000);
     const flow = covenantMetrics(state).underwritingCashFlow;
     state.debt.credit.balance = Math.round(flow * COVENANT_MAX_LEVERAGE * (1 - COVENANT_RISK_MARGIN / 2));
     expect(covenantMetrics(state).compliant).toBe(true);
-    // On its own the runway rule would borrow (covenant-safe) ...
-    expect(plan(state, 'cashRunway').commands.length).toBeGreaterThan(0);
-    // ... but next to the covenant warning it says not to.
+    // A loan just inside the covenants exists, but not one SUGGESTED_BORROWING_HEADROOM inside them (more than the risk
+    // margin), so the runway rule does not borrow on its own either ...
+    const cost = 2 * Math.max(monthlyBurn(state), OVERHEAD_PER_MONTH + state.sales.marketingPerMonth) + Math.max(0, state.finance.cash - fundingHint(state, 0).cushion);
+    expect(['draw', 'term', 'drawAndTerm']).toContain(fundingHint(state, cost).kind);
+    expect(plan(state, 'cashRunway').commands).toEqual([]);
+    // ... and next to the covenant warning it says not to.
     const plans = advicePlans(state);
     expect(plans.find((p) => p.advice.id === 'covenantCure')!.advice.why).toContain('Hold off on new borrowing');
     const runway = plans.find((p) => p.advice.id === 'cashRunway')!;
@@ -704,9 +848,9 @@ describe('outages', () => {
 });
 
 describe('stormUnderground', () => {
-  /** litGame with aerial plant, and `hits` storms that damaged the span on the busiest street. */
-  function stormy(hits: number, days = 150): { state: GameState; span: CableSpan } {
-    const state = litGame(days);
+  /** A lit grid (rural by default: every street exposed) with aerial plant, and `hits` storms that damaged the span on the busiest street. */
+  function stormy(hits: number, days = 150, city: City = ruralGrid()): { state: GameState; span: CableSpan } {
+    const state = litGame(days, city);
     for (const span of state.network.spans) span.method = 'aerial';
     state.network.version++;
     const subs = (seg: number) => state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === seg).length;
@@ -718,40 +862,64 @@ describe('stormUnderground', () => {
     return { state, span };
   }
 
-  it('suggests rebuilding a storm-prone aerial span underground, with the quote against the repairs', () => {
+  const band = (state: GameState, segment: number) => exposureBand(segmentExposure(state.city, segment));
+
+  it('suggests rebuilding a storm-prone aerial span on an exposed street underground, with the quote against the repairs', () => {
     const { state, span } = stormy(2);
+    expect(band(state, span.segment)).toBe('exposed');
     const quote = quoteConvert(state, span.id);
     expect(quote.ok).toBe(true);
+    const saved = quote.repairsAvoidedPerYear + 12 * quote.poleRentSaved;
+    expect(saved * CONVERT_PAYBACK_YEARS).toBeGreaterThanOrEqual(quote.cost);
     const p = plan(state, 'stormUnderground');
     const street = state.city.segments[span.segment]!.name;
     expect(p.advice).toMatchObject({ severity: 'tip', priority: ADVICE_PRIORITY.stormUnderground, title: `Rebuild ${street} underground` });
+    expect(p.advice.key).toBe(ADVICE_KEYS.stormUnderground(span.id));
     expect(p.advice.action).toEqual({ kind: 'focusSegment', segment: span.segment });
+    expect(p.advice.why).toContain('an exposed street');
     expect(p.advice.why).toContain('2 times');
     expect(p.advice.why).toContain(formatMoney(2 * repairCost(state.city.segments[span.segment]!, 'aerial')));
     expect(p.advice.why).toContain(formatMoney(quote.cost));
     expect(p.advice.why).toContain(formatMoney(quote.repairsAvoidedPerYear));
-    const saved = quote.repairsAvoidedPerYear + 12 * quote.poleRentSaved;
-    expect(saved * CONVERT_PAYBACK_YEARS).toBeGreaterThanOrEqual(quote.cost);
     expect(p.advice.why).toContain(`${Math.ceil(quote.cost / saved)} year`);
     expect(p.commands).toEqual([{ type: 'convertSpan', span: span.id }]);
     expectNoBackfire(state, p);
   });
 
-  it('does not suggest a rebuild that would not pay for itself (on a generated town)', () => {
+  it('points only at exposed streets: a sheltered street gets no card, however often storms hit it', () => {
+    const { state, span } = stormy(3, 150, shelteredGrid());
+    expect(band(state, span.segment)).not.toBe('exposed');
+    expect(planFor(state, 'stormUnderground')).toBeNull();
+    // Make that one street rural (a fresh copy of the city, so its exposure is measured anew): the card comes.
+    const copy = clone(state);
+    copy.city.segments[span.segment]!.zone = 'rural';
+    expect(band(copy, span.segment)).toBe('exposed');
+    expect(plan(copy, 'stormUnderground').advice.action).toEqual({ kind: 'focusSegment', segment: span.segment });
+  });
+
+  it('on a generated town: rebuilds only when it pays, else says build underground around it (and only there)', () => {
     const state = fixture('v3-town');
+    for (const segment of state.city.segments) segment.zone = 'rural';
     const aerial = state.network.spans.filter((s) => s.method === 'aerial' && s.stage === 'live');
     state.weather.storms = [1, 2].map((id) => ({ id, day: state.day - 40 * id, x: 0, y: 0, radius: 9, severity: 2, spans: aerial.map((s) => s.id), repairCost: 1 }));
     state.weather.nextStormId = 3;
     state.finance.cash += 200_000;
     const p = plan(state, 'stormUnderground');
     const segment = (p.advice.action as { segment: number }).segment;
+    expect(band(state, segment)).toBe('exposed');
     const span = state.network.spans.find((s) => s.segment === segment)!;
+    expect(p.advice.key).toBe(ADVICE_KEYS.stormUnderground(span.id));
     const quote = quoteConvert(state, span.id);
-    expect((quote.repairsAvoidedPerYear + 12 * quote.poleRentSaved) * CONVERT_PAYBACK_YEARS).toBeLessThan(quote.cost);
-    expect(p.advice.title).toBe(`Build underground around ${state.city.segments[segment]!.name}`);
+    const name = state.city.segments[segment]!.name;
     expect(p.advice.why).toContain(formatMoney(quote.cost));
-    expect(p.advice.why).toContain('underground instead');
-    expect(p.commands).toEqual([]);
+    if ((quote.repairsAvoidedPerYear + 12 * quote.poleRentSaved) * CONVERT_PAYBACK_YEARS >= quote.cost) {
+      expect(p.advice.title).toBe(`Rebuild ${name} underground`);
+      expect(p.commands).toEqual([{ type: 'convertSpan', span: span.id }]);
+    } else {
+      expect(p.advice.title).toBe(`Build underground around ${name}`);
+      expect(p.advice.why).toContain('underground instead');
+      expect(p.commands).toEqual([]);
+    }
   });
 
   it('falls back to building underground when cash does not cover the rebuild', () => {
@@ -759,7 +927,24 @@ describe('stormUnderground', () => {
     state.finance.cash = 100;
     const p = plan(state, 'stormUnderground');
     expect(p.advice.title).toBe(`Build underground around ${state.city.segments[span.segment]!.name}`);
+    expect(p.advice.why).toContain('build new streets around here underground');
     expect(p.commands).toEqual([]);
+  });
+
+  it('gives one card per span: a snoozed span gives way to the next storm-prone one', () => {
+    const { state, span } = stormy(2);
+    const subs = (seg: number) => state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === seg).length;
+    const second = [...state.network.spans].filter((s) => s.id !== span.id).sort((a, b) => subs(b.segment) - subs(a.segment))[0]!;
+    for (const storm of state.weather.storms) storm.spans = [span.id, second.id];
+    const first = advise(state, 99).find((a) => a.id === 'stormUnderground')!;
+    const other = first.key === ADVICE_KEYS.stormUnderground(span.id) ? second : span;
+    expect([span.id, second.id].map((id) => ADVICE_KEYS.stormUnderground(id))).toContain(first.key);
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: first.key })).toEqual({ ok: true, cost: 0 });
+    const next = advise(state, 99).find((a) => a.id === 'stormUnderground')!;
+    expect(next.key).toBe(ADVICE_KEYS.stormUnderground(other.id));
+    expect(next.action).toEqual({ kind: 'focusSegment', segment: other.segment });
+    // planFor ignores snoozes: the rule's own best subject.
+    expect(planFor(state, 'stormUnderground')!.advice.key).toBe(first.key);
   });
 
   it('does not fire for one storm, old storms, underground plant or a span feeding nobody', () => {
@@ -777,27 +962,156 @@ describe('stormUnderground', () => {
 });
 
 describe('incumbentPromo', () => {
+  /** litGame with the incumbent's promo running (not answered) at the CO cabinet for three more months. */
   function promoted(): GameState {
     const state = litGame(150);
     const cabinet = state.network.cabinets[0]!;
     const endDay = closeDayAfter(state.day, 3);
-    state.sales.incumbentPromos = [{ cabinet: cabinet.id, startDay: state.day - 1, endDay, price: incumbentPromoPrice(), quietUntil: closeDayAfter(endDay, 6) }];
+    state.sales.incumbentPromos = [{ cabinet: cabinet.id, startDay: state.day - 1, endDay, price: incumbentPromoPrice(), quietUntil: closeDayAfter(endDay, 6), triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     return state;
   }
 
-  it('compares the target take rate there with elsewhere, and suggests a promo or marketing, not a price cut', () => {
+  /** What bestIncumbentAnswer says when nothing pays. */
+  const none = (state: GameState, cabinet: number): IncumbentAnswer => ({ ...realIncumbent.bestIncumbentAnswer(state, cabinet), kind: 'none', promo: null, netValue: 0, text: '' });
+
+  it('when nothing pays: a tip with what the promo costs and that it ends on its own, recommending no remedy', () => {
+    answerMock.mockImplementation(none);
     const state = promoted();
     const cabinet = state.network.cabinets[0]!;
+    const promo = state.sales.incumbentPromos[0]!;
     const p = plan(state, 'incumbentPromo');
-    expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.incumbentPromo, action: { kind: 'openPanel', panel: 'pricing' }, actionLabel: 'Open Pricing' });
-    expect(p.advice.title).toContain(cornerName(state.city, cabinet.node));
+    expect(p.advice).toMatchObject({ severity: 'tip', priority: ADVICE_PRIORITY.incumbentPromoRideOut, action: { kind: 'focusCabinet', cabinet: cabinet.id }, actionLabel: 'Show me' });
+    expect(p.advice.key).toBe(ADVICE_KEYS.incumbentPromo(cabinet.id));
+    expect(p.advice.title).toBe(`Ride out the cable company's promo at ${cornerName(state.city, cabinet.node)}`);
     // Every lot here is a home: the weighted target is the home target.
     expect(p.advice.why).toContain(`${pct(stateTakeRate(state, 'home', cabinet.id))} instead of ${pct(stateTakeRate(state, 'home'))}`);
     expect(p.advice.why).toContain(formatMoney(incumbentPromoPrice()));
     expect(p.advice.why).toContain(formatMoney(INCUMBENT_PRICE));
     expect(p.advice.why).toContain('3 months');
-    expect(p.advice.why).toContain('intro promo');
-    expect(p.advice.why).toContain('rather than a permanent price cut');
+    const units = state.sales.accounts.filter((a) => a.cabinet === cabinet.id).reduce((n, a) => n + Object.values(a.tierUnits).reduce((x, y) => x + y, 0), 0);
+    const extra = Math.round(units * INCUMBENT_PROMO_CHURN * 3);
+    if (extra > 0) expect(p.advice.why).toContain(`about ${extra} cancellation`);
+    expect(p.advice.why).toContain(`ends on its own on ${formatDate(promo.endDay)}`);
+    // No remedy: never marketing, a price cut or a promo the quotes say does not pay.
+    expect(p.advice.why).not.toMatch(/marketing|price cut|Answer with/i);
+    expect(p.commands).toEqual([]);
+  });
+
+  it('when a remedy pays: recommends exactly bestIncumbentAnswer\'s sentence, with its command', () => {
+    const state = promoted();
+    const cabinet = state.network.cabinets[0]!;
+    const text = 'A retention offer (15% off until the promo ends) costs about $1 and keeps about 2 subscribers worth $3: answer it in Pricing.';
+    answerMock.mockImplementation((s, c) => ({ ...none(s, c), kind: 'retention', netValue: 2, text }));
+    // Drawn straight from planFor: the stub's answerIncumbent rejects until pricing-balance merges, so the command is not applied here.
+    const p = planFor(state, 'incumbentPromo')!;
+    expectWellFormed(p.advice);
+    expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.incumbentPromo, action: { kind: 'openPanel', panel: 'pricing' }, actionLabel: 'Open Pricing' });
+    expect(p.advice.title).toBe(`Answer the cable company's promo at ${cornerName(state.city, cabinet.node)}`);
+    expect(p.advice.why.endsWith(` ${text}`)).toBe(true);
+    expect(p.commands).toEqual([{ type: 'answerIncumbent', cabinet: cabinet.id }]);
+    expect(p.advice.why).not.toMatch(/marketing/i);
+
+    // An intro promo that pays: set it.
+    const introText = 'An intro promo (20% off for 3 months) wins about 4 signups worth $900 for $300 of discounts: set it in Pricing.';
+    const promo = { percentOff: 20, months: 3 };
+    answerMock.mockImplementation((s, c) => ({ ...none(s, c), kind: 'introPromo', promo, netValue: 600, text: introText }));
+    const q = plan(state, 'incumbentPromo');
+    expect(q.advice.why.endsWith(` ${introText}`)).toBe(true);
+    expect(q.commands).toEqual([{ type: 'setPromo', promo }]);
+  });
+
+  it('holds a paying remedy back while cash is short for the next payment: a discount would cut the revenue that pays it', () => {
+    const text = 'A retention offer (15% off until the promo ends) costs about $1 and keeps about 2 subscribers worth $3: answer it in Pricing.';
+    answerMock.mockImplementation((s, c) => ({ ...none(s, c), kind: 'retention', netValue: 2, text }));
+    const state = withLoan(promoted(), 600_000);
+    state.finance.cash = Math.max(0, estimateNextDebtService(state) + state.finance.cash - estimateCashAtClose(state) - 1);
+    expect(estimateCashAtClose(state)).toBeLessThan(estimateNextDebtService(state));
+    const plans = advicePlans(state);
+    expect(plans.some((p) => p.advice.id === 'paymentShort' || p.advice.id === 'cashRunway')).toBe(true);
+    expect(plans.some((p) => p.advice.id === 'incumbentPromo')).toBe(false);
+    // On its own (no earlier claims), the remedy is still what the rule would say.
+    expect(planFor(state, 'incumbentPromo')?.commands).toEqual([{ type: 'answerIncumbent', cabinet: state.network.cabinets[0]!.id }]);
+  });
+
+  it('clears once the promo is answered, or when none runs', () => {
+    const state = promoted();
+    expect(planFor(state, 'incumbentPromo')).not.toBeNull();
+    state.sales.incumbentPromos[0]!.answered = true;
+    expect(planFor(state, 'incumbentPromo')).toBeNull();
+    expect(advise(state, 99).some((a) => a.id === 'incumbentPromo')).toBe(false);
+    const over = promoted();
+    over.sales.incumbentPromos = [];
+    expect(planFor(over, 'incumbentPromo')).toBeNull();
+  });
+
+  it('clears once answered with the intro promo it recommended, and does not switch to another remedy', () => {
+    // SMART's young game with an incumbent promo at its largest area, where the intro promo is the best answer.
+    let found: { state: GameState; cabinet: number } | null = null;
+    for (const seed of TUNING_SEEDS) {
+      const state = runBot(seed, smartBot(), 4).state;
+      if (state.sales.promo !== null) expect(applyCommand(state, { type: 'setPromo', promo: null }).ok).toBe(true);
+      const { cabinet } = ensureIncumbentPromo(state);
+      if (realIncumbent.bestIncumbentAnswer(state, cabinet).kind === 'introPromo') {
+        found = { state, cabinet };
+        break;
+      }
+    }
+    expect(found, 'a tuning seed where the intro promo is the best answer').not.toBeNull();
+    const { state, cabinet } = found!;
+    const key = ADVICE_KEYS.incumbentPromo(cabinet);
+    const card = planFor(state, 'incumbentPromo')!;
+    expect(card.advice.key).toBe(key);
+    expect(card.commands).toHaveLength(1);
+    expect(card.commands[0]!.type).toBe('setPromo');
+    for (const command of card.commands) expect(applyCommand(state, command).ok).toBe(true);
+    const promo = state.sales.incumbentPromos.find((p) => p.cabinet === cabinet)!;
+    expect(promo.answeredWithPromo).toBe(true);
+    // The intro promo spares no churn: only a retention offer does.
+    expect(promo.answered).toBe(false);
+    expect(incumbent.answeredPromoAt(state, cabinet, state.day)).toBe(false);
+    expect(planFor(state, 'incumbentPromo')).toBeNull();
+    expect(advicePlans(state).some((p) => p.advice.key === key)).toBe(false);
+    expect(realIncumbent.bestIncumbentAnswer(state, cabinet).kind).toBe('none');
+    // Still answered a week on; taking the intro promo away brings the card back.
+    runDays(state, 7);
+    expect(advicePlans(state).some((p) => p.advice.key === key)).toBe(false);
+    expect(applyCommand(state, { type: 'setPromo', promo: null }).ok).toBe(true);
+    expect(state.sales.incumbentPromos.find((p) => p.cabinet === cabinet)!.answeredWithPromo).toBe(false);
+    expect(planFor(state, 'incumbentPromo')?.advice.key).toBe(key);
+  });
+
+  it('an intro promo set where the retention offer was the best answer leaves that card up', () => {
+    const state = promoted();
+    const cabinet = state.network.cabinets[0]!;
+    const promo = state.sales.incumbentPromos[0]!;
+    // setPromo asks the real bestIncumbentAnswer: whatever it says here is not an intro promo, so the promo is not answered by one.
+    expect(realIncumbent.bestIncumbentAnswer(state, cabinet.id).kind).not.toBe('introPromo');
+    expect(applyCommand(state, { type: 'setPromo', promo: { percentOff: 20, months: 3 } }).ok).toBe(true);
+    expect(promo.answeredWithPromo).toBe(false);
+    expect(planFor(state, 'incumbentPromo')?.advice.key).toBe(ADVICE_KEYS.incumbentPromo(cabinet.id));
+  });
+
+  it('gives one card per cabinet: a snoozed one gives way to the next area', () => {
+    answerMock.mockImplementation(none);
+    const state = makeTestState(makeGridCity({ cols: 4, rows: 2 }));
+    addLivePlant(state, { splitters: 4 });
+    const far = state.city.nodes.at(-1)!.id;
+    addLivePlant(state, { segments: [], node: far, splitters: 4 });
+    runDays(state, 150);
+    const cabinets = state.network.cabinets.filter((c) => state.sales.accounts.some((a) => a.cabinet === c.id));
+    expect(cabinets.length).toBe(2);
+    const endDay = closeDayAfter(state.day, 3);
+    state.sales.incumbentPromos = cabinets.map((c) => ({ cabinet: c.id, startDay: state.day - 1, endDay, price: incumbentPromoPrice(), quietUntil: closeDayAfter(endDay, 6), triggerTakePct: 45, answered: false, answeredWithPromo: false }));
+    const first = advise(state, 99).find((a) => a.id === 'incumbentPromo')!;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: first.key })).toEqual({ ok: true, cost: 0 });
+    const next = advise(state, 99).find((a) => a.id === 'incumbentPromo')!;
+    expect(next.key).not.toBe(first.key);
+    expect(next.key).toMatch(KEY_PATTERN.incumbentPromo);
+    // Answering the second clears it too: then only the snoozed one is left, and it stays snoozed.
+    const second = Number(next.key.split(':')[2]);
+    state.sales.incumbentPromos.find((p) => p.cabinet === second)!.answered = true;
+    expect(advise(state, 99).some((a) => a.id === 'incumbentPromo')).toBe(false);
+    expect(buildBriefing(state)!.snoozed).toBeGreaterThanOrEqual(1);
   });
 
   it('does not fire before the promo starts, after it ends, or where you have no subscribers', () => {
@@ -925,15 +1239,117 @@ describe('redCpp', () => {
 });
 
 describe('expand', () => {
-  /** A wide grid with a little plant by the CO: room to grow. */
+  /** A wide grid of homes with an apartment building on every street (green to build), and a little plant by the CO: room to grow. */
   function growing(): GameState {
-    const state = makeTestState(makeGridCity({ cols: 8, rows: 4 }));
+    const state = makeTestState(makeGridCity({ cols: 8, rows: 4, parcelKinds: (p) => (p.id % 8 === 0 ? { kind: 'mdu', units: 24 } : undefined) }));
     addLivePlant(state, { segments: [0, 1, 8, 9], splitters: 2 });
     runDays(state, 31);
     return state;
   }
 
-  it('points at the best green corner near the plant, funded from cash above the reserve', () => {
+  /** The reserve expand keeps without a loan: EXPAND_RESERVE_MONTHS of running costs, debt service and installs, the new area's installs, and the cushion. */
+  function reserveOf(state: GameState, node: number): number {
+    const m = covenantMetrics(state);
+    const service = Math.max(estimateNextDebtService(state), Math.ceil(m.annualDebtService / 12));
+    const subscribed = new Map(state.sales.accounts.map((a) => [a.parcel, Object.values(a.tierUnits).reduce((x, y) => x + y, 0)]));
+    const installs = Math.max(monthlyInstallPace(state), plannedInstallPace(state, subscribed));
+    const fixed = OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
+    const area = expectedAreaInstalls(state, buildOutPlan(state, node), getService(state).passings);
+    return EXPAND_RESERVE_MONTHS * (fixed + monthlyPoleRent(state) + service + installs) + area + fundingHint(state, 0).cushion;
+  }
+
+  /** Every corner expandCandidates may consider (no cabinet, near the planned plant, clear of every cabinet's reach), with its distance to the plant. */
+  function eligibleCorners(state: GameState): { node: number; d2: number }[] {
+    const { city, network } = state;
+    const plant = new Set<number>([city.coNode, ...network.cabinets.map((c) => c.node)]);
+    for (const span of network.spans) {
+      plant.add(city.segments[span.segment]!.a);
+      plant.add(city.segments[span.segment]!.b);
+    }
+    const cabinets = network.cabinets.map((c) => city.nodes[c.node]!);
+    const near = (EXPAND_REACH_MULTIPLE * CABINET_REACH_FT) / city.tileFt;
+    const apart = CABINET_REACH_FT / city.tileFt;
+    const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
+    const out: { node: number; d2: number }[] = [];
+    for (const node of city.nodes) {
+      if (cabinets.some((c) => c.id === node.id)) continue;
+      const d2 = Math.min(...[...plant].map((p) => dist2(city.nodes[p]!, node)));
+      if (d2 > near * near || cabinets.some((c) => dist2(c, node) < apart * apart)) continue;
+      out.push({ node: node.id, d2 });
+    }
+    return out;
+  }
+
+  /** Most passings of a green build-out (at least EXPAND_MIN_PASSINGS, with a cabinet) among `nodes`, 0 for none. */
+  function bestGreen(state: GameState, nodes: readonly number[]): number {
+    let best = 0;
+    for (const node of nodes) {
+      const b = buildOutPlan(state, node);
+      if (b.cpp !== null && cppBand(b.cpp) === 'green' && b.passings >= EXPAND_MIN_PASSINGS && b.commands.some((c) => c.type === 'placeCabinet')) best = Math.max(best, b.passings);
+    }
+    return best;
+  }
+
+  it('prices the corners on the cable that could pass the most, not the lowest-numbered ones (round 4b review)', () => {
+    // Angel-backed seed 1 after its first build: a feeder runs through town, and every corner on it is 0 ft from the plant.
+    const state = newGame(1, { difficulty: 'angel' });
+    const first = planFor(state, 'expand')!;
+    for (const command of first.commands) expect(applyCommand(state, command).ok).toBe(true);
+    const eligible = eligibleCorners(state);
+    const onCable = eligible.filter((c) => c.d2 === 0);
+    expect(onCable.length).toBeGreaterThan(EXPAND_CANDIDATES_MAX);
+    // What ranking by distance with the node id as tie-break would price ...
+    const byId = [...eligible].sort((a, b) => a.d2 - b.d2 || a.node - b.node).slice(0, EXPAND_CANDIDATES_MAX).map((c) => c.node);
+    const candidates = expandCandidates(state);
+    expect(candidates).toHaveLength(EXPAND_CANDIDATES_MAX);
+    expect(candidates).not.toEqual(byId);
+    // ... against what it prices now: eligible corners still, and the best green build-out among them beats the old pick.
+    for (const node of candidates) expect(eligible.some((c) => c.node === node)).toBe(true);
+    const now = bestGreen(state, candidates);
+    expect(now).toBeGreaterThan(bestGreen(state, byId));
+    expect(now).toBeGreaterThanOrEqual(bestGreen(state, eligible.map((c) => c.node)) / 2);
+  });
+
+  it('prices a green build-out whenever the eligible corners hold one: reach is measured along streets, not in a straight line (round 4b check)', () => {
+    // Angel-backed towns with their two largest green build-outs built (the largest of all, then the largest still
+    // eligible), a year on: green build-outs are left beside the plant. Measured in a straight line, a corner's
+    // reach took in streets across blocks no street joins: amber and red corners looked green, filled the six
+    // candidates, and expand said nothing with $700k+ in hand.
+    const largestGreen = (state: GameState, nodes: readonly number[]): number => {
+      let best = -1;
+      let most = 0;
+      for (const node of nodes) {
+        const passings = bestGreen(state, [node]);
+        if (passings > most) [best, most] = [node, passings];
+      }
+      return best;
+    };
+    for (const seed of [7, 13]) {
+      const state = newGame(seed, { difficulty: 'angel' });
+      for (const nodes of [() => state.city.nodes.map((n) => n.id), () => eligibleCorners(state).map((c) => c.node)]) {
+        const node = largestGreen(state, nodes());
+        expect(node, `seed ${seed}`).toBeGreaterThanOrEqual(0);
+        for (const command of buildOutPlan(state, node).commands) expect(applyCommand(state, command).ok).toBe(true);
+      }
+      runDays(state, DAYS_PER_YEAR);
+      const eligible = eligibleCorners(state).map((c) => c.node);
+      expect(bestGreen(state, eligible), `seed ${seed}: a green build-out is left`).toBeGreaterThan(0);
+      expect(bestGreen(state, expandCandidates(state)), `seed ${seed}: the candidates price one`).toBeGreaterThan(0);
+      const p = planFor(state, 'expand');
+      expect(p, `seed ${seed}`).not.toBeNull();
+      expect(cppBand(buildOutPlan(state, (p!.advice.action as { node: number }).node).cpp!), `seed ${seed}`).toBe('green');
+    }
+  }, 60_000);
+
+  it('keeps suggesting builds after the first ones: an Angel-backed follower places more than two cabinets', () => {
+    for (const seed of [1, 2027]) {
+      const run = runBot(seed, advisorFollowerBot, 24, { state: newGame(seed, { difficulty: 'angel' }) });
+      expect(run.gameOver, `seed ${seed}`).toBeNull();
+      expect(run.state.network.cabinets.length, `seed ${seed} cabinets`).toBeGreaterThan(2);
+    }
+  }, 120_000);
+
+  it('builds exactly coverage.buildOutPlan at the best green corner, from cash above a real reserve', () => {
     const state = growing();
     const candidates = expandCandidates(state);
     expect(candidates.length).toBeGreaterThan(0);
@@ -942,42 +1358,76 @@ describe('expand', () => {
     expect(p.advice.action.kind).toBe('focusNode');
     const node = (p.advice.action as { node: number }).node;
     expect(candidates).toContain(node);
-    const preview = coveragePreview(state, node);
-    expect(preview.projectedCppBand).toBe('green');
-    const newly = preview.passingsNow - preview.passingsServedElsewhere;
+    expect(p.advice.key).toBe(ADVICE_KEYS.expand(node));
+    const build = buildOutPlan(state, node);
+    expect(build.cpp).not.toBeNull();
+    expect(cppBand(build.cpp!)).toBe('green');
+    expect(build.passings).toBeGreaterThanOrEqual(EXPAND_MIN_PASSINGS);
+    // No green candidate passes more.
     for (const other of candidates) {
-      const q = coveragePreview(state, other);
-      if (q.projectedCppBand === 'green') expect(q.passingsNow - q.passingsServedElsewhere).toBeLessThanOrEqual(newly);
+      const q = buildOutPlan(state, other);
+      if (q.cpp !== null && cppBand(q.cpp) === 'green') expect(q.passings).toBeLessThanOrEqual(build.passings);
     }
     expect(p.advice).toMatchObject({ severity: 'tip', priority: ADVICE_PRIORITY.expandCash, title: `Build a cabinet at ${cornerName(state.city, node)}` });
-    expect(p.advice.why).toContain(`${newly} passings`);
-    expect(p.advice.why).toContain(formatMoney(preview.projectedCpp!));
-    expect(p.advice.why).toContain(formatMoney(preview.cabinetCost + preview.buildOutCost));
-    expect(p.commands).toEqual([{ type: 'placeCabinet', node }]);
-    expect(p.extraSpend).toBe(preview.buildOutCost);
-    // Never more than the funds above the reserve.
-    expect(state.finance.cash - preview.cabinetCost - preview.buildOutCost).toBeGreaterThanOrEqual(p.keep);
-    expectNoBackfire(state, p);
+    expect(p.advice.why).toContain(`${build.passings} passings`);
+    expect(p.advice.why).toContain(formatMoney(build.cpp!));
+    expect(p.advice.why).toContain(formatMoney(build.cost));
+    // Exactly what was costed: the plan's commands, nothing spent beyond them.
+    expect(p.commands).toEqual(build.commands);
+    expect(p.spend).toBe(build.cost);
+    expect(p.extraSpend).toBe(0);
+    expect(p.keep).toBe(reserveOf(state, node));
+    expect(p.advice.why).toContain(formatMoney(p.keep));
+    // The reserve holds months of running costs and the new area's installs on top of the cushion.
+    expect(p.keep).toBeGreaterThan(fundingHint(state, 0).cushion + EXPAND_RESERVE_MONTHS * OVERHEAD_PER_MONTH);
+    expect(expectedAreaInstalls(state, build, getService(state).passings)).toBeGreaterThan(0);
+    const after = expectNoBackfire(state, p);
+    expect(after.finance.cash).toBe(state.finance.cash - build.cost);
+    expect(after.finance.cash).toBeGreaterThanOrEqual(p.keep);
   });
 
-  it('borrows the rest with a covenant-safe term loan when cash above the reserve falls short', () => {
+  it('borrows the rest with a term loan that leaves the covenants EXPAND_COVENANT_HEADROOM inside their limits', () => {
     const state = growing();
     const first = plan(state, 'expand');
-    const node = (first.advice.action as { node: number }).node;
-    const preview = coveragePreview(state, node);
-    // Revenue history to lend against, and cash just above the reserve.
+    // Revenue history to lend against, and cash short of the build plus the reserve.
     const history = makeTradingState(60_000, 20_000);
     state.finance.reports = history.finance.reports;
-    state.finance.cash = first.keep + Math.round((preview.cabinetCost + preview.buildOutCost) / 2);
+    state.finance.cash = first.keep + Math.round(first.spend / 2);
     const p = plan(state, 'expand');
     expect(p.advice.priority).toBe(ADVICE_PRIORITY.expandLoan);
-    const loan = p.commands.find((c) => c.type === 'takeTermLoan') as { amount: number; termYears: 5 | 7 } | undefined;
-    expect(loan).toBeDefined();
-    expect(loan!.amount).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
-    expect(loan!.amount).toBeLessThanOrEqual(maxSafeTermLoan(state, loan!.termYears));
-    expect(quoteTermLoan(state, loan!.amount, loan!.termYears).after.compliant).toBe(true);
-    expect(p.advice.why).toContain(`${formatMoney(loan!.amount)} ${loan!.termYears}-year term loan`);
-    expectNoBackfire(state, p);
+    const loan = p.commands[0] as Extract<Command, { type: 'takeTermLoan' }>;
+    expect(loan.type).toBe('takeTermLoan');
+    expect(loan.amount).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+    expect(loan.amount).toBeLessThanOrEqual(maxSafeTermLoan(state, loan.termYears, EXPAND_COVENANT_HEADROOM));
+    const quote = quoteTermLoan(state, loan.amount, loan.termYears);
+    expect(covenantsWithin(quote.after, EXPAND_COVENANT_HEADROOM)).toBe(true);
+    const node = (p.advice.action as { node: number }).node;
+    expect(p.commands.slice(1)).toEqual(buildOutPlan(state, node).commands);
+    // The reserve counts the new loan's payments too.
+    expect(p.keep).toBe(reserveOf(state, node) + EXPAND_RESERVE_MONTHS * quote.payment + quote.stubInterest);
+    expect(p.advice.why).toContain(`${formatMoney(loan.amount)} ${loan.termYears}-year term loan`);
+    expect(p.advice.why).toContain(`${pct(EXPAND_COVENANT_HEADROOM)} inside their limits`);
+    const after = expectNoBackfire(state, p);
+    expect(covenantsWithin(covenantMetrics(after), EXPAND_COVENANT_HEADROOM)).toBe(true);
+  });
+
+  it('never fires beside covenantCure: not with a covenant within COVENANT_RISK_MARGIN of its limit, snoozed or not', () => {
+    const state = growing();
+    state.finance.reports = makeTradingState(60_000, 20_000).finance.reports;
+    expect(planFor(state, 'expand')).not.toBeNull();
+    // Debt until leverage is just inside the risk margin: covenantCure warns, and expand stays quiet.
+    let debt = 0;
+    while (covenantsWithin(covenantMetrics(state), COVENANT_RISK_MARGIN)) {
+      debt += LOAN_ROUNDING * 10;
+      state.debt.credit.balance = debt;
+    }
+    expect(covenantMetrics(state).compliant).toBe(true);
+    expect(planFor(state, 'covenantCure')).not.toBeNull();
+    expect(planFor(state, 'expand')).toBeNull();
+    // Snoozing the warning does not let expand through.
+    const cure = advise(state, 99).find((a) => a.id === 'covenantCure')!;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: cure.key }).ok).toBe(true);
+    expect(advise(state, 99).some((a) => a.id === 'expand')).toBe(false);
   });
 
   it('does not fire when not compliant, with installs paused, below the reserve or with no PON port', () => {
@@ -993,12 +1443,135 @@ describe('expand', () => {
     const full = growing();
     full.network.olt.ponPorts = ponPortsUsed(full) + CABINET_START_SPLITTERS - 1;
     expect(planFor(full, 'expand')).toBeNull();
+    // Just short of the build plus the reserve, with nothing to borrow against: nothing.
+    const short = growing();
+    const p = plan(short, 'expand');
+    short.finance.cash = p.keep + p.spend - 1;
+    const q = planFor(short, 'expand');
+    if (q) expect((q.advice.action as { node: number }).node).not.toBe((p.advice.action as { node: number }).node);
   });
+
+  it('a snoozed corner gives way to the next best one', () => {
+    const state = growing();
+    const first = advise(state, 99).find((a) => a.id === 'expand')!;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: first.key })).toEqual({ ok: true, cost: 0 });
+    const next = advise(state, 99).find((a) => a.id === 'expand');
+    if (next) expect(next.key).not.toBe(first.key);
+    expect(buildBriefing(state)!.snoozed).toBeGreaterThanOrEqual(1);
+  });
+
+  it('is safe to follow: after the plan, the next two closes bring no covenant warning, breach, missed or short payment', () => {
+    // States from several towns: following expand from the first months (cash), and borrowing variants a year in.
+    const checked = { cash: 0, loan: 0 };
+    /** Apply `p` to a copy of `state`, then play to the second close after it. */
+    const follow = (state: GameState, p: AdvicePlan, label: string) => {
+      const s = clone(state);
+      for (const command of p.commands) expect(applyCommand(s, command), `${label}: ${JSON.stringify(command)}`).toMatchObject({ ok: true });
+      expect(s.finance.cash, label).toBeGreaterThanOrEqual(p.keep);
+      checked[p.commands[0]!.type === 'takeTermLoan' ? 'loan' : 'cash']++;
+      const firstNotice = s.nextNoticeId;
+      const start = s.finance.reports.length;
+      while (s.finance.reports.length < start + 2 && !s.gameOver) {
+        const closes = s.finance.reports.length;
+        tick(s);
+        if (s.finance.reports.length === closes) continue;
+        // At each close: no covenant trouble, no payment trouble.
+        expect(s.gameOver, label).toBeNull();
+        expect(covenantMetrics(s).compliant, `${label}: breach`).toBe(true);
+        expect(s.debt.covenant.stage, label).toBe('compliant');
+        expect(planFor(s, 'covenantCure'), `${label}: covenantCure`).toBeNull();
+        expect(planFor(s, 'paymentShort'), `${label}: paymentShort`).toBeNull();
+      }
+      const bad = s.notices.filter((n) => n.id >= firstNotice && ['paymentMissed', 'covenantWarning', 'covenantPenalty', 'creditFrozen', 'insolvencyWarning'].includes(n.kind));
+      expect(bad.map((n) => n.message), label).toEqual([]);
+    };
+    const expandFollower = (seed: number): Bot => ({
+      name: 'expand-follower',
+      act(state, send) {
+        const p = advicePlans(state).find((x) => x.advice.id === 'expand');
+        if (!p) return;
+        follow(state, p, `seed ${seed} day ${state.day}`);
+        for (const command of p.commands) send(command);
+      },
+    });
+    for (const seed of [2027, 424242, 99]) {
+      const year = runBot(seed, expandFollower, 12).state;
+      // A year in, with cash for only half the build beyond the reserve: the plan borrows (when the bank lends enough).
+      const rich = clone(year);
+      rich.finance.cash += 300_000;
+      const cashPlan = planFor(rich, 'expand');
+      if (!cashPlan) continue;
+      const tight = clone(year);
+      tight.finance.cash = cashPlan.keep + Math.round(cashPlan.spend / 2);
+      let loanPlan = planFor(tight, 'expand');
+      // The bank may lend less than half of a large build: then cash short of it by half of the largest loan it makes safely.
+      const lends = maxSafeTermLoan(year, TERM_LOAN_YEARS[TERM_LOAN_YEARS.length - 1] as TermYears, EXPAND_COVENANT_HEADROOM);
+      if (!loanPlan && lends >= 2 * TERM_LOAN_MIN) {
+        tight.finance.cash = cashPlan.keep + cashPlan.spend - Math.round(lends / 2);
+        loanPlan = planFor(tight, 'expand');
+      }
+      if (loanPlan) follow(tight, loanPlan, `seed ${seed} borrowing`);
+    }
+    expect(checked.cash).toBeGreaterThanOrEqual(3);
+    expect(checked.loan).toBeGreaterThanOrEqual(1);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
 // Never backfires, on realistic states
 // ---------------------------------------------------------------------------
+
+describe('following the top suggestion', () => {
+  it('never brings on its own covenant-risk warning: Bootstrapped, where the runway loans used to land on the limit', () => {
+    // paymentShort alone may borrow up to the limits (a missed payment is worse than the warning, which then says so).
+    expect(SUGGESTED_BORROWING_HEADROOM).toBeGreaterThan(COVENANT_RISK_MARGIN);
+    const seen: string[] = [];
+    let borrowed = 0;
+    let runwayLoans = 0;
+    // The review's towns with the one cabinet the advisor used to build there on day one (the biggest green
+    // build-out near the CO that leaves a third of the purse), a network whose burn the runway loans bridge
+    // for years; and seed 1, where the advisor builds one itself.
+    const oneCabinet = (seed: number): GameState => {
+      const state = newGame(seed, { difficulty: 'bootstrapped' });
+      if (seed === 1) return state;
+      const co = state.city.nodes[state.city.coNode]!;
+      const near = (EXPAND_REACH_MULTIPLE * CABINET_REACH_FT) / state.city.tileFt;
+      let best: ReturnType<typeof buildOutPlan> | null = null;
+      for (const node of state.city.nodes) {
+        if ((node.x - co.x) * (node.x - co.x) + (node.y - co.y) * (node.y - co.y) > near * near) continue;
+        const b = buildOutPlan(state, node.id);
+        if (b.cpp === null || cppBand(b.cpp) !== 'green' || b.passings < EXPAND_MIN_PASSINGS || b.cost > (state.finance.cash * 2) / 3) continue;
+        if (!best || b.passings > best.passings) best = b;
+      }
+      for (const command of best!.commands) expect(applyCommand(state, command).ok).toBe(true);
+      return state;
+    };
+    for (const seed of [1, 99, 12345]) {
+      const follower: Bot = {
+        name: 'checked-follower',
+        act(state, send) {
+          const top = advicePlans(state)[0];
+          if (!top || top.commands.length === 0) return;
+          const before = planFor(state, 'covenantCure');
+          for (const cmd of top.commands) if (!send(cmd).ok) break;
+          if (top.advice.id === 'paymentShort') return;
+          const borrows = top.commands.some((c) => c.type === 'drawCredit' || c.type === 'takeTermLoan');
+          if (borrows) borrowed++;
+          if (borrows && top.advice.id === 'cashRunway') runwayLoans++;
+          const after = planFor(state, 'covenantCure');
+          const where = `seed ${seed} day ${state.day}: ${top.advice.id} ${JSON.stringify(top.commands)}`;
+          if (before === null && after !== null) seen.push(`${where} -> ${after.advice.title}`);
+          // What the card promised: the covenants at least SUGGESTED_BORROWING_HEADROOM inside their limits.
+          if (borrows && top.advice.id !== 'expand' && !covenantsWithin(covenantMetrics(state), SUGGESTED_BORROWING_HEADROOM)) seen.push(`${where} -> inside the headroom no more`);
+        },
+      };
+      runBot(seed, () => follower, 60, { state: oneCabinet(seed) });
+    }
+    expect(borrowed).toBeGreaterThan(0);
+    expect(runwayLoans).toBeGreaterThan(0);
+    expect(seen).toEqual([]);
+  }, 600_000);
+});
 
 describe('never backfires', () => {
   it('on the frozen v3 fixtures and variations of the healthy borrower', () => {
@@ -1020,6 +1593,7 @@ describe('never backfires', () => {
     expectAllSafe(quiet);
 
     const stormy = fixture('v3-town');
+    for (const segment of stormy.city.segments) segment.zone = 'rural';
     const aerial = stormy.network.spans.filter((s) => s.method === 'aerial' && s.stage === 'live');
     stormy.weather.storms = [1, 2].map((id) => ({ id, day: stormy.day - 40 * id, x: 0, y: 0, radius: 9, severity: 2, spans: aerial.map((s) => s.id), repairCost: 1 }));
     stormy.weather.nextStormId = 3;
@@ -1040,7 +1614,7 @@ describe('never backfires', () => {
 describe('suggestions shown together', () => {
   /** A full cabinet and a storm-prone aerial street feeding subscribers, on cash that covers the rebuild alone but not with the splitter. */
   function tight(): { state: GameState; span: CableSpan } {
-    const state = litGame(150);
+    const state = litGame(150, ruralGrid());
     for (const span of state.network.spans) span.method = 'aerial';
     state.network.version++;
     const subs = (seg: number) => state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === seg).length;
@@ -1066,6 +1640,12 @@ describe('suggestions shown together', () => {
     expect(storm.commands).toEqual([]);
     expect(storm.advice.title).toMatch(/^Build underground around /);
     expectTogetherSafe(state, plans);
+    // A snoozed suggestion claims nothing: with the splitter snoozed, cash covers the rebuild again.
+    const splitterKey = plans.find((p) => p.advice.id === 'addSplitter')!.advice.key;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: splitterKey }).ok).toBe(true);
+    const after = advicePlans(state);
+    expect(after.some((p) => p.advice.id === 'addSplitter')).toBe(false);
+    expect(after.find((p) => p.advice.id === 'stormUnderground')!.commands).toEqual([{ type: 'convertSpan', span: span.id }]);
   });
 
   it('never suggest borrowing twice: a later purchase waits once an earlier suggestion borrows', () => {
@@ -1243,5 +1823,240 @@ describe('buildBriefing', () => {
     expect(b.forward.runwayMonths).toBe(runwayMonths(state));
     expect(b.headline.debt).toBe(totalDebt(state));
     expect(b.headline.stage).toBe('frozen');
+  });
+});
+
+describe('snoozes and repeats (round 4b)', () => {
+  /** A lit game whose 1 Gig is priced 30% over the market (and, with `twoTiers`, 500 Meg 40% under it): the pricing tip fires. */
+  function overpriced(twoTiers = false): GameState {
+    const state = litGame(150);
+    const factor = (id: string) => (id === 'fiber1g' ? 1.3 : twoTiers && id === 'fiber500' ? 0.6 : 1);
+    const tiers = state.sales.pricing.tiers.map((t) => ({ id: t.id, price: Math.round(t.price * factor(t.id)), offered: t.offered }));
+    expect(applyCommand(state, { type: 'setPricing', tiers, smbMultiplier: state.sales.pricing.smbMultiplier })).toMatchObject({ ok: true });
+    return state;
+  }
+
+  /** Run to the next month close. */
+  function closeNext(state: GameState): void {
+    const before = state.finance.reports.length;
+    while (state.finance.reports.length === before) tick(state);
+  }
+
+  /** What the sheet does when a close-time briefing opens: note the keys it shows. */
+  function noteBriefing(state: GameState): Advice[] {
+    const briefing = buildBriefing(state)!;
+    expect(briefingBuiltOn(briefing)).toBe(state.day);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: briefing.advice.map((a) => a.key) })).toEqual({ ok: true, cost: 0 });
+    return briefing.advice;
+  }
+
+  it('every advice has a key naming its rule and subject, and a repeat count', () => {
+    const state = overpriced();
+    const all = advicePlans(state).map((p) => p.advice);
+    expect(all.length).toBeGreaterThan(0);
+    for (const a of all) {
+      expect(a.key).toMatch(KEY_PATTERN[a.id]);
+      expect(a.repeat).toBe(0);
+    }
+    expect(all.find((a) => a.id === 'pricing')!.key).toBe(ADVICE_KEYS.pricing('fiber1g'));
+  });
+
+  it('never repeats a suggestion word for word in briefings in a row', () => {
+    const state = overpriced();
+    const whys: string[] = [];
+    const titles: string[] = [];
+    let first = 0;
+    for (let i = 0; i < 4; i++) {
+      closeNext(state);
+      if (i === 0) first = state.day;
+      const shown = noteBriefing(state).find((a) => a.id === 'pricing');
+      expect(shown, `briefing ${i + 1}`).toBeDefined();
+      expect(shown!.repeat).toBe(i);
+      whys.push(shown!.why);
+      titles.push(shown!.title);
+    }
+    for (let i = 1; i < whys.length; i++) {
+      expect(whys[i] !== whys[i - 1] || titles[i] !== titles[i - 1], `briefings ${i} and ${i + 1}`).toBe(true);
+    }
+    // The first is the plain reason; the repeats say since when, and how many briefings running.
+    const covered = formatDate(first - 1).slice(0, 3);
+    expect(whys[0]).not.toMatch(/^Still open/);
+    expect(whys[1]).toMatch(new RegExp(`^Still open since the ${covered} \\d{4} briefing \\(2nd briefing in a row\\)\\. `));
+    expect(whys[2]).toContain('(3rd briefing in a row)');
+    expect(whys[3]).toContain('(4th briefing in a row)');
+    expect(whys[3]!.endsWith(whys[0]!.slice(-40))).toBe(true);
+    // A rebuild later the same day (the sheet after a snooze) words it the same way.
+    expect(buildBriefing(state)!.advice.find((a) => a.id === 'pricing')!.why).toBe(whys[3]);
+    // rewordRepeat leaves new advice alone.
+    const fresh = advice('pricing', ADVICE_PRIORITY.pricing);
+    expect(rewordRepeat(state, fresh)).toBe(fresh);
+  });
+
+  it('a snoozed suggestion leaves advise() and the briefing until its snooze ends, then comes back', () => {
+    const state = overpriced();
+    const pricing = advise(state).find((a) => a.id === 'pricing');
+    expect(pricing).toBeDefined();
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: pricing!.key })).toEqual({ ok: true, cost: 0 });
+    const until = closeDayAfter(state.day, ADVICE_SNOOZE_MONTHS);
+    expect(state.advisor.snoozes).toEqual([{ key: pricing!.key, untilDay: until, severity: pricing!.severity }]);
+    expect(advise(state).some((a) => a.key === pricing!.key)).toBe(false);
+    expect(advicePlans(state).some((p) => p.advice.key === pricing!.key)).toBe(false);
+    expect(isSnoozed(state, pricing!)).toBe(true);
+    // A worse situation (a higher severity) shows it again at once.
+    expect(isSnoozed(state, { key: pricing!.key, severity: 'urgent' })).toBe(false);
+    // Hidden at every close before the snooze ends, counted as snoozed; back on the close it ends at.
+    while (state.day < until - 1) {
+      closeNext(state);
+      if (state.day >= until) break;
+      const briefing = buildBriefing(state)!;
+      expect(briefing.advice.some((a) => a.key === pricing!.key)).toBe(false);
+      expect(briefing.snoozed).toBeGreaterThanOrEqual(1);
+    }
+    expect(state.day).toBe(until);
+    expect(isSnoozed(state, pricing!)).toBe(false);
+    expect(advise(state, 99).some((a) => a.key === pricing!.key)).toBe(true);
+  });
+
+  it('snoozes an urgent suggestion only until the next month', () => {
+    const state = withLoan(trading(20_000, 10_000, 0), 60_000);
+    state.finance.cash = estimateNextDebtService(state) + state.finance.cash - estimateCashAtClose(state) - 1;
+    const urgent = advise(state).find((a) => a.id === 'paymentShort')!;
+    expect(urgent.severity).toBe('urgent');
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: urgent.key }).ok).toBe(true);
+    expect(state.advisor.snoozes[0]).toEqual({ key: 'paymentShort', untilDay: closeDayAfter(state.day, ADVICE_SNOOZE_URGENT_MONTHS), severity: 'urgent' });
+    expect(advise(state).some((a) => a.id === 'paymentShort')).toBe(false);
+  });
+
+  it('shows a snoozed suggestion again when it turns more severe', () => {
+    // Compliant but near the leverage limit: covenantCure warns (important).
+    const state = trading(10_000, 9_000, 500_000);
+    let debt = 0;
+    while (covenantsWithin(covenantMetrics(state), COVENANT_RISK_MARGIN)) {
+      debt += LOAN_ROUNDING * 10;
+      state.debt.credit.balance = debt;
+    }
+    const warning = advise(state, 99).find((a) => a.id === 'covenantCure')!;
+    expect(warning.severity).toBe('important');
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: warning.key }).ok).toBe(true);
+    expect(advise(state, 99).some((a) => a.id === 'covenantCure')).toBe(false);
+    // Breached on the penalty stage: urgent, and it shows despite the snooze.
+    state.debt.credit.balance = debt * 3;
+    state.debt.covenant.stage = 'penalty';
+    const breach = advise(state, 99).find((a) => a.id === 'covenantCure');
+    expect(breach?.severity).toBe('urgent');
+  });
+
+  it('passes over a snoozed subject to the next one, and counts it as snoozed', () => {
+    const state = overpriced(true);
+    const first = advise(state, 99).find((a) => a.id === 'pricing')!;
+    expect(first.key).toBe(ADVICE_KEYS.pricing('fiber500'));
+    expect(buildBriefing(state)!.snoozed).toBe(0);
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: first.key }).ok).toBe(true);
+    const next = advise(state, 99).find((a) => a.id === 'pricing')!;
+    expect(next.key).toBe(ADVICE_KEYS.pricing('fiber1g'));
+    expect(buildBriefing(state)!.snoozed).toBe(1);
+    // The one shown in its place can be snoozed too; then neither shows, both count.
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: next.key }).ok).toBe(true);
+    expect(advise(state, 99).some((a) => a.id === 'pricing')).toBe(false);
+    expect(buildBriefing(state)!.snoozed).toBe(2);
+    expect(state.advisor.snoozes.map((x) => x.key)).toEqual([ADVICE_KEYS.pricing('fiber1g'), ADVICE_KEYS.pricing('fiber500')]);
+  });
+
+  it('replaces a snooze on the same key, drops ended ones and keeps at most ADVISOR_MEMORY_MAX', () => {
+    const state = overpriced();
+    const key = advise(state).find((a) => a.id === 'pricing')!.key;
+    state.advisor.snoozes = Array.from({ length: ADVISOR_MEMORY_MAX }, (_, i) => ({ key: `old:${String(i).padStart(2, '0')}`, untilDay: state.day + 40 + i, severity: 'tip' as const }));
+    state.advisor.snoozes.push({ key: 'ended', untilDay: state.day, severity: 'tip' });
+    state.advisor.snoozes.sort((a, b) => (a.key < b.key ? -1 : 1));
+    expect(applyCommand(state, { type: 'snoozeAdvice', key }).ok).toBe(true);
+    const keys = state.advisor.snoozes.map((x) => x.key);
+    expect(keys).toHaveLength(ADVISOR_MEMORY_MAX);
+    expect(keys).toContain(key);
+    expect(keys).not.toContain('ended');
+    // The soonest-ending went first; ascending key.
+    expect(keys).not.toContain('old:00');
+    expect([...keys].sort()).toEqual(keys);
+    // Snoozing it again just moves its end.
+    state.day += 1;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key }).ok).toBe(true);
+    expect(state.advisor.snoozes.filter((x) => x.key === key)).toHaveLength(1);
+  });
+
+  it('always keeps the new snooze when the memory is full, even one ending sooner than every other', () => {
+    // An urgent snooze (one close) ends before tips snoozed for three: the memory evicts among the others.
+    const state = withLoan(trading(20_000, 10_000, 0), 60_000);
+    state.finance.cash = estimateNextDebtService(state) + state.finance.cash - estimateCashAtClose(state) - 1;
+    const urgent = advise(state).find((a) => a.id === 'paymentShort')!;
+    expect(urgent.severity).toBe('urgent');
+    const later = closeDayAfter(state.day, ADVICE_SNOOZE_MONTHS);
+    expect(later).toBeGreaterThan(closeDayAfter(state.day, ADVICE_SNOOZE_URGENT_MONTHS));
+    state.advisor.snoozes = Array.from({ length: ADVISOR_MEMORY_MAX }, (_, i) => ({ key: `tip:${String(i).padStart(2, '0')}`, untilDay: later, severity: 'tip' as const }));
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: urgent.key })).toEqual({ ok: true, cost: 0 });
+    const keys = state.advisor.snoozes.map((x) => x.key);
+    expect(keys).toHaveLength(ADVISOR_MEMORY_MAX);
+    expect(keys).toContain(urgent.key);
+    expect([...keys].sort()).toEqual(keys);
+    expect(isSnoozed(state, urgent)).toBe(true);
+    expect(advise(state).some((a) => a.key === urgent.key)).toBe(false);
+    // A tip snoozed the same day as 32 others whose keys sort first is kept too.
+    const pricingState = overpriced();
+    const key = advise(pricingState).find((a) => a.id === 'pricing')!.key;
+    const until = closeDayAfter(pricingState.day, ADVICE_SNOOZE_MONTHS);
+    pricingState.advisor.snoozes = Array.from({ length: ADVISOR_MEMORY_MAX }, (_, i) => ({ key: `a:${String(i).padStart(2, '0')}`, untilDay: until, severity: 'tip' as const }));
+    expect(applyCommand(pricingState, { type: 'snoozeAdvice', key }).ok).toBe(true);
+    expect(pricingState.advisor.snoozes.map((x) => x.key)).toContain(key);
+    expect(pricingState.advisor.snoozes).toHaveLength(ADVISOR_MEMORY_MAX);
+  });
+
+  it('refuses to snooze a suggestion that is not showing, or a malformed key', () => {
+    const state = overpriced();
+    const before = JSON.stringify(state);
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: 'expand:node:99999' }).ok).toBe(false);
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: 'has space' }).ok).toBe(false);
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: 'x'.repeat(ADVICE_KEY_MAX_LENGTH + 1) }).ok).toBe(false);
+    expect(JSON.stringify(state)).toBe(before);
+  });
+
+  it('counts briefings in a row that showed a key', () => {
+    const state = overpriced();
+    const key = advise(state).find((a) => a.id === 'pricing')!.key;
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: [key] }).ok).toBe(true);
+    expect(state.advisor.shown).toEqual([{ key, firstDay: state.day, lastDay: state.day, times: 1 }]);
+    expect(repeatOf(state, key)).toBe(0);
+    const first = state.day;
+    runDays(state, 31);
+    expect(repeatOf(state, key)).toBe(1);
+    expect(advise(state).find((a) => a.key === key)?.repeat).toBe(1);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: [key] }).ok).toBe(true);
+    expect(state.advisor.shown).toEqual([{ key, firstDay: first, lastDay: state.day, times: 2 }]);
+    // Noting the same briefing twice the same day changes nothing.
+    const shown = structuredClone(state.advisor.shown);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: [key] }).ok).toBe(true);
+    expect(state.advisor.shown).toEqual(shown);
+    // A briefing without it breaks the run.
+    runDays(state, 31);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: ['cashRunway'] }).ok).toBe(true);
+    expect(state.advisor.shown.map((e) => e.key)).toEqual(['cashRunway']);
+    expect(repeatOf(state, key)).toBe(0);
+    // Bad lists are refused whole.
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: ['a', 'a'] }).ok).toBe(false);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: ['no spaces please'] }).ok).toBe(false);
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: Array.from({ length: ADVICE_SHOWN_MAX + 1 }, (_, i) => `k${i}`) }).ok).toBe(false);
+  });
+
+  it('knows the day a briefing was built: the close day for the close-time one, later for a reopened one', () => {
+    const state = litGame(31);
+    const atClose = buildBriefing(state)!;
+    expect(briefingBuiltOn(atClose)).toBe(closeDayOf(atClose.report));
+    runDays(state, 5);
+    const reopened = buildBriefing(state)!;
+    expect(reopened.report).toBe(atClose.report);
+    expect(briefingBuiltOn(reopened)).toBe(closeDayOf(atClose.report) + 5);
+    expect(briefingBuiltOn({ ...atClose })).toBeNull();
+  });
+
+  it('a new game remembers nothing', () => {
+    expect(newAdvisorState()).toEqual({ snoozes: [], shown: [] });
+    expect(newGame(7).advisor).toEqual({ snoozes: [], shown: [] });
   });
 });

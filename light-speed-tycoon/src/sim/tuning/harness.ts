@@ -25,13 +25,15 @@ import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
 import { orderFees, quoteCable, spanCharges } from '../network';
 import { otherEnd, parcelsServedBy, polesOnSegment, segmentsAtNode, segmentsWithin } from '../streets';
-import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
+import { cityExposure, exposureBand, meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
 import type {
+  CabinetId,
   CableMethod,
   City,
   Command,
   CommandResult,
   CovenantStage,
+  ExposureBand,
   GameOver,
   GameState,
   MonthlyReport,
@@ -87,6 +89,8 @@ export interface RunResult {
   capacityAfterClose: number[];
   /** Round 4: notices posted during the run, by kind (every one, though the game's log keeps only the newest). */
   notices: Partial<Record<NoticeKind, number>>;
+  /** Round 4b: every incumbent promo that started during the run (Sales.incumbentPromos records), in order of start. */
+  incumbentPromos: Array<{ cabinet: CabinetId; startDay: number }>;
 }
 
 export interface RunOptions {
@@ -127,6 +131,16 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     lastNotice = state.nextNoticeId - 1;
   };
   const noSubscriberYet = () => state.sales.accounts.length === 0 && state.sales.connectsTotal === 0;
+  const promoSeen = new Set<string>(state.sales.incumbentPromos.map((p) => `${p.cabinet}:${p.startDay}`));
+  const incumbentPromos: Array<{ cabinet: CabinetId; startDay: number }> = [];
+  const countPromos = () => {
+    for (const p of state.sales.incumbentPromos) {
+      const key = `${p.cabinet}:${p.startDay}`;
+      if (promoSeen.has(key)) continue;
+      promoSeen.add(key);
+      incumbentPromos.push({ cabinet: p.cabinet, startDay: p.startDay });
+    }
+  };
   const send: Send = (cmd) => {
     const cashBefore = state.finance.cash;
     const result = applyCommand(state, cmd);
@@ -146,7 +160,10 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     const closes = state.finance.reports.length;
     tick(state);
     countNotices();
-    if (state.finance.reports.length > closes) capacityAfterClose.push(borrowingCapacity(state));
+    if (state.finance.reports.length > closes) {
+      capacityAfterClose.push(borrowingCapacity(state));
+      countPromos();
+    }
     opts.afterTick?.(state);
   }
   const reports = state.finance.reports.slice(startReports);
@@ -171,6 +188,7 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     capacityBeforeFirstSubscriber,
     capacityAfterClose,
     notices,
+    incumbentPromos,
   };
 }
 
@@ -466,7 +484,12 @@ export function ownershipCostPerPassing(result: RunResult, years = VALUE_YEARS):
   return (result.state.finance.capex.osp + years * (running.poleRent + running.repairs)) / last.passings;
 }
 
-/** Years of trailing operating cash flow runValue counts: the horizon SMART weighs a street's running costs over (SMART_DEFAULTS.horizonYears). */
+/**
+ * Years of trailing operating cash flow runValue counts (and the years
+ * ownershipCostPerPassing counts running costs for): round 4's horizon for
+ * SMART's method choice (round 4b weighs storms twice over 13 years:
+ * SMART_DEFAULTS.horizonYears, stormWeight).
+ */
 export const VALUE_YEARS = 12;
 
 /**
@@ -931,4 +954,40 @@ export function treePath(city: City, tree: StreetTree, node: number): SegmentId[
     at = otherEnd(city.segments[seg] as StreetSegment, at);
   }
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Round 4b: storm exposure bands
+// ---------------------------------------------------------------------------
+
+/** Share of a town's street feet in each storm-exposure band (weather.exposureBand of weather.segmentExposure). */
+export function exposureBandShares(city: City): Record<ExposureBand, number> {
+  const exposure = cityExposure(city);
+  const feet: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  let total = 0;
+  for (const seg of city.segments) {
+    feet[exposureBand(exposure[seg.id] ?? 1)] += seg.lengthFt;
+    total += seg.lengthFt;
+  }
+  for (const band of Object.keys(feet) as ExposureBand[]) feet[band] = total > 0 ? feet[band] / total : 0;
+  return feet;
+}
+
+/**
+ * Expected storm damage per span-year of aerial cable in each exposure band:
+ * weather.stormRisk(..., 'aerial').outagesPerYear averaged over the town's
+ * poled streets in the band (0 for a band with none).
+ */
+export function expectedDamageByBand(state: GameState): Record<ExposureBand, number> {
+  const exposure = cityExposure(state.city);
+  const sum: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  const count: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  for (const seg of state.city.segments) {
+    if (!seg.hasPoles) continue;
+    const band = exposureBand(exposure[seg.id] ?? 1);
+    sum[band] += stormRisk(state, seg, 'aerial').outagesPerYear;
+    count[band]++;
+  }
+  for (const band of Object.keys(sum) as ExposureBand[]) sum[band] = count[band] > 0 ? sum[band] / count[band] : 0;
+  return sum;
 }

@@ -1,6 +1,6 @@
-// Balance report: the per-seed numbers behind targets.test.ts and
-// targets4.test.ts, printed only when asked for (otherwise this file is a
-// trivial pass):
+// Balance report: the per-seed numbers behind targets.test.ts,
+// targets4.test.ts and targets4b.test.ts, printed only when asked for
+// (otherwise this file is a trivial pass):
 //
 //   TUNE_REPORT=1 npx vitest run src/sim/tuning/report.test.ts
 //
@@ -8,9 +8,32 @@
 // TUNE_SWEEP=0 to skip the constant-price sweep (the slowest part).
 
 import { describe, expect, it } from 'vitest';
-import { CPP_TARGET, START_CASH } from '../balance';
+import { CPP_TARGET, DIFFICULTY_LEVELS, INCUMBENT_PROMO_MIN_PASSINGS, START_CASH } from '../balance';
 import { newGame } from '../game';
-import { allAerialBot, allUndergroundBot, carelessBot, frozenHoarderBot, idleBot, leveredBot, priceHikerBot, ruralBot, smartBot } from './bots';
+import { areaTakeRates } from '../incumbent';
+import {
+  advisorFollowerBot,
+  aggressiveBot,
+  allAerialBot,
+  allUndergroundBot,
+  ANSWER_EXPERIMENT_MONTH,
+  ANSWER_EXPERIMENT_MONTHS,
+  carelessBot,
+  FRESH_PROMO_MONTH,
+  freshPromoExperiment,
+  frozenHoarderBot,
+  idleBot,
+  incumbentAnswerExperiment,
+  leveredBot,
+  MATURE_PROMO_MONTH,
+  maturePromoExperiment,
+  noCheapTierBot,
+  priceHikerBot,
+  ruralBot,
+  smartBot,
+  smartLiteBot,
+  twoGigOnlyBot,
+} from './bots';
 import {
   averageArpu,
   averageBorrowingRate,
@@ -18,6 +41,8 @@ import {
   bestSweepPoint,
   cppProbes,
   cumulativeOperatingCashFlow,
+  expectedDamageByBand,
+  exposureBandShares,
   finalPassedShare,
   firstPositiveMonth,
   median,
@@ -136,6 +161,28 @@ function methodRow(name: string, run: RunResult): Record<string, string> {
   };
 }
 
+/** Round 4b: one row per bot of the pricing and advisor comparisons. */
+function botRow(name: string, run: RunResult): Record<string, string> {
+  const byCabinet = new Map<number, number>();
+  for (const p of run.incumbentPromos) byCabinet.set(p.cabinet, (byCabinet.get(p.cabinet) ?? 0) + 1);
+  return {
+    bot: name,
+    end: gameOverText(run),
+    'cf+ month': num(firstPositiveMonth(run)),
+    share: pct(run.gameOver ? 0 : finalPassedShare(run)),
+    subs: num(run.reports.at(-1)?.stats?.subscribers),
+    take: pct(run.kpis.at(-1)?.takeRate),
+    arpu: dollars(averageArpu(run)),
+    'op cash flow': dollars(cumulativeOperatingCashFlow(run)),
+    value: dollars(runValue(run)),
+    'peak debt': dollars(peakDebt(run)),
+    worst: worstStage(run),
+    missed: String(missedPaymentMonths(run).length),
+    promos: String(run.incumbentPromos.length),
+    'per area': String(Math.max(0, ...byCabinet.values())),
+  };
+}
+
 describe('balance report', () => {
   it.runIf(!ENABLED)('prints nothing unless TUNE_REPORT=1', () => {
     expect(ENABLED).toBe(false);
@@ -163,6 +210,18 @@ describe('balance report', () => {
         const spender = runBot(seed, frozenHoarderBot({ spendHoard: true }), MONTHS);
         const hiker = runBot(seed, priceHikerBot(), MONTHS);
         const hikerNotice = runBot(seed, priceHikerBot(0), MONTHS);
+        const levels = DIFFICULTY_LEVELS.map((level) => ({ level, run: runBot(seed, smartBot(), MONTHS, { state: newGame(seed, { difficulty: level.id }) }) }));
+        const twoGig = runBot(seed, twoGigOnlyBot(), MONTHS);
+        const noCheap = runBot(seed, noCheapTierBot(), MONTHS);
+        const aggressive = runBot(seed, aggressiveBot(), MONTHS);
+        const follower = runBot(seed, advisorFollowerBot, MONTHS);
+        const lite = runBot(seed, smartLiteBot(), MONTHS);
+        const answer = incumbentAnswerExperiment(seed);
+        const fresh = freshPromoExperiment(seed);
+        const mature = maturePromoExperiment(seed);
+        const bands = exposureBandShares(city);
+        const damage = expectedDamageByBand(newGame(seed));
+        const settled = areaTakeRates(smart.state).filter((a) => a.passings >= INCUMBENT_PROMO_MIN_PASSINGS).map((a) => a.takeRate);
         const k36 = smart.kpis[35];
         const last = smart.reports.length;
         out.push(
@@ -197,6 +256,29 @@ describe('balance report', () => {
             methodRow('PRICE_HIKER (0 months)', hikerNotice),
             methodRow('no loans', noDebt),
           ]),
+          'Round 4b: difficulty levels (SMART; lean below the Seed round purse)',
+          table(levels.map(({ level, run }) => botRow(`${level.name} ${dollars(level.startCash)}`, run))),
+          'Round 4b: pricing, the incumbent and the advisor',
+          table([
+            botRow('SMART', smart),
+            botRow('TWO_GIG_ONLY', twoGig),
+            botRow('NO_CHEAP_TIER', noCheap),
+            botRow('AGGRESSIVE (x0.8)', aggressive),
+            botRow('ADVISOR_FOLLOWER', follower),
+            botRow('SMART-lite', lite),
+          ]),
+          `SMART's area take rates at month ${MONTHS} (areas with ${INCUMBENT_PROMO_MIN_PASSINGS}+ passings): ${settled.map((t) => pct(t, 0)).join(' ')} (median ${pct(median(settled))})`,
+          `Incumbent promo at cabinet ${answer.cabinet} (${answer.injected ? 'injected' : 'running'}) at month ${ANSWER_EXPERIMENT_MONTH}, then ${ANSWER_EXPERIMENT_MONTHS} months of SMART operating: ` +
+            `ignore ${dollars(answer.ocf.ignore)}, retention ${dollars(answer.ocf.retention)}, intro promo ${dollars(answer.ocf.introPromo)}, ` +
+            `bestIncumbentAnswer (${answer.chosen}, quoted ${dollars(answer.netValue)}) ${dollars(answer.ocf.best)}; incumbent cancellations ` +
+            `${answer.incumbentChurn.ignore}/${answer.incumbentChurn.retention}/${answer.incumbentChurn.introPromo}/${answer.incumbentChurn.best}`,
+          `Intro promo, fresh area (month ${FRESH_PROMO_MONTH}, incumbent promo at its largest area): quote pays ${fresh.quote.pays} (gain ${dollars(fresh.quote.valueGained)} vs discount ${dollars(fresh.quote.discountCost)}); ` +
+            `op cash flow at 12/18/24 months with ${fresh.withPromo.map(dollars).join('/')} vs without ${fresh.without.map(dollars).join('/')}`,
+          `Intro promo, mature town (month ${MATURE_PROMO_MONTH}, no new areas): quote pays ${mature.quote.pays} (gain ${dollars(mature.quote.valueGained)} vs discount ${dollars(mature.quote.discountCost)}); ` +
+            `12 months with ${dollars(mature.withPromo[0])} vs without ${dollars(mature.without[0])}`,
+          `Storm exposure: street feet sheltered ${pct(bands.sheltered)}, moderate ${pct(bands.moderate)}, exposed ${pct(bands.exposed)}; ` +
+            `expected aerial damage per span-year sheltered ${damage.sheltered.toFixed(3)}, moderate ${damage.moderate.toFixed(3)}, exposed ${damage.exposed.toFixed(3)} ` +
+            `(${(damage.exposed / Math.max(1e-9, damage.sheltered)).toFixed(1)}x)`,
         );
         summary.push({
           seed: String(seed),
@@ -228,7 +310,19 @@ describe('balance report', () => {
           'aerial repairs x': `${(stormExposure(aerial).repairs / Math.max(1, stormExposure(smart).repairs)).toFixed(2)} (${(opsTotals(aerial).repairs / Math.max(1, opsTotals(smart).repairs)).toFixed(2)})`,
           'aerial out x': `${(stormExposure(aerial).subscriberDaysOut / Math.max(1e-9, stormExposure(smart).subscriberDaysOut)).toFixed(2)} (${(opsTotals(aerial).outageUnitDays / Math.max(1, opsTotals(smart).outageUnitDays)).toFixed(2)})`,
           'all-ugnd share': pct(finalPassedShare(underground)),
-          promos: num(smart.notices.incumbentPromo ?? 0),
+          promos: num(smart.incumbentPromos.length),
+          'aggr promos': num(aggressive.incumbentPromos.length),
+          '3 tiers/2G': (cumulativeOperatingCashFlow(smart) / Math.max(1, cumulativeOperatingCashFlow(twoGig))).toFixed(2),
+          '3 tiers/1G+2G': (cumulativeOperatingCashFlow(smart) / Math.max(1, cumulativeOperatingCashFlow(noCheap))).toFixed(2),
+          'answer best-ignore': dollars(Math.max(answer.ocf.retention, answer.ocf.introPromo, answer.ocf.best) - answer.ocf.ignore),
+          'chosen-ignore': dollars(answer.ocf.best - answer.ocf.ignore),
+          'fresh promo +': dollars((fresh.withPromo[1] ?? 0) - (fresh.without[1] ?? 0)),
+          'mature promo +': dollars((mature.withPromo[0] ?? 0) - (mature.without[0] ?? 0)),
+          'value vs aerial': dollars(runValue(smart) - runValue(aerial)),
+          'value vs ugnd': dollars(runValue(smart) - runValue(underground)),
+          'boot': gameOverText(levels.find((l) => l.level.id === 'bootstrapped')?.run as RunResult),
+          'shoe': gameOverText(levels.find((l) => l.level.id === 'shoestring')?.run as RunResult),
+          follower: `${gameOverText(follower)} ${pct(follower.gameOver ? 0 : finalPassedShare(follower))}/${pct(finalPassedShare(lite))}`,
           hoarder: hoarder.gameOver ? `${hoarder.gameOver.reason} m${hoarder.gameOverMonth}` : `repaid m${repaidAfterCall(hoarder) ?? '-'}`,
           'hiker subs': `${num(hiker.reports.at(-1)?.stats?.subscribers)}/${num(smart.reports.at(-1)?.stats?.subscribers)}`,
           ms: smart.ms.toFixed(0),
@@ -240,7 +334,9 @@ describe('balance report', () => {
           `share passed at month 60 >= 50% (median 50-70%), 15+ points over no loans; peak debt >= ${dollars(0.4 * START_CASH)}; ` +
           `rate 6-11%, rural >= SMART + 1%; worst stage warning; no missed payments; capacity after month 3 <= ${dollars(0.1 * START_CASH)}; ` +
           `LEVERED defaults on 4+ of 5; round 4: SMART underground 20-60%, all-aerial storm exposure (realized in brackets): repairs >= 1.25x, sub-days out >= 1.1x SMART's, ` +
-          `all-underground passes less, 1-10 incumbent promos, hoarders repay through the call or default, hikers end with <= half SMART's subscribers)`,
+          `all-underground passes less, hoarders repay through the call or default, hikers end with <= half SMART's subscribers; ` +
+          `round 4b: 0-6 incumbent promos, at most 2 per area, AGGRESSIVE meets one on 4+ of 5, 3 tiers >= 1.15x 2 Gig only, beat 1 Gig + 2 Gig on 4+ and the mean, ` +
+          `the best answer beats ignoring on 4+ and bestIncumbentAnswer never worse on 4+, the intro promo pays in a fresh area, bootstrapped survives)`,
         table(summary),
       );
       if (SWEEP) {

@@ -41,6 +41,7 @@ import {
   canAfford,
   checkInsolvency,
   closeMonth,
+  estimateCashAtClose,
   estimateMonthOperatingCashFlow,
   formatMoney,
   groupThousands,
@@ -54,7 +55,7 @@ import { applyCommand, runDays, tick } from './game';
 import { operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService } from './network';
 import { Rng } from './rng';
-import { subscriberUnits } from './sales';
+import { accrueDay, monthlyRecurringRevenue, subscriberUnits } from './sales';
 import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats, quietOpsStats } from './testing/fixtures';
 import type { BuildStage, CableMethod, City, Command, CovenantStage, GameState, LedgerEntry, MonthlyReport, SegmentId, TermLoan } from './types';
 
@@ -280,7 +281,7 @@ describe('closeMonth', () => {
     ];
     state.sales.connectsTotal = 5;
     state.sales.fullCabinets = [cabinet];
-    state.sales.month = { revenueDollarDays: 31 * 125, marketingDollarDays: 31 * 1_000, subscriberUnitDays: 31 * 2, grossAdds: 5, lostService: 3 };
+    state.sales.month = { revenueDollarDays: 31 * 125, marketingDollarDays: 31 * 1_000, subscriberUnitDays: 31 * 2, grossAdds: 5, lostService: 3, outageCreditDollarDays: 0 };
     state.finance.capex = { osp: 1_000, connect: 4_250, co: 18_000 };
     state.day = 31;
     const before = state.finance.monthToDate;
@@ -316,7 +317,7 @@ describe('closeMonth', () => {
       ponPorts: OLT_START_PON_PORTS,
       fullCabinets: 1,
     });
-    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0 });
+    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0, outageCreditDollarDays: 0 });
   });
 
   it('checks milestones and insolvency after the report is filed', () => {
@@ -328,6 +329,61 @@ describe('closeMonth', () => {
     expect(report.cashEnd).toBe(-1);
     expect(state.finance.negativeMonths).toBe(1);
     expect(state.notices.map((n) => n.kind)).toEqual(['milestone', 'insolvencyWarning']);
+  });
+});
+
+describe('outage credits (round 4b)', () => {
+  /** Two homes subscribed on 1 Gig at the grid's cabinet, no marketing. */
+  function trading(): GameState {
+    const state = makeState();
+    const cabinet = addLivePlant(state)!;
+    state.sales.marketingPerMonth = 0;
+    state.sales.accounts = [
+      { parcel: 0, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] },
+      { parcel: 2, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] },
+    ];
+    return state;
+  }
+
+  it('reports the month\'s outage credits in ops, with revenue already net of them', () => {
+    const state = trading();
+    const rate = monthlyRecurringRevenue(state) / 2;
+    // January: parcel 0 cut off for 10 days.
+    for (let d = 0; d < 31; d++) accrueDay(state, d < 10 ? { cutOff: new Set([0]), lent: new Map() } : null);
+    state.day = 31;
+    const report = close(state, 8);
+    expect(report.ops!.outageCredits).toBe(Math.round((rate * 10) / 31));
+    expect(report.totals.revenue).toBe(Math.round((rate * (31 + 21)) / 31));
+    expect(report.totals.revenue! + report.ops!.outageCredits).toBeCloseTo(2 * rate, -0.5);
+    expect(report.totals.overhead).toBe(-OVERHEAD_PER_MONTH - Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (31 + 21)) / 31));
+  });
+
+  it('projects the close\'s cash from billing net of credits: exact on the month\'s last day', () => {
+    const state = trading();
+    for (let d = 0; d < 31; d++) {
+      state.day = d;
+      accrueDay(state, d < 10 ? { cutOff: new Set([0]), lent: new Map() } : null);
+    }
+    state.day = 30;
+    const projected = estimateCashAtClose(state);
+    state.day = 31;
+    const report = close(state, 8);
+    expect(report.cashEnd).toBe(projected);
+    // Mid-month it bills today's subscribers for the days left (an outage under way is assumed repaired).
+    const mid = trading();
+    for (let d = 0; d <= 14; d++) {
+      mid.day = d;
+      accrueDay(mid, { cutOff: new Set([0]), lent: new Map() });
+    }
+    const plain = trading();
+    for (let d = 0; d <= 14; d++) {
+      plain.day = d;
+      accrueDay(plain);
+    }
+    // The cut-off home's 15 days: billing not charged, and no support charged for them either.
+    const credit = (15 * monthlyRecurringRevenue(mid)) / 2 / 31;
+    const support = (15 * SUPPORT_COST_PER_SUB_PER_MONTH) / 31;
+    expect(Math.abs(estimateCashAtClose(plain) - estimateCashAtClose(mid) - (credit - support))).toBeLessThanOrEqual(1.5);
   });
 });
 

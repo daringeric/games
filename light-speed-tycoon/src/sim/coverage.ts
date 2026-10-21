@@ -6,10 +6,23 @@
 
 import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, SPLITTER_COST } from './balance';
 import { cppBand } from './metrics';
-import { getService, orderFees, plannedService, segmentsLitByCabinetAt, spanCharges } from './network';
-import { isNodeId, parcelsServedBy, segmentsWithin } from './streets';
+import { getService, orderFees, plannedService, quoteCable, segmentsLitByCabinetAt, spanCharges } from './network';
+import { isNodeId, parcelsServedBy, segmentsWithin, shortestPath } from './streets';
 import type { SegmentReach } from './streets';
-import type { CableMethod, City, CoveragePreview, CoverageSegment, GameState, Network, NodeId, StreetSegment } from './types';
+import type {
+  BuildOutPlan,
+  CableMethod,
+  City,
+  Command,
+  CoveragePreview,
+  CoverageSegment,
+  GameState,
+  Network,
+  NodeId,
+  SegmentId,
+  StreetSegment,
+} from './types';
+import { preferredMethod } from './weather';
 
 export type { SegmentReach } from './streets';
 
@@ -46,8 +59,8 @@ function emptyPreview(node: NodeId): CoveragePreview {
   };
 }
 
-/** Cheapest buildable cable on a segment before per-order fees: aerial where poled (unless boring is cheaper), else underground. */
-function cheapestBuild(segment: StreetSegment): { method: CableMethod; total: number } {
+/** Cheapest buildable cable on a segment before per-order fees: aerial where poled (unless boring is cheaper), else underground. Round 4b: exported for advisor.expandCandidates' estimate. */
+export function cheapestBuild(segment: StreetSegment): { method: CableMethod; total: number } {
   const underground = spanCharges(segment, 'underground').total;
   if (!segment.hasPoles) return { method: 'underground', total: underground };
   const aerial = spanCharges(segment, 'aerial').total;
@@ -143,4 +156,52 @@ export function coveragePreview(state: GameState, node: NodeId): CoveragePreview
 
   previewCache.set(state, { network, version: network.version, day, node, preview });
   return preview;
+}
+
+/**
+ * Round 4b: everything a new cabinet at `node` needs to light what it
+ * reaches, as commands (see BuildOutPlan): the feeder, the uncabled
+ * segments of the cheapest route from the CO to `node` where already-cabled
+ * streets (any stage) cost next to nothing (so it joins the nearest planned
+ * plant); the reach, every uncabled segment within CABINET_REACH_FT along
+ * streets (as coveragePreview's build-out); each segment built by
+ * weather.preferredMethod; commands placeCabinet (unless one stands there),
+ * then one layCable per method used (aerial first). cost = the cabinet's
+ * price (as coveragePreview) + each order's quoteCable cost (fees included);
+ * passings = coveragePreview's passingsNow - passingsServedElsewhere; cpp =
+ * cost / passings (null for none). An invalid node gives an empty plan.
+ * Cash and PON ports are not checked (the advisor checks them). Pure.
+ * Implemented by the contract (the advisor's expand suggestion and the
+ * tuning stage's advice-following bot send these commands).
+ */
+export function buildOutPlan(state: GameState, node: NodeId): BuildOutPlan {
+  const { city, network } = state;
+  const plan: BuildOutPlan = { node, feeder: [], reach: [], aerial: [], underground: [], commands: [], cost: 0, passings: 0, cpp: null };
+  if (!isNodeId(city, node)) return plan;
+  const preview = coveragePreview(state, node);
+  const cabled = new Set<SegmentId>(network.spans.map((s) => s.segment));
+  // Cabled streets are nearly free to travel, so the route joins the nearest planned plant.
+  const route = shortestPath(city, city.coNode, node, (seg) => (cabled.has(seg.id) ? seg.lengthFt / 1_000_000 : seg.lengthFt)) ?? [];
+  plan.feeder = route.filter((id) => !cabled.has(id));
+  const inFeeder = new Set(plan.feeder);
+  plan.reach = preview.segments.map((s) => s.segment).filter((id) => !cabled.has(id) && !inFeeder.has(id));
+  for (const id of [...plan.feeder, ...plan.reach]) {
+    const segment = city.segments[id] as StreetSegment;
+    (preferredMethod(state, segment) === 'aerial' ? plan.aerial : plan.underground).push(id);
+  }
+  plan.aerial.sort((a, b) => a - b);
+  plan.underground.sort((a, b) => a - b);
+  const commands: Command[] = [];
+  if (preview.cabinetCost > 0) commands.push({ type: 'placeCabinet', node });
+  plan.cost = preview.cabinetCost;
+  for (const method of ['aerial', 'underground'] as const) {
+    const segments = method === 'aerial' ? plan.aerial : plan.underground;
+    if (segments.length === 0) continue;
+    commands.push({ type: 'layCable', segments: [...segments], method });
+    plan.cost += quoteCable(state, segments, method).cost;
+  }
+  plan.commands = commands;
+  plan.passings = preview.passingsNow - preview.passingsServedElsewhere;
+  plan.cpp = plan.passings > 0 ? plan.cost / plan.passings : null;
+  return plan;
 }

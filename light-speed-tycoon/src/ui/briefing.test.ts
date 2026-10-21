@@ -5,12 +5,13 @@
 // balance.ts constants and sim results, never literal dollar amounts.
 
 import { describe, expect, it } from 'vitest';
-import { CPP_TARGET } from '../sim/balance';
-import { buildBriefing } from '../sim/advisor';
-import { runDays } from '../sim/game';
+import { ADVICE_SNOOZE_MONTHS, ADVICE_SNOOZE_URGENT_MONTHS, COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_TARGET } from '../sim/balance';
+import { buildBriefing, COVENANT_RISK_MARGIN } from '../sim/advisor';
+import { applyCommand, runDays } from '../sim/game';
 import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
-import type { Briefing, BriefingChange, GameState, LedgerCategory, Notice } from '../sim/types';
+import type { Briefing, BriefingChange, CovenantMetrics, GameState, LedgerCategory, Notice } from '../sim/types';
 import {
+  ALERTS_MAX,
   BRIEFING_FREQUENCIES,
   BRIEFING_STORAGE_KEY,
   BriefingPreference,
@@ -18,10 +19,12 @@ import {
   CPP_BAND_TEXT,
   DEFAULT_BRIEFING_FREQUENCY,
   FREQUENCY_LABEL,
+  GLANCE_KEYS,
   NOTICE_ROWS_MAX,
   NOTICE_TEXT_MAX,
   QUARTER_MONTHS,
   actionPoint,
+  alertRows,
   briefingAtClose,
   briefingDue,
   briefingSpan,
@@ -30,8 +33,11 @@ import {
   changeRow,
   condenseNotice,
   cppTargetText,
+  debtTone,
+  isCloseTimeBriefing,
   noticeRows,
   readBriefingFrequency,
+  snoozeLabel,
   startingBriefingSetting,
   writeBriefingFrequency,
 } from './briefing';
@@ -229,11 +235,13 @@ describe('the briefing view', () => {
 
   it('puts the headline at a glance: net, cash, subscribers, passings, take rate, cost per passing and debt', () => {
     const b = briefingOf(120);
-    const view = briefingView(b, 'Testville');
+    const view = briefingView(b, 'Otter Junction Fiber');
     expect(view.title).toBe(briefingTitle(b));
-    expect(view.subtitle).toContain('Testville');
-    expect(view.subtitle).toContain('paused');
+    // The company name leads the subtitle.
+    expect(view.subtitle).toMatch(/^Otter Junction Fiber · game paused\. /);
+    expect(briefingView(b).subtitle).toMatch(/^game paused\. /);
     expect(view.tiles.map((t) => t.key)).toEqual(['net', 'cash', 'subscribers', 'passings', 'takeRate', 'cpp', 'debt']);
+    expect(view.tiles.map((t) => t.key)).toEqual(GLANCE_KEYS);
     const tile = (key: string) => view.tiles.find((t) => t.key === key)!;
     expect(tile('net').value).toBe(formatSignedMoney(b.headline.net));
     expect(tile('cash').value).toBe(formatMoney(b.headline.cash));
@@ -260,32 +268,103 @@ describe('the briefing view', () => {
     expect(none).toMatchObject({ value: '–', tone: null, detail: `Target ${formatMoney(CPP_TARGET)}` });
   });
 
-  it('shows the covenant stage beside the debt, colored and in words', () => {
+  it('never colors the debt success green: neutral in good standing, amber or red only for covenant trouble', () => {
     const b = briefingOf(60);
-    const frozen = briefingView({ ...b, headline: { ...b.headline, debt: 250_000, stage: 'frozen' } }).tiles.find((t) => t.key === 'debt')!;
-    expect(frozen.tone).toBe('danger');
-    expect(frozen.detail).toMatch(/^Frozen: leverage .+, coverage .+$/);
-    const warned = briefingView({ ...b, headline: { ...b.headline, debt: 250_000, stage: 'warning' } }).tiles.find((t) => t.key === 'debt')!;
+    /** Covenant figures with leverage and coverage `share` of the way from comfortable to their limits (1: on them). */
+    const covenant = (leverage: number, coverage: number): CovenantMetrics => ({
+      ...b.headline.covenant,
+      totalDebt: 250_000,
+      annualDebtService: 40_000,
+      leverage,
+      coverage,
+      leverageOk: leverage <= COVENANT_MAX_LEVERAGE,
+      coverageOk: coverage >= COVENANT_MIN_COVERAGE,
+      compliant: leverage <= COVENANT_MAX_LEVERAGE && coverage >= COVENANT_MIN_COVERAGE,
+    });
+    const clear = covenant(COVENANT_MAX_LEVERAGE * 0.5, COVENANT_MIN_COVERAGE * 2);
+    const near = covenant(COVENANT_MAX_LEVERAGE * (1 - COVENANT_RISK_MARGIN / 2), COVENANT_MIN_COVERAGE * 2);
+    const breached = covenant(COVENANT_MAX_LEVERAGE * 1.2, COVENANT_MIN_COVERAGE * 2);
+    const tile = (over: Partial<Briefing['headline']>, forward: Partial<Briefing['forward']> = {}) =>
+      briefingView({ ...b, headline: { ...b.headline, debt: 250_000, ...over }, forward: { ...b.forward, ...forward } }).tiles.find((t) => t.key === 'debt')!;
+
+    // Nothing owed, or owed in good standing with room to spare: no color at all.
+    expect(debtTone(b)).toBeNull();
+    const good = tile({ stage: 'compliant', covenant: clear });
+    expect(good.tone).toBeNull();
+    expect(good.detail).toMatch(/^Compliant: leverage .+, coverage .+$/);
+    // Compliant but a covenant near its limit (the advisor's warning), or breached at today's figures: amber, said in words.
+    const atRisk = tile({ stage: 'compliant', covenant: near });
+    expect(atRisk.tone).toBe('warn');
+    expect(atRisk.detail).toMatch(/^At risk: leverage /);
+    expect(tile({ stage: 'compliant', covenant: breached }).tone).toBe('warn');
+    // The warning and penalty stages: amber.
+    const warned = tile({ stage: 'warning', covenant: clear });
     expect(warned.tone).toBe('warn');
     expect(warned.detail).toMatch(/^Warning/);
-    const unmeasurable = { ...b.headline.covenant, leverage: null };
-    const penalty = briefingView({ ...b, headline: { ...b.headline, debt: 250_000, stage: 'penalty', covenant: unmeasurable } }).tiles.find((t) => t.key === 'debt')!;
+    const unmeasurable = { ...clear, leverage: null };
+    const penalty = tile({ stage: 'penalty', covenant: unmeasurable });
+    expect(penalty.tone).toBe('warn');
     expect(penalty.detail).toMatch(/^Penalty rate: leverage not measurable, coverage /);
+    // Frozen, or the loans called: red.
+    const frozen = tile({ stage: 'frozen', covenant: breached });
+    expect(frozen.tone).toBe('danger');
+    expect(frozen.detail).toMatch(/^Frozen: leverage .+, coverage .+$/);
+    const called = tile({ stage: 'frozen', covenant: breached }, { accelerationClosesLeft: 2 });
+    expect(called.tone).toBe('danger');
+    expect(called.detail).toMatch(/^Loans called: /);
+    // Whatever the stage, never the success tone.
+    for (const stage of ['compliant', 'warning', 'penalty', 'frozen'] as const) {
+      for (const cov of [clear, near, breached]) expect(['warn', 'danger', null]).toContain(tile({ stage, covenant: cov }).tone);
+    }
+    // Its change against the month before is neutral news, whichever way it went.
+    const more = { ...b.changes.find((c) => c.key === 'debt')!, now: 250_000, before: 100_000, delta: 150_000, upIsGood: false };
+    const less = { ...more, now: 50_000, delta: -50_000 };
+    for (const change of [more, less]) {
+      const t = briefingView({ ...b, changes: b.changes.map((c) => (c.key === 'debt' ? change : c)) }).tiles.find((x) => x.key === 'debt')!;
+      expect(t.change).toMatchObject({ tone: 'neutral' });
+      expect(changeRow(change).tone).toBe('neutral');
+    }
+    // The sim's own change row says neutral too.
+    expect(b.changes.find((c) => c.key === 'debt')!.upIsGood).toBeNull();
   });
 
-  it('lists what changed against the month before, with direction words and good/bad tones', () => {
+  it('puts each tile’s change against the month before in the tile, and keeps only the rest in what changed', () => {
     const b = briefingOf(120);
     const view = briefingView(b);
     expect(view.comparedWith).toBe('March');
-    expect(view.changes.map((c) => c.key)).toEqual(b.changes.map((c) => c.key));
-    for (const row of view.changes) {
-      expect(row.value).not.toMatch(/NaN|undefined/);
-      if (row.direction === 'up' || row.direction === 'down') expect(row.change).toMatch(new RegExp(`^${row.direction} `));
+    // Every tile says how it moved, in words.
+    for (const tile of view.tiles) {
+      const row = changeRow(b.changes.find((c) => c.key === tile.key)!);
+      expect(tile.change, tile.key).toEqual({ direction: row.direction, text: row.change, before: row.before, tone: row.tone });
+      if (tile.change!.direction === 'up' || tile.change!.direction === 'down') expect(tile.change!.text).toMatch(new RegExp(`^${tile.change!.direction} `));
     }
+    // What changed holds only what is not a tile: revenue and operating cash flow.
+    expect(view.changes.map((c) => c.key)).toEqual(['revenue', 'operatingCashFlow']);
+    for (const row of view.changes) expect(row.value).not.toMatch(/NaN|undefined/);
     // The first month has nothing to compare with.
     const first = briefingView(briefingOf(31));
     expect(first.changes).toEqual([]);
     expect(first.comparedWith).toBeNull();
+    for (const tile of first.tiles) expect(tile.change).toBeNull();
+  });
+
+  it('never shows a figure both in the glance and in what changed', () => {
+    for (const days of [60, 120, 181]) {
+      for (const span of [1, 3]) {
+        const view = briefingView(briefingOf(days, span));
+        const tileKeys = new Set<string>(view.tiles.map((t) => t.key));
+        for (const row of view.changes) expect(tileKeys.has(row.key), row.key).toBe(false);
+        // No tile's small print quotes a what-changed figure (the operating cash flow used to sit under net).
+        const figures = view.changes.map((c) => c.value).filter((v) => v !== '–');
+        for (const tile of view.tiles) for (const figure of figures) expect(`${tile.value} ${tile.detail ?? ''}`).not.toContain(figure);
+      }
+    }
+  });
+
+  it('folds the money in and out, the notices and the look ahead into closed details', () => {
+    const view = briefingView(briefingOf(120));
+    expect(view.details).toEqual(['money', 'notices', 'forward']);
+    expect(view.noticeCount).toBe(briefingOf(120).notices.length);
   });
 
   it('turns a change into words: up or down by how much, good or bad by upIsGood, no change when it rounds away', () => {
@@ -301,7 +380,9 @@ describe('the briefing view', () => {
     });
     expect(changeRow(change({}))).toMatchObject({ direction: 'up', change: `up ${formatMoney(500)}`, tone: 'good', before: `was ${formatMoney(1_000)}` });
     expect(changeRow(change({ now: 500, delta: -500 }))).toMatchObject({ direction: 'down', change: `down ${formatMoney(500)}`, tone: 'bad' });
-    expect(changeRow(change({ key: 'debt', upIsGood: false }))).toMatchObject({ direction: 'up', tone: 'bad' });
+    // Debt is neutral news whichever way it moves (round 4b).
+    expect(changeRow(change({ key: 'debt', upIsGood: false }))).toMatchObject({ direction: 'up', tone: 'neutral' });
+    expect(changeRow(change({ key: 'debt', upIsGood: false, now: 500, delta: -500 }))).toMatchObject({ direction: 'down', tone: 'neutral' });
     expect(changeRow(change({ key: 'cpp', upIsGood: false, now: 500, delta: -500 }))).toMatchObject({ direction: 'down', tone: 'good' });
     expect(changeRow(change({ upIsGood: null }))).toMatchObject({ direction: 'up', tone: 'neutral' });
     expect(changeRow(change({ delta: 0.3 }))).toMatchObject({ direction: 'flat', change: 'no change', tone: 'neutral' });
@@ -365,7 +446,53 @@ describe('the briefing view', () => {
       expect(card.severityLabel).toMatch(/^(Urgent|Important|Tip)$/);
       expect(card.title).toBeTruthy();
       expect(card.why).toBeTruthy();
+      expect(card.key).toBe(b.advice.find((a) => a.title === card.title)!.key);
+      expect(card.snoozeLabel).toBe(snoozeLabel(card.severity));
     }
+  });
+
+  it('labels the snooze with how long it lasts, and counts what is snoozed', () => {
+    const months = (n: number) => (n === 1 ? 'Snooze until next month' : `Snooze ${n} months`);
+    expect(snoozeLabel('tip')).toBe(months(ADVICE_SNOOZE_MONTHS));
+    expect(snoozeLabel('important')).toBe(months(ADVICE_SNOOZE_MONTHS));
+    expect(snoozeLabel('urgent')).toBe(months(ADVICE_SNOOZE_URGENT_MONTHS));
+    expect(months(3)).toBe('Snooze 3 months');
+
+    const state = litGame(120);
+    state.sales.fullCabinets = [state.network.cabinets[0]!.id];
+    const before = briefingView(buildBriefing(state)!);
+    expect(before.snoozed).toBe(0);
+    expect(before.snoozedText).toBeNull();
+    const card = before.advice[0]!;
+    expect(applyCommand(state, { type: 'snoozeAdvice', key: card.key }).ok).toBe(true);
+    const after = briefingView(buildBriefing(state)!);
+    expect(after.advice.some((a) => a.key === card.key)).toBe(false);
+    expect(after.snoozed).toBe(1);
+    expect(after.snoozedText).toBe('1 snoozed suggestion');
+  });
+
+  it('surfaces notices that need attention in the glance, newest first, keeping the full list', () => {
+    const b = briefingOf(60);
+    const notice = (id: number, kind: Notice['kind']): Notice => ({ id, day: b.report.month * 30, kind, message: `${kind} ${id}.`, cabinet: null, milestone: null });
+    const notices = [notice(1, 'insolvencyWarning'), notice(2, 'milestone'), notice(3, 'covenantWarning'), notice(4, 'creditFrozen'), notice(5, 'cabinetFull')];
+    const alerts = alertRows({ notices, needsAttention: true });
+    expect(alerts.map((a) => a.text)).toEqual(['creditFrozen 4.', 'covenantWarning 3.']);
+    expect(alerts.length).toBeLessThanOrEqual(ALERTS_MAX);
+    expect(alertRows({ notices, needsAttention: false })).toEqual([]);
+    const view = briefingView({ ...b, notices, needsAttention: true });
+    expect(view.alerts).toEqual(alerts);
+    expect(view.notices).toHaveLength(notices.length);
+  });
+
+  it('knows a close-time briefing from one reopened later in the month', () => {
+    const state = litGame(1);
+    closeNext(state);
+    const atClose = buildBriefing(state)!;
+    expect(isCloseTimeBriefing(atClose)).toBe(true);
+    runDays(state, 3);
+    expect(isCloseTimeBriefing(buildBriefing(state)!)).toBe(false);
+    // A copy (not built by buildBriefing) never counts.
+    expect(isCloseTimeBriefing({ ...atClose })).toBe(false);
   });
 });
 

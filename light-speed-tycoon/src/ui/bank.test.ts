@@ -4,11 +4,15 @@
 // from balance.ts constants, never literal tuning values. Round 4: the
 // covenant remedy, the frozen line's sweep and countdown, the called loans,
 // the draw preview, the safe builder default and same-month re-pricing.
+// Round 4b: the builder's start inside the covenant headroom (on a real
+// trading state, against debt.maxSafeTermLoan), the borrower line and debt
+// figures that are never toned.
 
 import { describe, expect, it } from 'vitest';
 import {
   ACCELERATION_CLOSES,
   ACCELERATION_WARNING_CLOSES,
+  BANK_PREFILL_HEADROOM,
   BASE_RATE_BPS,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
@@ -28,10 +32,13 @@ import {
   UNDERWRITING_MIN_MARGIN,
 } from '../sim/balance';
 import { dayOf, formatDate } from '../sim/calendar';
+import { covenantsWithin, maxSafeTermLoan, quoteTermLoan, termCapacity } from '../sim/debt';
+import { makeTradingState } from '../sim/testing/fixtures';
 import type { CovenantMetrics, CreditOffer, CureOption, DrawQuote, PrepayQuote, RateBreakdown, TermLoan, TermLoanQuote } from '../sim/types';
 import {
   STAGE_LABEL,
   STAGE_TONE,
+  borrowerLine,
   closeDayAfter,
   covenantView,
   remedyLine,
@@ -39,6 +46,7 @@ import {
   creditView,
   cureAdvice,
   cureText,
+  debtFigure,
   defaultTermAmount,
   drawPresets,
   drawPreview,
@@ -51,6 +59,8 @@ import {
   nextCloseDay,
   nextPaymentFigure,
   parseAmount,
+  prefillLine,
+  prefillTermAmount,
   prepayView,
   rateRows,
   repayPresets,
@@ -216,6 +226,34 @@ describe('term loan builder', () => {
     expect(defaultTermAmount(0)).toBe(TERM_LOAN_MIN);
     expect(defaultTermAmount(37 * LOAN_ROUNDING)).toBe(Math.max(TERM_LOAN_MIN, 37 * LOAN_ROUNDING));
     expect(defaultTermAmount(400 * LOAN_ROUNDING)).toBe(400 * LOAN_ROUNDING);
+  });
+
+  it('starts inside the covenant headroom (BANK_PREFILL_HEADROOM), not exactly on the limits', () => {
+    // Thin cash flow on healthy revenue: the bank lends a lot, but not all of it keeps the covenants.
+    const state = makeTradingState(40_000, 36_000);
+    expect(maxSafeTermLoan(state, 7, BANK_PREFILL_HEADROOM)).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+    for (const years of [5, 7] as const) {
+      const exact = maxSafeTermLoan(state, years);
+      const inside = maxSafeTermLoan(state, years, BANK_PREFILL_HEADROOM);
+      expect(exact).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+      expect(exact).toBeLessThan(termCapacity(state));
+      const start = prefillTermAmount(state, years);
+      expect(start).toBe(inside >= TERM_LOAN_MIN ? inside : TERM_LOAN_MIN);
+      if (inside >= TERM_LOAN_MIN) {
+        // Below the exact limit, with the headroom to spare on its own quote.
+        expect(start).toBeLessThan(exact);
+        expect(covenantsWithin(quoteTermLoan(state, start, years).after, BANK_PREFILL_HEADROOM)).toBe(true);
+        expect(prefillLine(start, exact)).toBe(
+          `The amount starts at ${formatMoney(start)}, leaving the covenants ${Math.round(BANK_PREFILL_HEADROOM * 100)}% inside their limits.`,
+        );
+      }
+    }
+    // Nothing inside the headroom (nothing to lend against): the smallest loan, and no line about it.
+    const empty = makeTradingState(0, 10_000);
+    expect(maxSafeTermLoan(empty, 7, BANK_PREFILL_HEADROOM)).toBe(0);
+    expect(prefillTermAmount(empty, 7)).toBe(TERM_LOAN_MIN);
+    expect(prefillLine(TERM_LOAN_MIN, 0)).toBe('');
+    expect(prefillLine(120 * LOAN_ROUNDING, 120 * LOAN_ROUNDING)).toBe('');
   });
 
   it('says what the largest covenant-safe amount is, or that none is', () => {
@@ -536,5 +574,30 @@ describe('the draw preview', () => {
     );
     expect(drawPreview(breach, 'penalty')!.warning).toContain('a frozen credit line next');
     expect(drawPreview(draw({ ok: false, reasons: ['Only $5,000 is available'] }), 'compliant')).toBeNull();
+  });
+});
+
+describe('round 4b: the borrower and neutral debt', () => {
+  it('names the borrower in the Bank header, as text', () => {
+    expect(borrowerLine('Otter Junction Fiber')).toBe('Borrower: Otter Junction Fiber');
+    expect(borrowerLine('  Bramble Light & Wire ')).toBe('Borrower: Bramble Light & Wire');
+    expect(borrowerLine('<b>x</b>')).toBe('Borrower: <b>x</b>');
+    expect(borrowerLine('')).toBe('Credit line, term loans and covenants');
+  });
+
+  it('never tones a debt figure: not in the summary, the credit line or the covenant figures', () => {
+    expect(debtFigure('Debt', 250_000)).toEqual({ label: 'Debt', value: formatMoney(250_000) });
+    expect(debtFigure('Debt', 250_000, 'owed').tone).toBeUndefined();
+    const drawn = creditView(offer({ balance: 40_000 })).figures.find((f) => f.label === 'Drawn')!;
+    expect(drawn.value).toBe(formatMoney(40_000));
+    expect(drawn.tone).toBeUndefined();
+    for (const stage of ['compliant', 'warning', 'penalty', 'frozen'] as const) {
+      const cov = covenantView(stage, 0, metrics({ totalDebt: 250_000, leverage: COVENANT_MAX_LEVERAGE * 2, compliant: false, leverageOk: false }), null, null, null);
+      const debt = cov.figures.find((f) => f.label === 'Debt')!;
+      expect(debt.value).toBe(formatMoney(250_000));
+      expect(debt.tone).toBeUndefined();
+    }
+    // The covenant badges keep their tones.
+    expect(STAGE_TONE.frozen).toBe('danger');
   });
 });

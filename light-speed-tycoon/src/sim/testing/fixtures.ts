@@ -327,6 +327,7 @@ export function quietOpsStats(state: GameState): OpsStats {
     repairs: 0,
     incumbentPromos: 0,
     mrr: monthlyRecurringRevenue(state),
+    outageCredits: 0,
   };
 }
 

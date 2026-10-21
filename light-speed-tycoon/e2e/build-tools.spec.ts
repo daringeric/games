@@ -1,9 +1,10 @@
 // Build tools in the real app: drag-to-draw cable (mouse and touch), the
 // cabinet tool's coverage card and splitters, cabinet removal, the OLT panel
 // and the cost overlay switch; round 4: storms and outages on the map, and the
-// span panel's underground rebuild.
+// span panel's underground rebuild; round 4b: the storm-exposure overlay (kept
+// apart from the cost overlay) and the storm-risk line on aerial quotes.
 //
-// Owner: ui-map workstream (round 4 additions: sim-storms).
+// Owner: ui-map workstream (round 4 additions: sim-storms; round 4b: storms-balance).
 
 import { expect, test } from '@playwright/test';
 import type { CDPSession, Page } from '@playwright/test';
@@ -261,6 +262,89 @@ test('the cost overlay switch flips with a click or the O key', async ({ page })
   expect(errors).toEqual([]);
 });
 
+test('the storm-exposure overlay flips with a click or the E key, shows its legend, and keeps the cost overlay apart', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  const exposure = page.getByTestId('exposure-overlay-toggle');
+  const cost = page.getByTestId('cost-overlay-toggle');
+  const legend = page.getByTestId('exposure-legend');
+  await expect(exposure).toHaveAttribute('aria-pressed', 'false');
+  await expect(exposure).toHaveAttribute('aria-keyshortcuts', 'E');
+  await expect(legend).toBeHidden();
+  expect(await page.evaluate(() => window.__lst!.stats().exposureOverlay)).toBeNull();
+
+  await exposure.click();
+  await expect(exposure).toHaveAttribute('aria-pressed', 'true');
+  await expect(legend).toBeVisible();
+  await expect(legend).toContainText('Storm exposure');
+  for (const band of ['sheltered', 'moderate', 'exposed']) await expect(legend.locator(`[data-band="${band}"]`)).toContainText(band);
+  // Every street drawn in one of the three bands, and a generated town has them all.
+  const drawn = await page.evaluate(() => ({ bands: window.__lst!.stats().exposureOverlay, streets: window.__lst!.getState().city.segments.length }));
+  expect(drawn.bands).not.toBeNull();
+  expect(drawn.bands!.sheltered + drawn.bands!.moderate + drawn.bands!.exposed).toBe(drawn.streets);
+  expect(drawn.bands!.sheltered).toBeGreaterThan(0);
+  expect(drawn.bands!.exposed).toBeGreaterThan(0);
+
+  // The cost overlay (O) takes its place: one street overlay at a time.
+  await page.keyboard.press('o');
+  await expect(cost).toHaveAttribute('aria-pressed', 'true');
+  await expect(exposure).toHaveAttribute('aria-pressed', 'false');
+  await expect(legend).toBeHidden();
+  await expect(page.getByTestId('cost-legend')).toBeVisible();
+  expect(await page.evaluate(() => window.__lst!.stats())).toMatchObject({ costOverlay: 'cheapest', exposureOverlay: null });
+
+  // And E takes it back, then turns it off.
+  await page.keyboard.press('e');
+  await expect(exposure).toHaveAttribute('aria-pressed', 'true');
+  await expect(cost).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.getByTestId('cost-legend')).toBeHidden();
+  await expect(legend).toBeVisible();
+  expect(await page.evaluate(() => window.__lst!.stats().costOverlay)).toBeNull();
+  await page.keyboard.press('E');
+  await expect(exposure).toHaveAttribute('aria-pressed', 'false');
+  await expect(legend).toBeHidden();
+  expect(await page.evaluate(() => window.__lst!.stats().exposureOverlay)).toBeNull();
+  expect(errors).toEqual([]);
+});
+
+test('an aerial quote card shows the storm-risk line: band, repairs a year and days out', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await page.getByRole('button', { name: 'Got it' }).click();
+  // A poled street out of the CO, both corners on open map.
+  const ends = await page.evaluate(() => {
+    const lst = window.__lst!;
+    const { city } = lst.getState();
+    const onCanvas = (id: number) => {
+      const n = city.nodes[id]!;
+      const p = lst.worldToScreen(n.x, n.y);
+      return document.elementFromPoint(p.x, p.y)?.tagName === 'CANVAS';
+    };
+    const seg = city.segments.find((s) => (s.a === city.coNode || s.b === city.coNode) && s.hasPoles && onCanvas(s.a) && onCanvas(s.b));
+    return seg ? [city.coNode, seg.a === city.coNode ? seg.b : seg.a] : null;
+  });
+  expect(ends, 'a poled street out of the CO on screen').not.toBeNull();
+  await page.keyboard.press('a');
+  const [from, to] = await Promise.all(ends!.map((n) => nodeOnScreen(page, n)));
+  await page.mouse.click(from!.x, from!.y);
+  await page.mouse.move(to!.x, to!.y, { steps: 6 });
+  const card = page.locator('.float-card');
+  await expect(card).toContainText('Aerial cable');
+  const row = card.locator('.row').filter({ hasText: 'Storm risk' });
+  await expect(row).toHaveCount(1);
+  await expect(row).toContainText(/(Sheltered|Moderate|Exposed)[^:]*: (about \$[\d,]+|under \$1) a year in storm repairs, (~[\d.,]+|under 0\.1) days out/);
+  await expect(row).toContainText('/mo pole rent');
+  // The underground quote for the same street talks dig-ins instead.
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('u');
+  await page.mouse.click(from!.x, from!.y);
+  await page.mouse.move(to!.x, to!.y, { steps: 6 });
+  await expect(card).toContainText('Underground cable');
+  await expect(card.locator('.row').filter({ hasText: 'Storm risk' })).toContainText('a year in dig-in and washout repairs');
+  await page.keyboard.press('Escape');
+  expect(errors).toEqual([]);
+});
+
 /** Screen boxes of the floating card, its itemized amounts, the HUD and the toolbar. */
 function layout(page: Page): Promise<{
   card: { left: number; top: number; right: number; bottom: number; scrollWidth: number; clientWidth: number; compact: boolean } | null;
@@ -512,6 +596,8 @@ test('the span panel shows a span’s storm exposure and rebuilds it underground
   await expect(panel).toHaveAttribute('role', 'dialog');
   await expect(panel).toContainText(`Cable on ${live.name}`);
   await expect(panel).toContainText('Storm history');
+  await expect(panel).toContainText(/Storm exposure\s*(Sheltered|Moderate|Exposed)/);
+  await expect(panel).toContainText('Street exposure');
   await expect(panel.getByTestId('span-risk')).toContainText('Aerial (now)');
   await expect(panel.getByTestId('span-risk')).toContainText('Underground');
 

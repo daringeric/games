@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { generateCity } from '../sim/citygen';
+import { cityGroveField, groveAt } from '../sim/terrain';
 import { makeGridCity } from '../sim/testing/fixtures';
+import type { City } from '../sim/types';
 import { placeTrees } from './decor';
+import type { Tree } from './decor';
 import { parcelGrid } from './geometry';
 import { toyTown } from './theme';
 
@@ -43,6 +47,51 @@ describe('placeTrees', () => {
         expect(d).toBeGreaterThanOrEqual(toyTown.road.width[seg.streetClass] / 2 + t.r);
       }
     }
+  });
+
+  it('places exactly the trees of round 4: the grove field moved to sim/terrain without moving a tree', () => {
+    // Fingerprints taken before the move (tree count, FNV-1a of the trees' JSON). Re-take them
+    // only when the theme's tree settings change on purpose.
+    const fingerprint = (trees: readonly Tree[]) => {
+      const json = JSON.stringify(trees);
+      let h = 0x811c9dc5;
+      for (let i = 0; i < json.length; i++) {
+        h ^= json.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return { count: trees.length, hash: (h >>> 0).toString(16) };
+    };
+    expect(fingerprint(placeTrees(city, toyTown))).toEqual({ count: 102, hash: '978dc59c' });
+    expect(fingerprint(placeTrees(generateCity(2027), toyTown))).toEqual({ count: 1286, hash: 'f908e1cd' });
+    expect(fingerprint(placeTrees(generateCity(424242), toyTown))).toEqual({ count: 1782, hash: '8ac9ae8d' });
+  });
+
+  it('grows open-country groves where the shared grove field is high', () => {
+    // Away from lots, cells in a full grove carry far more trees than clearings.
+    const town: City = generateCity(2027);
+    const field = cityGroveField(town);
+    const grid = parcelGrid(town);
+    const perCell = new Map<number, number>();
+    for (const t of placeTrees(town, toyTown)) {
+      const key = Math.floor(t.y / toyTown.cell) * town.width + Math.floor(t.x / toyTown.cell);
+      perCell.set(key, (perCell.get(key) ?? 0) + 1);
+    }
+    const tally = { grove: { cells: 0, trees: 0 }, clearing: { cells: 0, trees: 0 } };
+    for (let y = 1; y < town.height - 1; y++) {
+      for (let x = 1; x < town.width - 1; x++) {
+        let nearLot = false;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (grid[(y + dy) * town.width + x + dx] !== 0) nearLot = true;
+        if (nearLot) continue;
+        const g = groveAt(field, x, y);
+        const bucket = g >= 0.8 ? tally.grove : g <= 0.2 ? tally.clearing : null;
+        if (!bucket) continue;
+        bucket.cells++;
+        bucket.trees += perCell.get(y * town.width + x) ?? 0;
+      }
+    }
+    expect(tally.grove.cells).toBeGreaterThan(20);
+    expect(tally.clearing.cells).toBeGreaterThan(20);
+    expect(tally.grove.trees / tally.grove.cells).toBeGreaterThan(3 * (tally.clearing.trees / tally.clearing.cells));
   });
 
   it('returns trees sorted back to front', () => {

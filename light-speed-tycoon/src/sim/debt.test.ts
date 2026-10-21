@@ -59,6 +59,7 @@ import {
   frozenReason,
   levelPayment,
   maxSafeTermLoan,
+  covenantsWithin,
   leverageSpreadBps,
   newDebt,
   penaltyBps,
@@ -1765,6 +1766,49 @@ describe('maxSafeTermLoan', () => {
     expect(quoteTermLoan(loaded, TERM_LOAN_MIN, 5).after.compliant).toBe(false);
     expect(maxSafeTermLoan(loaded, 5)).toBe(0);
     expect(maxSafeTermLoan(roomy, 6 as TermYears)).toBe(0);
+  });
+});
+
+describe('covenant headroom (round 4b)', () => {
+  const COSTS = 20_000;
+  const H = 0.15;
+
+  it('covenantsWithin is m.compliant at 0 and tighter with headroom', () => {
+    const state = trading(COSTS);
+    for (const amount of [TERM_LOAN_MIN, maxSafeTermLoan(state, 7), termCapacity(state)]) {
+      const after = quoteTermLoan(state, amount, 7).after;
+      expect(covenantsWithin(after, 0)).toBe(after.compliant);
+      if (covenantsWithin(after, H)) expect(after.compliant).toBe(true);
+    }
+    const none = covenantMetrics(trading());
+    expect(covenantsWithin(none, H)).toBe(true);
+  });
+
+  it('maxSafeTermLoan with headroom stays that far inside both limits, and is no more than without it', () => {
+    const state = trading(COSTS);
+    const plain = maxSafeTermLoan(state, 7);
+    const roomy = maxSafeTermLoan(state, 7, H);
+    expect(roomy).toBeLessThan(plain);
+    expect(roomy % LOAN_ROUNDING).toBe(0);
+    if (roomy >= TERM_LOAN_MIN) {
+      const after = quoteTermLoan(state, roomy, 7).after;
+      expect(after.leverage).not.toBeNull();
+      expect(after.leverage!).toBeLessThanOrEqual(COVENANT_MAX_LEVERAGE * (1 - H));
+      if (after.coverage !== null) expect(after.coverage).toBeGreaterThanOrEqual(COVENANT_MIN_COVERAGE * (1 + H));
+      expect(covenantsWithin(quoteTermLoan(state, roomy + LOAN_ROUNDING, 7).after, H)).toBe(false);
+    }
+    expect(maxSafeTermLoan(state, 7, 0)).toBe(plain);
+  });
+
+  it('fundingHint with headroom only suggests financing that keeps it', () => {
+    const state = trading();
+    state.finance.cash = 50_000;
+    const years = TERM_LOAN_YEARS.at(-1) as TermYears;
+    const cost = 50_000 + creditAvailable(state) * 2;
+    const hint = fundingHint(state, cost, H);
+    if (hint.kind === 'term') expect(covenantsWithin(quoteTermLoan(state, hint.termLoan, years).after, H)).toBe(true);
+    if (hint.kind === 'draw') expect(covenantsWithin(quoteDraw(state, hint.draw).after, H)).toBe(true);
+    expect(fundingHint(state, cost, 0)).toEqual(fundingHint(state, cost));
   });
 });
 

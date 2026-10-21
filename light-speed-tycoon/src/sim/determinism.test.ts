@@ -261,7 +261,10 @@ describe('determinism with debt', () => {
 });
 
 // Storm season on the sales town: mostly aerial plant, an underground
-// rebuild ordered once storms have begun, and two years of weather.
+// rebuild ordered once storms have begun, and two years of weather. Round
+// 4b: the storm sequence comes from the weather stream alone and each
+// storm's (and day's) per-street draws from sub-streams of the seed, so a
+// different plant on the same seed meets the same storms.
 const STORM_SCRIPT: ReadonlyArray<Step> = [
   ...SALES_SCRIPT,
   STORM_START_DAY - 330,
@@ -291,6 +294,20 @@ describe('determinism with weather', () => {
     expect(a.state.weather).toEqual(b.state.weather);
     expect(hashState(a.state)).toBe(hashState(b.state));
     expect(hashState(stormSession(6).state)).not.toBe(hashState(a.state));
+  });
+
+  it('brings the same storms to a different plant on the same seed (round 4b: fair streams)', () => {
+    const a = stormSession(5);
+    // The same session, but the late order goes in underground instead of aerial, and the rebuild never happens.
+    const other: ReadonlyArray<Step> = [...SALES_SCRIPT, STORM_START_DAY - 330, { type: 'layCable', segments: [12, 13, 14, 15], method: 'underground' }, 300];
+    const b = stormSession(5, other);
+    expect(b.results.every((r) => r.ok), JSON.stringify(b.results)).toBe(true);
+    const sequence = (s: GameState) => s.weather.storms.map(({ id, day, x, y, radius, severity }) => ({ id, day, x, y, radius, severity }));
+    expect(sequence(a.state).length).toBeGreaterThan(0);
+    expect(sequence(b.state)).toEqual(sequence(a.state));
+    expect(b.state.rng.weather).toBe(a.state.rng.weather);
+    // The plants differ, and so does what the storms did to them.
+    expect(hashState(b.state)).not.toBe(hashState(a.state));
   });
 
   it('replays identically through a save and load taken while spans are out of service', () => {

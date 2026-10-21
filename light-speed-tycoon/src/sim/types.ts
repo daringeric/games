@@ -39,6 +39,14 @@
 //       the new DebtStats fields, and the round-4 notice kinds. v3 saves
 //       migrate with no storms, locks or promos (save.ts migrateV3toV4); v1
 //       and v2 saves migrate v1 -> v2 -> v3 -> v4.
+//       Round 4b extends v4 in place (round 4 was never released, so no
+//       version bump): GameState.company (name, difficulty), GameState.advisor
+//       (snoozed and recently shown suggestions), the 'retention' price lock
+//       and IncumbentPromo.triggerTakePct / answered, MonthAccrual.
+//       outageCreditDollarDays and OpsStats.outageCredits. A v4 save written
+//       before these fields gets them on load (save.ts upgradeEarlyV4); older
+//       saves get them from migrateV3toV4 (difficulty 'seed', the name
+//       company.defaultCompanyName(town)).
 
 export type NodeId = number;
 export type SegmentId = number;
@@ -485,6 +493,13 @@ export interface OpsStats {
   incumbentPromos: number;
   /** What every subscriber pays for a full month at month end, price locks included (sales.monthlyRecurringRevenue after churn). */
   mrr: number;
+  /**
+   * Round 4b: billing not charged for days subscribers had no service
+   * because of outages (round(MonthAccrual.outageCreditDollarDays / days in
+   * the month)), dollars >= 0. Revenue in `totals` is already net of it.
+   * Reports written by an earlier round-4 build get 0 on load.
+   */
+  outageCredits: number;
 }
 
 /**
@@ -772,9 +787,11 @@ export interface Account {
  *   grandfather - a price rise grandfathered for months (setPricing grandfatherMonths >= 1)
  *   notice      - a price rise passed on at the next bill (setPricing grandfatherMonths 0)
  *   promo       - it signed up on the intro promo (Sales.promo)
+ *   retention   - round 4b: a retention offer answering the incumbent's promo
+ *                 in its cabinet area (answerIncumbent), until that promo ends
  * The reason sets the churn share of the price step when the lock ends.
  */
-export type PriceLockReason = 'grandfather' | 'notice' | 'promo';
+export type PriceLockReason = 'grandfather' | 'notice' | 'promo' | 'retention';
 
 /** A price an account's units on one tier pay until a month close (Account.locks). */
 export interface PriceLock {
@@ -789,6 +806,24 @@ export interface PriceLock {
    */
   untilDay: number;
   reason: PriceLockReason;
+  /**
+   * Round 4b, on a 'retention' lock only (absent otherwise): the dearer lock
+   * it replaced that was promised past the incumbent promo's end (a
+   * grandfathered or intro-promo price), so the offer never cuts that
+   * promise short. When the retention lock ends at a close, its units go
+   * back to this price (a step from the retention price, RETENTION_STEP_SHARE)
+   * until resume.untilDay, with resume.reason, instead of to the list price.
+   */
+  resume?: PriceLockResume;
+}
+
+/** Round 4b: the lock a retention lock gives back when it ends (PriceLock.resume): never itself a retention lock. */
+export interface PriceLockResume {
+  /** Household monthly price, whole dollars >= 1, above the retention lock's. */
+  price: number;
+  /** A month-close day after the retention lock's untilDay. */
+  untilDay: number;
+  reason: Exclude<PriceLockReason, 'retention'>;
 }
 
 /** The intro offer new signups get (Sales.promo): a discount off the list price for their first months. */
@@ -819,8 +854,34 @@ export interface IncumbentPromo {
   endDay: number;
   /** The incumbent's promo price there, whole dollars a month, 1..INCUMBENT_PRICE. */
   price: number;
-  /** No new promo at this cabinet before this day (>= endDay); the record is dropped at the first close on or after it. */
+  /**
+   * No new promo at this cabinet before this day (>= endDay). Round 4b: the
+   * record is kept after it as the area's memory (at most one record per
+   * cabinet; a new promo replaces it): the next promo there needs the area's
+   * take rate at least triggerTakePct / 100 + INCUMBENT_PROMO_RETRIGGER_POINTS
+   * (incumbent.reviewIncumbent), so a mature area does not cycle forever. It
+   * is dropped when its cabinet no longer exists.
+   */
   quietUntil: number;
+  /** Round 4b: your take rate in the area when it started, whole percent 0..100 (round(takeRate x 100)). */
+  triggerTakePct: number;
+  /**
+   * Round 4b: the player answered it with a retention offer
+   * (answerIncumbent: 'retention' price locks for the area's subscribers
+   * until endDay). The advisor's card about it clears; at most one answer
+   * per promo.
+   */
+  answered: boolean;
+  /**
+   * Round 4b: the player set an intro promo while it ran where
+   * incumbent.bestIncumbentAnswer recommended one (setPromo: see
+   * incumbent.setIntroPromo), and it is still set. The advisor's card about it
+   * clears too, but unlike `answered` it spares no churn (the intro promo
+   * speeds up signups; only a retention offer keeps subscribers), and a
+   * retention offer can still be made. Back to false when the intro promo is
+   * taken away (setPromo null) while it runs.
+   */
+  answeredWithPromo: boolean;
 }
 
 /**
@@ -843,6 +904,14 @@ export interface MonthAccrual {
   grossAdds: number;
   /** Units disconnected so far this month because service went away. */
   lostService: number;
+  /**
+   * Round 4b: sum over the month's daily steps of the monthly rate of the
+   * units cut off that day (network.outageService), which revenueDollarDays
+   * leaves out: outage days are not billed (nor charged support:
+   * subscriberUnitDays leaves those units out too). The close reports
+   * round(/ days in the month) as OpsStats.outageCredits. >= 0.
+   */
+  outageCreditDollarDays: number;
 }
 
 export interface Sales {
@@ -972,9 +1041,67 @@ export interface RngStreams {
   weather: number;
 }
 
+/**
+ * Round 4b: how hard the game is. Levels differ ONLY in starting cash for now
+ * (balance.DIFFICULTY_LEVELS: Angel-backed, Seed round = START_CASH,
+ * Bootstrapped, Shoestring); more knobs may follow.
+ */
+export type DifficultyId = 'angel' | 'seed' | 'bootstrapped' | 'shoestring';
+
+/** Round 4b: the player's company (chosen on the start screen; never renamed mid-game). */
+export interface Company {
+  /**
+   * Display name, e.g. "Otter Junction Fiber": a string already normalized by
+   * company.normalizeCompanyName (trimmed, inner whitespace collapsed to one
+   * space, no control characters), 1..COMPANY_NAME_MAX UTF-16 code units.
+   * The UI renders it as text only (textContent), never as HTML.
+   */
+  name: string;
+  difficulty: DifficultyId;
+}
+
+/**
+ * Round 4b: a suggestion the player dismissed (snoozeAdvice). advise() leaves
+ * out an advice with this key while state.day < untilDay, unless its severity
+ * is now above the snoozed one (the situation got materially worse).
+ */
+export interface AdviceSnooze {
+  /** Advice.key it silences (1..ADVICE_KEY_MAX_LENGTH characters). */
+  key: string;
+  /** A close day (the 1st of a month) after the day it was snoozed: hidden before it, shown again from it. */
+  untilDay: number;
+  /** The advice's severity when it was snoozed. */
+  severity: AdviceSeverity;
+}
+
+/**
+ * Round 4b: a suggestion shown in recent month-end briefings
+ * (noteAdviceShown): how many briefings in a row have shown it, so the
+ * advisor never repeats it word for word (Advice.repeat).
+ */
+export interface AdviceShown {
+  key: string;
+  /** Day of the first briefing of the current run that showed it. */
+  firstDay: number;
+  /** Day of the latest briefing that showed it (>= firstDay). */
+  lastDay: number;
+  /** Briefings in a row that showed it, >= 1. */
+  times: number;
+}
+
+/** Round 4b: what the advisor remembers between briefings (saved, so it survives reloads). */
+export interface AdvisorState {
+  /** Snoozed suggestions, ascending key, one per key, at most ADVISOR_MEMORY_MAX. */
+  snoozes: AdviceSnooze[];
+  /** Suggestions the latest briefing showed, ascending key, one per key, at most ADVISOR_MEMORY_MAX. */
+  shown: AdviceShown[];
+}
+
 export interface GameState {
   schemaVersion: 4;
   seed: number;
+  /** Round 4b: the player's company: its name and the difficulty it started at. */
+  company: Company;
   day: number;
   rng: RngStreams;
   /** Monotonic id source for spans and cabinets. */
@@ -987,6 +1114,8 @@ export interface GameState {
   sales: Sales;
   /** Round 4: storms and the month's outage totals (weather.newWeather() for a new game). */
   weather: Weather;
+  /** Round 4b: snoozed and recently shown suggestions (advisor.newAdvisorState() for a new game). */
+  advisor: AdvisorState;
   /** Achieved milestones, in the order achieved; each id at most once. */
   milestones: MilestoneRecord[];
   /** The newest NOTICE_LOG_MAX notices, oldest first. */
@@ -1044,7 +1173,27 @@ export type Command =
   /** Borrow a fixed-rate term loan of whole dollars (TERM_LOAN_MIN..capacity). Cost = -amount (cash in). */
   | { type: 'takeTermLoan'; amount: number; termYears: TermYears }
   /** Prepay whole dollars (>= 1, <= balance) of a term loan plus the interest accrued on them. Cost = amount + accrued interest. */
-  | { type: 'prepayLoan'; loan: LoanId; amount: number };
+  | { type: 'prepayLoan'; loan: LoanId; amount: number }
+  /**
+   * Round 4b: answer the incumbent's running promo at `cabinet` with a
+   * retention offer: every subscriber there gets a 'retention' price lock
+   * (RETENTION_PERCENT_OFF off) until the promo ends, which spares them the
+   * promo's extra churn. Free now (the discount is revenue given up). Once
+   * per promo. See incumbent.answerIncumbent / quoteRetention.
+   */
+  | { type: 'answerIncumbent'; cabinet: CabinetId }
+  /**
+   * Round 4b: snooze (dismiss) the suggestion with this Advice.key for
+   * ADVICE_SNOOZE_MONTHS closes (ADVICE_SNOOZE_URGENT_MONTHS for an urgent
+   * one). Free; changes only what the advisor shows. See advisor.snoozeAdvice.
+   */
+  | { type: 'snoozeAdvice'; key: string }
+  /**
+   * Round 4b: the month-end briefing just showed these suggestions
+   * (Advice.key); the UI sends it once per close-time briefing (not when the
+   * menu reopens one). Free; feeds Advice.repeat. See advisor.noteAdviceShown.
+   */
+  | { type: 'noteAdviceShown'; keys: string[] };
 
 /**
  * On success `cost` is the net cash spent now: negative for a refund or money
@@ -1126,6 +1275,29 @@ export interface CableQuote {
    * this route face another street". Ascending ids.
    */
   wrongSideParcels: ParcelId[];
+  /**
+   * Round 4b: the storm (and, underground, dig-in) exposure of the new
+   * segments as this method would build them (weather.stormRisk summed, and
+   * the exposure bands of weather.segmentExposure): the aerial quote card's
+   * storm-risk line. Null when there are no new segments.
+   */
+  stormRisk: CableStormRisk | null;
+}
+
+/** Round 4b: how exposed a street is to storms (weather.exposureBand of weather.segmentExposure). */
+export type ExposureBand = 'sheltered' | 'moderate' | 'exposed';
+
+/** Round 4b: a cable quote's storm exposure (CableQuote.stormRisk). Estimates, not rounded. */
+export interface CableStormRisk {
+  method: CableMethod;
+  /** Sums over the new segments of weather.stormRisk(segment, method). */
+  outagesPerYear: number;
+  repairCostPerYear: number;
+  outageDaysPerYear: number;
+  /** The most exposed band among the new segments. */
+  band: ExposureBand;
+  /** Feet of the new segments in the 'exposed' band. */
+  exposedFt: number;
 }
 
 export interface CabinetQuote {
@@ -1523,6 +1695,122 @@ export interface ConvertQuote {
   poleRentSaved: number;
   /** Expected storm repair cost a year it avoids (weather.stormRisk aerial minus underground), dollars (an estimate). */
   repairsAvoidedPerYear: number;
+  /** Round 4b: the span's street's storm exposure band (weather.exposureBand of weather.segmentExposure). */
+  exposure: ExposureBand;
+}
+
+/**
+ * Round 4b: the households a price lineup wins, by price sensitivity
+ * (balance.DEMAND_SEGMENTS: value seekers who only take a cheap tier,
+ * mainstream, speed seekers). sales.segmentDemand; the pricing panel's
+ * "who signs up" rows.
+ */
+export type DemandSegmentId = 'value' | 'mainstream' | 'speed';
+
+/** One demand segment's response to a lineup (sales.segmentDemand). */
+export interface SegmentDemand {
+  segment: DemandSegmentId;
+  /** Its share of households (DEMAND_SEGMENTS share; the shares sum to 1). */
+  share: number;
+  /** Its target take rate under the lineup, 0..1 (before TAKE_RATE_KIND_FACTOR: a household's). */
+  takeRate: number;
+  /** The tier it would mostly take, or null when no offered tier suits it (it does not sign up). */
+  tier: TierId | null;
+}
+
+/**
+ * Round 4b: what a retention offer answering the incumbent's promo at
+ * `cabinet` would cost and save (incumbent.quoteRetention), for the pricing
+ * panel and the advisor. Estimates rounded to whole dollars / units.
+ */
+export interface RetentionQuote {
+  /** answerIncumbent would accept it: a promo runs there now, not answered yet, with subscribers. */
+  ok: boolean;
+  reasons: string[];
+  cabinet: CabinetId;
+  /** Subscribed units on accounts of that cabinet today. */
+  units: number;
+  /** RETENTION_PERCENT_OFF. */
+  percentOff: number;
+  /** Month closes until the promo ends (the locks' length). */
+  months: number;
+  /** Revenue a month the offer gives up (MRR now less with the locks). */
+  monthlyCost: number;
+  /** monthlyCost x months. */
+  totalCost: number;
+  /** Cancellations the promo is expected to cause there over its remaining months that the offer avoids. */
+  cancellationsAvoided: number;
+  /** What those cancellations would cost (lost margin until replaced, reinstalls), dollars. */
+  valueSaved: number;
+  /** valueSaved > totalCost: the advisor recommends it only then. */
+  pays: boolean;
+}
+
+/**
+ * Round 4b: the best answer to the incumbent's promo at a cabinet
+ * (incumbent.bestIncumbentAnswer): the remedy that pays most, or none when
+ * nothing beats waiting it out. The advisor's incumbentPromo card says this
+ * and only this; the pricing panel shows the same figures.
+ */
+export interface IncumbentAnswer {
+  cabinet: CabinetId;
+  /** retention: answerIncumbent pays; introPromo: setPromo(promo) pays; none: nothing pays (or the promo is answered or over). */
+  kind: 'retention' | 'introPromo' | 'none';
+  /** The retention offer's quote (always computed). */
+  retention: RetentionQuote;
+  /** The intro promo it weighed (kind introPromo: the one to set), else null. */
+  promo: IntroPromo | null;
+  /** What the remedy is worth beyond its cost, dollars (0 for none). */
+  netValue: number;
+  /** One plain-language sentence with the figures (empty for none). */
+  text: string;
+}
+
+/**
+ * Round 4b: what an intro promo would do (sales.quotePromo), for the pricing
+ * panel ("when it pays") and the advisor. Estimates over PROMO_QUOTE_MONTHS.
+ */
+export interface PromoQuote {
+  /** setPromo would accept it (null: always). */
+  ok: boolean;
+  reasons: string[];
+  promo: IntroPromo | null;
+  /** Units waiting to sign up across lit areas today (target take less subscribed), the gap a promo speeds up. */
+  waitingUnits: number;
+  /** Extra signups the promo brings within PROMO_QUOTE_MONTHS (its signup boost on the waiting gap). */
+  extraSignups: number;
+  /** Revenue given up on the discounted signups within the horizon, dollars. */
+  discountCost: number;
+  /** Margin the extra (and earlier) signups bring within the horizon, dollars. */
+  valueGained: number;
+  /** valueGained > discountCost. */
+  pays: boolean;
+  /** One plain-language sentence on when it pays ("Pays while you light new areas: ..."). */
+  advice: string;
+}
+
+/**
+ * Round 4b: everything a new cabinet at `node` needs to light what it
+ * reaches (coverage.buildOutPlan), as commands a player (or the advisor's
+ * expand suggestion, or a bot following it) can send in order.
+ */
+export interface BuildOutPlan {
+  node: NodeId;
+  /** Uncabled segments joining the node to the planned plant (network.cableRoute from the nearest planned plant node), in route order; empty when already joined. */
+  feeder: SegmentId[];
+  /** Uncabled segments within CABINET_REACH_FT of the node along streets (coveragePreview's build-out), ascending. */
+  reach: SegmentId[];
+  /** Feeder and reach segments by method (weather.preferredMethod per segment), each ascending: one layCable order per non-empty list. */
+  aerial: SegmentId[];
+  underground: SegmentId[];
+  /** placeCabinet (when none stands there), then layCable aerial, then layCable underground. */
+  commands: Command[];
+  /** Cabinet price plus both orders' quoteCable costs, dollars. */
+  cost: number;
+  /** Units on existing parcels the plan would newly pass (not served elsewhere: coveragePreview). */
+  passings: number;
+  /** cost / passings, or null when passings is 0. */
+  cpp: number | null;
 }
 
 /** Expected yearly storm and dig-in exposure of a span of `method` on a segment (weather.stormRisk). */
@@ -1571,6 +1859,20 @@ export type AdviceAction =
 /** One ranked suggestion (advisor.advise). */
 export interface Advice {
   id: AdviceId;
+  /**
+   * Round 4b: the suggestion's identity for snoozes and repeats: its rule and
+   * subject, e.g. "addSplitter:cabinet:12", "expand:node:345",
+   * "pricing:fiber2g", "cashRunway" (1..ADVICE_KEY_MAX_LENGTH characters, no
+   * whitespace). Two suggestions with the same key are the same advice; a
+   * different subject is a different one (a snooze does not silence it).
+   */
+  key: string;
+  /**
+   * Round 4b: how many month-end briefings in a row before this one showed
+   * this key (AdvisorState.shown); 0 = new. The advisor words a repeat
+   * differently (never word for word); the briefing may compact it.
+   */
+  repeat: number;
   /**
    * Rank: higher first (ties by AdviceId order above). Bands: urgent 300-399,
    * important 200-299, tip 100-199, so severity and priority always agree.
@@ -1652,8 +1954,10 @@ export interface Briefing {
     /** Loans called: closes left to repay everything, else null. */
     accelerationClosesLeft: number | null;
   };
-  /** advisor.advise(state): at most ADVICE_MAX, ranked. */
+  /** advisor.advise(state): at most ADVICE_MAX, ranked (snoozed suggestions left out). */
   advice: Advice[];
+  /** Round 4b: suggestions that fired but are snoozed (AdvisorState.snoozes), so not in `advice`. */
+  snoozed: number;
   /** Something needs the player: urgent advice, or a period notice of a kind that needs action (advisor.noticeNeedsAttention). */
   needsAttention: boolean;
 }

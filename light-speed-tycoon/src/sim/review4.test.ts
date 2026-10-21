@@ -28,6 +28,7 @@ import { accountUnits, retireDestination, TIER_IDS, unitsByTier } from './sales'
 import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
 import { frozenHoarderBot, smartBot } from './tuning/bots';
 import { runBot } from './tuning/harness';
+import type { BotFactory } from './tuning/harness';
 import type { Account, CabinetId, Command, GameState, MonthlyReport, Notice, ParcelId, SegmentId, TierId } from './types';
 import { cutOffOf, outageChurnFor, outageChurnProbability } from './weather';
 
@@ -45,6 +46,37 @@ function tiers(units: number, tier: TierId = 'fiber500'): Record<TierId, number>
 
 function account(parcel: ParcelId, cabinet: CabinetId, units: number, since: number): Account {
   return { parcel, cabinet, tierUnits: tiers(units), since, locks: [] };
+}
+
+/**
+ * The state right after each month close of `makeBot` played on `seed`
+ * (index i: after close i + 1), cached per run. Tests that need a scenario a
+ * bot reaches (a frozen line one close before the call, installs posted on
+ * the 1st...) take the first close that has it, not a fixed month, so a
+ * balance change that moves the bot's path does not lose the scenario.
+ */
+const closesCache = new Map<string, GameState[]>();
+function statesAfterCloses(key: string, seed: number, makeBot: BotFactory, months: number): GameState[] {
+  const cached = closesCache.get(key);
+  if (cached) return cached;
+  const states: GameState[] = [];
+  let closes = 0;
+  runBot(seed, makeBot, months, {
+    afterTick: (s) => {
+      if (s.finance.reports.length === closes) return;
+      closes = s.finance.reports.length;
+      states.push(structuredClone(s));
+    },
+  });
+  closesCache.set(key, states);
+  return states;
+}
+
+/** The first state after a close (from month `from` on) that `has` the scenario; fails the test when the run never reaches it. */
+function firstClose(states: readonly GameState[], from: number, has: (state: GameState) => boolean): GameState {
+  const found = states.slice(from - 1).find(has);
+  expect(found, 'a close with the scenario').toBeDefined();
+  return found!;
 }
 
 /** Put a storm outage on the live span of `segment`, `daysLeft` days to repair. */
@@ -305,10 +337,12 @@ describe('#8 the cash projected at the next close from the 1st of the month', ()
   }
 
   it('does not scale one day of installs up to a month, so a healthy operator gets no false payment alarm', () => {
-    const { state } = runBot(12345, smartBot(), 53);
+    // A mature, healthy operator (SMART in its fifth year) at a close where installs landed on the 1st.
+    const installsOnThe1st = (s: GameState) => s.finance.monthToDate.some((e) => e.category === 'install' && e.day === s.day);
+    const state = firstClose(statesAfterCloses('smart:12345', 12345, smartBot(), 60), 48, installsOnThe1st);
     expect(dateOf(state.day).day).toBe(1);
     // The briefing runs right after the close, with the 1st's installs already posted.
-    expect(state.finance.monthToDate.some((e) => e.category === 'install' && e.day === state.day)).toBe(true);
+    expect(installsOnThe1st(state)).toBe(true);
     const projected = estimateCashAtClose(state);
     const actual = cashAtDebtStep(state);
     // Off by less than a month of installs (scaling the 1st's up to the month missed by several months' worth).
@@ -442,8 +476,15 @@ describe('#9 covenant cures and the bank\'s call', () => {
     return copy;
   }
 
+  /** FROZEN_HOARDER on 12345, close by close: it freezes, the bank calls its loans, and it runs out of cash to repay them. */
+  const hoarder = () => statesAfterCloses('hoarder:12345', 12345, frozenHoarderBot(), 40);
+
   it('one close before the call, suggests repaying everything (which stops it), not a cure that cannot finish in time', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 18);
+    // Frozen, not yet called, the call due before a cure could lift the freeze, with a prepayment that would pass today's tests.
+    const state = firstClose(hoarder(), 1, (s) => {
+      const left = closesUntilAcceleration(s);
+      return s.debt.covenant.stage === 'frozen' && s.debt.acceleration === null && left !== null && left < COVENANT_CURE_CLOSES && cureOptions(s)[0]?.kind === 'prepayLoan';
+    });
     expect(state.debt.covenant.stage).toBe('frozen');
     expect(closesUntilAcceleration(state)).toBeLessThan(COVENANT_CURE_CLOSES);
     expect(covenantMetrics(state).compliant).toBe(false);
@@ -466,7 +507,7 @@ describe('#9 covenant cures and the bank\'s call', () => {
   });
 
   it('once the loans are called, suggests repaying everything when cash covers it, never a growth target', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 19);
+    const state = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.finance.cash >= totalDebt(s));
     expect(state.debt.acceleration).not.toBeNull();
     expect(cureOptions(state)[0]?.kind).toBe('grow');
     const plans = advicePlans(state);
@@ -484,7 +525,7 @@ describe('#9 covenant cures and the bank\'s call', () => {
   });
 
   it('with the loans called and too little cash to repay them, gives no cure card, and one card for a last close that cannot pay', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 32);
+    const state = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.finance.cash < totalDebt(s) && s.gameOver === null);
     expect(state.debt.acceleration).not.toBeNull();
     expect(state.finance.cash).toBeLessThan(totalDebt(state));
     expect(cureFor(state)).toBeNull();

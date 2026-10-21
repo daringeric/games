@@ -1,5 +1,6 @@
 /* Map tools chrome: itemized quote card, cabinet coverage card, OLT panel,
-   cost-overlay toggle and legend. Imported by main.ts after style.css. Colors
+   cost-overlay toggle and legend, and (round 4b) the storm-exposure toggle
+   and legend, which share the cost legend's place (only one shows). Imported by main.ts after style.css. Colors
    and sizes come from the theme's CSS custom properties (themeCss.ts), e.g.
    var(--cpp-green), var(--cpp-amber), var(--cpp-red).
 
@@ -76,6 +77,12 @@
 .quote-lines .quote-amount {
   font-size: 13px;
   text-align: right;
+}
+
+/* Row labels stay on one line; a long value (round 4b: the storm-risk line) wraps instead. */
+.float-card dt {
+  flex: none;
+  white-space: nowrap;
 }
 
 .float-card dd.tone-value {
@@ -182,6 +189,11 @@
 
 .cost-legend[hidden] {
   display: none;
+}
+
+/* Round 4b: the storm-exposure legend takes the cost legend's look and place. */
+.exposure-legend .cost-swatch {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 18%, transparent);
 }
 
 .cost-legend-title {
@@ -437,5 +449,18 @@
 
   .float-card.has-lines {
     max-width: min(340px, calc(100vw - 16px));
+  }
+}
+
+/* Phones: seven buttons (five tools, two overlay switches) fit a 390px-wide bar. */
+@media (max-width: 480px) {
+  .toolbar {
+    gap: 4px;
+    padding: 5px;
+  }
+
+  .toolbar .tool {
+    width: 46px;
+    height: 46px;
   }
 }

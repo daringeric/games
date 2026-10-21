@@ -3,7 +3,8 @@
 // its lifetime cost (SMART) against all-aerial and all-underground copies of
 // itself, storms that hurt aerial plant, a frozen-line hoarder who no longer
 // out-grows careful borrowing, default prices near the best constant price,
-// extreme price hikes that lose subscribers, and the incumbent's promos.
+// extreme price hikes that lose subscribers (round 4b moved the incumbent's
+// promos to targets4b.test.ts).
 // The round-2/3 targets (start cash, cost per passing, break-even, growth with
 // loans, LEVERED's default...) stay in targets.test.ts.
 //
@@ -63,8 +64,6 @@ const SWEEP_MULTIPLIERS: readonly number[] = [0.8, 0.9, 1, 1.1, 1.2, 1.3];
 const HIKER_SUBSCRIBER_SHARE_MAX = 0.5;
 /** ... and its price-step cancellations (ops.priceChurn) are at least this many units on every seed. */
 const HIKER_PRICE_CHURN_MIN = 10;
-/** Incumbent promos SMART meets in five years: a few on every seed, never everywhere all the time. */
-const INCUMBENT_PROMOS: [number, number] = [1, 10];
 /** Months the frozen v3 fixture is played on: enough for the call (FROZEN_ACCELERATION_CLOSES) and repayment. */
 const FIXTURE_MONTHS = 12;
 
@@ -187,18 +186,8 @@ describe('pricing realism', () => {
     },
     TEST_TIMEOUT_MS,
   );
-
-  it(
-    "meets the incumbent's promo a few times in SMART's dense areas",
-    () => {
-      for (const seed of TUNING_SEEDS) {
-        const promos = smart(seed).notices.incumbentPromo ?? 0;
-        expect(promos, `seed ${seed} incumbent promos`).toBeGreaterThanOrEqual(INCUMBENT_PROMOS[0]);
-        expect(promos, `seed ${seed} incumbent promos`).toBeLessThanOrEqual(INCUMBENT_PROMOS[1]);
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
+  // Round 4b replaced the incumbent-promo band [1, 10] with targets4b.test.ts's
+  // (promos trigger above SMART's settled take rate, at most twice per area).
 });
 
 // ---------------------------------------------------------------------------

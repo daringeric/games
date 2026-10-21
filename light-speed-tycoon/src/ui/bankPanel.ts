@@ -4,7 +4,12 @@
 // covenant preview, repay), the term-loan builder (amount, 5 or 7 years, a
 // live quote with the rate's parts, the payment, same-month re-pricing and the
 // covenants before and after; it starts at the largest covenant-safe amount),
-// the loans list (prepay) and the bank's notices. Every figure comes from
+// the loans list (prepay) and the bank's notices. Round 4b
+// (briefing-advisor-polish): the builder starts BANK_PREFILL_HEADROOM inside
+// the covenant limits (prefillTermAmount), not exactly on them, while the
+// line under it still names the exact largest covenant-safe amount; the
+// header names the borrower (the company); debt figures carry no tone (never
+// success green; only the covenant badges keep theirs). Every figure comes from
 // debt.ts (creditOffer, quoteDraw, quoteTermLoan, maxSafeTermLoan,
 // quotePrepay, covenantMetrics, cureFor, estimateNextDebtService,
 // estimateSweep, closesUntilAcceleration, acceleratedSchedule); the panel only
@@ -27,6 +32,7 @@ import {
   ACCELERATION_WARNING_CLOSES,
   ARR_SPIKE_CAP,
   ARR_TRAILING_MONTHS,
+  BANK_PREFILL_HEADROOM,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
   COVENANT_MIN_COVERAGE,
@@ -326,7 +332,7 @@ export function creditView(offer: CreditOffer, pricing?: LinePricing): CreditVie
   return {
     figures: [
       { label: 'Limit', value: formatMoney(offer.limit) },
-      { label: 'Drawn', value: formatMoney(offer.balance) },
+      debtFigure('Drawn', offer.balance),
       { label: 'Available', value: formatMoney(offer.available), tone: offer.available > 0 ? undefined : 'muted' },
       { label: 'Interest so far this month', value: formatMoney(offer.accruedInterest) },
     ],
@@ -343,13 +349,43 @@ export function creditView(offer: CreditOffer, pricing?: LinePricing): CreditVie
 }
 
 /**
- * Where the builder starts: the largest covenant-safe amount
- * (TermLoanQuote.safeMaxAmount / debt.maxSafeTermLoan); TERM_LOAN_MIN when
- * none is safe (the quote then shows the breach warning). The presets still
- * reach the whole capacity.
+ * Where the builder starts, given the largest loan it may start at:
+ * that amount, or TERM_LOAN_MIN when there is none (0: the quote then shows
+ * any breach warning). The presets still reach the whole capacity.
  */
 export function defaultTermAmount(safeMaxAmount: number): number {
   return safeMaxAmount >= TERM_LOAN_MIN ? safeMaxAmount : TERM_LOAN_MIN;
+}
+
+/**
+ * Round 4b: the builder's starting amount for `termYears`: the largest loan
+ * that leaves the covenants BANK_PREFILL_HEADROOM inside their limits
+ * (debt.maxSafeTermLoan with that headroom), so the default is never right
+ * on a limit; TERM_LOAN_MIN when even that is 0.
+ */
+export function prefillTermAmount(state: GameState, termYears: TermYears): number {
+  return defaultTermAmount(maxSafeTermLoan(state, termYears, BANK_PREFILL_HEADROOM));
+}
+
+/**
+ * "The amount starts at $X, 15% inside the covenant limits." when the
+ * builder's start (`prefill`) is below the exact safe maximum; '' otherwise
+ * (nothing safe, or no room between them).
+ */
+export function prefillLine(prefill: number, safeMaxAmount: number): string {
+  if (prefill < TERM_LOAN_MIN || safeMaxAmount < TERM_LOAN_MIN || prefill >= safeMaxAmount) return '';
+  return `The amount starts at ${formatMoney(prefill)}, leaving the covenants ${Math.round(BANK_PREFILL_HEADROOM * 100)}% inside their limits.`;
+}
+
+/** "Borrower: Otter Junction Fiber": the Bank's subtitle (the company's name, rendered as text). */
+export function borrowerLine(companyName: string): string {
+  const name = companyName.trim();
+  return name ? `Borrower: ${name}` : 'Credit line, term loans and covenants';
+}
+
+/** A debt amount as a figure: never toned (debt is not good or bad news by itself; the covenant badges say how it stands). */
+export function debtFigure(label: string, amount: number, sub?: string): Figure {
+  return sub === undefined ? { label, value: formatMoney(amount) } : { label, value: formatMoney(amount), sub };
 }
 
 /**
@@ -669,7 +705,7 @@ export function covenantView(
     meaning: atRisk ? atRiskMeaning(metrics, nextClose) : stageMeaning(stage),
     checks: [leverageCheck(null, metrics), coverageCheck(null, metrics)],
     figures: [
-      { label: 'Debt', value: formatMoney(metrics.totalDebt) },
+      debtFigure('Debt', metrics.totalDebt),
       { label: 'Lending ARR', value: `${formatMoney(metrics.arr)}/yr`, sub: lendingArrNote() },
       {
         label: 'Cash flow the bank counts',
@@ -1011,7 +1047,7 @@ export class BankPanel {
     if (this.session.state.gameOver) return;
     const sheet = openSheet({
       title: 'Bank',
-      subtitle: 'Credit line, term loans and covenants',
+      subtitle: borrowerLine(this.session.state.company.name),
       className: 'bank',
       onClose: () => {
         if (this.sheet === sheet) {
@@ -1096,8 +1132,11 @@ class BankView {
   /** The player typed an amount (or picked a preset): capacity changes leave it alone. */
   private termDirty = false;
   private termMax = -1;
-  /** Capacity, safe maximum and term the builder's default amount was last set for. */
+  /** Capacity, starting amount and term the builder's default amount was last set for. */
   private termDefaultKey = '';
+  /** The builder's starting amount for the chosen term (0 with nothing to borrow), for the line under the safe amount. */
+  private termPrefill = 0;
+  private readonly termPrefillNote: HTMLElement;
   // Loans.
   private readonly loanList: HTMLElement;
   private readonly loansEmpty: HTMLElement;
@@ -1213,6 +1252,7 @@ class BankView {
     // b) Term loan builder.
     this.termCapacity = el('p', { class: 'bank-note', attrs: { 'data-testid': 'bank-term-capacity' } });
     this.termSafe = el('p', { class: 'bank-note bank-safe', attrs: { 'data-testid': 'bank-term-safe', hidden: '' } });
+    this.termPrefillNote = el('p', { class: 'bank-note bank-prefill', attrs: { 'data-testid': 'bank-term-prefill', hidden: '' } });
     this.termRepriced = el('ul', { class: 'bank-repriced', attrs: { 'data-testid': 'bank-term-repriced', hidden: '' } });
     this.termInput = amountInput('Term loan amount', 'bank-term-amount');
     const termPresets = el('div', { class: 'bank-presets', attrs: { role: 'group', 'aria-label': 'Share of what you can borrow' } });
@@ -1270,6 +1310,7 @@ class BankView {
     const term = section('term', 'New term loan', [
       this.termCapacity,
       this.termSafe,
+      this.termPrefillNote,
       this.termFieldset,
       this.termQuote,
       this.termWarning,
@@ -1369,18 +1410,20 @@ class BankView {
   }
 
   /**
-   * Set the builder to the largest covenant-safe amount of the chosen term
-   * (debt.maxSafeTermLoan; TERM_LOAN_MIN when none) whenever that, the
-   * capacity or the term changes, unless the player typed or picked an
-   * amount. `picked`: the player just chose the term (the input may have focus).
+   * Set the builder to its starting amount for the chosen term
+   * (prefillTermAmount: BANK_PREFILL_HEADROOM inside the covenant limits;
+   * TERM_LOAN_MIN when none) whenever that, the capacity or the term
+   * changes, unless the player typed or picked an amount. `picked`: the
+   * player just chose the term (the input may have focus).
    */
   private syncTermDefault(state: GameState, max: number, picked = false): void {
-    const safe = max > 0 ? maxSafeTermLoan(state, this.termYears) : 0;
-    const key = `${max}:${safe}:${this.termYears}`;
+    const prefill = max > 0 ? prefillTermAmount(state, this.termYears) : TERM_LOAN_MIN;
+    this.termPrefill = max > 0 ? prefill : 0;
+    const key = `${max}:${prefill}:${this.termYears}`;
     if (key === this.termDefaultKey) return;
     this.termDefaultKey = key;
     if (this.termDirty || (!picked && document.activeElement === this.termInput)) return;
-    this.termInput.value = String(defaultTermAmount(safe));
+    this.termInput.value = String(prefill);
   }
 
   /** The covenant preview under the draw form, for what is typed (hidden for nothing typed or an amount the line can't give). */
@@ -1430,7 +1473,7 @@ class BankView {
     const atClose = estimateCashAtClose(state);
     const projected = cashAtCloseFigure(atClose, estimate);
     this.summary.set([
-      { label: 'Debt', value: formatMoney(totalDebt(state)) },
+      debtFigure('Debt', totalDebt(state)),
       nextPaymentFigure(estimate, atClose, state.day),
       { label: 'Cash', value: formatMoney(state.finance.cash), tone: state.finance.cash < 0 ? 'danger' : undefined },
       ...(projected ? [projected] : []),
@@ -1543,6 +1586,9 @@ class BankView {
     this.termCapacity.hidden = view.capacity === '';
     setText(this.termSafe, view.safe);
     this.termSafe.hidden = view.safe === '';
+    const prefill = prefillLine(this.termPrefill, quote.safeMaxAmount);
+    setText(this.termPrefillNote, prefill);
+    this.termPrefillNote.hidden = prefill === '';
     setList(this.termRepriced, view.repriced, this.termRepricedKey);
     // Nothing to borrow: the reasons say why, and there is no loan to quote.
     this.termQuote.hidden = quote.maxAmount <= 0;

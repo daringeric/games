@@ -2,6 +2,7 @@
 // looks the same, and only on cells no parcel will ever use, clear of every road.
 
 import { Rng, deriveSeed } from '../sim/rng';
+import { drawGroveField, groveAt } from '../sim/terrain';
 import type { City, StreetClass } from '../sim/types';
 import { horizontalStreet, parcelGrid, streetLattice, verticalStreet } from './geometry';
 import type { StreetLattice } from './geometry';
@@ -81,8 +82,9 @@ function nodeAt(city: City, x: number, y: number): number | undefined {
 
 /**
  * Trees for a city, deterministic per seed. Density varies with a coarse noise
- * field so backyards and countryside get clumps and clearings instead of an
- * even sprinkle.
+ * field (sim/terrain's grove field, which also makes wooded streets more
+ * exposed to storms) so backyards and countryside get clumps and clearings
+ * instead of an even sprinkle.
  */
 export function placeTrees(city: City, theme: Theme): Tree[] {
   const rng = new Rng(deriveSeed(city.seed, 'decor'));
@@ -91,23 +93,9 @@ export function placeTrees(city: City, theme: Theme): Tree[] {
   const c = theme.cell;
   const { minRadius, maxRadius, density } = theme.tree;
 
-  // Coarse random field (one value per 6x6 cells), bilinearly blended.
-  const NOISE = 6;
-  const nw = Math.ceil(city.width / NOISE) + 2;
-  const nh = Math.ceil(city.height / NOISE) + 2;
-  const field = Array.from({ length: nw * nh }, () => rng.next());
-  const noise = (x: number, y: number) => {
-    const fx = x / NOISE;
-    const fy = y / NOISE;
-    const ix = Math.floor(fx);
-    const iy = Math.floor(fy);
-    const tx = fx - ix;
-    const ty = fy - iy;
-    const at = (i: number, j: number) => field[j * nw + i] ?? 0;
-    const top = at(ix, iy) * (1 - tx) + at(ix + 1, iy) * tx;
-    const bottom = at(ix, iy + 1) * (1 - tx) + at(ix + 1, iy + 1) * tx;
-    return top * (1 - ty) + bottom * ty;
-  };
+  // The coarse grove field (sim/terrain: the same field the sim calls wooded
+  // streets by) comes first from the 'decor' stream; the trees follow from it.
+  const field = drawGroveField(city, rng);
 
   const occupied = (x: number, y: number) =>
     x >= 0 && y >= 0 && x < city.width && y < city.height && parcels[y * city.width + x] !== 0;
@@ -119,7 +107,7 @@ export function placeTrees(city: City, theme: Theme): Tree[] {
       // groves where the noise is high and clearings where it is low.
       let backyard = false;
       for (let dy = -1; dy <= 1 && !backyard; dy++) for (let dx = -1; dx <= 1; dx++) if (occupied(cx + dx, cy + dy)) backyard = true;
-      const grove = Math.max(0, Math.min(1, (noise(cx, cy) - 0.3) / 0.4));
+      const grove = groveAt(field, cx, cy);
       const chance = backyard ? density * 0.6 : density * (0.08 + 0.92 * grove);
       if (!rng.chance(chance)) continue;
       const count = backyard ? 1 : 1 + rng.int(0, Math.round(2 * grove));

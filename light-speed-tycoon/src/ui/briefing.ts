@@ -1,8 +1,19 @@
 // The month-end briefing (round 4, the owner's own idea): at a month close the
 // game pauses and a sheet shows the period at a glance, the advisor's
-// suggestions (each with a real "Show me" button), what changed, the period's
-// notices, the money in and out and a look ahead; Continue picks the game up
-// at the speed the player had.
+// suggestions (each with a real "Show me" button), and, folded away, the
+// money in and out, the period's notices and a look ahead; Continue picks the
+// game up at the speed the player had.
+//
+// Round 4b (briefing-advisor-polish): glance first. The headline tiles carry
+// their own change against the period before (so "what changed" keeps only
+// what is not a tile: revenue and operating cash flow, inside the money
+// details), notices needing attention surface under them, and the details
+// are closed <details>; the frequency is a compact select in the header and
+// the company name leads the subtitle. Each card can be snoozed
+// (snoozeAdvice through deps.dispatch, then re-rendered from deps.rebuild);
+// a close-time briefing records what it showed (noteAdviceShown) once per
+// report. Debt is never success green: neutral, amber or red only for
+// covenant trouble (debtTone).
 //
 // The data is advisor.buildBriefing (pure sim); this file only turns it into
 // words (briefingView, pure and unit-tested) and DOM (BriefingSheet). How often
@@ -12,24 +23,28 @@
 // off unless the URL asks for it with ?briefing=1 (the stored preference) or
 // ?briefing=<frequency>; the debug hook's setBriefing switches it too.
 //
-// Owner: ui-briefing workstream.
+// Owner: ui-briefing workstream (round 4b: briefing-advisor-polish).
 
-import { buildBriefing } from '../sim/advisor';
+import { briefingBuiltOn, buildBriefing, closeDayOf, COVENANT_RISK_MARGIN } from '../sim/advisor';
+import { ADVICE_SNOOZE_MONTHS, ADVICE_SNOOZE_URGENT_MONTHS } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatDate } from '../sim/calendar';
+import { covenantsWithin } from '../sim/debt';
 import type {
   AdviceAction,
   AdviceSeverity,
   Briefing,
   BriefingChange,
   BriefingChangeKey,
+  Command,
+  CommandResult,
   CppBand,
   GameState,
   LedgerCategory,
   MonthlyReport,
   Notice,
+  NoticeKind,
 } from '../sim/types';
-import { STAGE_LABEL, STAGE_TONE } from './bankPanel';
-import type { BankTone } from './bankPanel';
+import { AT_RISK_LABEL, STAGE_LABEL } from './bankPanel';
 import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { DEBUG_PARAM } from './debugHook';
@@ -205,14 +220,36 @@ export class BriefingPreference {
 
 export type GlanceKey = 'net' | 'cash' | 'subscribers' | 'passings' | 'takeRate' | 'cpp' | 'debt';
 
+/** The glance's tiles, in order: each also carries its change against the period before (so "what changed" never repeats them). */
+export const GLANCE_KEYS: readonly GlanceKey[] = ['net', 'cash', 'subscribers', 'passings', 'takeRate', 'cpp', 'debt'];
+
+/** A tile's change against the period before, in words (never color alone). */
+export interface TileChange {
+  direction: ChangeDirection | null;
+  /** "up $1,200", "down 2.1 pts", "no change". */
+  text: string;
+  /** "was $9,800" for the earlier figure, or null. */
+  before: string | null;
+  /** Good or bad news by BriefingChange.upIsGood; debt is always neutral. */
+  tone: 'good' | 'bad' | 'neutral';
+}
+
+/** The debt tile's coloring: none while compliant, amber for a warning, the penalty rate or covenants at risk, red when frozen or called. */
+export type DebtTone = 'warn' | 'danger' | null;
+
 export interface GlanceTile {
   key: GlanceKey;
   label: string;
   value: string;
-  /** Small print under the value (the CPP band and target, the covenant stage), or null. */
+  /** Small print under the value (the CPP band and target, the covenant stage, the month's subscriber moves), or null. */
   detail: string | null;
-  /** Coloring, always alongside words: negative money, the CPP band, or the covenant stage's tone. */
-  tone: 'negative' | CppBand | BankTone | null;
+  /**
+   * Coloring, always alongside words: negative money, the CPP band, or the
+   * debt's covenant trouble (DebtTone). Never success green on debt.
+   */
+  tone: 'negative' | CppBand | DebtTone;
+  /** Its change against the period before (null on the first briefing, or with nothing to compare). */
+  change: TileChange | null;
 }
 
 export type ChangeDirection = 'up' | 'down' | 'flat';
@@ -228,17 +265,23 @@ export interface ChangeRow {
   change: string;
   /** "was $9,800" for the earlier figure, or null. */
   before: string | null;
-  /** Good or bad news by BriefingChange.upIsGood; neutral for no change or no comparison. */
+  /** Good or bad news by BriefingChange.upIsGood; neutral for no change, no comparison, or debt. */
   tone: 'good' | 'bad' | 'neutral';
 }
 
 export interface AdviceCard {
+  /** Advice.key: what the Snooze button snoozes. */
+  key: string;
   severity: AdviceSeverity;
   severityLabel: string;
   title: string;
   why: string;
   actionLabel: string;
   action: AdviceAction;
+  /** Briefings in a row before this one that showed it (Advice.repeat): the why already says "Still open since ...". */
+  repeat: number;
+  /** "Snooze 3 months", or "Snooze until next month" for urgent advice. */
+  snoozeLabel: string;
 }
 
 export interface NoticeRow {
@@ -274,26 +317,45 @@ export interface ForwardRow {
   tone: 'negative' | 'warn' | 'danger' | null;
 }
 
+/** The sheet's sections below the glance and the advisor: folded away (closed) until the player opens them. */
+export type DetailKey = 'money' | 'notices' | 'forward';
+
 export interface BriefingView {
-  /** "March 2028 briefing" / "Jan–Mar 2028 briefing" */
+  /** "March 2028 briefing" / "Jan–Mar 2028 briefing" (the dialog's accessible name). */
   title: string;
+  /** "Otter Junction Fiber · game paused. Here is how the month went." */
   subtitle: string;
   /** 'month' or 'quarter', for headings. */
   period: 'month' | 'quarter';
+  /** The glance: the headline figures, each with its change against the period before. */
   tiles: GlanceTile[];
-  /** What changed against the period before (empty when there is none: the first month). */
+  /**
+   * What changed that is not a tile (revenue and operating cash flow; empty
+   * when there is nothing to compare: the first month). Shown inside the
+   * money details, so no figure appears in both.
+   */
   changes: ChangeRow[];
   /** "March" / "the quarter before", what the changes compare against, or null. */
   comparedWith: string | null;
   advice: AdviceCard[];
+  /** Suggestions that fired but are snoozed (Briefing.snoozed): "1 snoozed". */
+  snoozed: number;
+  /** "1 snoozed suggestion", or null with none. */
+  snoozedText: string | null;
+  /** Notices that need the player, surfaced in the glance (at most ALERTS_MAX; the full list stays in the details). */
+  alerts: NoticeRow[];
   notices: NoticeRow[];
   /** Notices left out of `notices` (it shows at most NOTICE_ROWS_MAX rows). */
   moreNotices: number;
+  /** All the period's notices (the details' summary count). */
+  noticeCount: number;
   money: MoneyGroupView[];
   /** The period's net cash flow (all groups). */
   net: string;
   netNegative: boolean;
   forward: ForwardRow[];
+  /** The details sections, in order, all closed by default. */
+  details: DetailKey[];
   needsAttention: boolean;
 }
 
@@ -301,6 +363,24 @@ export interface BriefingView {
 export const NOTICE_ROWS_MAX = 6;
 /** A notice longer than this is cut to its first sentence (or to this many characters). */
 export const NOTICE_TEXT_MAX = 150;
+/** Most notices needing attention the glance surfaces. */
+export const ALERTS_MAX = 2;
+/**
+ * Notice kinds the glance surfaces while the briefing needs attention: money
+ * and covenant trouble and lost service (storms, full cabinets and paused
+ * installs only matter while they still stand, which the advisor's cards
+ * cover).
+ */
+export const ALERT_NOTICE_KINDS: ReadonlySet<NoticeKind> = new Set<NoticeKind>([
+  'insolvencyWarning',
+  'paymentMissed',
+  'covenantWarning',
+  'covenantPenalty',
+  'creditFrozen',
+  'accelerationWarning',
+  'loansCalled',
+  'serviceLost',
+]);
 
 export const SEVERITY_LABEL: Readonly<Record<AdviceSeverity, string>> = {
   urgent: 'Urgent',
@@ -402,7 +482,11 @@ function changeValue(change: BriefingChange, amount: number): string {
   }
 }
 
-/** One "what changed" row: the figure, its direction and size in words, and whether that is good news. */
+/**
+ * One change in words: the figure, its direction and size, and whether that
+ * is good news. Debt is never good or bad news by itself (round 4b): its
+ * tone is neutral whatever upIsGood says.
+ */
 export function changeRow(change: BriefingChange): ChangeRow {
   const value = change.now === null ? '–' : changeValue(change, change.now);
   const before = change.before === null ? null : `was ${changeValue(change, change.before)}`;
@@ -412,31 +496,50 @@ export function changeRow(change: BriefingChange): ChangeRow {
   const shownZero = change.unit === 'ratio' ? Math.round(Math.abs(change.delta) * 1000) === 0 : Math.round(Math.abs(change.delta)) === 0;
   if (shownZero) return { key: change.key, label: change.label, value, direction: 'flat', change: 'no change', before, tone: 'neutral' };
   const direction: ChangeDirection = change.delta > 0 ? 'up' : 'down';
-  const tone = change.upIsGood === null ? 'neutral' : (direction === 'up') === change.upIsGood ? 'good' : 'bad';
+  const tone = change.key === 'debt' || change.upIsGood === null ? 'neutral' : (direction === 'up') === change.upIsGood ? 'good' : 'bad';
   return { key: change.key, label: change.label, value, direction, change: `${direction} ${size}`, before, tone };
+}
+
+/** A tile's change from its BriefingChange (null with nothing to compare). */
+function tileChange(b: Briefing, key: GlanceKey): TileChange | null {
+  if (!b.previous) return null;
+  const change = b.changes.find((c) => c.key === key);
+  if (!change) return null;
+  const row = changeRow(change);
+  if (row.direction === null) return null;
+  return { direction: row.direction, text: row.change, before: row.before, tone: row.tone };
+}
+
+/**
+ * The debt tile's tone: none while nothing is owed or the loans are in good
+ * standing with both covenants clear of their limits; amber ('warn') on the
+ * warning or penalty stage, or compliant with a covenant breached or within
+ * advisor.COVENANT_RISK_MARGIN of its limit at today's figures; red
+ * ('danger') when frozen or the loans are called. Never success green.
+ */
+export function debtTone(b: Pick<Briefing, 'headline' | 'forward'>): DebtTone {
+  const h = b.headline;
+  if (h.stage === 'frozen' || b.forward.accelerationClosesLeft !== null) return 'danger';
+  if (h.stage === 'warning' || h.stage === 'penalty') return 'warn';
+  if (h.debt > 0 && !covenantsWithin(h.covenant, COVENANT_RISK_MARGIN)) return 'warn';
+  return null;
 }
 
 function glanceTiles(b: Briefing): GlanceTile[] {
   const h = b.headline;
   const quarter = b.span > 1;
-  const flow = b.changes.find((c) => c.key === 'operatingCashFlow')?.now ?? null;
-  const debtTone = h.debt > 0 || h.stage !== 'compliant' ? STAGE_TONE[h.stage] : null;
+  const tone = debtTone(b);
   let debtDetail: string;
   if (h.debt <= 0 && h.stage === 'compliant') debtDetail = 'No loans';
   else {
     const leverage = h.covenant.leverage === null ? 'not measurable' : formatRatio(h.covenant.leverage);
     const figures = h.debt > 0 ? `: leverage ${leverage}, coverage ${formatRatio(h.covenant.coverage)}` : '';
-    debtDetail = `${STAGE_LABEL[h.stage]}${figures}`;
+    const stage = h.stage === 'compliant' && tone === 'warn' ? AT_RISK_LABEL : STAGE_LABEL[h.stage];
+    debtDetail = `${b.forward.accelerationClosesLeft !== null ? 'Loans called' : stage}${figures}`;
   }
-  return [
-    {
-      key: 'net',
-      label: quarter ? 'Net this quarter' : 'Net this month',
-      value: formatSignedMoney(h.net),
-      detail: flow === null ? null : `operating ${formatSignedMoney(flow)}`,
-      tone: h.net < 0 ? 'negative' : null,
-    },
-    { key: 'cash', label: 'Cash', value: formatMoney(h.cash), detail: 'at the close', tone: h.cash < 0 ? 'negative' : null },
+  const tiles: Omit<GlanceTile, 'change'>[] = [
+    { key: 'net', label: quarter ? 'Net this quarter' : 'Net this month', value: formatSignedMoney(h.net), detail: null, tone: h.net < 0 ? 'negative' : null },
+    { key: 'cash', label: 'Cash', value: formatMoney(h.cash), detail: null, tone: h.cash < 0 ? 'negative' : null },
     {
       key: 'subscribers',
       label: 'Subscribers',
@@ -444,27 +547,31 @@ function glanceTiles(b: Briefing): GlanceTile[] {
       detail: quarter ? null : subscriberMovements(b.report),
       tone: null,
     },
-    { key: 'passings', label: 'Passings', value: formatNumber(h.passings), detail: 'homes and businesses lit', tone: null },
-    { key: 'takeRate', label: 'Take rate', value: h.takeRate === null ? '–' : formatPercent(h.takeRate), detail: 'of passings subscribe', tone: null },
-    {
-      key: 'cpp',
-      label: 'Cost per passing',
-      value: formatMaybeMoney(h.cpp),
-      detail: cppTargetText(h.cppBand, h.cppTarget),
-      tone: h.cppBand,
-    },
-    { key: 'debt', label: 'Debt', value: formatMoney(h.debt), detail: debtDetail, tone: debtTone },
+    { key: 'passings', label: 'Passings', value: formatNumber(h.passings), detail: null, tone: null },
+    { key: 'takeRate', label: 'Take rate', value: h.takeRate === null ? '–' : formatPercent(h.takeRate), detail: null, tone: null },
+    { key: 'cpp', label: 'Cost per passing', value: formatMaybeMoney(h.cpp), detail: cppTargetText(h.cppBand, h.cppTarget), tone: h.cppBand },
+    { key: 'debt', label: 'Debt', value: formatMoney(h.debt), detail: debtDetail, tone },
   ];
+  return tiles.map((tile) => ({ ...tile, change: tileChange(b, tile.key) }));
+}
+
+/** "Snooze 3 months" (ADVICE_SNOOZE_MONTHS), or "Snooze until next month" for urgent advice (ADVICE_SNOOZE_URGENT_MONTHS). */
+export function snoozeLabel(severity: AdviceSeverity): string {
+  const months = Math.max(1, severity === 'urgent' ? ADVICE_SNOOZE_URGENT_MONTHS : ADVICE_SNOOZE_MONTHS);
+  return months === 1 ? 'Snooze until next month' : `Snooze ${months} months`;
 }
 
 function adviceCards(b: Briefing): AdviceCard[] {
   return b.advice.map((a) => ({
+    key: a.key,
     severity: a.severity,
     severityLabel: SEVERITY_LABEL[a.severity],
     title: a.title,
     why: a.why,
     actionLabel: a.actionLabel,
     action: a.action,
+    repeat: a.repeat,
+    snoozeLabel: snoozeLabel(a.severity),
   }));
 }
 
@@ -488,6 +595,13 @@ export function noticeRows(notices: readonly Notice[]): { rows: NoticeRow[]; mor
   const shown = rows.slice(0, NOTICE_ROWS_MAX);
   const more = rows.slice(NOTICE_ROWS_MAX).reduce((n, r) => n + r.count, 0);
   return { rows: shown, more };
+}
+
+/** The notices the glance surfaces: while the briefing needs attention, the newest ALERTS_MAX of ALERT_NOTICE_KINDS, newest first. */
+export function alertRows(b: Pick<Briefing, 'notices' | 'needsAttention'>): NoticeRow[] {
+  if (!b.needsAttention) return [];
+  const alerts = b.notices.filter((n) => ALERT_NOTICE_KINDS.has(n.kind));
+  return noticeRows(alerts.slice(-ALERTS_MAX).reverse()).rows;
 }
 
 function moneyGroups(b: Briefing): MoneyGroupView[] {
@@ -565,28 +679,34 @@ function forwardRows(b: Briefing): ForwardRow[] {
   return rows;
 }
 
-/** Everything the sheet shows for a briefing, in words. Pure. */
-export function briefingView(b: Briefing, cityName = ''): BriefingView {
+/** Everything the sheet shows for a briefing, in words; `companyName` leads the subtitle. Pure. */
+export function briefingView(b: Briefing, companyName = ''): BriefingView {
   const quarter = b.span > 1;
   const period = quarter ? 'quarter' : 'month';
   const { rows, more } = noticeRows(b.notices);
-  const changes = b.previous ? b.changes.map(changeRow) : [];
+  const tileKeys = new Set<string>(GLANCE_KEYS);
+  const changes = b.previous ? b.changes.filter((c) => !tileKeys.has(c.key)).map(changeRow) : [];
   const comparedWith = b.previous ? (quarter ? 'the quarter before' : formatMonthLong(b.previous.year, b.previous.month).split(' ')[0]!) : null;
-  const where = cityName ? `${cityName}: ` : '';
+  const who = companyName.trim() ? `${companyName.trim()} · ` : '';
   return {
     title: briefingTitle(b),
-    subtitle: `${where}game paused. ${b.needsAttention ? 'Something needs your attention.' : `Here is how the ${period} went.`}`,
+    subtitle: `${who}game paused. ${b.needsAttention ? 'Something needs your attention.' : `Here is how the ${period} went.`}`,
     period,
     tiles: glanceTiles(b),
     changes,
     comparedWith,
     advice: adviceCards(b),
+    snoozed: b.snoozed,
+    snoozedText: b.snoozed > 0 ? `${plural(b.snoozed, 'snoozed suggestion')}` : null,
+    alerts: alertRows(b),
     notices: rows,
     moreNotices: more,
+    noticeCount: b.notices.length,
     money: moneyGroups(b),
     net: formatSignedMoney(b.headline.net),
     netNegative: b.headline.net < 0,
     forward: forwardRows(b),
+    details: ['money', 'notices', 'forward'],
     needsAttention: b.needsAttention,
   };
 }
@@ -686,6 +806,25 @@ export interface BriefingSheetDeps {
   onAction(action: AdviceAction): void;
   /** The frequency could not be stored (blocked storage): it lasts for this page only. */
   onStoreFailed?(): void;
+  /**
+   * Round 4b: send a command through the session (snoozeAdvice when a card
+   * is dismissed, noteAdviceShown once per close-time briefing); the sheet
+   * never touches the game state itself. main.ts wires session.dispatch.
+   */
+  dispatch?(cmd: Command): CommandResult;
+  /** Round 4b: the briefing rebuilt from today's state for `span` months (after a snooze), or null. main.ts wires advisor.buildBriefing. */
+  rebuild?(span: number): Briefing | null;
+}
+
+/**
+ * Whether `briefing` is the close-time one: built (advisor.briefingBuiltOn)
+ * on its report's close day (advisor.closeDayOf). The menu's "Latest
+ * briefing" later in the month is built on a later day; a copy of a briefing
+ * (not built by buildBriefing) is never close-time.
+ */
+export function isCloseTimeBriefing(briefing: Briefing): boolean {
+  const day = briefingBuiltOn(briefing);
+  return day !== null && day === closeDayOf(briefing.report);
 }
 
 /** How the open sheet closes: Continue (resume), a Show me action, or quietly (a game replaced). */
@@ -694,14 +833,25 @@ type Exit = { kind: 'continue' } | { kind: 'action'; action: AdviceAction } | { 
 const TONE_ICON: Readonly<Record<ToastTone, string>> = { ok: ICONS.spark, warn: ICONS.warning, err: ICONS.close };
 const ARROW: Readonly<Record<ChangeDirection, string>> = { up: '▲', down: '▼', flat: '•' };
 
-/** Ids for each render's headings and radio group, unique on the page. */
+const DETAIL_TITLE: Readonly<Record<DetailKey, (view: BriefingView) => string>> = {
+  money: (view) => (view.period === 'quarter' ? 'Money in and out this quarter' : 'Money in and out'),
+  notices: (view) => `${view.period === 'quarter' ? 'This quarter’s notices' : 'This month’s notices'} (${formatNumber(view.noticeCount)})`,
+  forward: () => 'Looking ahead',
+};
+
+/** Ids for each render's headings and controls, unique on the page. */
 let renders = 0;
 
 export class BriefingSheet {
   /** The sheet on screen and how it is closing (its close event comes later, so each sheet keeps its own). */
   private current: { sheet: Sheet; exit: Exit } | null = null;
   private shown: Briefing | null = null;
+  /** The company name the open briefing's subtitle leads with (kept for a re-render after a snooze). */
+  private companyName = '';
   private renderId = 0;
+  /** Reports whose close-time briefing recorded its suggestions (noteAdviceShown): never twice. */
+  private readonly noted = new WeakSet<MonthlyReport>();
+  private advisorSection: HTMLElement | null = null;
 
   constructor(private readonly deps: BriefingSheetDeps) {}
 
@@ -716,12 +866,17 @@ export class BriefingSheet {
   }
 
   /**
-   * Show a briefing (the caller has paused the game). Over one already open
-   * (a later close while it shows), the content is replaced in place.
+   * Show a briefing (the caller has paused the game); `companyName` leads the
+   * subtitle. Over one already open (a later close while it shows), the
+   * content is replaced in place. A close-time briefing (isCloseTimeBriefing)
+   * records the suggestions it shows (noteAdviceShown) once per report, so
+   * the advisor can word a repeat differently next time; the menu's reopened
+   * one does not.
    */
-  open(briefing: Briefing, cityName: string): void {
-    const view = briefingView(briefing, cityName);
+  open(briefing: Briefing, companyName: string): void {
+    const view = briefingView(briefing, companyName);
     this.shown = briefing;
+    this.companyName = companyName;
     let entry = this.current;
     if (!entry || !entry.sheet.dialog.open) {
       const created: { sheet: Sheet | null; exit: Exit } = { sheet: null, exit: { kind: 'continue' } };
@@ -744,6 +899,7 @@ export class BriefingSheet {
       setTextOf(entry.sheet.dialog.querySelector('.sheet-subtitle'), view.subtitle);
     }
     this.render(entry.sheet, view);
+    this.noteShown(briefing);
   }
 
   /** Close without resuming (the game in play was replaced, or ended). */
@@ -758,19 +914,20 @@ export class BriefingSheet {
     entry.sheet.close();
   }
 
+  /** Record the suggestions a close-time briefing shows, once per report. */
+  private noteShown(briefing: Briefing): void {
+    if (!this.deps.dispatch || this.noted.has(briefing.report) || !isCloseTimeBriefing(briefing)) return;
+    this.noted.add(briefing.report);
+    this.deps.dispatch({ type: 'noteAdviceShown', keys: briefing.advice.map((a) => a.key) });
+  }
+
   private render(sheet: Sheet, view: BriefingView): void {
     this.renderId = ++renders;
     const { body, actions } = sheet;
     sheet.dialog.classList.toggle('briefing-attention', view.needsAttention);
-    body.replaceChildren(
-      this.glance(view),
-      this.advisor(view),
-      this.changes(view),
-      this.notices(view),
-      this.money(view),
-      this.forward(view),
-      this.frequency(),
-    );
+    this.frequency(sheet);
+    this.advisorSection = this.advisor(view);
+    body.replaceChildren(this.glance(view), this.advisorSection, ...view.details.map((key) => this.detail(key, view)));
     const go = el('button', {
       class: 'btn sheet-primary briefing-continue',
       text: 'Continue',
@@ -782,69 +939,163 @@ export class BriefingSheet {
     go.focus({ preventScroll: true });
   }
 
-  private section(name: string, title: string, children: (Node | null)[]): HTMLElement {
+  /** Snooze a card: the command, then the advisor section re-rendered in place from a rebuilt briefing, focus kept nearby. */
+  private snooze(card: AdviceCard, index: number): void {
+    const entry = this.current;
+    const shown = this.shown;
+    if (!entry || !shown || !this.deps.dispatch) return;
+    this.deps.dispatch({ type: 'snoozeAdvice', key: card.key });
+    const fresh = this.deps.rebuild?.(shown.span) ?? null;
+    if (!fresh) return;
+    this.shown = fresh;
+    const view = briefingView(fresh, this.companyName);
+    entry.sheet.dialog.classList.toggle('briefing-attention', view.needsAttention);
+    setTextOf(entry.sheet.dialog.querySelector('.sheet-subtitle'), view.subtitle);
+    const section = this.advisor(view);
+    this.advisorSection?.replaceWith(section);
+    this.advisorSection = section;
+    // Focus the card that took its place, else the one before, else the advisor's heading.
+    const cards = section.querySelectorAll<HTMLElement>('.briefing-card');
+    const next = cards[Math.min(index, cards.length - 1)];
+    const target = next?.querySelector<HTMLElement>('.briefing-show') ?? section.querySelector<HTMLElement>('h3');
+    target?.focus({ preventScroll: false });
+  }
+
+  private section(name: string, title: string, children: (Node | null)[], extra: Node | null = null): HTMLElement {
     const id = `briefing-${name}-${this.renderId}`;
     return el('section', { class: `briefing-section briefing-${name}`, attrs: { 'aria-labelledby': id } }, [
-      el('h3', { text: title, attrs: { id } }),
+      el('div', { class: 'briefing-section-head' }, [el('h3', { text: title, attrs: { id, tabindex: '-1' } }), extra]),
       ...children,
     ]);
   }
 
+  /** The frequency, a compact select in the header under the subtitle (kept in this browser). */
+  private frequency(sheet: Sheet): void {
+    const heading = sheet.dialog.querySelector('.sheet-heading');
+    if (!heading) return;
+    heading.querySelector('.briefing-frequency')?.remove();
+    const id = `briefing-frequency-${this.renderId}`;
+    const chosen = this.deps.preference.frequency;
+    const select = el(
+      'select',
+      { class: 'field briefing-frequency-select', attrs: { id, title: 'Kept in this browser. Reopen the latest briefing from the menu.' } },
+      BRIEFING_FREQUENCIES.map((frequency) => el('option', { text: FREQUENCY_LABEL[frequency], attrs: { value: frequency } })),
+    );
+    select.value = chosen;
+    select.addEventListener('change', () => {
+      const value = select.value;
+      if (!isBriefingFrequency(value)) return;
+      if (!this.deps.preference.choose(value)) this.deps.onStoreFailed?.();
+    });
+    heading.append(el('div', { class: 'briefing-frequency' }, [el('label', { text: 'Show this briefing', attrs: { for: id } }), select]));
+  }
+
   private glance(view: BriefingView): HTMLElement {
-    return this.section('glance', `The ${view.period} at a glance`, [
-      el(
-        'dl',
-        { class: 'briefing-tiles' },
-        view.tiles.map((tile) =>
-          el('div', { class: `briefing-tile briefing-tile-${tile.key}`, attrs: { 'data-key': tile.key } }, [
-            el('dt', { text: tile.label }),
-            el('dd', {}, [
-              el('span', { class: `num briefing-tile-value${tile.tone ? ` tone-${tile.tone}` : ''}`, text: tile.value }),
-              tile.detail
-                ? el('small', { class: 'briefing-tile-detail' }, [
-                    tile.key === 'cpp' && tile.tone ? el('span', { class: `band-swatch cpp-bg-${tile.tone}`, attrs: { 'aria-hidden': 'true' } }) : null,
-                    el('span', { text: tile.detail }),
-                  ])
-                : null,
+    const vs = view.comparedWith ? el('span', { class: 'briefing-vs', text: `▲▼ against ${view.comparedWith}` }) : null;
+    return this.section(
+      'glance',
+      `The ${view.period} at a glance`,
+      [
+        el(
+          'dl',
+          { class: 'briefing-tiles' },
+          view.tiles.map((tile) =>
+            el('div', { class: `briefing-tile briefing-tile-${tile.key}`, attrs: { 'data-key': tile.key } }, [
+              el('dt', { text: tile.label }),
+              el('dd', {}, [
+                el('span', { class: `num briefing-tile-value${tile.tone ? ` tone-${tile.tone}` : ''}`, text: tile.value }),
+                tile.change
+                  ? el('small', { class: `briefing-tile-change change-${tile.change.tone}`, attrs: tile.change.before ? { title: tile.change.before } : {} }, [
+                      tile.change.direction ? el('span', { class: 'briefing-arrow', text: ARROW[tile.change.direction], attrs: { 'aria-hidden': 'true' } }) : null,
+                      el('span', { text: tile.change.text }),
+                      tile.change.before ? el('span', { class: 'visually-hidden', text: ` (${tile.change.before})` }) : null,
+                    ])
+                  : null,
+                tile.detail
+                  ? el('small', { class: 'briefing-tile-detail' }, [
+                      tile.key === 'cpp' && tile.tone ? el('span', { class: `band-swatch cpp-bg-${tile.tone}`, attrs: { 'aria-hidden': 'true' } }) : null,
+                      el('span', { text: tile.detail }),
+                    ])
+                  : null,
+              ]),
             ]),
-          ]),
+          ),
         ),
-      ),
-    ]);
+        view.alerts.length > 0
+          ? el(
+              'ul',
+              { class: 'briefing-alerts', attrs: { 'aria-label': 'Needs attention' } },
+              view.alerts.map((row) =>
+                el('li', { class: `briefing-alert notice-${row.tone}` }, [
+                  icon(TONE_ICON[row.tone], 'icon briefing-notice-icon'),
+                  el('span', { class: 'visually-hidden', text: `${row.toneLabel}: ` }),
+                  el('span', { class: 'briefing-notice-text', text: row.text }),
+                ]),
+              ),
+            )
+          : null,
+      ],
+      vs,
+    );
   }
 
   private advisor(view: BriefingView): HTMLElement {
+    const snoozed = view.snoozedText ? el('span', { class: 'briefing-snoozed', text: view.snoozedText }) : null;
     if (view.advice.length === 0) {
-      return this.section('advisor', 'Advisor', [el('p', { class: 'briefing-empty', text: 'Nothing pressing. Keep building and signing people up!' })]);
+      return this.section('advisor', 'Advisor', [el('p', { class: 'briefing-empty', text: 'Nothing pressing. Keep building and signing people up!' })], snoozed);
     }
-    return this.section('advisor', 'Advisor', [
-      el(
-        'ol',
-        { class: 'briefing-advice' },
-        view.advice.map((card) =>
-          el('li', { class: `briefing-card briefing-card-${card.severity}` }, [
-            el('div', { class: 'briefing-card-head' }, [
-              el('span', { class: `briefing-severity briefing-severity-${card.severity}`, text: card.severityLabel }),
-              el('h4', { class: 'briefing-card-title', text: card.title }),
+    const canSnooze = this.deps.dispatch !== undefined && this.deps.rebuild !== undefined;
+    return this.section(
+      'advisor',
+      'Advisor',
+      [
+        el(
+          'ol',
+          { class: 'briefing-advice' },
+          view.advice.map((card, index) =>
+            el('li', { class: `briefing-card briefing-card-${card.severity}${card.repeat > 0 ? ' briefing-card-repeat' : ''}`, attrs: { 'data-key': card.key } }, [
+              el('div', { class: 'briefing-card-head' }, [
+                el('span', { class: `briefing-severity briefing-severity-${card.severity}`, text: card.severityLabel }),
+                el('h4', { class: 'briefing-card-title', text: card.title }),
+              ]),
+              el('p', { class: 'briefing-card-why', text: card.why }),
+              el('div', { class: 'briefing-card-actions' }, [
+                el('button', {
+                  class: 'btn sheet-secondary briefing-show',
+                  text: card.actionLabel,
+                  attrs: { type: 'button', 'aria-label': `${card.actionLabel}: ${card.title}` },
+                  on: { click: () => this.finish({ kind: 'action', action: card.action }) },
+                }),
+                canSnooze
+                  ? el('button', {
+                      class: 'btn briefing-snooze',
+                      text: card.snoozeLabel,
+                      attrs: { type: 'button', 'aria-label': `${card.snoozeLabel}: ${card.title}` },
+                      on: { click: () => this.snooze(card, index) },
+                    })
+                  : null,
+              ]),
             ]),
-            el('p', { class: 'briefing-card-why', text: card.why }),
-            el('button', {
-              class: 'btn sheet-secondary briefing-show',
-              text: card.actionLabel,
-              attrs: { type: 'button', 'aria-label': `${card.actionLabel}: ${card.title}` },
-              on: { click: () => this.finish({ kind: 'action', action: card.action }) },
-            }),
-          ]),
+          ),
         ),
-      ),
+      ],
+      snoozed,
+    );
+  }
+
+  /** A details section, closed by default: money in and out (with what changed that is not a tile), the notices, the look ahead. */
+  private detail(key: DetailKey, view: BriefingView): HTMLElement {
+    const content = key === 'money' ? this.money(view) : key === 'notices' ? this.notices(view) : this.forward(view);
+    return el('details', { class: `briefing-section briefing-details briefing-${key}`, attrs: { 'data-section': key } }, [
+      el('summary', { class: 'briefing-summary', text: DETAIL_TITLE[key](view) }),
+      el('div', { class: 'briefing-details-body' }, content),
     ]);
   }
 
-  private changes(view: BriefingView): HTMLElement {
-    if (view.changes.length === 0) {
-      return this.section('changes', 'What changed', [el('p', { class: 'briefing-empty', text: 'Your first month: nothing earlier to compare with yet.' })]);
-    }
-    return this.section('changes', `What changed since ${view.comparedWith ?? 'last time'}`, [
+  private changes(view: BriefingView): HTMLElement | null {
+    if (view.changes.length === 0) return null;
+    return el('div', { class: 'briefing-changes-block' }, [
+      el('h4', { text: `Against ${view.comparedWith ?? 'last time'}` }),
       el(
         'ul',
         { class: 'briefing-changes' },
@@ -864,10 +1115,9 @@ export class BriefingSheet {
     ]);
   }
 
-  private notices(view: BriefingView): HTMLElement {
-    const title = view.period === 'quarter' ? 'This quarter’s notices' : 'This month’s notices';
-    if (view.notices.length === 0) return this.section('notices', title, [el('p', { class: 'briefing-empty', text: `No notices this ${view.period}.` })]);
-    return this.section('notices', title, [
+  private notices(view: BriefingView): Node[] {
+    if (view.notices.length === 0) return [el('p', { class: 'briefing-empty', text: `No notices this ${view.period}.` })];
+    return [
       el(
         'ul',
         { class: 'briefing-notices' },
@@ -880,12 +1130,11 @@ export class BriefingSheet {
           ]),
         ),
       ),
-      view.moreNotices > 0 ? el('p', { class: 'briefing-more', text: `and ${plural(view.moreNotices, 'more notice')}` }) : null,
-    ]);
+      ...(view.moreNotices > 0 ? [el('p', { class: 'briefing-more', text: `and ${plural(view.moreNotices, 'more notice')}` })] : []),
+    ];
   }
 
-  private money(view: BriefingView): HTMLElement {
-    const title = view.period === 'quarter' ? 'Money in and out this quarter' : 'Money in and out';
+  private money(view: BriefingView): Node[] {
     const groups = view.money.map((group) =>
       el('div', { class: `briefing-money-group money-${group.group}` }, [
         el('h4', { text: group.label }),
@@ -904,14 +1153,16 @@ export class BriefingSheet {
           : null,
       ]),
     );
-    return this.section('money', title, [
+    const changes = this.changes(view);
+    return [
+      ...(changes ? [changes] : []),
       ...(groups.length > 0 ? groups : [el('p', { class: 'briefing-empty', text: 'No money moved.' })]),
       el('p', { class: 'briefing-money-net' }, [el('span', { text: 'Net cash flow' }), el('span', { class: `num${view.netNegative ? ' negative' : ''}`, text: view.net })]),
-    ]);
+    ];
   }
 
-  private forward(view: BriefingView): HTMLElement {
-    return this.section('forward', 'Looking ahead', [
+  private forward(view: BriefingView): Node[] {
+    return [
       el(
         'dl',
         { class: 'briefing-forward' },
@@ -922,30 +1173,7 @@ export class BriefingSheet {
           ]),
         ),
       ),
-    ]);
-  }
-
-  private frequency(): HTMLElement {
-    const name = `briefing-frequency-${this.renderId}`;
-    const chosen = this.deps.preference.frequency;
-    const note = el('p', { class: 'briefing-frequency-note', text: 'Kept in this browser. Reopen the latest briefing from the menu.' });
-    return el('fieldset', { class: 'briefing-section briefing-frequency' }, [
-      el('legend', { text: 'Show this briefing' }),
-      el(
-        'div',
-        { class: 'briefing-choices' },
-        BRIEFING_FREQUENCIES.map((frequency) => {
-          const input = el('input', { attrs: { type: 'radio', name, value: frequency } });
-          input.checked = frequency === chosen;
-          input.addEventListener('change', () => {
-            if (!input.checked) return;
-            if (!this.deps.preference.choose(frequency)) this.deps.onStoreFailed?.();
-          });
-          return el('label', { class: 'briefing-choice' }, [input, el('span', { text: FREQUENCY_LABEL[frequency] })]);
-        }),
-      ),
-      note,
-    ]);
+    ];
   }
 }
 

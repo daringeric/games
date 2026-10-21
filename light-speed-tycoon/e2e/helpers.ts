@@ -5,10 +5,11 @@
 // Debug pages start with the month-end briefing off (round 4): a spec that
 // wants it opens with openWithBriefings() or calls setBriefing().
 //
-// Owner: ui-economy workstream. Other specs import these; if a spec needs a
+// Owner: ui-economy workstream (round 4b: start-screen added the start-screen
+// helpers at the end). Other specs import these; if a spec needs a
 // helper that is not here, define it in that spec.
 
-import type { ConsoleMessage, Page } from '@playwright/test';
+import type { ConsoleMessage, Locator, Page } from '@playwright/test';
 
 // Web fonts come from Google Fonts; a sandbox or CI box without internet access
 // fails those requests, which is not an app error.
@@ -110,4 +111,49 @@ export async function currentGame(page: Page): Promise<{ seed: number; day: numb
     const s = window.__lst!.getState();
     return { seed: s.seed, day: s.day, name: s.city.name, cash: s.finance.cash, cabinets: s.network.cabinets.map((c) => c.node) };
   });
+}
+
+// --- Round 4b: the start screen ---------------------------------------------
+// Debug pages skip the first-launch start screen (and a fresh ?seed link's)
+// and start a Seed-round game with the default company name, so every spec
+// above behaves as before. ?start=1 shows it; the menu's New game and the
+// game-over dialog's "Start a new town" show it on every page.
+
+/** `url` with start=1 added: a debug page that shows the first-launch start screen. */
+export function withStart(url: string): string {
+  const [path = '/', query = ''] = url.split('?');
+  const params = new URLSearchParams(query);
+  params.set('start', '1');
+  return `${path}?${params.toString()}`;
+}
+
+/** Open `url` like open(), with the first-launch start screen shown (when there is no game to resume). */
+export async function openWithStart(page: Page, url: string): Promise<void> {
+  await open(page, withStart(url));
+}
+
+/** The start screen dialog. */
+export function startScreen(page: Page): Locator {
+  return page.getByRole('dialog', { name: 'Start your fiber company' });
+}
+
+/** The difficulty cards' titles on the start screen, by id. */
+export const DIFFICULTY_NAMES = {
+  angel: 'Angel-backed',
+  seed: 'Seed round',
+  bootstrapped: 'Bootstrapped',
+  shoestring: 'Shoestring',
+} as const;
+
+/**
+ * On the open start screen: type a company name and pick a difficulty (each
+ * only when given), then press Start and wait for the screen to close.
+ */
+export async function startCompany(page: Page, opts: { name?: string; difficulty?: keyof typeof DIFFICULTY_NAMES } = {}): Promise<void> {
+  const screen = startScreen(page);
+  await screen.waitFor();
+  if (opts.name !== undefined) await screen.getByLabel('Company name').fill(opts.name);
+  if (opts.difficulty) await screen.getByRole('radio', { name: new RegExp(DIFFICULTY_NAMES[opts.difficulty]) }).click();
+  await screen.getByRole('button', { name: 'Start', exact: true }).click();
+  await screen.waitFor({ state: 'hidden' });
 }

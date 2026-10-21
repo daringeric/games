@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, SPLITTER_COST } from './balance';
-import { coveragePreview, segmentsWithinReach } from './coverage';
-import { newGame } from './game';
+import { buildOutPlan, coveragePreview, segmentsWithinReach } from './coverage';
+import { applyCommand, newGame, runDays } from './game';
 import { cppBand } from './metrics';
 import { getService, orderFees, quoteCable, spanCharges } from './network';
 import { parcelsServedBy } from './streets';
 import { makeGridCity, makeTestState } from './testing/fixtures';
+import { preferredMethod } from './weather';
 import type { BuildStage, CableMethod, City, CoveragePreview, GameState, SegmentId, StreetSegment } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
@@ -325,5 +326,50 @@ describe('coveragePreview', () => {
     const perHover = (performance.now() - start) / city.nodes.length;
     // Typically well under 0.1 ms; the bound leaves room for slow CI machines.
     expect(perHover).toBeLessThan(2);
+  });
+});
+
+describe('buildOutPlan (round 4b)', () => {
+  it('joins a corner to the CO, cables what it reaches by the preferred method, and prices it as the commands will', () => {
+    const state = newGame(3, { city: makeGridCity() });
+    const node = 10;
+    const plan = buildOutPlan(state, node);
+    const preview = coveragePreview(state, node);
+    expect(plan.node).toBe(node);
+    // Nothing is cabled yet: the feeder runs from the CO and the reach is coveragePreview's build-out.
+    expect(plan.feeder.length).toBeGreaterThan(0);
+    expect(new Set([...plan.feeder, ...plan.reach]).size).toBe(plan.feeder.length + plan.reach.length);
+    for (const id of preview.segments.map((s) => s.segment)) expect([...plan.feeder, ...plan.reach]).toContain(id);
+    for (const id of [...plan.aerial, ...plan.underground]) expect([...plan.feeder, ...plan.reach]).toContain(id);
+    expect(plan.aerial.length + plan.underground.length).toBe(plan.feeder.length + plan.reach.length);
+    for (const id of plan.aerial) expect(preferredMethod(state, state.city.segments[id] as StreetSegment)).toBe('aerial');
+    for (const id of plan.underground) expect(preferredMethod(state, state.city.segments[id] as StreetSegment)).toBe('underground');
+    expect(plan.commands[0]).toEqual({ type: 'placeCabinet', node });
+    const quoted =
+      CABINET_PRICE +
+      (plan.aerial.length > 0 ? quoteCable(state, plan.aerial, 'aerial').cost : 0) +
+      (plan.underground.length > 0 ? quoteCable(state, plan.underground, 'underground').cost : 0);
+    expect(plan.cost).toBe(quoted);
+    expect(plan.passings).toBe(preview.passingsNow - preview.passingsServedElsewhere);
+    expect(plan.cpp).toBe(plan.passings > 0 ? plan.cost / plan.passings : null);
+
+    // Sending the commands spends exactly the cost and lights the corner's streets once built.
+    state.finance.cash = plan.cost + 1_000_000;
+    const before = state.finance.cash;
+    for (const cmd of plan.commands) expect(applyCommand(state, cmd).ok).toBe(true);
+    expect(before - state.finance.cash).toBe(plan.cost);
+    runDays(state, 400);
+    const lit = getService(state).litSegments;
+    for (const s of preview.segments) if (s.distanceFt < CABINET_REACH_FT) expect(lit.has(s.segment)).toBe(true);
+  });
+
+  it('needs no feeder or cabinet where plant already stands, and is empty for a bad node', () => {
+    const state = newGame(3, { city: makeGridCity() });
+    const co = state.city.coNode;
+    addCabinet(state, co);
+    const plan = buildOutPlan(state, co);
+    expect(plan.feeder).toEqual([]);
+    expect(plan.commands.some((c) => c.type === 'placeCabinet')).toBe(false);
+    expect(buildOutPlan(state, -1)).toMatchObject({ feeder: [], reach: [], commands: [], cost: 0, passings: 0, cpp: null });
   });
 });

@@ -1,6 +1,7 @@
 // Static layers drawn once per city: the grass board, roads, rock stipple,
 // trees, the pole overlay shown while planning aerial runs, the stronger rock
-// texture shown while planning underground runs, and the $/ft cost overlay.
+// texture shown while planning underground runs, the $/ft cost overlay and
+// (round 4b) the storm-exposure overlay.
 
 import type { Graphics } from 'pixi.js';
 import {
@@ -12,7 +13,8 @@ import {
 } from '../sim/balance';
 import { segmentCostPerFt } from '../sim/network';
 import { polesOnSegment } from '../sim/streets';
-import type { CableMethod, City, CppBand, StreetSegment } from '../sim/types';
+import type { CableMethod, City, CppBand, ExposureBand, StreetSegment } from '../sim/types';
+import { cityExposure, exposureBand } from '../sim/weather';
 import type { Tree } from './decor';
 import type { Bounds } from './camera';
 import { hashInt, mapExit, straightRuns, streetLattice } from './geometry';
@@ -240,4 +242,28 @@ export function drawCostOverlay(g: Graphics, city: City, theme: Theme, mode: Cos
       join: 'round',
     });
   }
+}
+
+/** The storm-exposure overlay's bands, least to most exposed (drawn in this order, so exposed streets sit on top). */
+export const EXPOSURE_BANDS: readonly ExposureBand[] = ['sheltered', 'moderate', 'exposed'];
+
+/** Every street's storm-exposure band (weather.exposureBand of weather.cityExposure), by segment id. */
+export function exposureBands(city: City): ExposureBand[] {
+  const exposure = cityExposure(city);
+  return city.segments.map((seg) => exposureBand(exposure[seg.id] ?? 1));
+}
+
+/**
+ * Every street colored by its storm-exposure band (theme.exposureOverlay).
+ * Returns how many streets it drew in each band.
+ */
+export function drawExposureOverlay(g: Graphics, city: City, theme: Theme): Record<ExposureBand, number> {
+  const buckets: Record<ExposureBand, Line[]> = { sheltered: [], moderate: [], exposed: [] };
+  const bands = exposureBands(city);
+  for (const seg of city.segments) buckets[bands[seg.id] ?? 'moderate'].push(segmentLine(city, seg, theme));
+  const { exposureOverlay } = theme;
+  for (const band of EXPOSURE_BANDS) {
+    strokeLines(g, buckets[band], { width: exposureOverlay.width, color: exposureOverlay.band[band], alpha: exposureOverlay.alpha, cap: 'round', join: 'round' });
+  }
+  return { sheltered: buckets.sheltered.length, moderate: buckets.moderate.length, exposed: buckets.exposed.length };
 }

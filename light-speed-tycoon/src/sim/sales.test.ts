@@ -28,6 +28,9 @@ import {
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
   PROMO_STEP_SHARE,
+  PROMO_SIGNUP_BOOST,
+  RETENTION_CHURN_CUT,
+  RETENTION_PERCENT_OFF,
   SMB_MULTIPLIER_DEFAULT,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
@@ -38,6 +41,7 @@ import {
   TAKE_PRICE_WEIGHT,
   TAKE_RATE_BASE,
   TAKE_RATE_KIND_FACTOR,
+  RETENTION_STEP_SHARE,
   TAKE_RATE_MAX,
   TAKE_RATE_MIN,
   TAKE_RATE_PER_ADVANTAGE,
@@ -45,6 +49,8 @@ import {
   TAKE_SPEED_WEIGHT,
   TAKE_UPLOAD_RATIO_CAP,
   TAKE_UPLOAD_WEIGHT,
+  DEMAND_RESERVATION_SOFTNESS,
+  DEMAND_SEGMENTS,
   TIER_DEFAULTS,
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
@@ -53,7 +59,9 @@ import {
   TIER_RETIRE_CHURN_PER_RISE,
   CHURN_TOTAL_MAX,
 } from './balance';
+import type { DemandSegment } from './balance';
 import { dateOf, dayOf, MONTH_LENGTHS } from './calendar';
+import { formatMoney } from './finance';
 import { incumbentChurnFor } from './incumbent';
 import { applyCommand, newGame, runDays } from './game';
 import { getService, quoteRemoveCabinet, quoteRemoveSpan } from './network';
@@ -80,6 +88,14 @@ import {
   setPromo,
   stateTakeRate,
   stepChurnProbability,
+  segmentDemand,
+  quotePromo,
+  reservationPrice,
+  reservationSuit,
+  promoAdvice,
+  promoSignupFactor,
+  retentionPrice,
+  SUGGESTED_PROMO,
   stepShare,
   totalChurn,
   unitsByTier,
@@ -101,7 +117,7 @@ import {
 } from './sales';
 import type { SalesClose } from './sales';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import type { Account, CabinetId, City, GameState, IntroPromo, ParcelKind, PriceLock, Pricing, Tier, TierId, TierSetting } from './types';
+import type { Account, CabinetId, City, GameState, IntroPromo, ParcelKind, PriceLock, Pricing, PromoQuote, Tier, TierId, TierSetting } from './types';
 import { outageChurnProbability } from './weather';
 
 // The sales town: 4x4 blocks of 4x2 cells with the CO (and its cabinet) in the
@@ -189,7 +205,7 @@ const ALL_KINDS: readonly ParcelKind[] = ['home', 'mdu', 'smb'];
  * ends), for tests of the base take-rate model in towns big enough to trigger it.
  */
 function quietIncumbent(state: GameState, cabinet: CabinetId): void {
-  state.sales.incumbentPromos = [{ cabinet, startDay: 0, endDay: 1, price: INCUMBENT_PRICE, quietUntil: 1_000_000 }];
+  state.sales.incumbentPromos = [{ cabinet, startDay: 0, endDay: 1, price: INCUMBENT_PRICE, quietUntil: 1_000_000, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
 }
 
 /**
@@ -203,15 +219,90 @@ function closeAt(state: GameState): SalesClose {
   return withRng(state, 'sales', (rng) => closeSalesMonth(state, rng, MONTH_LENGTHS[date.month - 1]!, state.day - 1));
 }
 
+/** clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE x advantage, TAKE_RATE_MIN, TAKE_RATE_MAX). */
+function clampedTake(advantage: number): number {
+  return Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage));
+}
+
+/** The balance.ts demand-segment model for one segment, written out independently: its take (before the kind factor) and mix weights. */
+function segmentModel(pricing: Pricing, seg: DemandSegment, kind: ParcelKind = 'home', incumbentPrice = INCUMBENT_PRICE): { take: number; weights: Record<TierId, number> } {
+  const factor = kind === 'smb' ? pricing.smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
+  const speed = (down: number) => TAKE_SPEED_WEIGHT * Math.min(Math.min(down, seg.maxUsefulMbps) / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP);
+  const incumbent = speed(INCUMBENT_DOWN_MBPS) + TAKE_UPLOAD_WEIGHT - (TAKE_PRICE_WEIGHT * seg.priceWeight * incumbentPrice) / INCUMBENT_PRICE;
+  const reservation = seg.maxPriceRatio * incumbentPrice;
+  let take = 0;
+  const weights = tierUnits({});
+  for (const t of pricing.tiers) {
+    if (!t.offered) continue;
+    const paid = t.price * factor;
+    const suit = paid <= reservation ? 1 : Math.max(0, 1 - (paid - reservation) / reservation / DEMAND_RESERVATION_SOFTNESS);
+    if (suit <= 0) continue;
+    const value =
+      speed(t.downMbps) + TAKE_UPLOAD_WEIGHT * Math.min(t.upMbps / INCUMBENT_UP_MBPS, TAKE_UPLOAD_RATIO_CAP) - ((TAKE_PRICE_WEIGHT * seg.priceWeight * t.price) / INCUMBENT_PRICE) * factor;
+    take = Math.max(take, suit * clampedTake(value - incumbent));
+    weights[t.id] = TIER_DEFAULTS.find((d) => d.id === t.id)!.popularity * Math.max(0, value - incumbent) * suit;
+  }
+  return { take, weights };
+}
+
+/** The whole model: sum over DEMAND_SEGMENTS of share x take, times the kind factor. */
+function modelTake(pricing: Pricing, kind: ParcelKind = 'home', incumbentPrice = INCUMBENT_PRICE): number {
+  let take = 0;
+  for (const seg of DEMAND_SEGMENTS) take += seg.share * segmentModel(pricing, seg, kind, incumbentPrice).take;
+  return take * TAKE_RATE_KIND_FACTOR[kind];
+}
+
+/** Round 4's single-segment target (the best offered tier's advantage over the incumbent), for comparison. */
+function round4Take(pricing: Pricing): number {
+  return clampedTake(Math.max(...pricing.tiers.filter((t) => t.offered).map(value)) - INCUMBENT);
+}
+
 describe('targetTakeRate', () => {
-  it('follows the documented formula for the default lineup', () => {
+  it('follows the documented demand-segment formula for the default lineup', () => {
     const pricing = defaultPricing();
-    const advantage = Math.max(...pricing.tiers.map(value)) - INCUMBENT;
-    const raw = TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage;
-    const clamped = Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, raw));
-    for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(pricing, kind)).toBeCloseTo(clamped * TAKE_RATE_KIND_FACTOR[kind], 12);
+    for (const kind of ALL_KINDS) expect(targetTakeRate(pricing, kind)).toBeCloseTo(modelTake(pricing, kind), 12);
+    // Every tier at or under a segment's reservation suits it fully: its take is the plain clamp of its best advantage.
+    const shares = DEMAND_SEGMENTS.reduce((sum, seg) => sum + seg.share, 0);
+    expect(shares).toBeCloseTo(1, 12);
+  });
+
+  it('keeps the default lineup near round 4\'s target', () => {
+    const pricing = defaultPricing();
+    const round4 = round4Take(pricing);
+    expect(Math.abs(targetTakeRate(pricing, 'home') - round4)).toBeLessThan(0.02);
+  });
+
+  it('loses the value seekers without a cheap tier: 2 Gig only and 1 Gig + 2 Gig sign up clearly fewer', () => {
+    const full = targetTakeRate(defaultPricing(), 'home');
+    const twoGig = targetTakeRate(pricingWith({}, { fiber500: false, fiber1g: false }), 'home');
+    const noCheap = targetTakeRate(pricingWith({}, { fiber500: false }), 'home');
+    expect(twoGig).toBeLessThan(full * 0.6);
+    expect(noCheap).toBeLessThan(full * 0.85);
+    expect(twoGig).toBeLessThan(noCheap);
+    // Round 4's single model kept most of the target for a 2 Gig-only lineup.
+    expect(round4Take(pricingWith({}, { fiber500: false, fiber1g: false }))).toBeGreaterThan(full * 0.85);
+    // Who is lost: the price-sensitive households, who find no plan they would pay for.
+    const value = segmentDemand(pricingWith({}, { fiber500: false, fiber1g: false })).find((s) => s.segment === 'value')!;
+    expect(value).toMatchObject({ takeRate: 0, tier: null });
+    expect(segmentDemand(defaultPricing()).find((s) => s.segment === 'value')!.tier).toBe('fiber500');
+  });
+
+  it('has no cliff when every price rises a little', () => {
+    const scaled = (x: number) => pricingWith(Object.fromEntries(TIER_DEFAULTS.map((t) => [t.id, Math.round(t.price * x * 100) / 100])));
+    let previous = targetTakeRate(scaled(1), 'home');
+    let biggest = 0;
+    for (let step = 1; step <= 60; step++) {
+      const next = targetTakeRate(scaled(1 + step / 100), 'home');
+      expect(next).toBeLessThanOrEqual(previous + 1e-12);
+      biggest = Math.max(biggest, previous - next);
+      previous = next;
     }
+    // A 1% rise never costs more than about three points, though value seekers drop out over that range ...
+    expect(biggest).toBeLessThan(0.03);
+    // ... where a hard reservation (no softness) would drop the whole segment's take in one step.
+    const value = DEMAND_SEGMENTS.find((s) => s.id === 'value')!;
+    expect(biggest).toBeLessThan((value.share * clampedTake(0)) / 3);
+    expect(targetTakeRate(scaled(1.6), 'home')).toBeLessThan(targetTakeRate(scaled(1), 'home') - value.share * clampedTake(0) * 0.9);
   });
 
   it('falls as the price rises', () => {
@@ -230,17 +321,30 @@ describe('targetTakeRate', () => {
     expect(r2g).toBeGreaterThan(r1g);
   });
 
-  it('only counts the best offered tier', () => {
+  it('counts only each segment\'s best suiting tier', () => {
     const all = defaultPricing();
-    const best = all.tiers.reduce((a, b) => (value(b) > value(a) ? b : a));
-    expect(targetTakeRate(all, 'home')).toBeCloseTo(targetTakeRate(only(best.id, best.price), 'home'), 12);
+    // Dropping a tier no segment likes best changes nobody's take (it only moves the mix).
+    const best = new Set(segmentDemand(all).map((s) => s.tier));
+    for (const tier of all.tiers) {
+      if (best.has(tier.id)) continue;
+      const without = pricingWith({}, { [tier.id]: false });
+      expect(targetTakeRate(without, 'home')).toBeCloseTo(targetTakeRate(all, 'home'), 12);
+      expect(tierMix(without)[tier.id]).toBe(0);
+    }
   });
 
-  it('clamps to TAKE_RATE_MIN..TAKE_RATE_MAX before the kind factor', () => {
+  it('signs nobody up when no tier suits any segment, and clamps at TAKE_RATE_MAX before the kind factor', () => {
     const priced = (price: number) => pricingWith({ fiber500: price, fiber1g: price, fiber2g: price });
     for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(priced(1_000_000), kind)).toBeCloseTo(TAKE_RATE_MIN * TAKE_RATE_KIND_FACTOR[kind], 12);
+      expect(targetTakeRate(priced(1_000_000), kind)).toBe(0);
       expect(targetTakeRate(priced(-1_000_000), kind)).toBeCloseTo(TAKE_RATE_MAX * TAKE_RATE_KIND_FACTOR[kind], 12);
+    }
+    // Each segment's take is 0 exactly when no tier suits it, and within the clamp otherwise.
+    for (let price = TIER_PRICE_MIN; price <= TIER_PRICE_MAX; price += 20) {
+      for (const seg of segmentDemand(priced(price))) {
+        expect(seg.takeRate).toBeLessThanOrEqual(TAKE_RATE_MAX);
+        expect(seg.takeRate === 0).toBe(seg.tier === null);
+      }
     }
   });
 
@@ -262,6 +366,7 @@ describe('targetTakeRate', () => {
     const rates: number[] = [];
     for (let m = SMB_MULTIPLIER_MIN; m <= SMB_MULTIPLIER_MAX; m += 0.5) {
       rates.push(targetTakeRate(at(m), 'smb'));
+      expect(targetTakeRate(at(m), 'smb')).toBeCloseTo(modelTake(at(m), 'smb'), 12);
       expect(targetTakeRate(at(m), 'home')).toBe(targetTakeRate(defaultPricing(), 'home'));
       expect(targetTakeRate(at(m), 'mdu')).toBe(targetTakeRate(defaultPricing(), 'mdu'));
     }
@@ -271,6 +376,42 @@ describe('targetTakeRate', () => {
     expect(targetTakeRate(defaultPricing(), 'smb')).toBeCloseTo(targetTakeRate(defaultPricing(), 'home') * TAKE_RATE_KIND_FACTOR.smb, 12);
     // Below it, businesses sign up more readily.
     expect(targetTakeRate(at(SMB_MULTIPLIER_MIN), 'smb')).toBeGreaterThan(targetTakeRate(defaultPricing(), 'smb'));
+    // Round 4b: at the top multiplier only speed seekers still find a plan they would pay for (round 4 kept every
+    // business at TAKE_RATE_MIN or more; a segment priced out entirely now signs up nobody).
+    const top = segmentDemand(at(SMB_MULTIPLIER_MAX), 'smb');
+    expect(top.filter((seg) => seg.tier !== null).map((seg) => seg.segment)).toEqual(['speed']);
+    expect(rates.at(-1)!).toBeGreaterThan(0);
+  });
+});
+
+describe('segmentDemand', () => {
+  it('reports each segment\'s share, take and favourite tier, in DEMAND_SEGMENTS order', () => {
+    const pricing = defaultPricing();
+    const segments = segmentDemand(pricing);
+    expect(segments.map((seg) => seg.segment)).toEqual(DEMAND_SEGMENTS.map((seg) => seg.id));
+    for (const [i, seg] of segments.entries()) {
+      const model = segmentModel(pricing, DEMAND_SEGMENTS[i]!);
+      expect(seg.share).toBe(DEMAND_SEGMENTS[i]!.share);
+      expect(seg.takeRate).toBeCloseTo(model.take, 12);
+      const favourite = TIER_IDS.reduce((a, b) => (model.weights[b] > model.weights[a] ? b : a));
+      expect(seg.tier).toBe(favourite);
+    }
+  });
+
+  it('prices segments out at their reservation (maxPriceRatio x the incumbent\'s local price), softly', () => {
+    const value = DEMAND_SEGMENTS.find((s) => s.id === 'value')!;
+    const reservation = reservationPrice('value');
+    expect(reservation).toBeCloseTo(value.maxPriceRatio * INCUMBENT_PRICE, 12);
+    expect(reservationPrice('value', INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT)).toBeLessThan(reservation);
+    expect(reservationSuit(reservation, reservation)).toBe(1);
+    expect(reservationSuit(reservation * (1 + DEMAND_RESERVATION_SOFTNESS / 2), reservation)).toBeCloseTo(0.5, 12);
+    expect(reservationSuit(reservation * (1 + DEMAND_RESERVATION_SOFTNESS), reservation)).toBe(0);
+    // A cheap tier just over the value seekers' reservation keeps some of them; well over it, none.
+    const near = segmentDemand(only('fiber500', Math.ceil(reservation * (1 + DEMAND_RESERVATION_SOFTNESS / 2)))).find((s) => s.segment === 'value')!;
+    const far = segmentDemand(only('fiber500', Math.ceil(reservation * (1 + DEMAND_RESERVATION_SOFTNESS)) + 1)).find((s) => s.segment === 'value')!;
+    expect(near.takeRate).toBeGreaterThan(0);
+    expect(near.tier).toBe('fiber500');
+    expect(far).toMatchObject({ takeRate: 0, tier: null });
   });
 });
 
@@ -281,23 +422,31 @@ describe('tierMix', () => {
     const pricing = defaultPricing();
     expect(tierMix(pricing, 'smb')).toEqual(tierMix(pricing));
     expect(tierMix(pricing, 'mdu')).toEqual(tierMix(pricing));
-    // Dearer business prices push businesses from the dearest tier toward the cheapest.
-    // (A little dearer: far enough up, no tier beats the incumbent and offered tiers split evenly.)
+    // Dearer business prices push businesses off the dearest tier. (Round 4b: they also price the value-seeking
+    // businesses out first, and those took the cheapest tier, so its share no longer has to rise.)
     const dearer = SMB_MULTIPLIER_DEFAULT * 1.25;
     const dear = tierMix({ ...pricing, smbMultiplier: dearer }, 'smb');
     expect(sum(dear)).toBeCloseTo(1, 12);
-    expect(dear.fiber500).toBeGreaterThan(tierMix(pricing).fiber500);
     expect(dear.fiber2g).toBeLessThan(tierMix(pricing).fiber2g);
+    expect(dear).not.toEqual(tierMix(pricing));
     expect(tierMix({ ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX })).toEqual(tierMix(pricing));
   });
 
-  it('splits signups over offered tiers by popularity x advantage', () => {
+  it('sums the segments\' popularity x advantage x suit mixes, weighted by share x take', () => {
     const pricing = defaultPricing();
     const mix = tierMix(pricing);
     expect(sum(mix)).toBeCloseTo(1, 12);
-    const weight = (t: Tier) => TIER_DEFAULTS.find((d) => d.id === t.id)!.popularity * Math.max(0, value(t) - INCUMBENT);
-    const total = pricing.tiers.reduce((s, t) => s + weight(t), 0);
-    for (const tier of pricing.tiers) expect(mix[tier.id]).toBeCloseTo(weight(tier) / total, 12);
+    const expected = tierUnits({});
+    let total = 0;
+    for (const seg of DEMAND_SEGMENTS) {
+      const model = segmentModel(pricing, seg);
+      const weights = TIER_IDS.reduce((s, id) => s + model.weights[id], 0);
+      for (const id of TIER_IDS) expected[id] += seg.share * model.take * (model.weights[id] / weights);
+      total += seg.share * model.take;
+    }
+    for (const id of TIER_IDS) expect(mix[id]).toBeCloseTo(expected[id] / total, 12);
+    // Value seekers mostly take 500 Mbps, so it leads the mix.
+    expect(mix.fiber500).toBeGreaterThan(mix.fiber1g);
   });
 
   it('gives unoffered tiers nothing', () => {
@@ -308,7 +457,7 @@ describe('tierMix', () => {
     expect(tierMix(only('fiber1g', TIER_PRICE_MAX))).toEqual({ fiber500: 0, fiber1g: 1, fiber2g: 0 });
   });
 
-  it('splits evenly when no offered tier beats the incumbent', () => {
+  it('splits evenly when nobody would sign up', () => {
     expect(tierMix(pricingWith({ fiber500: 1e6, fiber1g: 1e6, fiber2g: 1e6 }))).toEqual({
       fiber500: 1 / 3,
       fiber1g: 1 / 3,
@@ -951,6 +1100,7 @@ describe('closeSalesMonth', () => {
       priceChurn: 0,
       outageChurn: 0,
       incumbentChurn: 0,
+      outageCredits: 0,
     });
     const entries = state.finance.monthToDate.filter((e) => e.category !== 'install');
     expect(entries).toEqual([
@@ -958,7 +1108,7 @@ describe('closeSalesMonth', () => {
       { day: 30, category: 'marketing', amount: -close.marketing, memo: 'Marketing for Jan 2027' },
       { day: 30, category: 'overhead', amount: -close.support, memo: 'Customer support' },
     ]);
-    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0 });
+    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0, outageCreditDollarDays: 0 });
   });
 
   it('skips empty charges', () => {
@@ -978,6 +1128,7 @@ describe('closeSalesMonth', () => {
       priceChurn: 0,
       outageChurn: 0,
       incumbentChurn: 0,
+      outageCredits: 0,
     });
     expect(state.finance.monthToDate).toEqual([]);
   });
@@ -1554,7 +1705,7 @@ describe('churn causes', () => {
     const outageDays = 6;
     // Every account was cut off 6 days and has service again by the close.
     state.weather.cutOff = state.sales.accounts.map((a) => ({ parcel: a.parcel, days: outageDays, charged: 0, units: accountUnits(a) }));
-    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600 }];
+    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     const units = subscriberUnits(state);
     const close = closeAt(state);
     const parts = {
@@ -1586,7 +1737,7 @@ describe('churn causes', () => {
     quiet.sales.accounts = city.parcels.map((p) => account(p.id, 1, { fiber500: p.units }));
     const noisy = structuredClone(quiet);
     // The promo runs at another cabinet; the outage on a street nobody here lives on.
-    noisy.sales.incumbentPromos = [{ cabinet: 2, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600 }];
+    noisy.sales.incumbentPromos = [{ cabinet: 2, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     noisy.weather.month.segmentOutageDays = [{ segment: city.segments.length - 1, days: 9 }];
     expect(city.parcels.some((p) => p.segment === city.segments.length - 1)).toBe(false);
     const a = closeAt(quiet);
@@ -1600,11 +1751,8 @@ describe('the incumbent\'s local price', () => {
   it('lowers the target take rate where it is cheaper', () => {
     const pricing = defaultPricing();
     const promo = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
-    const incumbent = TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - (TAKE_PRICE_WEIGHT * promo) / INCUMBENT_PRICE;
-    const advantage = Math.max(...pricing.tiers.map(value)) - incumbent;
-    const clamped = Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage));
     for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(pricing, kind, promo)).toBeCloseTo(clamped * TAKE_RATE_KIND_FACTOR[kind], 12);
+      expect(targetTakeRate(pricing, kind, promo)).toBeCloseTo(modelTake(pricing, kind, promo), 12);
       expect(targetTakeRate(pricing, kind, promo)).toBeLessThan(targetTakeRate(pricing, kind));
       expect(targetTakeRate(pricing, kind, INCUMBENT_PRICE)).toBe(targetTakeRate(pricing, kind));
     }
@@ -1619,7 +1767,7 @@ describe('the incumbent\'s local price', () => {
     for (const rngSales of [1, 2, 3]) {
       const a = litTown({ city, rngSales, marketing: LOUD, splitters: 1 });
       const b = litTown({ city, rngSales, marketing: LOUD, splitters: 1 });
-      b.state.sales.incumbentPromos = [{ cabinet: b.cabinet, startDay: 0, endDay: 10_000, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 10_000 }];
+      b.state.sales.incumbentPromos = [{ cabinet: b.cabinet, startDay: 0, endDay: 10_000, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 10_000, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
       step(a.state, 365);
       step(b.state, 365);
       calm += subscriberUnits(a.state);
@@ -1778,5 +1926,245 @@ describe('round-4 determinism', () => {
     for (const kind of ['priceStep', 'tierRetired'] as const) expect(kinds.has(kind), kind).toBe(true);
     // Through a save and load too.
     expect(serialize(deserialize(serialize(a)))).toBe(serialize(a));
+  });
+});
+
+describe('round 4b contract: demand segments, the promo quote, retention steps', () => {
+  it('segmentDemand adds up to targetTakeRate for every kind and lineup', () => {
+    const lineups: Pricing[] = [defaultPricing(), { ...defaultPricing(), tiers: defaultPricing().tiers.map((t) => ({ ...t, offered: t.id === 'fiber2g' })) }];
+    for (const pricing of lineups) {
+      for (const kind of ['home', 'mdu', 'smb'] as const) {
+        const segments = segmentDemand(pricing, kind);
+        expect(segments.length).toBeGreaterThan(0);
+        let shares = 0;
+        let take = 0;
+        for (const s of segments) {
+          shares += s.share;
+          take += s.share * s.takeRate * TAKE_RATE_KIND_FACTOR[kind];
+          if (s.tier !== null) expect(pricing.tiers.find((t) => t.id === s.tier)?.offered).toBe(true);
+        }
+        expect(shares).toBeCloseTo(1, 9);
+        expect(take).toBeCloseTo(targetTakeRate(pricing, kind), 9);
+      }
+    }
+  });
+
+  it('quotePromo refuses what setPromo would refuse', () => {
+    const state = makeTestState(TOWN);
+    expect(quotePromo(state, null).ok).toBe(true);
+    expect(quotePromo(state, { percentOff: 20, months: 3 }).ok).toBe(true);
+    expect(quotePromo(state, { percentOff: 0, months: 3 }).ok).toBe(false);
+    expect(quotePromo(state, { percentOff: 20, months: 0 }).ok).toBe(false);
+    state.gameOver = { day: 0, reason: 'insolvent', message: 'Out of cash' };
+    expect(quotePromo(state, { percentOff: 20, months: 3 })).toMatchObject({ ok: false, reasons: ['Game over: Out of cash'], advice: '' });
+  });
+
+  it('a retention lock steps up with RETENTION_STEP_SHARE', () => {
+    expect(stepShare('retention')).toBe(RETENTION_STEP_SHARE);
+  });
+});
+
+describe('the intro promo speeds signups up', () => {
+  it('multiplies the signup ramp by 1 + PROMO_SIGNUP_BOOST x percentOff / 100', () => {
+    expect(promoSignupFactor(null)).toBe(1);
+    expect(promoSignupFactor({ percentOff: 20, months: 3 })).toBeCloseTo(1 + (PROMO_SIGNUP_BOOST * 20) / 100, 12);
+    const offer: IntroPromo = { percentOff: PROMO_MAX_PERCENT_OFF, months: 1 };
+    let plain = 0;
+    let promoted = 0;
+    for (const rngSales of [1, 2, 3, 4, 5, 6]) {
+      const a = litTown({ city: towers(), rngSales, marketing: LOUD, splitters: 2 });
+      const b = litTown({ city: towers(), rngSales, marketing: LOUD, splitters: 2 });
+      b.state.sales.promo = offer;
+      step(a.state, 20);
+      step(b.state, 20);
+      plain += subscriberUnits(a.state);
+      promoted += subscriberUnits(b.state);
+    }
+    // Early on signups are about gap x ramp: the promo's factor, times the little it lifts the target.
+    const lift = targetTakeRate(defaultPricing(), 'mdu', INCUMBENT_PRICE, offer) / targetTakeRate(defaultPricing(), 'mdu');
+    const expected = promoSignupFactor(offer) * lift;
+    expect(promoted / plain).toBeGreaterThan(expected * 0.85);
+    expect(promoted / plain).toBeLessThan(expected * 1.1);
+  });
+});
+
+describe('quotePromo', () => {
+  /** TOWN lit, with each street's subscribers one short of its target take rate (a mature town). */
+  function mature(): GameState {
+    const { state, cabinet } = litTown();
+    const take = targetTakeRate(state.sales.pricing, 'home');
+    const accounts: Account[] = [];
+    for (const segment of state.city.segments) {
+      const homes = state.city.parcels.filter((p) => p.segment === segment.id);
+      const n = Math.max(0, Math.ceil(take * homes.length) - 1);
+      for (const parcel of homes.slice(0, n)) accounts.push(account(parcel.id, cabinet, { fiber1g: 1 }));
+    }
+    state.sales.accounts = accounts.sort((a, b) => a.parcel - b.parcel);
+    return state;
+  }
+
+  it('pays in a freshly lit town, where many households are waiting, and says so', () => {
+    const { state } = litTown();
+    const before = JSON.stringify(state);
+    const q = quotePromo(state, { ...SUGGESTED_PROMO });
+    expect(JSON.stringify(state)).toBe(before);
+    expect(q.ok).toBe(true);
+    expect(q.waitingUnits).toBeGreaterThan(HOMES / 3);
+    expect(q.extraSignups).toBeGreaterThan(0);
+    expect(q.extraSignups).toBeLessThanOrEqual(q.waitingUnits);
+    expect(q.pays).toBe(true);
+    expect(q.valueGained).toBeGreaterThan(q.discountCost);
+    expect(q.advice).toMatch(/^Pays now: about \d+ households in newly lit areas are still waiting to sign up/);
+    expect(q.advice).toContain('in a mature town it would mostly discount people who would sign up anyway');
+    // A deep, long offer costs more in discounts than bringing them in sooner is worth.
+    const deep = quotePromo(state, { percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS });
+    expect(deep.discountCost).toBeGreaterThan(q.discountCost);
+    expect(deep.pays).toBe(false);
+    expect(deep.advice).toMatch(/^Doesn't pay at this discount: .*a smaller or shorter offer pays while many are waiting/);
+  });
+
+  it('finds less to gain in a mature town, where it mostly discounts people who would sign up anyway', () => {
+    const offer: IntroPromo = { percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS };
+    const fresh = quotePromo(litTown().state, offer);
+    const state = mature();
+    const q = quotePromo(state, offer);
+    expect(q.waitingUnits).toBeGreaterThan(0);
+    expect(q.waitingUnits).toBeLessThan(fresh.waitingUnits / 3);
+    expect(q.extraSignups).toBeLessThan(fresh.extraSignups);
+    expect(q.valueGained).toBeLessThan(fresh.valueGained);
+    // Everyone who wants fiber signed up: nobody waits, nothing to gain.
+    state.sales.accounts = state.city.parcels.map((p) => account(p.id, state.network.cabinets[0]!.id, { fiber1g: 1 }));
+    expect(quotePromo(state, { ...SUGGESTED_PROMO })).toMatchObject({ waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }).advice).toMatch(/^Nobody is waiting to sign up now: an intro promo pays once you light new areas/);
+  });
+
+  it('says when it pays: newly lit areas or the cable company\'s promo, not a mature town', () => {
+    const quote = (over: Partial<PromoQuote>): PromoQuote => ({
+      ok: true,
+      reasons: [],
+      promo: { ...SUGGESTED_PROMO },
+      waitingUnits: 40,
+      extraSignups: 8,
+      discountCost: 1_000,
+      valueGained: 2_000,
+      pays: true,
+      advice: '',
+      ...over,
+    });
+    expect(promoAdvice(quote({}), 30, 0)).toMatch(/^Pays now: about 40 households in newly lit areas are still waiting/);
+    expect(promoAdvice(quote({}), 0, 30)).toMatch(/^Pays now: about 40 households where the cable company's promo runs are still waiting/);
+    expect(promoAdvice(quote({}), 0, 0)).toMatch(/^Pays now: about 40 households are still waiting/);
+    expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 30, 0)).toMatch(/^Doesn't pay at this discount/);
+    expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 0)).toBe(
+      "Doesn't pay now: most households who want fiber have signed up, so it would mostly discount people who would sign up anyway; it pays when you light new areas.",
+    );
+    expect(promoAdvice(quote({ waitingUnits: 0 }), 0, 0)).toMatch(/^Nobody is waiting/);
+    expect(promoAdvice(quote({ waitingUnits: 1 }), 1, 0)).toMatch(/^Pays now: about 1 household in newly lit areas is still waiting/);
+  });
+
+  it('quotes nothing for no promo, but says when one pays', () => {
+    const q = quotePromo(litTown().state, null);
+    expect(q).toMatchObject({ ok: true, promo: null, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
+    expect(q.waitingUnits).toBeGreaterThan(0);
+    expect(q.advice).toMatch(/pays while many are waiting, as in newly lit areas, and in a mature town mostly discounts people who would sign up anyway\.$/);
+  });
+
+  it('counts only one cabinet\'s streets when asked', () => {
+    const { state, cabinet } = litTown();
+    const all = quotePromo(state, { ...SUGGESTED_PROMO });
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }, cabinet)).toEqual(all);
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }, cabinet + 1_000)).toMatchObject({ waitingUnits: 0, extraSignups: 0 });
+  });
+});
+
+describe('outage days are not billed', () => {
+  it('leaves units cut off out of billing and support, and credits their rate', () => {
+    const { state, cabinet } = litTown();
+    const cut = 0;
+    const other = state.city.parcels.find((p) => p.segment !== state.city.parcels[cut]!.segment)!.id;
+    state.sales.accounts = [account(cut, cabinet, { fiber1g: 1 }), account(other, cabinet, { fiber500: 2 })].sort((a, b) => a.parcel - b.parcel);
+    const rate1g = listOf(state, 'fiber1g');
+    const rate500 = listOf(state, 'fiber500');
+    const daysOut = 10;
+    const days = MONTH_LENGTHS[0]!;
+    for (let d = 0; d < days; d++) accrueDay(state, d < daysOut ? { cutOff: new Set([cut]), lent: new Map() } : null);
+    const month = state.sales.month;
+    expect(month.outageCreditDollarDays).toBe(rate1g * daysOut);
+    expect(month.revenueDollarDays).toBe(rate1g * (days - daysOut) + 2 * rate500 * days);
+    expect(month.subscriberUnitDays).toBe(1 * (days - daysOut) + 2 * days);
+    state.day = days - 1;
+    const close = closeAt(state);
+    const full = (rate1g + 2 * rate500) * days;
+    // Revenue and credits add up to a full month's billing (each rounded once).
+    expect(Math.abs(close.revenue + close.outageCredits - full / days)).toBeLessThanOrEqual(1);
+    expect(close.outageCredits).toBe(Math.round((rate1g * daysOut) / days));
+    expect(close.support).toBe(Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (3 * days - daysOut)) / days));
+    const memo = state.finance.monthToDate.find((e) => e.category === 'revenue')!.memo;
+    expect(memo).toContain(`(${formatMoney(close.outageCredits)} not billed for outage days)`);
+  });
+
+  it('is applied by the daily sales step to whoever the outage cuts off', () => {
+    const { state, cabinet } = litTown();
+    // Nobody signs up at these prices, so only the two accounts bill.
+    for (const tier of state.sales.pricing.tiers) tier.price = TIER_PRICE_MAX;
+    const cutSeg = state.city.parcels[0]!.segment;
+    const other = state.city.parcels.find((p) => p.segment !== cutSeg)!.id;
+    state.sales.accounts = [account(0, cabinet, { fiber1g: 1 }), account(other, cabinet, { fiber1g: 1 })].sort((a, b) => a.parcel - b.parcel);
+    for (let d = 0; d < 5; d++) {
+      state.day++;
+      const service = getService(state);
+      service.interruptedSegments.add(cutSeg);
+      service.cutOffCabinets.set(cutSeg, new Set(service.segmentCabinets.get(cutSeg) ?? []));
+      withRng(state, 'sales', (rng) => stepSales(state, rng));
+    }
+    expect(state.sales.accounts).toHaveLength(2);
+    expect(state.sales.month.outageCreditDollarDays).toBe(5 * TIER_PRICE_MAX);
+    expect(state.sales.month.revenueDollarDays).toBe(5 * TIER_PRICE_MAX);
+    expect(state.sales.month.subscriberUnitDays).toBe(5);
+  });
+});
+
+describe('retention locks at the close', () => {
+  const city = towers(60);
+  /** Every unit on 1 Gig at cabinet 1, where the incumbent's promo runs all month (answered or not), on the given locks. */
+  function contested(answered: boolean, lockFor: (list: number) => PriceLock | null, rngSales = 3): { state: GameState; units: number; list: number } {
+    const state = makeTestState(city, { rngSales });
+    state.day = 40;
+    const list = listOf(state, 'fiber1g');
+    const lock = lockFor(list);
+    state.sales.accounts = city.parcels.map((p) => ({ ...account(p.id, 1, { fiber1g: p.units }), locks: lock ? [lock] : [] }));
+    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600, triggerTakePct: 45, answered, answeredWithPromo: false }];
+    return { state, units: subscriberUnits(state), list };
+  }
+
+  it('spare the incumbent promo\'s churn, and step back up with RETENTION_STEP_SHARE when they end', () => {
+    const until = closeDayAfter(40, 1);
+    const plain = contested(false, () => null);
+    const a = closeAt(plain.state);
+    expectNear(a.incumbentChurn, plain.units, INCUMBENT_PROMO_CHURN);
+    const kept = contested(true, (list) => lockOf('fiber1g', retentionPrice(list), until, 'retention'));
+    const offer = retentionPrice(kept.list);
+    expect(offer).toBe(Math.max(1, Math.round((kept.list * (100 - RETENTION_PERCENT_OFF)) / 100)));
+    const b = closeAt(kept.state);
+    expectNear(b.incumbentChurn, kept.units, INCUMBENT_PROMO_CHURN * Math.max(0, 1 - RETENTION_CHURN_CUT));
+    expect(b.incumbentChurn).toBeLessThan(a.incumbentChurn);
+    expectNear(b.priceChurn, kept.units, stepChurnProbability(offer, kept.list, RETENTION_STEP_SHARE));
+    const notice = kept.state.notices.find((n) => n.kind === 'priceStep')!;
+    expect(notice.message).toMatch(/whose retention offers ended at the Feb 2027 close/);
+    expect(kept.state.sales.accounts.every((acc) => acc.locks.length === 0)).toBe(true);
+  });
+
+  it('cover a cheaper lock kept under an answered promo, but not under one left unanswered', () => {
+    const later = closeDayAfter(40, 6);
+    const cheaper = (list: number) => lockOf('fiber1g', retentionPrice(list) - 5, later, 'promo');
+    const answered = contested(true, cheaper);
+    const ignored = contested(false, cheaper);
+    const a = closeAt(answered.state);
+    const b = closeAt(ignored.state);
+    expectNear(a.incumbentChurn, answered.units, INCUMBENT_PROMO_CHURN * Math.max(0, 1 - RETENTION_CHURN_CUT));
+    expectNear(b.incumbentChurn, ignored.units, INCUMBENT_PROMO_CHURN);
+    // A dearer lock (a grandfathered price above the offer) is not covered without a retention lock.
+    const dearer = contested(true, (list) => lockOf('fiber1g', retentionPrice(list) + 1, later, 'grandfather'));
+    expectNear(closeAt(dearer.state).incumbentChurn, dearer.units, INCUMBENT_PROMO_CHURN);
   });
 });

@@ -49,7 +49,7 @@ export class Menu {
         [el('span', { class: 'menu-label', text: label }), el('span', { class: 'menu-detail', text: detail })],
       );
     this.root = el('div', { class: 'menu pill-card', attrs: { role: 'menu', 'aria-label': 'Game menu' } }, [
-      item('New game', 'A fresh town from a new seed', actions.newGame),
+      item('New game', 'A new company in a fresh town', actions.newGame),
       item('Save', 'Keep this game in your browser', actions.save),
       item('Load', 'Go back to your last save', actions.load),
       item('Export', 'Download the game as a file', actions.exportFile),

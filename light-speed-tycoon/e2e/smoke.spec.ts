@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import { clickNode, currentGame, isFontNoise, nodeOnScreen, open, routeFromCo, watchErrors } from './helpers';
+import { clickNode, currentGame, isFontNoise, nodeOnScreen, open, routeFromCo, startCompany, startScreen, watchErrors } from './helpers';
 
 test('lay fiber from the CO, light homes, and see it in the HUD', async ({ page }) => {
   // Headless Chromium draws WebGL in software, so each map redraw is slow here.
@@ -273,10 +273,11 @@ test('a ?seed link keeps its own progress and never replaces the main game', asy
   await open(page, '/?seed=777');
   expect(await currentGame(page)).toMatchObject({ seed: 777, day: 31 });
 
-  // Starting a new game from a seed link makes it the main game.
+  // Starting a new game from a seed link (through the start screen) makes it the main game.
   await page.getByRole('button', { name: 'Menu' }).click();
   await page.getByRole('menuitem', { name: /New game/ }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Start a new town' }).click();
+  await startCompany(page);
   await expect(page.getByRole('dialog')).toBeHidden();
   const fresh = await currentGame(page);
   // ?seed is dropped; ?debug=1 stays so the reload below still has the hook.
@@ -461,6 +462,9 @@ test('replacing the town asks first, and a stray double Space can never wipe it'
   await page.keyboard.press(' ');
   await page.keyboard.press(' ');
   await expect(dialog).toBeVisible();
+  // Round 4b: it names the company it would replace.
+  const company = await page.evaluate(() => window.__lst!.getState().company.name);
+  await expect(dialog).toHaveAccessibleName(`Replace ${company}?`);
   await expect(dialog.getByRole('button', { name: 'Keep playing' })).toBeFocused();
   await page.keyboard.press(' ');
   await expect(dialog).toBeHidden();
@@ -480,10 +484,18 @@ test('replacing the town asks first, and a stray double Space can never wipe it'
   await expect(dialog).toBeHidden();
   expect(await currentGame(page)).toEqual(before);
 
-  // Confirming replaces the town.
+  // Confirming opens the start screen (round 4b); Esc there keeps the town, Start replaces it.
   await menuButton.click();
   await page.getByRole('menuitem', { name: /New game/ }).click();
   await dialog.getByRole('button', { name: 'Start a new town' }).click();
+  await expect(startScreen(page)).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  expect(await currentGame(page)).toEqual(before);
+  await menuButton.click();
+  await page.getByRole('menuitem', { name: /New game/ }).click();
+  await dialog.getByRole('button', { name: 'Start a new town' }).click();
+  await startCompany(page);
   await expect(dialog).toBeHidden();
   expect(await currentGame(page)).toMatchObject({ day: 0 });
   expect((await currentGame(page)).seed).not.toBe(before.seed);

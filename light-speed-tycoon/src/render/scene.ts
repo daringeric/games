@@ -1,5 +1,6 @@
 // The map scene. Layers, bottom to top: board, roads, rock stipple, trees,
-// strong rock texture (underground tool), $/ft cost overlay, pole overlay,
+// strong rock texture (underground tool), $/ft cost overlay, storm-exposure
+// overlay (round 4b), pole overlay,
 // parcels, recent storms' clouds, cables, coverage shading and route preview,
 // central office, cabinets, storm badges, tool marks. The world container is
 // a render group, so panning and zooming only change its transform; each
@@ -10,9 +11,9 @@ import { Container, Graphics } from 'pixi.js';
 import type { Application } from 'pixi.js';
 import { getService } from '../sim/network';
 import { accountUnits } from '../sim/sales';
-import type { City, GameState, ParcelId, ServiceSnapshot } from '../sim/types';
+import type { City, ExposureBand, GameState, ParcelId, ServiceSnapshot } from '../sim/types';
 import type { Bounds, Camera } from './camera';
-import { boardBounds, drawBoard, drawCostOverlay, drawPoleOverlay, drawRoads, drawRock, drawTrees, townBounds } from './cityLayer';
+import { boardBounds, drawBoard, drawCostOverlay, drawExposureOverlay, drawPoleOverlay, drawRoads, drawRock, drawTrees, townBounds } from './cityLayer';
 import type { CostOverlayMode } from './cityLayer';
 import { buildCentralOffice } from './coLayer';
 import { placeTrees } from './decor';
@@ -41,6 +42,8 @@ export interface SceneStats {
   fullCabinets: number;
   /** The $/ft overlay's mode, or null when it is off. */
   costOverlay: CostOverlayMode | null;
+  /** Round 4b: streets the storm-exposure overlay shows in each band, or null when it is off. */
+  exposureOverlay: Record<ExposureBand, number> | null;
   /** The strong rock texture is showing (underground tool). */
   rockEmphasis: boolean;
   /** Live spans drawn out of service (storm or dig-in damage). */
@@ -60,6 +63,9 @@ export class Scene {
   private rockStrongCity: City | null = null;
   private costMode: CostOverlayMode | null = null;
   private costDrawn: { city: City; mode: CostOverlayMode } | null = null;
+  private readonly exposure = new Graphics();
+  private exposureOn = false;
+  private exposureDrawn: { city: City; bands: Record<ExposureBand, number> } | null = null;
   private readonly parcels: ParcelLayer;
   private readonly network: NetworkLayer;
   private readonly storms: StormLayer;
@@ -88,10 +94,12 @@ export class Scene {
     this.poles.visible = false;
     this.rockStrong.visible = false;
     this.cost.visible = false;
+    this.exposure.visible = false;
     this.world.addChild(
       this.ground,
       this.rockStrong,
       this.cost,
+      this.exposure,
       this.poles,
       this.parcels.container,
       this.storms.under,
@@ -212,6 +220,26 @@ export class Scene {
     }
   }
 
+  /** Color every street by its storm-exposure band (weather.exposureBand), or hide the overlay. Drawn on first use per city. */
+  setExposureOverlay(on: boolean): void {
+    this.exposureOn = on;
+    this.refreshExposureOverlay();
+  }
+
+  private refreshExposureOverlay(): void {
+    const city = this.city;
+    if (this.exposureOn && city && this.exposureDrawn?.city !== city) {
+      this.exposure.clear();
+      this.exposureDrawn = { city, bands: drawExposureOverlay(this.exposure, city, this.theme) };
+      this.dirty = true;
+    }
+    const visible = this.exposureOn && city !== null;
+    if (this.exposure.visible !== visible) {
+      this.exposure.visible = visible;
+      this.dirty = true;
+    }
+  }
+
   setOverlay(spec: OverlaySpec): void {
     if (this.city && this.overlay.draw(this.city, spec)) this.dirty = true;
   }
@@ -226,6 +254,7 @@ export class Scene {
       dimSpans: this.network.dimSpans,
       fullCabinets: this.network.fullRings,
       costOverlay: this.cost.visible ? this.costMode : null,
+      exposureOverlay: this.exposure.visible && this.exposureDrawn ? { ...this.exposureDrawn.bands } : null,
       rockEmphasis: this.rockStrong.visible,
       outageSpans: this.network.outageSpans,
       rebuildSpans: this.network.rebuildSpans,
@@ -267,6 +296,7 @@ export class Scene {
       this.rockStrongCity = city;
     }
     this.costDrawn = null;
+    this.exposureDrawn = null;
 
     // Graphics.destroy given options keeps its context (and the GPU buffers
     // behind it) unless asked: say so, or every new town leaks the old building.
@@ -280,5 +310,6 @@ export class Scene {
     this.overlay.draw(city, {});
     this.city = city;
     this.refreshCostOverlay();
+    this.refreshExposureOverlay();
   }
 }

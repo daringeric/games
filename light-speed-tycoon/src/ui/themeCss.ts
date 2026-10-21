@@ -41,6 +41,9 @@ export function applyThemeCss(theme: Theme, root: HTMLElement = document.documen
     '--cpp-green': theme.cpp.green,
     '--cpp-amber': theme.cpp.amber,
     '--cpp-red': theme.cpp.red,
+    '--exposure-sheltered': theme.exposureOverlay.band.sheltered,
+    '--exposure-moderate': theme.exposureOverlay.band.moderate,
+    '--exposure-exposed': theme.exposureOverlay.band.exposed,
   };
   for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
   document.querySelector('meta[name="theme-color"]')?.setAttribute('content', ui.page);

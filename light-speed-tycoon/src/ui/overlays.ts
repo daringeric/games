@@ -206,4 +206,9 @@ export class HintCard {
   hide(): void {
     this.root.hidden = true;
   }
+
+  /** Round 4b: show it again (a first launch hides it behind the start screen until Start). */
+  show(): void {
+    this.root.hidden = false;
+  }
 }

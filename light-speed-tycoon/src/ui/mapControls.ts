@@ -1,7 +1,10 @@
 // Everything the player does on the map: the tool palette, pointer and
 // keyboard input routed to tools (clicks, taps and drag-to-draw), the tool
 // overlay and the floating quote card, the $/ft cost overlay and its legend,
-// the OLT panel and the span panel. main.ts builds one MapControls, appends
+// the storm-exposure overlay and its legend (round 4b), the OLT panel and the
+// span panel. The two street overlays are mutually exclusive: both recolor
+// every street, so switching one on (button or key: O for cost, E for
+// exposure) switches the other off, legend included. main.ts builds one MapControls, appends
 // its toolbar and card, and calls update() every frame; it never reaches into
 // the tools itself. Panels of our own (the OLT panel, the span panel, the
 // legend) are mounted here, next to the map canvas. One map panel shows at a
@@ -12,11 +15,11 @@
 // only uses the public members below.
 
 import type { Camera } from '../render/camera';
-import { costOverlayThresholds } from '../render/cityLayer';
+import { costOverlayThresholds, EXPOSURE_BANDS } from '../render/cityLayer';
 import type { CostOverlayMode } from '../render/cityLayer';
 import type { Scene } from '../render/scene';
 import type { Theme } from '../render/theme';
-import type { Command, GameState } from '../sim/types';
+import type { Command, ExposureBand, GameState } from '../sim/types';
 import { el } from './dom';
 import { FloatingCard } from './floatingCard';
 import { formatPerFt } from './format';
@@ -45,6 +48,13 @@ export interface MenuLike {
   close(): void;
 }
 
+/** The storm-exposure legend's line per band: what it means and where it tends to be. */
+export const EXPOSURE_LEGEND: Record<ExposureBand, string> = {
+  sheltered: 'sheltered · fewer storms',
+  moderate: 'moderate',
+  exposed: 'exposed · rural, wooded, edge',
+};
+
 const MODE_LABEL: Record<CostOverlayMode, string> = {
   aerial: 'aerial',
   underground: 'underground',
@@ -62,6 +72,8 @@ export class MapControls {
   readonly span: SpanPanel;
   /** Legend of the $/ft cost overlay; mounted next to the map by MapControls. */
   readonly legend: HTMLElement;
+  /** Round 4b: legend of the storm-exposure overlay (sheltered / moderate / exposed); mounted next to the map. */
+  readonly exposureLegend: HTMLElement;
   private readonly legendMode: HTMLElement;
   private readonly legendNone: HTMLElement;
   private readonly tools = new ToolController();
@@ -73,11 +85,13 @@ export class MapControls {
   private cardHold: 'next' | { x: number; y: number } | null = null;
   private input: Input | null = null;
   private costOverlay = false;
+  private exposureOverlay = false;
 
   constructor(private readonly deps: MapControlsDeps) {
     this.toolbar = new Toolbar(
       (tool) => this.pickTool(tool),
       () => this.toggleCostOverlay(),
+      () => this.toggleExposureOverlay(),
     );
     this.olt = new OltPanel({
       getState: () => deps.session.state,
@@ -95,6 +109,7 @@ export class MapControls {
     this.legendMode = el('span', { class: 'cost-legend-mode' });
     this.legendNone = legendItem(deps.theme.costOverlay.none, 'no poles');
     this.legend = buildLegend(deps.theme, this.legendMode, this.legendNone);
+    this.exposureLegend = buildExposureLegend(deps.theme);
     this.mount();
   }
 
@@ -102,7 +117,7 @@ export class MapControls {
   private mount(): void {
     if (this.olt.root.isConnected && this.span.root.isConnected) return;
     const host = this.deps.canvas.parentElement ?? document.getElementById('app');
-    if (host) host.append(this.legend, this.olt.root, this.span.root);
+    if (host) host.append(this.legend, this.exposureLegend, this.olt.root, this.span.root);
   }
 
   /** Start routing pointer and keyboard input to the map (once, after the menu exists). */
@@ -170,6 +185,7 @@ export class MapControls {
       setSpeed: (speed) => session.setSpeed(speed),
       togglePause: () => session.togglePause(),
       toggleOverlay: () => this.toggleCostOverlay(),
+      toggleExposureOverlay: () => this.toggleExposureOverlay(),
     });
   }
 
@@ -207,11 +223,35 @@ export class MapControls {
     this.syncCostOverlay();
   }
 
-  /** Show or hide the $/ft cost overlay (toolbar switch, or the O key). */
+  /** Whether the storm-exposure overlay is showing. */
+  get exposureOverlayOn(): boolean {
+    return this.exposureOverlay;
+  }
+
+  /** Show or hide the $/ft cost overlay (toolbar switch, or the O key). Showing it hides the exposure overlay. */
   toggleCostOverlay(on = !this.costOverlay): void {
+    if (on && this.exposureOverlay) this.setExposure(false);
     this.costOverlay = on;
     this.toolbar.setOverlay(on);
     this.syncCostOverlay();
+  }
+
+  /** Show or hide the storm-exposure overlay (toolbar switch, or the E key). Showing it hides the cost overlay. */
+  toggleExposureOverlay(on = !this.exposureOverlay): void {
+    if (on && this.costOverlay) {
+      this.costOverlay = false;
+      this.toolbar.setOverlay(false);
+      this.syncCostOverlay();
+    }
+    this.setExposure(on);
+  }
+
+  private setExposure(on: boolean): void {
+    this.exposureOverlay = on;
+    this.toolbar.setExposureOverlay(on);
+    this.deps.scene.setExposureOverlay(on);
+    this.exposureLegend.hidden = !on;
+    this.placeLegend();
   }
 
   /** The overlay prices the active cable tool's method, otherwise each street's cheaper buildable method. */
@@ -231,14 +271,15 @@ export class MapControls {
    * runs along the bottom: just under the HUD, whatever height it has grown to.
    */
   private placeLegend(): void {
-    if (this.legend.hidden) return;
+    const shown = [this.legend, this.exposureLegend].filter((legend) => !legend.hidden);
+    if (shown.length === 0) return;
     const bar = this.toolbar.root.getBoundingClientRect();
     let top = '';
     if (bar.height > 0 && bar.top > window.innerHeight / 2) {
       const hud = document.querySelector('.hud')?.getBoundingClientRect();
       if (hud && hud.height > 0) top = `${Math.round(hud.bottom + 8)}px`;
     }
-    if (this.legend.style.top !== top) this.legend.style.top = top;
+    for (const legend of shown) if (legend.style.top !== top) legend.style.top = top;
   }
 
   /** The band the floating card may use: under the HUD, and above the toolbar when it runs along the bottom (phones). */
@@ -294,6 +335,29 @@ function buildLegend(theme: Theme, mode: HTMLElement, none: HTMLElement): HTMLEl
         legendItem(theme.cpp.red, 'more · rock'),
         none,
       ]),
+    ],
+  );
+}
+
+/**
+ * The storm-exposure overlay's legend: one swatch per band (theme.exposureOverlay),
+ * light to dark as storms get likelier (weather.exposureBand of weather.segmentExposure).
+ */
+function buildExposureLegend(theme: Theme): HTMLElement {
+  return el(
+    'aside',
+    { class: 'cost-legend exposure-legend pill-card', attrs: { 'aria-label': 'Storm exposure legend', 'data-testid': 'exposure-legend', hidden: '' } },
+    [
+      el('p', { class: 'cost-legend-title' }, ['Storm exposure']),
+      el(
+        'ul',
+        {},
+        EXPOSURE_BANDS.map((band) => {
+          const item = legendItem(theme.exposureOverlay.band[band], EXPOSURE_LEGEND[band]);
+          item.setAttribute('data-band', band);
+          return item;
+        }),
+      ),
     ],
   );
 }

@@ -16,12 +16,46 @@
 // its plant, an all-aerial copy is clearly more exposed to storms, default
 // prices are the best constant price, hikes lose subscribers, a frozen-line
 // hoarder repays through the call or defaults); see DESIGN.md, "Round 4 tuning".
+// Round 4b: difficulty levels (only the starting cash differs) and the
+// incumbent's promo, the retention offer and the storm-exposure bands
+// (targets4b.test.ts: dropping the cheap tiers loses, promos do not cycle,
+// the best answer to one beats ignoring it, the intro promo pays in a fresh
+// area, storms favour exposed streets); see DESIGN.md, "Round 4b".
 
-import type { CppBand, ParcelKind, TermYears, TierId } from './types';
+import type { CppBand, DemandSegmentId, DifficultyId, ParcelKind, TermYears, TierId, Zone } from './types';
 
 export const START_YEAR = 2027;
-/** Start cash covers only ~25-33% of the town's build-out (tuning target). */
+/**
+ * Start cash covers only ~25-33% of the town's build-out (tuning target).
+ * Round 4b: the Seed round difficulty's starting investment (every round-2..4
+ * tuning target is measured at it); DIFFICULTY_LEVELS holds the others.
+ */
 export const START_CASH = 750_000;
+
+/** Round 4b: one difficulty level (owner decision 2026-10-21: levels differ ONLY in starting cash). */
+export interface DifficultyLevel {
+  id: DifficultyId;
+  /** Start-screen card title, e.g. "Seed round". */
+  name: string;
+  /** finance.cash on day 0, whole dollars. */
+  startCash: number;
+  /** One line on the card: how it plays. */
+  feel: string;
+}
+
+/**
+ * Round 4b: the four difficulty levels, easiest first (the start screen's
+ * card order). Seed round is START_CASH, the tuned default game; the others
+ * change nothing but the starting investment.
+ */
+export const DIFFICULTY_LEVELS: readonly DifficultyLevel[] = [
+  { id: 'angel', name: 'Angel-backed', startCash: 1_500_000, feel: 'Relaxed: cable a big chunk of town on day one.' },
+  { id: 'seed', name: 'Seed round', startCash: START_CASH, feel: 'The standard game: build smart, then borrow to grow.' },
+  { id: 'bootstrapped', name: 'Bootstrapped', startCash: 400_000, feel: 'Tight: one neighborhood, then sales and loans.' },
+  { id: 'shoestring', name: 'Shoestring', startCash: 200_000, feel: 'Expert: one good street, and every dollar counts.' },
+];
+/** Round 4b: the level a new game starts at unless the player picks another, and every save from before difficulty existed. */
+export const DEFAULT_DIFFICULTY: DifficultyId = 'seed';
 
 /** Feet per map cell. A typical residential lot frontage. */
 export const TILE_FT = 60;
@@ -468,8 +502,17 @@ export const PROMO_MAX_MONTHS = 12;
  * price a new signup weighs).
  */
 export const PROMO_HORIZON_MONTHS = 24;
-/** The incumbent answers when your take rate in a cabinet area reaches this ... */
-export const INCUMBENT_PROMO_TAKE_RATE = 0.45; // first guess 0.35 sat under the default target take rate: promos ran nearly everywhere
+/**
+ * The incumbent answers when your take rate in a cabinet area reaches this ...
+ * Round 4b: 0.45 -> 0.5, above where a careful operator's areas settle (the
+ * median area of SMART's at month 60 sits at ~43%), so a promo answers an
+ * area that is doing unusually well (an apartment block, a dense corner, or
+ * prices pushed down) rather than every mature one; with the per-area memory
+ * (INCUMBENT_PROMO_RETRIGGER_POINTS) no area meets more than two in five years.
+ * (Round 4's first guess 0.35 sat under the default target take rate: promos
+ * ran nearly everywhere.)
+ */
+export const INCUMBENT_PROMO_TAKE_RATE = 0.5;
 /** ... on at least this many passings there. */
 export const INCUMBENT_PROMO_MIN_PASSINGS = 100;
 /** Dollars a month the incumbent's promo price is below INCUMBENT_PRICE. */
@@ -477,8 +520,14 @@ export const INCUMBENT_PROMO_DISCOUNT = 20;
 /** Month closes an incumbent promo runs, and the quiet months after it before another can start there. */
 export const INCUMBENT_PROMO_MONTHS = 6;
 export const INCUMBENT_PROMO_QUIET_MONTHS = 6;
-/** Monthly churn probability added for subscribers in an area while the incumbent's promo runs there. */
-export const INCUMBENT_PROMO_CHURN = 0.01;
+/**
+ * Monthly churn probability added for subscribers in an area while the
+ * incumbent's promo runs there. Round 4b: 0.01 -> 0.03: ignoring a promo now
+ * costs about a sixth of the area's subscribers over its six months, so
+ * answering it matters (at 1% no answer beat ignoring it by more than the
+ * game's own noise).
+ */
+export const INCUMBENT_PROMO_CHURN = 0.03;
 /**
  * The most a unit's total churn probability at a close may be (regular +
  * price step + outage + incumbent), so a bad month never empties a network
@@ -545,3 +594,181 @@ export const CONVERT_PAYBACK_YEARS = 10;
 export const MARKETING_PER_PASSING_GOOD = 2;
 /** expand: months of fixed costs (overhead + marketing) kept in reserve on top of the funding cushion. */
 export const EXPAND_RESERVE_MONTHS = 3;
+
+// ---------------------------------------------------------------------------
+// Round 4b (start screen and difficulty: above, with START_CASH; the rest
+// fixes round 4's design gaps). The architect's and integrator's values, as
+// the round-4b tuning moved them (tuning/targets4b.test.ts, DESIGN.md "Round
+// 4b"): the incumbent's trigger, promo churn and retention offer, and the
+// storm exposure's industrial zone, center weight and bands moved; the rest
+// held. Rules that are not balance (lengths, caps) live in their modules.
+// ---------------------------------------------------------------------------
+
+// Advisor (advisor.ts) ----------------------------------------------------------
+
+/** snoozeAdvice: month closes a dismissed suggestion stays hidden (it shows again at the close this many closes on). */
+export const ADVICE_SNOOZE_MONTHS = 3;
+/** ... and for an urgent one (it comes back at the next close unless dealt with). */
+export const ADVICE_SNOOZE_URGENT_MONTHS = 1;
+/**
+ * expand: a financed build must leave the covenants this far inside their
+ * limits pro forma (leverage at most COVENANT_MAX_LEVERAGE x (1 - this),
+ * coverage at least COVENANT_MIN_COVERAGE x (1 + this); debt.covenantsWithin),
+ * so following the advice never brings the advisor's own covenant-risk warning.
+ */
+export const EXPAND_COVENANT_HEADROOM = 0.15;
+/** expand: months of the new area's expected installs (connect capex) kept in reserve on top of EXPAND_RESERVE_MONTHS of running costs. */
+export const EXPAND_INSTALL_MONTHS = 6;
+/** Bank: the term-loan builder starts at the largest loan this far inside the covenant limits (debt.maxSafeTermLoan headroom), not exactly on them. */
+export const BANK_PREFILL_HEADROOM = 0.15;
+
+// Pricing: demand segments (sales.ts) -----------------------------------------------
+
+/** One slice of households by price sensitivity (see DEMAND_SEGMENTS). */
+export interface DemandSegment {
+  id: DemandSegmentId;
+  /** Share of households; the shares sum to 1. */
+  share: number;
+  /** Speed beyond this many Mbps adds nothing for them (their speed term uses min(down, this)). */
+  maxUsefulMbps: number;
+  /** Multiplies TAKE_PRICE_WEIGHT for them (price sensitivity), for your tiers and the incumbent alike. */
+  priceWeight: number;
+  /**
+   * Most they will pay, as a multiple of the incumbent's price where they
+   * live (incumbent.incumbentPriceFor): a tier above it does not suit them
+   * (within DEMAND_RESERVATION_SOFTNESS above it, less and less), and with no
+   * tier that suits them they do not sign up.
+   */
+  maxPriceRatio: number;
+}
+
+/**
+ * Round 4b: households in three price-sensitivity segments, so dropping the
+ * cheap tiers is not dominant (round 4's single model let a 2 Gig-only
+ * lineup keep ~93% of the default target take rate at a far higher ARPU).
+ * The target take rate of a building kind becomes
+ *   sum over segments of share x clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE
+ *     x best advantage among the offered tiers that suit the segment,
+ *     TAKE_RATE_MIN, TAKE_RATE_MAX) (0 for a segment no tier suits)
+ *   x TAKE_RATE_KIND_FACTOR[kind],
+ * each segment valuing tiers with its own maxUsefulMbps and priceWeight
+ * against the incumbent scored the same way; the tier mix sums the segments'
+ * mixes weighted by share x their take. Interim values keep the default
+ * lineup where round 4 had it, ~56% of homes at ~$69 (round 4: 55% at ~$72:
+ * within ~1.5% of its revenue per household, which every round-2..4 target was
+ * tuned on), while value seekers drop out of a lineup without a tier near the
+ * incumbent's price: a 2 Gig-only lineup signs up ~31% (a fifth less revenue
+ * per household than the default lineup) and 1 Gig + 2 Gig ~44%.
+ * (Integrator, round 4b: the architect's first values, value 35% /
+ * mainstream 45% / speed 20% with price weights 1.5 / 1 / 0.6, kept the take
+ * rate but moved signups to 500 Mbps, cutting revenue per household ~6% and
+ * SMART's share of the town at month 60 by ~10 points.)
+ */
+export const DEMAND_SEGMENTS: readonly DemandSegment[] = [
+  { id: 'value', share: 0.25, maxUsefulMbps: 500, priceWeight: 2.5, maxPriceRatio: 0.9 },
+  { id: 'mainstream', share: 0.45, maxUsefulMbps: 1_000, priceWeight: 0.6, maxPriceRatio: 1.2 },
+  { id: 'speed', share: 0.3, maxUsefulMbps: 2_000, priceWeight: 0.55, maxPriceRatio: 2 },
+];
+/**
+ * A tier priced above a segment's reservation (maxPriceRatio x the
+ * incumbent's price) by a share s of it still suits that segment with
+ * weight max(0, 1 - s / this): no cliff when every price rises a little.
+ */
+export const DEMAND_RESERVATION_SOFTNESS = 0.15;
+
+// Pricing: the incumbent and the levers that answer it (incumbent.ts, sales.ts)
+
+/**
+ * The incumbent promo trigger (INCUMBENT_PROMO_TAKE_RATE, round 4) must sit
+ * above the steady-state take rate a careful operator reaches; and once a
+ * promo has run in an area, the next one there needs the area's take rate
+ * this many points (a fraction) above the one that started the last
+ * (IncumbentPromo.triggerTakePct), so a mature area never cycles forever.
+ */
+export const INCUMBENT_PROMO_RETRIGGER_POINTS = 0.05;
+/**
+ * answerIncumbent: whole percent off the list price for the area's
+ * subscribers until the promo ends. Round 4b tuning: 15 -> 12, with
+ * INCUMBENT_PROMO_CHURN 0.03, so the offer pays over a promo's months (it
+ * keeps about half the cancellations a promo causes, for less than they are
+ * worth) but not in its last month (RETENTION_STEP_SHARE).
+ */
+export const RETENTION_PERCENT_OFF = 12;
+/** Share of the incumbent promo's extra churn (INCUMBENT_PROMO_CHURN) a unit on a retention lock is spared (1: all of it). */
+export const RETENTION_CHURN_CUT = 1;
+/**
+ * Churn share of the price step when a retention lock ends (as
+ * GRANDFATHER_STEP_SHARE / PROMO_STEP_SHARE). Round 4b tuning: 0.25 -> 1 (the
+ * discount ends like a rise passed on at the next bill), so a retention offer
+ * made with a close or two left costs more at its end than it saves.
+ */
+export const RETENTION_STEP_SHARE = 1;
+/**
+ * While an intro promo is set, the signup ramp is multiplied by
+ * 1 + PROMO_SIGNUP_BOOST x percentOff / 100 (households switch sooner for a
+ * deal): worth most where many homes have not signed up yet (a freshly lit
+ * area, or one the incumbent is contesting). Round 4b tuning: kept at 2,
+ * where SMART's 20% off for 3 months pays in a freshly lit area (quoted and
+ * realized). It pays in a mature town too: the boost speeds every street's
+ * gap alike, and churn keeps a mature town's gap about as large per signup as
+ * a fresh one's; no value of it, PROMO_HORIZON_MONTHS or PROMO_QUOTE_MONTHS
+ * separates the two (DESIGN.md, "What round 4b could not reach").
+ */
+export const PROMO_SIGNUP_BOOST = 2;
+/** sales.quotePromo: months its estimate looks ahead. */
+export const PROMO_QUOTE_MONTHS = 12;
+
+// Storm exposure (weather.ts) ---------------------------------------------------
+
+/**
+ * Round 4b: storms favour exposed streets. A street's exposure
+ * (weather.segmentExposure, a multiplier with mean ~1 over a generated
+ * town) is STORM_EXPOSURE_ZONE[its zone] x (1 + STORM_EXPOSURE_WOODED x how
+ * wooded it is, 0..1: the grove field the map's trees are drawn from) x
+ * (1 + STORM_EXPOSURE_EDGE near the map's edge, fading to 0 at
+ * STORM_EXPOSURE_EDGE_CELLS cells in), deterministic from the city. It scales
+ * the storm damage chance on the street, and where storms center
+ * (STORM_CENTER_EXPOSURE_WEIGHT). Residential streets, most of every town and
+ * of a careful operator's plant, rate 1 so a typical one keeps round 4's
+ * aerial storm risk (integrator, round 4b: at the architect's 0.9 they fell to
+ * ~0.8x of it, since storms center toward the exposed edges, and burying
+ * stopped paying on the short residential blocks). Round 4b tuning:
+ * industrial 0.9 -> 0.7 (yards and low sheds, few trees near the lines), so
+ * downtown and the industrial blocks make the 'sheltered' band at least a
+ * tenth of every tuning town (the overlay's three bands each mean something).
+ */
+export const STORM_EXPOSURE_ZONE: Readonly<Record<Zone, number>> = { downtown: 0.6, residential: 1, industrial: 0.7, rural: 1.5 };
+/** (Integrator, round 4b: 0.6, was the architect's 0.8, so residential at 1 keeps the town's mean exposure about 1.) */
+export const STORM_EXPOSURE_WOODED = 0.6;
+export const STORM_EXPOSURE_EDGE = 0.5;
+export const STORM_EXPOSURE_EDGE_CELLS = 10;
+/**
+ * Storm centers are drawn with weight 1 + this x (exposure there - 1) (0:
+ * uniform, as round 4). Round 4b tuning: 1 -> 1.25, so storms lean a little
+ * more toward the exposed edges and groves than toward the town (exposed
+ * streets take 3-4x a sheltered street's damage per span-year), which keeps
+ * an all-aerial copy of SMART clearly more exposed than its mix.
+ */
+export const STORM_CENTER_EXPOSURE_WEIGHT = 1.25;
+/** Cells around a lattice point whose streets set how exposed it is for drawing storm centers (weather.pointExposure). */
+export const STORM_CENTER_REACH_CELLS = 6;
+/** Feet of street at the town's mean exposure every lattice point counts besides its own streets (open country rates as an average street). */
+export const STORM_CENTER_OPEN_FT = 360;
+/**
+ * Exposure bands for the overlay, quote cards and the advisor: 'moderate'
+ * from this exposure (a plain residential street, exactly the residential
+ * zone's 1) ... Round 4b tuning: 0.85 -> 1 and 1.3 -> 1.2, so each band holds
+ * 10-70% of a tuning town's street feet (sheltered 10-17%, moderate 62-69%,
+ * exposed 16-24%; at 0.85 / 1.3 the sheltered band was 7-12% and the
+ * moderate one 70-78%). Labels only: no rule reads the bands but the
+ * overlay, the quote and span cards and the advisor's storm suggestion.
+ */
+export const STORM_EXPOSURE_MODERATE = 1;
+/** ... and 'exposed' from this one ('sheltered' below 'moderate'): a residential street with trees or near the map's edge, a rural one. */
+export const STORM_EXPOSURE_EXPOSED = 1.2;
+/**
+ * weather.preferredMethod: years of ownership over which a street's method
+ * is judged (construction, make-ready and fees, pole rent, expected storm
+ * repairs), as SMART's lifetime method choice does (tuning VALUE_YEARS).
+ */
+export const BUILD_METHOD_HORIZON_YEARS = 12;

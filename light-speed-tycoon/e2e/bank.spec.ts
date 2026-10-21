@@ -5,7 +5,9 @@
 // the Bank leads with covenant status, the builder starts at the largest
 // covenant-safe amount, a draw previews its covenants, and a frozen line
 // shows the sweep and the countdown to the bank calling the loans (then what
-// falls due once it has).
+// falls due once it has). Round 4b: the builder starts BANK_PREFILL_HEADROOM
+// inside the covenant limits (the exact largest safe amount stays a line
+// under it), and the header names the borrower (the company).
 //
 // Conditions are set up through window.__lst the way economy.spec.ts does:
 // closed months with revenue pushed into finance.reports give the town
@@ -16,8 +18,8 @@
 
 import { expect, test } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
-import { ACCELERATION_CLOSES, FROZEN_ACCELERATION_CLOSES, LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
-import { closesUntilAcceleration, creditLimit, maxSafeTermLoan, quoteDraw, termCapacity } from '../src/sim/debt';
+import { ACCELERATION_CLOSES, BANK_PREFILL_HEADROOM, FROZEN_ACCELERATION_CLOSES, LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
+import { closesUntilAcceleration, covenantsWithin, creditLimit, maxSafeTermLoan, quoteDraw, quoteTermLoan, termCapacity } from '../src/sim/debt';
 import type { GameState } from '../src/sim/types';
 import { formatRatio } from '../src/ui/format';
 import { nodeOnScreen, open, routeFromCo, watchErrors } from './helpers';
@@ -285,7 +287,7 @@ test('covenant breaches step the stage up to a frozen line, and a payment missed
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
   const toasts = await recordToasts(page);
-  const town = (await state(page)).city.name;
+  const company = (await state(page)).company.name;
   await giveRevenue(page, 40_000, 20_000);
   // Borrow most of what the bank allows, then (test-only) rewrite the months it lent against
   // into a cash-flow history that cannot carry the debt.
@@ -354,7 +356,7 @@ test('covenant breaches step the stage up to a frozen line, and a payment missed
   const over = page.getByRole('dialog', { name: 'Game over' });
   await expect(over).toBeVisible();
   await expect(bank).toBeHidden();
-  await expect(over).toContainText(`${town} has defaulted on its loans.`);
+  await expect(over).toContainText(`${company} has defaulted on its loans.`);
   await expect(page.getByTestId('hud-insolvency')).toHaveText('Game over: loan default');
   expect(errors).toEqual([]);
 });
@@ -387,7 +389,7 @@ test('a quote card shows the cash an order leaves, and the credit line when cash
   expect(errors).toEqual([]);
 });
 
-test('the Bank leads with covenant status, starts the builder at the safe amount and previews a draw\'s covenants', async ({ page }) => {
+test('the Bank leads with covenant status, names the borrower, starts the builder inside the covenant headroom and previews a draw\'s covenants', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
   // Thin cash flow on healthy revenue: the bank lends a lot, but not all of it keeps the covenants.
@@ -406,17 +408,30 @@ test('the Bank leads with covenant status, starts the builder at the safe amount
   await expect(bank.getByTestId('bank-covenant-checks')).toContainText('Leverage');
   await expect(bank.getByTestId('bank-cov-lending-arr')).toHaveText(/^\$[\d,]+\/yr$/);
 
-  // The builder starts at the largest covenant-safe amount, and says so.
+  // The borrower is named in the header.
+  await expect(bank.locator('.sheet-subtitle')).toHaveText(`Borrower: ${s.company.name}`);
+
+  // The builder starts inside the covenant headroom, not on the limits; the exact largest safe amount stays a line.
   const term = bank.getByTestId('bank-term');
   const amountField = term.getByLabel('Term loan amount');
-  await expect(amountField).toHaveValue(String(safe));
+  const start = (years: 5 | 7) => {
+    const inside = maxSafeTermLoan(s, years, BANK_PREFILL_HEADROOM);
+    return inside >= TERM_LOAN_MIN ? inside : TERM_LOAN_MIN;
+  };
+  const start5 = start(5);
+  expect(start5).toBeLessThan(safe);
+  expect(covenantsWithin(quoteTermLoan(s, start5, 5).after, BANK_PREFILL_HEADROOM)).toBe(true);
+  await expect(amountField).toHaveValue(String(start5));
   await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe)} over 5 years.`);
+  await expect(bank.getByTestId('bank-term-prefill')).toHaveText(
+    `The amount starts at ${money(start5)}, leaving the covenants ${Math.round(BANK_PREFILL_HEADROOM * 100)}% inside their limits.`,
+  );
   await expect(bank.getByTestId('bank-term-warning')).toBeHidden();
-  // The 7-year term has its own safe amount, and the builder follows it until the player picks one.
+  // The 7-year term has its own amounts, and the builder follows them until the player picks one.
   const safe7 = maxSafeTermLoan(s, 7);
   expect(safe7).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
   await term.getByRole('radio', { name: '7 years' }).click();
-  await expect(amountField).toHaveValue(String(safe7));
+  await expect(amountField).toHaveValue(String(start(7)));
   await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe7)} over 7 years.`);
   // The presets still reach the whole capacity: the reckless path is one tap away, with the breach warning.
   await term.getByRole('button', { name: /^100% of what you can borrow/ }).click();

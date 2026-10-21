@@ -10,7 +10,13 @@
 // setPricing (with grandfatherMonths), then setPromo if it changed, then
 // setMarketing; the sim validates each and its reason is shown on a rejection.
 //
-// Owner: sim-pricing workstream (round 4; ui-economy before).
+// Round 4b (pricing-balance): "Who signs up" (sales.segmentDemand: each
+// demand segment's take rate and favourite tier, and a warning when no plan
+// suits one), the intro promo's "when it pays" line (sales.quotePromo), and
+// for each running incumbent promo the retention offer's figures
+// (incumbent.quoteRetention) with a button that sends answerIncumbent.
+//
+// Owner: pricing-balance workstream (round 4b; sim-pricing in round 4, ui-economy before).
 
 import {
   GRANDFATHER_MONTHS_DEFAULT,
@@ -20,20 +26,28 @@ import {
   MARKETING_MAX_PER_MONTH,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
+  PROMO_QUOTE_MONTHS,
+  RETENTION_PERCENT_OFF,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
-import { activePromos } from '../sim/incumbent';
+import { activePromos, quoteRetention } from '../sim/incumbent';
 import { getService } from '../sim/network';
 import {
   lockOn,
   marketingBoost,
+  promoDiscountShare,
   promoPrice,
   quotePricing,
+  quotePromo,
+  reservationPrice,
   retireDestination,
+  roughMoney,
+  segmentDemand,
+  SUGGESTED_PROMO,
   TIER_IDS,
   targetTakeRate,
   tierMix,
@@ -41,7 +55,18 @@ import {
   unitsByTier,
 } from '../sim/sales';
 import { cornerName } from '../sim/streets';
-import type { CabinetId, GameState, IntroPromo, ParcelKind, Pricing, PricingQuote, TierId, TierSetting } from '../sim/types';
+import type {
+  CabinetId,
+  DemandSegmentId,
+  GameState,
+  IntroPromo,
+  ParcelKind,
+  Pricing,
+  PricingQuote,
+  RetentionQuote,
+  TierId,
+  TierSetting,
+} from '../sim/types';
 import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { el, setText } from './dom';
@@ -66,8 +91,8 @@ export interface PricingDraft {
   promo: PromoDraft;
 }
 
-/** Where the promo controls start when the game has no promo (a UI suggestion, not a sim rule). */
-export const PROMO_DRAFT_START: Readonly<IntroPromo> = { percentOff: Math.min(20, PROMO_MAX_PERCENT_OFF), months: Math.min(3, PROMO_MAX_MONTHS) };
+/** Where the promo controls start when the game has no promo (a UI suggestion, not a sim rule: sales.SUGGESTED_PROMO, which the advisor's answer weighs too). */
+export const PROMO_DRAFT_START: Readonly<IntroPromo> = SUGGESTED_PROMO;
 
 export interface PricingPreview {
   /** Every field is in range and at least one tier is offered (the sim would accept it). */
@@ -237,6 +262,89 @@ export function promoHint(base: Pricing, draft: PricingDraft, preview: PricingPr
   );
 }
 
+/**
+ * The intro promo's "when it pays" line: sales.quotePromo for the offer the
+ * controls hold (even while switched off, so the player sees when one would
+ * pay; with no valid offer typed, the general advice), its advice sentence
+ * and, for an offer with households waiting, its figures over
+ * PROMO_QUOTE_MONTHS. Empty once the game is over. Pure.
+ */
+export function promoAdviceLine(state: GameState, draft: PricingDraft): string {
+  const typed = inRange(draft.promo.percentOff, 1, PROMO_MAX_PERCENT_OFF) && inRange(draft.promo.months, 1, PROMO_MAX_MONTHS);
+  const offer: IntroPromo | null = typed ? { percentOff: draft.promo.percentOff, months: draft.promo.months } : null;
+  const quote = quotePromo(state, offer);
+  if (!quote.ok) return '';
+  if (offer === null || quote.waitingUnits <= 0) return quote.advice;
+  return (
+    `${quote.advice} ${offer.percentOff}% off for ${plural(offer.months, 'month')}, over the next ${PROMO_QUOTE_MONTHS} months: ` +
+    `${quote.extraSignups < 1 ? 'less than one more signup' : `about ${plural(quote.extraSignups, 'more signup')}`}, ` +
+    `${roughMoney(quote.valueGained)} of margin against ${roughMoney(quote.discountCost)} of discounts.`
+  );
+}
+
+/** The panel's name for each demand segment (balance.DEMAND_SEGMENTS). */
+export const SEGMENT_LABELS: Readonly<Record<DemandSegmentId, string>> = {
+  value: 'Price-sensitive households',
+  mainstream: 'Mainstream households',
+  speed: 'Speed seekers',
+};
+
+/** One "Who signs up" row (segmentRows). */
+export interface SegmentRow {
+  segment: DemandSegmentId;
+  label: string;
+  share: number;
+  /** The segment's target take rate at the draft prices (a household's). */
+  takeRate: number;
+  /** The tier it mostly takes; null when no plan suits it (it does not sign up). */
+  tier: TierId | null;
+  /** "Price-sensitive households (35%): 54% sign up, mostly 500 Mbps", or the warning when no plan suits them. */
+  text: string;
+  /**
+   * When no offered plan is at or under the segment's reservation price:
+   * "Price-sensitive households (35%) won't sign up: no plan at or under
+   * $68" (no plan suits them at all), or "... only 12% sign up: no plan at
+   * or under $68" (the cheapest is a little above it); else null.
+   */
+  warning: string | null;
+}
+
+/**
+ * "Who signs up" at the draft prices and intro promo (sales.segmentDemand
+ * for households against the incumbent's usual price): per segment its
+ * share, take rate and favourite tier, with a warning when the cheapest
+ * offered plan (less the promo's discount share, as the model weighs it) is
+ * above its reservation (sales.reservationPrice): they do not sign up, or
+ * only a few do. Null while the draft's tiers are invalid. Pure.
+ */
+export function segmentRows(base: Pricing, draft: PricingDraft): SegmentRow[] | null {
+  if (tierProblemsOf(base, draft).length > 0) return null;
+  const smbOk = Number.isFinite(draft.smbMultiplier) && draft.smbMultiplier >= SMB_MULTIPLIER_MIN && draft.smbMultiplier <= SMB_MULTIPLIER_MAX;
+  const pricing = pricingFrom(base, draft, smbOk);
+  const promo = promoOk(draft.promo) ? draftPromo(draft) : null;
+  const discount = promoDiscountShare(promo);
+  let cheapest = Infinity;
+  for (const tier of pricing.tiers) if (tier.offered) cheapest = Math.min(cheapest, tier.price - tier.price * discount);
+  return segmentDemand(pricing, 'home', INCUMBENT_PRICE, promo).map((seg) => {
+    const label = SEGMENT_LABELS[seg.segment];
+    const who = `${label} (${formatPercent(seg.share)})`;
+    const tierName = seg.tier === null ? null : (base.tiers.find((t) => t.id === seg.tier)?.name ?? seg.tier);
+    const reservation = reservationPrice(seg.segment);
+    const noPlan = `no plan at or under ${formatMoney(reservation)}`;
+    const warning =
+      seg.tier === null ? `${who} won't sign up: ${noPlan}` : cheapest > reservation ? `${who}: only ${formatPercent(seg.takeRate)} sign up: ${noPlan}` : null;
+    return {
+      segment: seg.segment,
+      label,
+      share: seg.share,
+      takeRate: seg.takeRate,
+      tier: seg.tier,
+      text: warning ?? `${who}: ${formatPercent(seg.takeRate)} sign up, mostly ${tierName}`,
+      warning,
+    };
+  });
+}
+
 /** The verb form that agrees with a count: agree(1, 'pays', 'pay') = 'pays'. */
 function agree(n: number, one: string, many: string): string {
   return n === 1 ? one : many;
@@ -318,6 +426,10 @@ export interface IncumbentRow {
   /** Your households' target take rate on streets that cabinet serves, and where the incumbent runs no promo (draft prices when valid). */
   takeThere: number;
   takeElsewhere: number;
+  /** Round 4b: the retention offer that would answer it (incumbent.quoteRetention at the game's prices). */
+  retention: RetentionQuote;
+  /** Round 4b: already answered with a retention offer (IncumbentPromo.answered). */
+  answered: boolean;
 }
 
 /** The incumbent's promos running today (incumbent.activePromos), ascending cabinet, at the draft's prices and promo when valid. */
@@ -339,8 +451,34 @@ export function incumbentRows(state: GameState, draft: PricingDraft): IncumbentR
       endDay: p.endDay,
       takeThere: targetTakeRate(pricing, 'home', p.price, promo),
       takeElsewhere: elsewhere,
+      retention: quoteRetention(state, p.cabinet),
+      answered: p.answered,
     };
   });
+}
+
+/**
+ * The retention offer under an incumbent promo row: once answered, what its
+ * subscribers pay until when; else the offer's figures (cost, cancellations
+ * avoided, their worth, whether it pays), or why it is not possible.
+ */
+export function retentionLine(row: IncumbentRow): string {
+  const q = row.retention;
+  if (row.answered) return `Answered: its subscribers pay ${RETENTION_PERCENT_OFF}% less until ${formatDate(row.endDay)}, which spares them the promo's extra cancellations.`;
+  if (!q.ok) return `No retention offer: ${q.reasons[0] ?? 'not possible there'}.`;
+  return (
+    `Retention offer: ${q.percentOff}% off for its ${plural(q.units, 'subscriber')} until ${formatDate(row.endDay)} costs about ${roughMoney(q.totalCost)} ` +
+    `(${formatMoney(q.monthlyCost)}/mo) and keeps ${q.cancellationsAvoided < 1 ? 'less than one subscriber' : `about ${plural(q.cancellationsAvoided, 'subscriber')}`} ` +
+    `who would cancel, worth ${roughMoney(q.valueSaved)}: ` +
+    `${q.pays ? 'it pays' : "it doesn't pay"}.`
+  );
+}
+
+/** The "Answer with a retention offer" button for a row: "Answered" once done; disabled, with the reason, when not possible. */
+export function retentionButton(row: IncumbentRow): { label: string; disabled: boolean; reason: string | null } {
+  if (row.answered) return { label: 'Answered', disabled: true, reason: null };
+  if (!row.retention.ok) return { label: 'Answer with a retention offer', disabled: true, reason: row.retention.reasons[0] ?? 'Not possible there' };
+  return { label: 'Answer with a retention offer', disabled: false, reason: null };
 }
 
 /** "Around Elm St & 3rd Ave: cable at $55/mo until Dec 1, 2027. Your target take rate there 38% (elsewhere 49%)." */
@@ -380,6 +518,31 @@ export class PricingPanel {
 
   close(): void {
     this.sheet?.close();
+  }
+
+  /** One running incumbent promo: where, its price, your targets, and the retention offer with its button (answerIncumbent). */
+  private incumbentItem(row: IncumbentRow, refresh: () => void, fail: (message: string) => void): HTMLElement {
+    const state = retentionButton(row);
+    const button = el('button', {
+      class: 'btn retention-answer',
+      text: state.label,
+      attrs: { type: 'button', 'data-cabinet': String(row.cabinet), ...(state.reason ? { title: state.reason } : {}) },
+    });
+    button.disabled = state.disabled;
+    button.addEventListener('click', () => {
+      const result = this.session.dispatch({ type: 'answerIncumbent', cabinet: row.cabinet });
+      if (!result.ok) {
+        fail(`No retention offer sent: ${result.reason}`);
+        return;
+      }
+      this.toasts.show(`Retention offer sent around ${row.place}: ${RETENTION_PERCENT_OFF}% off until ${formatDate(row.endDay)}`, true);
+      refresh();
+    });
+    return el('li', { class: 'incumbent-row', attrs: { 'data-cabinet': String(row.cabinet) } }, [
+      el('span', { class: 'incumbent-line', text: incumbentLine(row) }),
+      el('span', { class: row.answered ? 'retention-line answered' : 'retention-line', text: retentionLine(row) }),
+      button,
+    ]);
   }
 
   open(): void {
@@ -474,6 +637,7 @@ export class PricingPanel {
       'aria-label': 'Intro promo months',
     });
     const promoLine = el('p', { class: 'field-hint promo-hint' });
+    const promoAdvice = el('p', { class: 'field-hint promo-advice', attrs: { 'aria-live': 'polite' } });
     const marketingInput = numberInput(draft.marketingPerMonth, {
       min: '0',
       max: String(MARKETING_MAX_PER_MONTH),
@@ -490,6 +654,10 @@ export class PricingPanel {
       takeRates.set(kind, value);
       preview.append(el('div', { class: 'take-rate' }, [el('dt', { text: label }), el('dd', {}, [value])]));
     }
+
+    // Who signs up: the demand segments.
+    const segmentList = el('ul', { class: 'segment-list' });
+    const segments = el('section', { class: 'preview who-signs-up', attrs: { 'aria-label': 'Who signs up' } }, [el('h3', { text: 'Who signs up' }), segmentList]);
 
     // Today's subscribers: the quote.
     const impactLines = el('ul', { class: 'impact-lines' });
@@ -540,12 +708,14 @@ export class PricingPanel {
         ]),
       ]),
       promoLine,
+      promoAdvice,
       el('div', { class: 'field-row' }, [
         el('label', { class: 'field-label', text: 'Marketing', attrs: { for: 'pricing-marketing' } }),
         el('span', { class: 'money-field' }, [el('span', { text: '$', attrs: { 'aria-hidden': 'true' } }), marketingInput, el('span', { class: 'per', text: '/mo' })]),
       ]),
       boostLine,
       el('section', { class: 'preview', attrs: { 'aria-label': 'Target take rate' } }, [el('h3', { text: 'Target take rate' }), preview]),
+      segments,
       impact,
       incumbent,
       problems,
@@ -580,6 +750,15 @@ export class PricingPanel {
       for (const [kind, value] of takeRates) setText(value, p.takeRate ? formatPercent(p.takeRate[kind]) : '–');
       setText(grandfatherLine, grandfatherHint(now.grandfatherMonths));
       setText(promoLine, promoHint(base, now, p));
+      setText(promoAdvice, promoAdviceLine(game, now));
+      promoAdvice.hidden = promoAdvice.textContent === '';
+      const who = segmentRows(base, now);
+      segments.hidden = who === null;
+      segmentList.replaceChildren(
+        ...(who ?? []).map((row) =>
+          el('li', { class: row.warning ? 'segment-row segment-out' : 'segment-row', text: row.text, attrs: { 'data-segment': row.segment } }),
+        ),
+      );
       setText(boostLine, boostHint(p.boost, now.marketingPerMonth, passings));
 
       const effect = pricingImpact(game, now);
@@ -590,7 +769,8 @@ export class PricingPanel {
 
       const rivals = incumbentRows(game, now);
       incumbent.hidden = rivals.length === 0;
-      incumbentList.replaceChildren(...rivals.map((row) => el('li', { text: incumbentLine(row), attrs: { 'data-cabinet': String(row.cabinet) } })));
+      // fail is declared below; the closure reads it only on a click.
+      incumbentList.replaceChildren(...rivals.map((row) => this.incumbentItem(row, refresh, (message) => fail(message))));
 
       setText(problems, p.problems.join('. '));
       problems.hidden = p.problems.length === 0;

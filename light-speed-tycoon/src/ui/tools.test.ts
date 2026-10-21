@@ -18,9 +18,23 @@ import {
   spanOnSegment,
 } from '../sim/network';
 import { makeGridCity } from '../sim/testing/fixtures';
-import type { Command, CommandResult, GameState } from '../sim/types';
+import type { City, Command, CommandResult, GameState, Zone } from '../sim/types';
+import { exposureBand, segmentExposure } from '../sim/weather';
 import { formatMoney, formatNumber, formatPerFt } from './format';
-import { ToolController, accountAt, cableExposure, cancelRefund, cornerLabel, stormRiskText, wrongSideWarning } from './tools';
+import {
+  ToolController,
+  accountAt,
+  cableExposure,
+  cableQuoteCard,
+  cancelRefund,
+  cornerLabel,
+  daysOutText,
+  EXPOSURE_LABEL,
+  stormRiskLine,
+  stormRiskText,
+  streetExposure,
+  wrongSideWarning,
+} from './tools';
 import type { CardModel } from './tools';
 
 // Grid town: nodes (i, j) at (4i, 2j), id j * 4 + i; the CO is node 0 at (0, 0).
@@ -820,7 +834,7 @@ describe('storms, outages and rebuilds (round 4)', () => {
     expect(tools.click(state, dispatcher(state), 4, 0.1)).toBeNull();
   });
 
-  it('adds the expected storm repairs a year to aerial and underground quotes', () => {
+  it('adds the storm-risk line to aerial and underground quotes: band, repairs a year, days out, and pole rent', () => {
     const state = game();
     const tools = new ToolController();
     const quoteRow = (method: 'aerial' | 'underground') => {
@@ -832,13 +846,86 @@ describe('storms, outages and rebuilds (round 4)', () => {
     };
     const aerial = cableExposure(state, [0, 1], 'aerial');
     const underground = cableExposure(state, [0, 1], 'underground');
-    expect(quoteRow('aerial')).toEqual({ label: 'Storm risk', value: stormRiskText(aerial.repairsPerYear), sub: `+ ${formatMoney(aerial.poleRentPerMonth)}/mo pole rent` });
-    expect(quoteRow('underground')).toEqual({ label: 'Storm risk', value: stormRiskText(underground.repairsPerYear), sub: 'no pole rent' });
+    const aerialRisk = quoteCable(state, [0, 1], 'aerial').stormRisk!;
+    const undergroundRisk = quoteCable(state, [0, 1], 'underground').stormRisk!;
+    const lengthFt = quoteCable(state, [0, 1], 'aerial').lengthFt;
+    expect(quoteRow('aerial')).toEqual({
+      label: 'Storm risk',
+      value: stormRiskLine(aerialRisk, lengthFt),
+      sub: `+ ${formatMoney(aerial.poleRentPerMonth)}/mo pole rent`,
+      ...(aerialRisk.band === 'exposed' ? { tone: 'exposed' } : {}),
+    });
+    expect(quoteRow('underground')).toEqual({ label: 'Storm risk', value: stormRiskLine(undergroundRisk, lengthFt), sub: 'no pole rent' });
+    expect(aerialRisk.repairCostPerYear).toBeCloseTo(aerial.repairsPerYear, 6);
     expect(aerial.repairsPerYear).toBeGreaterThan(underground.repairsPerYear);
     expect(underground.poleRentPerMonth).toBe(0);
     expect(aerial.poleRentPerMonth).toBe((polesOnSegment(state.city.segments[0]!) + polesOnSegment(state.city.segments[1]!)) * POLE_RENT_PER_POLE_PER_MONTH);
     expect(stormRiskText(0.4)).toBe('under $1 a year in repairs');
     expect(stormRiskText(340.4)).toBe(`about ${formatMoney(340)} a year in repairs`);
+  });
+
+  /** The default grid with every street in `zone`, moved `inland` cells in from the map's edges. */
+  function zonedGame(zone: Zone, inland = 0): GameState {
+    const city: City = makeGridCity();
+    for (const seg of city.segments) seg.zone = zone;
+    for (const node of city.nodes) Object.assign(node, { x: node.x + inland, y: node.y + inland });
+    for (const parcel of city.parcels) Object.assign(parcel, { x: parcel.x + inland, y: parcel.y + inland });
+    city.width += 2 * inland;
+    city.height += 2 * inland;
+    return newGame(7, { city });
+  }
+
+  it('words the storm-risk line from CableQuote.stormRisk, toned for exposed aerial cable', () => {
+    // Rural streets on the map's edge: exposed.
+    const rural = zonedGame('rural');
+    const quote = quoteCable(rural, [0, 1], 'aerial');
+    const risk = quote.stormRisk!;
+    expect(risk.band).toBe('exposed');
+    const line = stormRiskLine(risk, quote.lengthFt);
+    expect(line).toBe(`Exposed: about ${formatMoney(risk.repairCostPerYear)} a year in storm repairs, ${daysOutText(risk.outageDaysPerYear)}`);
+    const card = cableQuoteCard('aerial', quote, '', undefined, cableExposure(rural, quote.newSegments, 'aerial'));
+    expect(card.rows.find((r) => r.label === 'Storm risk')).toMatchObject({ value: line, tone: 'exposed' });
+    // Underground on the same streets: dig-ins and washouts, never toned.
+    const ug = quoteCable(rural, [0, 1], 'underground');
+    const ugCard = cableQuoteCard('underground', ug, '', undefined, cableExposure(rural, ug.newSegments, 'underground'));
+    const ugRow = ugCard.rows.find((r) => r.label === 'Storm risk')!;
+    expect(ugRow.value).toBe(`about ${formatMoney(ug.stormRisk!.repairCostPerYear)} a year in dig-in and washout repairs, ${daysOutText(ug.stormRisk!.outageDaysPerYear)}`);
+    expect(ugRow.tone).toBeUndefined();
+    // Downtown, deep inside a big map: sheltered, no tone.
+    const downtown = zonedGame('downtown', 40);
+    const calm = quoteCable(downtown, [0, 1], 'aerial');
+    expect(calm.stormRisk!.band).toBe('sheltered');
+    const calmRow = cableQuoteCard('aerial', calm, '').rows.find((r) => r.label === 'Storm risk')!;
+    expect(calmRow.value).toMatch(/^Sheltered: about \$[\d,]+ a year in storm repairs, /);
+    expect(calmRow.tone).toBeUndefined();
+    expect(calmRow.sub).toBeUndefined();
+    // No new streets, no line.
+    expect(cableQuoteCard('aerial', quoteCable(rural, [], 'aerial'), '').rows.some((r) => r.label === 'Storm risk')).toBe(false);
+  });
+
+  it('says how much of a run is exposed when only part of it is, and rounds the days out', () => {
+    const risk = { method: 'aerial' as const, outagesPerYear: 0.3, repairCostPerYear: 1_234.4, outageDaysPerYear: 1.26, band: 'exposed' as const, exposedFt: 480 };
+    expect(stormRiskLine(risk, 1_200)).toBe(`Exposed (480 ft of it): about ${formatMoney(1_234)} a year in storm repairs, ~1.3 days out`);
+    expect(stormRiskLine(risk, 480)).toBe(`Exposed: about ${formatMoney(1_234)} a year in storm repairs, ~1.3 days out`);
+    expect(stormRiskLine({ ...risk, band: 'moderate', exposedFt: 0, repairCostPerYear: 0.2 }, 480)).toBe('Moderate: under $1 a year in storm repairs, ~1.3 days out');
+    expect(daysOutText(0)).toBe('under 0.1 days out');
+    expect(daysOutText(0.04)).toBe('under 0.1 days out');
+    expect(daysOutText(0.35)).toBe('~0.4 days out');
+    expect(daysOutText(9.94)).toBe('~9.9 days out');
+    expect(daysOutText(12.6)).toBe('~13 days out');
+  });
+
+  it('shows a street\'s storm exposure on the inspect card', () => {
+    const rural = zonedGame('rural');
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    const card = tools.view(rural).card;
+    expect(card?.rows.find((r) => r.label === 'Storm exposure')).toEqual({ label: 'Storm exposure', value: 'Exposed', tone: 'exposed', sub: 'storms hit here more' });
+    const downtown = zonedGame('downtown', 40);
+    tools.hoverAt(42, 40.1);
+    const calm = tools.view(downtown).card;
+    expect(row(calm, 'Storm exposure')).toBe(EXPOSURE_LABEL.sheltered);
+    for (const seg of downtown.city.segments) expect(streetExposure(downtown, seg.id)).toBe(exposureBand(segmentExposure(downtown.city, seg.id)));
   });
 
   it('shows an incumbent promo running in a cabinet’s area', () => {
@@ -849,7 +936,7 @@ describe('storms, outages and rebuilds (round 4)', () => {
     tools.hoverAt(4, 0.05);
     expect(row(tools.view(state).card, 'Incumbent promo')).toBeUndefined();
     // Promos start and end at month closes, which the view's day key follows; here the hover moves instead.
-    state.sales.incumbentPromos = [{ cabinet: cabinet.id, startDay: 0, endDay: 181, price: 55, quietUntil: 362 }];
+    state.sales.incumbentPromos = [{ cabinet: cabinet.id, startDay: 0, endDay: 181, price: 55, quietUntil: 362, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     tools.hoverAt(4, 0.06);
     const promoCard = tools.view(state).card;
     expect(promoCard?.title).toBe('Cabinet');

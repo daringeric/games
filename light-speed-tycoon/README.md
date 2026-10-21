@@ -11,6 +11,8 @@ npm run check      # typecheck + unit tests + production build
 npm run e2e        # Playwright smoke tests against the production build
 ```
 
+A first launch (no saved game) opens the start screen: company name, difficulty (starting cash) and town. Pages with `?debug=1` (every e2e test) skip it and start a Seed-round game at once unless the URL also has `?start=1`; the menu's New game always shows it. `?seed=N` plays that town in an autosave of its own.
+
 ## Layout
 
 ```
@@ -28,14 +30,16 @@ src/
     finance.ts    ledger, monthly close, insolvency
     debt.ts       credit line, term loans, underwriting, pricing, covenants, default,
                   the frozen-line sweep and loan acceleration
-    weather.ts    storms, dig-ins, span outages and repairs
+    weather.ts    storms, dig-ins, span outages and repairs, storm exposure
+    terrain.ts    the grove field the map's trees are drawn from (wooded streets are storm-exposed)
     incumbent.ts  the incumbent cable company's local promos
-    advisor.ts    the month-end briefing and the advisor's ranked suggestions
+    advisor.ts    the month-end briefing and the advisor's ranked suggestions, snoozes and repeats
+    company.ts    the player's company: name rules, suggested names, difficulty levels
     metrics.ts    cost-per-passing bands and report KPIs
     milestones.ts scorecard milestones
     notices.ts    player-facing notices raised by the sim
     game.ts       newGame / applyCommand / tick
-    save.ts       serialize / deserialize, v1 -> v2 -> v3 -> v4 migration
+    save.ts       serialize / deserialize, v1 -> v2 -> v3 -> v4 migration (v4 extended in place in round 4b)
     testing/      fixtures for unit tests (incl. frozen schemaVersion 1, 2 and 3 saves)
     tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes

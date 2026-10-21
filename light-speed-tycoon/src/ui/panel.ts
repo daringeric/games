@@ -6,7 +6,7 @@
 // collapsed to three headline figures; "Details" opens the rest.
 //
 // Owner: ui-economy workstream; financing rows: ui-bank workstream; round-4
-// rows: ui-briefing workstream.
+// rows: ui-briefing workstream; round 4b's outage credits row: pricing-balance workstream.
 
 import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatMonth } from '../sim/calendar';
@@ -29,6 +29,7 @@ export type ReportRowKey =
   | 'repairs'
   | 'passings'
   | 'outages'
+  | 'outageCredits'
   | 'priceChurn'
   | 'tierMoves'
   | 'incumbentPromos'
@@ -191,8 +192,9 @@ export function repairsRow(report: MonthlyReport): ReportRow {
 
 /**
  * Round 4's operating figures (report.ops): outages, price-step and
- * tier-move cancellations, and the incumbent's promos. A report from before
- * round 4 (no ops) reads '–' throughout.
+ * tier-move cancellations, and the incumbent's promos; round 4b: the outage
+ * credits (billing not charged for outage days, quiet when $0). A report
+ * from before round 4 (no ops) reads '–' throughout.
  */
 export function operationsRows(report: MonthlyReport): ReportRow[] {
   const ops = report.ops ?? null;
@@ -206,6 +208,15 @@ export function operationsRows(report: MonthlyReport): ReportRow[] {
       detail: ops ? `${plural(ops.storms, 'storm')}, ${formatNumber(ops.outageChurn)} cancelled` : null,
       hint: 'Subscriber-days without service because a damaged span cut their street off, the storms that hit, and the cancellations the outages caused',
       quiet: !ops || (ops.outageUnitDays === 0 && ops.storms === 0 && ops.outageChurn === 0),
+    },
+    {
+      key: 'outageCredits',
+      label: 'Outage credits',
+      value: ops ? formatMoney(ops.outageCredits ?? 0) : DASH,
+      tone: null,
+      detail: null,
+      hint: 'Billing not charged for the days subscribers had no service because of outages (revenue is already net of it)',
+      quiet: !ops || !(ops.outageCredits > 0),
     },
     {
       key: 'priceChurn',

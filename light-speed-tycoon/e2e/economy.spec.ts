@@ -1,32 +1,20 @@
-// The economy UI end to end: subscribers in the HUD and report, the pricing
-// panel (round 4: grandfathering a rise, the intro promo), insolvency and
-// game over, milestones, the rate card, importing a schemaVersion 1 save, and
-// the debug-hook gate.
+// The economy UI end to end: subscribers in the HUD and report, insolvency
+// and game over, milestones, the rate card, importing a schemaVersion 1 save,
+// and the debug-hook gate. (Round 4b: the pricing panel's tests moved to
+// pricing.spec.ts.)
 //
-// Owner: sim-pricing workstream (round 4; ui-economy before).
+// Owner: start-screen workstream (round 4b: game over and a new game go
+// through the start screen; the HUD shows the company); sim-pricing (round
+// 4) and ui-economy before.
 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
-import {
-  CABINET_START_SPLITTERS,
-  GRANDFATHER_MONTHS_DEFAULT,
-  INCUMBENT_DOWN_MBPS,
-  INCUMBENT_PRICE,
-  INSOLVENCY_GRACE_MONTHS,
-  OLT_START_PON_PORTS,
-  PROMO_MAX_MONTHS,
-  PROMO_MAX_PERCENT_OFF,
-  TIER_DEFAULTS,
-  TIER_PRICE_MAX,
-  TIER_PRICE_MIN,
-} from '../src/sim/balance';
-import { open, routeFromCo, watchErrors } from './helpers';
+import { CABINET_START_SPLITTERS, INSOLVENCY_GRACE_MONTHS, OLT_START_PON_PORTS } from '../src/sim/balance';
+import { defaultCompanyName } from '../src/sim/company';
+import { open, routeFromCo, startCompany, startScreen, watchErrors } from './helpers';
 
-const money = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US')}`;
-const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const moreMonths = (n: number) => `${n} more month${n === 1 ? '' : 's'}`;
 const closes = (n: number) => `${n} close${n === 1 ? '' : 's'}`;
 const speedOf = (page: Page) => page.locator('.speed[aria-pressed="true"]').getAttribute('data-speed');
 
@@ -120,224 +108,6 @@ test('lit homes sign up: subscribers and revenue in the HUD, the report and the 
   expect(errors).toEqual([]);
 });
 
-test('the pricing panel previews and applies prices and marketing, and shows a rejection', async ({ page }) => {
-  const errors = watchErrors(page);
-  await open(page, '/?seed=12345');
-  const toasts = await recordToasts(page);
-  await page.evaluate(() => window.__lst!.setSpeed(0));
-  const pricingButton = page.getByRole('button', { name: 'Pricing' });
-  await pricingButton.click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
-  await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText(`Incumbent cable: ${INCUMBENT_DOWN_MBPS} Mbps for ${money(INCUMBENT_PRICE)}/mo`);
-  for (const tier of TIER_DEFAULTS) await expect(dialog.getByLabel(`${tier.name} price per month`)).toHaveValue(String(tier.price));
-
-  // The preview follows the edits: a cheaper top tier raises the target take rate.
-  const homes = dialog.locator('.take-rate').first().locator('dd');
-  const before = await homes.textContent();
-  const top = TIER_DEFAULTS[TIER_DEFAULTS.length - 1]!;
-  const newPrice = TIER_PRICE_MIN + 5;
-  await dialog.getByLabel(`${top.name} price per month`).fill(String(newPrice));
-  await expect(homes).not.toHaveText(before!);
-
-  // Typing in a field never reaches the map's shortcuts ("2" is the 2x speed key).
-  const marketing = dialog.getByLabel('Marketing budget per month');
-  await marketing.fill('');
-  await marketing.pressSequentially('2500');
-  expect(await speedOf(page)).toBe('0');
-  await expect(dialog.locator('.boost-hint')).not.toBeEmpty();
-
-  await dialog.getByRole('button', { name: 'Apply' }).click();
-  await expect(dialog).toBeHidden();
-  await expect.poll(toasts).toContainEqual(toast('ok', 'Pricing updated'));
-  const sales = await page.evaluate((id) => {
-    const s = window.__lst!.getState().sales;
-    return { price: s.pricing.tiers.find((t) => t.id === id)!.price, marketing: s.marketingPerMonth };
-  }, top.id);
-  expect(sales).toEqual({ price: newPrice, marketing: 2500 });
-
-  // An out-of-range price is refused with the sim's reason, and nothing changes.
-  await pricingButton.click();
-  await expect(dialog.getByLabel(`${top.name} price per month`)).toHaveValue(String(newPrice));
-  const first = TIER_DEFAULTS[0]!;
-  await dialog.getByLabel(`${first.name} price per month`).fill(String(TIER_PRICE_MAX + 1));
-  await expect(dialog.getByLabel(`${first.name} price per month`)).toHaveAttribute('aria-invalid', 'true');
-  await dialog.getByRole('button', { name: 'Apply' }).click();
-  await expect(dialog.getByRole('alert')).toContainText(`${first.name} price must be a whole number`);
-  await expect.poll(toasts).toContainEqual(toast('err', `${first.name} price must be a whole number`));
-  await expect(dialog).toBeVisible();
-  expect(await page.evaluate(() => window.__lst!.getState().sales.pricing.tiers[0]!.price)).toBe(first.price);
-
-  // Esc closes it and hands focus back.
-  await page.keyboard.press('Escape');
-  await expect(dialog).toBeHidden();
-  await expect(pricingButton).toBeFocused();
-  expect(errors).toEqual([]);
-});
-
-/** Light the best two streets out of the CO with a cabinet there, and run `days` days so homes sign up. */
-async function litTownWithSubscribers(page: Page, days: number): Promise<void> {
-  const route = await routeFromCo(page, 2);
-  expect(route, 'a cable route out of the CO').not.toBeNull();
-  const results = await page.evaluate(
-    ({ segments, days }) => {
-      const lst = window.__lst!;
-      const co = lst.getState().city.coNode;
-      const out = [lst.dispatch({ type: 'layCable', segments, method: 'underground' }), lst.dispatch({ type: 'placeCabinet', node: co })];
-      lst.tick(days);
-      return out;
-    },
-    { segments: route!.segments, days },
-  );
-  expect(results.map((r) => r.ok)).toEqual([true, true]);
-}
-
-test('a price rise is grandfathered: the preview says who keeps what until when, and they do', async ({ page }) => {
-  // Headless Chromium draws WebGL in software, so each map redraw is slow here.
-  test.setTimeout(120_000);
-  const errors = watchErrors(page);
-  await open(page, '/?seed=12345');
-  const toasts = await recordToasts(page);
-  await page.evaluate(() => window.__lst!.setSpeed(0));
-  await litTownWithSubscribers(page, 200);
-  const before = await page.evaluate(() => {
-    const s = window.__lst!.getState();
-    const tier = s.sales.pricing.tiers.find((t) => t.id === 'fiber1g')!;
-    const on1g = s.sales.accounts.reduce((n, a) => n + a.tierUnits.fiber1g, 0);
-    return { price: tier.price, name: tier.name, on1g, day: s.day };
-  });
-  expect(before.on1g, 'subscribers on 1 Gig').toBeGreaterThan(0);
-
-  await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
-  await expect(dialog).toBeVisible();
-  const months = dialog.getByLabel('Grandfathering months');
-  await expect(months).toHaveValue(String(GRANDFATHER_MONTHS_DEFAULT));
-  await expect(dialog.locator('.grandfather-hint')).toHaveText(new RegExp(`keep their price for ${GRANDFATHER_MONTHS_DEFAULT} months; 0 = from the next bill`));
-  const impact = dialog.getByRole('region', { name: "Today's subscribers" });
-  await expect(impact).toContainText("No change for today's subscribers.");
-
-  // Raise 1 Gig, grandfathered for 2 months: the preview names who keeps the old price and until when.
-  const raised = before.price + 10;
-  await dialog.getByLabel(`${before.name} price per month`).fill(String(raised));
-  await months.fill('2');
-  await expect(dialog.locator('.grandfather-hint')).toHaveText(/keep their price for 2 months/);
-  const keep = new RegExp(`${before.on1g.toLocaleString('en-US')} subscribers? on ${before.name} keeps? ${escapeRe(money(before.price))}/mo until [A-Z][a-z]{2} 1, \\d{4}, then pays? ${escapeRe(money(raised))}/mo\\.`);
-  await expect(impact.locator('.impact-lines')).toContainText(keep);
-  await expect(impact.getByTestId('pricing-mrr-now')).toHaveText(/^\$[\d,]+\/mo$/);
-  await expect(impact.getByTestId('pricing-mrr-after')).toHaveText(/^\$[\d,]+\/mo$/);
-  await expect(impact.getByTestId('pricing-cancels')).toHaveText(/^~\d+$/);
-  const mrr = await impact.getByTestId('pricing-mrr-now').textContent();
-  const after = await impact.getByTestId('pricing-mrr-after').textContent();
-  const dollars = (t: string | null) => Number((t ?? '').replace(/[^\d]/g, ''));
-  expect(dollars(after)).toBeGreaterThan(dollars(mrr));
-
-  await dialog.getByRole('button', { name: 'Apply' }).click();
-  await expect(dialog).toBeHidden();
-  await expect.poll(toasts).toContainEqual(toast('ok', 'Pricing updated'));
-
-  // Every subscriber on 1 Gig keeps the old price until the close 2 closes after the next one.
-  const locked = await page.evaluate(() => {
-    const s = window.__lst!.getState();
-    return s.sales.accounts.filter((a) => a.tierUnits.fiber1g > 0).map((a) => a.locks.find((l) => l.tier === 'fiber1g') ?? null);
-  });
-  expect(locked.length).toBeGreaterThan(0);
-  const untilDay = locked[0]!.untilDay;
-  for (const lock of locked) expect(lock).toEqual({ tier: 'fiber1g', price: before.price, untilDay, reason: 'grandfather' });
-  // The next close bills them the old price and keeps their locks.
-  await tickToNextClose(page);
-  const mid = await page.evaluate(() => {
-    const s = window.__lst!.getState();
-    return { day: s.day, locks: s.sales.accounts.filter((a) => a.tierUnits.fiber1g > 0 && a.locks.length > 0).length };
-  });
-  expect(mid.day).toBeLessThan(untilDay);
-  expect(mid.locks).toBeGreaterThan(0);
-  // Once their lock's close has passed they pay the new price, and were told.
-  await page.evaluate((until) => {
-    const lst = window.__lst!;
-    while (lst.getState().day < until && !lst.getState().gameOver) lst.tick(1);
-  }, untilDay);
-  const done = await page.evaluate(() => {
-    const s = window.__lst!.getState();
-    return {
-      locks: s.sales.accounts.filter((a) => a.locks.some((l) => l.reason === 'grandfather')).length,
-      stepped: s.notices.filter((n) => n.kind === 'priceStep').map((n) => n.message),
-    };
-  });
-  expect(done.locks).toBe(0);
-  expect(done.stepped.some((m) => /^Prices stepped up for [\d,]+ subscribers? whose grandfathered prices ended/.test(m))).toBe(true);
-  expect(errors).toEqual([]);
-});
-
-test('an intro promo is set from the pricing panel and new signups get it', async ({ page }) => {
-  test.setTimeout(120_000);
-  const errors = watchErrors(page);
-  await page.setViewportSize({ width: 390, height: 844 });
-  await open(page, '/?seed=12345');
-  const toasts = await recordToasts(page);
-  await page.evaluate(() => window.__lst!.setSpeed(0));
-  await page.getByRole('button', { name: 'Got it' }).click();
-  await litTownWithSubscribers(page, 30);
-
-  await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
-  await expect(dialog).toBeVisible();
-  // Fits a phone: one column, nothing wider than the screen.
-  const fits = () =>
-    page.evaluate(() => {
-      const body = document.querySelector<HTMLElement>('dialog.pricing .sheet-body')!;
-      const box = document.querySelector<HTMLElement>('dialog.pricing')!.getBoundingClientRect();
-      return body.scrollWidth <= body.clientWidth && box.left >= 0 && box.right <= window.innerWidth;
-    });
-  expect(await fits()).toBe(true);
-  const toggle = dialog.getByLabel('Intro promo for new subscribers');
-  const percent = dialog.getByLabel('Intro promo percent off');
-  const months = dialog.getByLabel('Intro promo months');
-  await expect(toggle).not.toBeChecked();
-  await expect(percent).toBeDisabled();
-  await expect(dialog.locator('.promo-hint')).toHaveText('No intro promo: new subscribers pay the list price.');
-  const homes = dialog.locator('.take-rate').first().locator('dd');
-  const plainTake = await homes.textContent();
-
-  await toggle.check();
-  await expect(percent).toBeEnabled();
-  // The deepest, longest offer, so its lift shows in the whole-percent take rate.
-  await percent.fill(String(PROMO_MAX_PERCENT_OFF));
-  await months.fill(String(PROMO_MAX_MONTHS));
-  await expect(dialog.locator('.promo-hint')).toContainText(
-    `New subscribers get ${PROMO_MAX_PERCENT_OFF}% off for the rest of their first month and ${moreMonths(PROMO_MAX_MONTHS)}`,
-  );
-  // The offer lifts the target take rate.
-  await expect(homes).not.toHaveText(plainTake!);
-  await percent.scrollIntoViewIfNeeded();
-  expect(await fits()).toBe(true);
-
-  await dialog.getByRole('button', { name: 'Apply' }).click();
-  await expect(dialog).toBeHidden();
-  await expect.poll(toasts).toContainEqual(toast('ok', `intro promo ${PROMO_MAX_PERCENT_OFF}% off for ${PROMO_MAX_MONTHS} month`));
-  const applied = await page.evaluate(() => ({ promo: window.__lst!.getState().sales.promo, day: window.__lst!.getState().day }));
-  expect(applied.promo).toEqual({ percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS });
-
-  // New accounts from here on carry the promo lock.
-  await page.evaluate(() => window.__lst!.tick(60));
-  const fresh = await page.evaluate((day) => {
-    const s = window.__lst!.getState();
-    return s.sales.accounts.filter((a) => a.since > day).map((a) => a.locks.map((l) => l.reason));
-  }, applied.day);
-  expect(fresh.length).toBeGreaterThan(0);
-  for (const reasons of fresh) expect(reasons).toEqual(['promo']);
-
-  // The panel reopens on the promo, and switching it off is applied too.
-  await page.getByRole('button', { name: 'Pricing' }).click();
-  await expect(toggle).toBeChecked();
-  await expect(percent).toHaveValue(String(PROMO_MAX_PERCENT_OFF));
-  await toggle.uncheck();
-  await dialog.getByRole('button', { name: 'Apply' }).click();
-  await expect.poll(toasts).toContainEqual(toast('ok', 'intro promo off'));
-  expect(await page.evaluate(() => window.__lst!.getState().sales.promo)).toBeNull();
-  expect(errors).toEqual([]);
-});
-
 test('running out of cash warns at each close, then ends the game for good', async ({ page }) => {
   test.setTimeout(90_000);
   const errors = watchErrors(page);
@@ -416,7 +186,11 @@ test('a game over can start a new town straight away', async ({ page }) => {
   await expect(over).toBeVisible();
   // No manual save in this browser: nothing to load.
   await expect(over.getByRole('button', { name: 'Load last save' })).toHaveCount(0);
+  // Round 4b: it says which company ended, and a new town starts from the start screen.
+  const ended = await page.evaluate(() => window.__lst!.getState().company.name);
+  await expect(over).toContainText(`${ended} has gone bankrupt.`);
   await over.getByRole('button', { name: 'Start a new town' }).click();
+  await startCompany(page);
   await expect(over).toBeHidden();
   expect(await page.evaluate(() => window.__lst!.getState())).toMatchObject({ day: 0, gameOver: null });
   expect(new URL(page.url()).search).toBe('?debug=1');
@@ -431,14 +205,22 @@ test('a schemaVersion 1 save imports and migrates', async ({ page }) => {
   const v1 = JSON.parse(readFileSync(file, 'utf8')) as { schemaVersion: number; city: { name: string } };
   expect(v1.schemaVersion).toBe(1);
 
+  const current = await page.evaluate(() => window.__lst!.getState().company.name);
   await page.getByRole('button', { name: 'Menu' }).click();
   const chooser = page.waitForEvent('filechooser');
   await page.getByRole('menuitem', { name: /Import/ }).click();
   await (await chooser).setFiles(file);
-  await page.getByRole('dialog').getByRole('button', { name: 'Open imported game' }).click();
-  await expect.poll(toasts).toContainEqual(toast('ok', `Imported ${v1.city.name}`));
+  // Round 4b: the confirm names the company it replaces, and the incoming company and town.
+  const confirm = page.getByRole('dialog', { name: `Replace ${current}?` });
+  const incoming = defaultCompanyName(v1.city.name);
+  await expect(confirm).toContainText(`${incoming} in ${v1.city.name}`);
+  await confirm.getByRole('button', { name: 'Open imported game' }).click();
+  await expect.poll(toasts).toContainEqual(toast('ok', `Imported ${incoming} (${v1.city.name})`));
   expect(await page.evaluate(() => window.__lst!.getState().schemaVersion)).toBe(4);
+  // A save from before company names: the default name, at Seed round.
+  expect(await page.evaluate(() => window.__lst!.getState().company)).toEqual({ name: incoming, difficulty: 'seed' });
   await expect(page.locator('.hud-town')).toHaveText(v1.city.name);
+  await expect(page.getByTestId('hud-company')).toHaveText(incoming);
   // Its reports predate subscribers: their KPIs read "–".
   const panel = page.getByRole('region', { name: 'Monthly report' });
   await expect(panel.locator('.stat-subscribers dd')).toHaveText('–');
@@ -468,6 +250,10 @@ test('a production page without ?debug=1 has no debug hook', async ({ page }) =>
   await expect(page.getByTestId('hud-date')).toHaveText('Jan 1, 2027');
   await expect(page.getByTestId('hud-subs')).toHaveText('0');
   expect(await page.evaluate(() => window.__lst === undefined)).toBe(true);
+  // Round 4b: a first launch (no saved company) opens on the start screen.
+  await expect(startScreen(page)).toBeVisible();
+  await startCompany(page, { name: 'Otter Light & Wire' });
+  await expect(page.getByTestId('hud-company')).toHaveText('Otter Light & Wire');
   // The flag turns it on.
   await page.goto('/?debug=1');
   await page.waitForFunction(() => window.__lst !== undefined);

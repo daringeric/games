@@ -135,6 +135,7 @@ describe('report rows', () => {
       'repairs',
       'passings',
       'outages',
+      'outageCredits',
       'priceChurn',
       'tierMoves',
       'incumbentPromos',
@@ -221,7 +222,7 @@ describe('report rows', () => {
     expect(row(rows, 'passings').value).toBe('12');
     for (const key of ['interest', 'principal', 'proceeds', 'debt', 'leverage', 'coverage'] as const) expect(row(rows, key).value).toBe('–');
     // Round-4 figures read – too, and the panel leaves them out.
-    for (const key of ['repairs', 'outages', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
+    for (const key of ['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
       expect(row(rows, key)).toMatchObject({ value: '–', quiet: true });
     }
   });
@@ -240,6 +241,7 @@ describe('round-4 report rows', () => {
     repairs: 0,
     incumbentPromos: 0,
     mrr: 0,
+    outageCredits: 0,
     ...over,
   });
   const report = (o: OpsStats | undefined, totals: MonthlyReport['totals'] = {}, debt?: DebtStats): MonthlyReport => ({
@@ -261,7 +263,17 @@ describe('round-4 report rows', () => {
     expect(row(rows, 'priceChurn')).toMatchObject({ value: '6', quiet: false });
     expect(row(rows, 'tierMoves')).toMatchObject({ value: '21', quiet: false });
     expect(row(rows, 'incumbentPromos')).toMatchObject({ value: '1', detail: '5 cancelled', quiet: false });
+    expect(row(rows, 'outageCredits')).toMatchObject({ value: '$0', quiet: true });
     for (const r of rows) expect(`${r.value} ${r.detail ?? ''}`).not.toMatch(/NaN|undefined|null|Infinity/);
+  });
+
+  it('shows the outage credits (billing not charged for outage days) right after the outages, quiet when $0', () => {
+    const rows = reportRows(report(ops({ outageUnitDays: 340, storms: 1, outageCredits: 812 })));
+    expect(row(rows, 'outageCredits')).toMatchObject({ label: 'Outage credits', value: formatMoney(812), tone: null, quiet: false });
+    expect(row(rows, 'outageCredits').hint).toMatch(/not charged/);
+    const keys = rows.map((r) => r.key);
+    expect(keys.indexOf('outageCredits')).toBe(keys.indexOf('outages') + 1);
+    expect(row(reportRows(report(ops())), 'outageCredits')).toMatchObject({ value: '$0', quiet: true });
   });
 
   it('reads zero for a quiet round-4 month, and the panel leaves those rows out', () => {
@@ -270,7 +282,7 @@ describe('round-4 report rows', () => {
     expect(row(rows, 'outages')).toMatchObject({ value: '0 sub-days', quiet: true });
     for (const key of ['priceChurn', 'tierMoves', 'incumbentPromos'] as const) expect(row(rows, key)).toMatchObject({ value: '0', quiet: true });
     // Rows from before round 4 never go quiet.
-    for (const r of rows) if (!['repairs', 'outages', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'].includes(r.key)) expect(r.quiet).toBeUndefined();
+    for (const r of rows) if (!['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'].includes(r.key)) expect(r.quiet).toBeUndefined();
   });
 
   it('shows the frozen line’s sweep, or – on a report from before round 4', () => {

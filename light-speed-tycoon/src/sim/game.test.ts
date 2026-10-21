@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_DIFFICULTY,
+  DIFFICULTY_LEVELS,
   GRANDFATHER_MONTHS_MAX,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
@@ -20,12 +22,15 @@ import {
   STORM_START_DAY,
   TERM_LOAN_MIN,
 } from './balance';
+import { newAdvisorState } from './advisor';
 import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
+import { COMPANY_NAME_MAX, defaultCompanyName } from './company';
 import { newDebt, rateOf } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng, withRng } from './rng';
+import { hashState } from './save';
 import { defaultPricing, newSales, stepSales } from './sales';
 import { addLivePlant, makeGridCity, noDebtStats, quietOpsStats } from './testing/fixtures';
 import { newWeather } from './weather';
@@ -46,6 +51,77 @@ function closedOn(report: MonthlyReport): number {
   return dayOf({ year: report.year, month: report.month, day: 1 }) + (MONTH_LENGTHS[report.month - 1] as number);
 }
 
+describe('newGame: company and difficulty (round 4b)', () => {
+  it('starts every difficulty with its own starting cash and nothing else different', () => {
+    const city = makeGridCity();
+    const base = newGame(42, { city });
+    expect(base.company).toEqual({ name: defaultCompanyName(city.name), difficulty: DEFAULT_DIFFICULTY });
+    expect(base.finance.cash).toBe(START_CASH);
+    for (const level of DIFFICULTY_LEVELS) {
+      const state = newGame(42, { city, difficulty: level.id });
+      expect(state.company.difficulty).toBe(level.id);
+      expect(state.finance.cash).toBe(level.startCash);
+      // Only the cash (and the difficulty on record) differ: the same seed replays the same town and streams.
+      expect({ ...state, company: base.company, finance: { ...state.finance, cash: START_CASH } }).toEqual(base);
+    }
+  });
+
+  it('lists four levels, easiest first, with Seed round at START_CASH', () => {
+    expect(DIFFICULTY_LEVELS.map((l) => l.id)).toEqual(['angel', 'seed', 'bootstrapped', 'shoestring']);
+    expect(DIFFICULTY_LEVELS.find((l) => l.id === DEFAULT_DIFFICULTY)?.startCash).toBe(START_CASH);
+    for (let i = 1; i < DIFFICULTY_LEVELS.length; i++) {
+      expect(DIFFICULTY_LEVELS[i]!.startCash).toBeLessThan(DIFFICULTY_LEVELS[i - 1]!.startCash);
+    }
+  });
+
+  it('keeps the chosen company name, normalized', () => {
+    const state = newGame(42, { city: makeGridCity(), companyName: '  Otter   Junction Fiber ' });
+    expect(state.company.name).toBe('Otter Junction Fiber');
+  });
+
+  it('refuses a bad name or an unknown difficulty', () => {
+    const city = makeGridCity();
+    expect(() => newGame(42, { city, companyName: '   ' })).toThrow(RangeError);
+    expect(() => newGame(42, { city, companyName: 'x'.repeat(COMPANY_NAME_MAX + 1) })).toThrow(RangeError);
+    expect(() => newGame(42, { city, difficulty: 'nightmare' as never })).toThrow(RangeError);
+  });
+
+  it('replays one seed and difficulty identically', () => {
+    const run = () => {
+      const state = newGame(9, { city: makeGridCity(), difficulty: 'shoestring', companyName: 'Wren Light & Wire' });
+      applyCommand(state, { type: 'placeCabinet', node: 0 });
+      applyCommand(state, { type: 'layCable', segments: [0, 1], method: 'aerial' });
+      runDays(state, 120);
+      return hashState(state);
+    };
+    expect(run()).toBe(run());
+  });
+});
+
+describe('round 4b commands: field types', () => {
+  it('rejects malformed answerIncumbent, snoozeAdvice and noteAdviceShown without touching the game', () => {
+    const state = game();
+    const before = JSON.stringify(state);
+    const bad: unknown[] = [
+      { type: 'answerIncumbent' },
+      { type: 'answerIncumbent', cabinet: '1' },
+      { type: 'snoozeAdvice' },
+      { type: 'snoozeAdvice', key: 7 },
+      { type: 'noteAdviceShown' },
+      { type: 'noteAdviceShown', keys: 'expand' },
+      { type: 'noteAdviceShown', keys: [1] },
+    ];
+    for (const cmd of bad) expect(applyCommand(state, cmd as Command).ok).toBe(false);
+    expect(JSON.stringify(state)).toBe(before);
+  });
+
+  it('records the suggestions a briefing showed, for free', () => {
+    const state = game();
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: ['expand:node:3', 'cashRunway'] })).toEqual({ ok: true, cost: 0 });
+    expect(state.advisor.shown.map((e) => e.key)).toEqual(['cashRunway', 'expand:node:3']);
+  });
+});
+
 describe('newGame', () => {
   it('starts a fresh game on the given city', () => {
     const city = makeGridCity();
@@ -53,6 +129,7 @@ describe('newGame', () => {
     expect(state).toEqual({
       schemaVersion: 4,
       seed: 42,
+      company: { name: defaultCompanyName(city.name), difficulty: DEFAULT_DIFFICULTY },
       day: 0,
       rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales'), weather: deriveSeed(42, 'weather') },
       nextId: 1,
@@ -68,6 +145,7 @@ describe('newGame', () => {
       debt: newDebt(),
       sales: newSales(),
       weather: newWeather(),
+      advisor: newAdvisorState(),
       milestones: [],
       notices: [],
       nextNoticeId: 1,

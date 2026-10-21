@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  DIFFICULTY_LEVELS,
   CPP_AMBER_MULTIPLIER,
   CPP_TARGET,
   INSOLVENCY_GRACE_MONTHS,
@@ -18,14 +19,15 @@ import {
   PENALTY_STEP_UP_BPS,
 } from '../sim/balance';
 import { acceleratedSchedule, cureOptions, totalDebt } from '../sim/debt';
-import { runDays } from '../sim/game';
+import { defaultCompanyName } from '../sim/company';
+import { newGame, runDays } from '../sim/game';
 import { cppBand, operatingCashFlow, reportKpis } from '../sim/metrics';
 import { getService } from '../sim/network';
 import { addLivePlant, makeGridCity, makeTestState, makeTradingState } from '../sim/testing/fixtures';
 import type { GameState, TermLoan } from '../sim/types';
 import { cureAdvice } from './bankPanel';
 import { formatBpsDelta, formatMoney, formatPercent, formatRatio, plural } from './format';
-import { MRR_TIP, calledChipText, covenantStatus, cppStatus, debtStatus, frozenChipText, overdraftStatus, ponStatus, runwayHint } from './hud';
+import { MRR_TIP, calledChipText, covenantStatus, cppStatus, debtStatus, frozenChipText, hudIdentity, overdraftStatus, ponStatus, runwayHint } from './hud';
 
 /** A grid town fully lit from the CO with plenty of ports, run long enough to have subscribers and closed months. */
 function litGame(days = 120): GameState {
@@ -205,5 +207,26 @@ describe('HUD chips, round 4', () => {
     expect(MRR_TIP).toMatch(/^MRR \(monthly run-rate\)/);
     expect(MRR_TIP).toContain('lending ARR');
     expect(MRR_TIP).not.toMatch(/annual recurring revenue/i);
+  });
+});
+
+describe('HUD company label, round 4b', () => {
+  it('shows the company first and the town second, with the difficulty in the tooltip', () => {
+    const level = DIFFICULTY_LEVELS.find((l) => l.id === 'bootstrapped')!;
+    const state = newGame(9, { difficulty: level.id, companyName: 'Heron Broadband Co-op' });
+    const who = hudIdentity(state);
+    expect(who.company).toBe('Heron Broadband Co-op');
+    expect(who.town).toBe(state.city.name);
+    expect(who.tip).toContain('Heron Broadband Co-op');
+    expect(who.tip).toContain(state.city.name);
+    expect(who.tip).toContain(level.name);
+    expect(who.tip).toContain(formatMoney(level.startCash));
+  });
+
+  it('names a game started without a name after its town, at Seed round', () => {
+    const state = newGame(9);
+    const seed = DIFFICULTY_LEVELS.find((l) => l.id === 'seed')!;
+    expect(hudIdentity(state)).toMatchObject({ company: defaultCompanyName(state.city.name), town: state.city.name });
+    expect(hudIdentity(state).tip).toContain(seed.name);
   });
 });

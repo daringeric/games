@@ -2,10 +2,13 @@
 // the period at a glance and the advisor's suggestions; Continue (or Esc, or
 // the backdrop) resumes the speed the player had; the frequency setting and
 // its persistence; Show me moving the map or opening a panel; the phone
-// layout. Debug pages start with briefings off, so every test here opens with
-// ?briefing=... (helpers.openWithBriefings).
+// layout. Round 4b: glance first (Continue and the first card in view at
+// 1280x800, the details folded away, the frequency at the top), snoozing a
+// card (gone, "1 snoozed", still snoozed after a reload) and recording what a
+// close-time briefing showed. Debug pages start with briefings off, so every
+// test here opens with ?briefing=... (helpers.openWithBriefings).
 //
-// Owner: ui-briefing workstream.
+// Owner: ui-briefing workstream (round 4b: briefing-advisor-polish).
 
 import { expect, test } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
@@ -23,6 +26,15 @@ const briefingOpen = (page: Page) => page.evaluate(() => window.__lst!.briefingO
 const pressedSpeed = (page: Page) => page.locator('.speed[aria-pressed="true"]');
 const briefingSheet = (page: Page) => page.locator('dialog.briefing');
 const continueButton = (sheet: Locator) => sheet.getByRole('button', { name: 'Continue', exact: true });
+const frequencySelect = (sheet: Locator) => sheet.getByRole('combobox', { name: 'Show this briefing' });
+/** Price 1 Gig 30% over the market (test-only state through a real command): the advisor's pricing tip fires at every close. */
+const overprice = (page: Page) =>
+  page.evaluate(() => {
+    const lst = window.__lst!;
+    const pricing = lst.getState().sales.pricing;
+    const tiers = pricing.tiers.map((t) => ({ id: t.id, price: t.id === 'fiber1g' ? Math.round(t.price * 1.3) : t.price, offered: t.offered }));
+    return lst.dispatch({ type: 'setPricing', tiers, smbMultiplier: pricing.smbMultiplier, grandfatherMonths: 0 }).ok;
+  });
 
 async function dismissHint(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Got it' }).click();
@@ -44,17 +56,18 @@ test('a month close pauses the game on the briefing; Continue resumes the speed 
   // No month-closed toast behind it: the briefing says it all.
   await expect(page.locator('.toast').filter({ hasText: 'Jan 2027 closed' })).toHaveCount(0);
 
-  // At a glance first, then the advisor, what changed, notices, money and the look ahead, and the frequency.
+  // At a glance first, then the advisor; the money, the notices and the look ahead folded away, closed.
   await expect(sheet.locator('.briefing-tile')).toHaveCount(7);
-  await expect(sheet.locator('.briefing-section > h3')).toHaveText([
-    'The month at a glance',
-    'Advisor',
-    'What changed',
-    'This month’s notices',
-    'Money in and out',
-    'Looking ahead',
-  ]);
-  await expect(sheet.getByRole('radio', { name: 'Every month' })).toBeChecked();
+  await expect(sheet.locator('.briefing-section h3')).toHaveText(['The month at a glance', 'Advisor']);
+  await expect(sheet.locator('details.briefing-details > summary')).toHaveText(['Money in and out', /^This month’s notices \(\d+\)$/, 'Looking ahead']);
+  for (const details of await sheet.locator('details.briefing-details').all()) await expect(details).not.toHaveAttribute('open');
+  // The details open on a click, and hold what they did before.
+  await sheet.locator('details.briefing-money > summary').click();
+  await expect(sheet.locator('details.briefing-money')).toHaveAttribute('open');
+  await expect(sheet.locator('.briefing-money-net')).toBeVisible();
+  // The frequency is a compact control at the top, in the header.
+  await expect(frequencySelect(sheet)).toHaveValue('monthly');
+  await expect(sheet.locator('.sheet-head').getByRole('combobox', { name: 'Show this briefing' })).toHaveCount(1);
 
   // Paused: the day does not move while it shows.
   await page.waitForTimeout(1200);
@@ -106,8 +119,8 @@ test('every quarter: nothing at the Jan and Feb closes, the quarter at the Mar c
   await tick(page, 31);
   const sheet = page.getByRole('dialog', { name: 'Jan–Mar 2027 briefing' });
   await expect(sheet).toBeVisible();
-  await expect(sheet.locator('.briefing-section > h3').first()).toHaveText('The quarter at a glance');
-  await expect(sheet.getByRole('radio', { name: 'Every quarter' })).toBeChecked();
+  await expect(sheet.locator('.briefing-section h3').first()).toHaveText('The quarter at a glance');
+  await expect(frequencySelect(sheet)).toHaveValue('quarterly');
   expect(errors).toEqual([]);
 });
 
@@ -127,8 +140,9 @@ test('only when something needs attention: quiet closes pass, an overdrawn close
   const sheet = page.getByRole('dialog', { name: 'February 2027 briefing' });
   await expect(sheet).toBeVisible();
   await expect(sheet).toHaveClass(/briefing-attention/);
-  await expect(sheet.getByRole('radio', { name: 'Only when something needs attention' })).toBeChecked();
-  // The notice is in the briefing, not toasted behind it.
+  await expect(frequencySelect(sheet)).toHaveValue('attention');
+  // The notice is in the briefing, not toasted behind it: surfaced in the glance, and in the full list folded below.
+  await expect(sheet.locator('.briefing-alert').filter({ hasText: message!.slice(0, 40) })).toBeVisible();
   await expect(sheet.locator('.briefing-notice').filter({ hasText: message!.slice(0, 40) })).toHaveCount(1);
   await expect(page.locator('.toast').filter({ hasText: message!.slice(0, 40) })).toHaveCount(0);
   expect(errors).toEqual([]);
@@ -140,7 +154,7 @@ test('the frequency chosen on the sheet persists across a reload', async ({ page
   await tick(page, 31);
   const sheet = briefingSheet(page);
   await expect(sheet).toBeVisible();
-  await sheet.getByRole('radio', { name: 'Every quarter' }).check();
+  await frequencySelect(sheet).selectOption('quarterly');
   expect(await page.evaluate(() => localStorage.getItem('lst:briefing'))).toBe('quarterly');
   await continueButton(sheet).click();
   await expect(sheet).toBeHidden();
@@ -154,7 +168,7 @@ test('the frequency chosen on the sheet persists across a reload', async ({ page
   await tick(page, 31);
   const quarter = page.getByRole('dialog', { name: 'Jan–Mar 2027 briefing' });
   await expect(quarter).toBeVisible();
-  await expect(quarter.getByRole('radio', { name: 'Every quarter' })).toBeChecked();
+  await expect(frequencySelect(quarter)).toHaveValue('quarterly');
   expect(errors).toEqual([]);
 });
 
@@ -313,18 +327,28 @@ test.describe('on a phone', () => {
     // The tiles wrap: no more than two side by side at phone width.
     expect(layout.columns).toBeLessThanOrEqual(2);
 
+    // One column: every section starts at the same left edge.
+    const lefts = await sheet.locator('.sheet-body > *').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().left)));
+    expect(new Set(lefts).size).toBe(1);
+
     const go = continueButton(sheet);
     await expect(go).toBeInViewport();
     await expect(go).toBeFocused();
     const size = await go.boundingBox();
     expect(size!.height).toBeGreaterThanOrEqual(44);
-    for (const button of await sheet.locator('.briefing-show, .briefing-choice').all()) {
+    for (const button of await sheet.locator('.briefing-show, .briefing-snooze, .briefing-summary, .briefing-frequency-select').all()) {
       expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
     }
 
-    // Shift+Tab walks back from Continue through the frequency choice to the advisor's button.
+    // Shift+Tab walks back from Continue through the folded details to the last card's buttons.
     await page.keyboard.press('Shift+Tab');
-    await expect(sheet.getByRole('radio', { name: 'Every month' })).toBeFocused();
+    await expect(sheet.locator('details.briefing-forward > summary')).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(sheet.locator('details.briefing-notices > summary')).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(sheet.locator('details.briefing-money > summary')).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(sheet.locator('.briefing-snooze').last()).toBeFocused();
     await page.keyboard.press('Shift+Tab');
     await expect(sheet.locator('.briefing-show').last()).toBeFocused();
     // The body scrolled the focused button into view.
@@ -332,6 +356,107 @@ test.describe('on a phone', () => {
 
     await go.tap();
     await expect(sheet).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+});
+
+test('snoozing a card hides it, shows "1 snoozed", and the snooze survives a reload to the next close', async ({ page }) => {
+  test.setTimeout(90_000);
+  const errors = watchErrors(page);
+  await openWithBriefings(page, SEED);
+  await dismissHint(page);
+  expect(await overprice(page)).toBe(true);
+  await tick(page, 31);
+  const sheet = page.getByRole('dialog', { name: 'January 2027 briefing' });
+  await expect(sheet).toBeVisible();
+  const card = sheet.locator('.briefing-card[data-key="pricing:fiber1g"]');
+  await expect(card).toHaveCount(1);
+  await expect(sheet.locator('.briefing-snoozed')).toHaveCount(0);
+  // The close-time briefing recorded what it showed.
+  const shown = await page.evaluate(() => window.__lst!.getState().advisor.shown.map((e) => ({ key: e.key, lastDay: e.lastDay })));
+  expect(shown).toContainEqual({ key: 'pricing:fiber1g', lastDay: 31 });
+  const cards = await sheet.locator('.briefing-card').count();
+
+  // The button says how long; snoozing re-renders in place.
+  const snooze = card.getByRole('button', { name: /^Snooze 3 months: / });
+  await expect(snooze).toHaveText('Snooze 3 months');
+  await snooze.click();
+  await expect(sheet).toBeVisible();
+  await expect(card).toHaveCount(0);
+  await expect(sheet.locator('.briefing-snoozed')).toHaveText('1 snoozed suggestion');
+  await expect(sheet.locator('.briefing-card')).toHaveCount(cards - 1);
+  // Focus stays in the advisor: on the card that took its place, else the heading.
+  const focusedInAdvisor = await page.evaluate(() => document.activeElement?.closest('.briefing-advisor') !== null);
+  expect(focusedInAdvisor).toBe(true);
+  expect(await page.evaluate(() => window.__lst!.getState().advisor.snoozes.map((x) => x.key))).toEqual(['pricing:fiber1g']);
+  await continueButton(sheet).click();
+  await expect(sheet).toBeHidden();
+
+  // Reopened from the menu later in the month: still hidden, and nothing more recorded.
+  await tick(page, 3);
+  await page.getByRole('button', { name: 'Menu' }).click();
+  await page.getByRole('menuitem', { name: /Latest briefing/ }).click();
+  await expect(sheet).toBeVisible();
+  await expect(sheet.locator('.briefing-card[data-key="pricing:fiber1g"]')).toHaveCount(0);
+  await expect(sheet.locator('.briefing-snoozed')).toHaveText('1 snoozed suggestion');
+  expect(await page.evaluate(() => Math.max(...window.__lst!.getState().advisor.shown.map((e) => e.lastDay)))).toBe(31);
+  await continueButton(sheet).click();
+
+  // The next close autosaves with the snooze; reload and play to the close after it: still snoozed.
+  await tick(page, 25);
+  const feb = page.getByRole('dialog', { name: 'February 2027 briefing' });
+  await expect(feb).toBeVisible();
+  await expect(feb.locator('.briefing-card[data-key="pricing:fiber1g"]')).toHaveCount(0);
+  await continueButton(feb).click();
+  await page.reload();
+  await page.waitForFunction(() => window.__lst !== undefined);
+  expect(await day(page)).toBe(59);
+  expect(await page.evaluate(() => window.__lst!.getState().advisor.snoozes.map((x) => x.key))).toEqual(['pricing:fiber1g']);
+  await tick(page, 31);
+  const mar = page.getByRole('dialog', { name: 'March 2027 briefing' });
+  await expect(mar).toBeVisible();
+  await expect(mar.locator('.briefing-card[data-key="pricing:fiber1g"]')).toHaveCount(0);
+  await expect(mar.locator('.briefing-snoozed')).toHaveText('1 snoozed suggestion');
+  expect(errors).toEqual([]);
+});
+
+test.describe('on a desktop screen', () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test('glance first: Continue and the first advice card are in view without scrolling, the frequency at the top', async ({ page }) => {
+    const errors = watchErrors(page);
+    await openWithBriefings(page, SEED);
+    await dismissHint(page);
+    expect(await overprice(page)).toBe(true);
+    await tick(page, 31);
+    const sheet = briefingSheet(page);
+    await expect(sheet).toBeVisible();
+    await expect(sheet.locator('.briefing-card')).not.toHaveCount(0);
+    const layout = await page.evaluate(() => {
+      const dialog = document.querySelector<HTMLElement>('dialog.briefing')!;
+      const body = dialog.querySelector<HTMLElement>('.sheet-body')!;
+      const card = dialog.querySelector<HTMLElement>('.briefing-card')!.getBoundingClientRect();
+      const view = body.getBoundingClientRect();
+      const go = dialog.querySelector<HTMLElement>('.briefing-continue')!.getBoundingClientRect();
+      const select = dialog.querySelector<HTMLElement>('.briefing-frequency-select')!.getBoundingClientRect();
+      const glance = dialog.querySelector<HTMLElement>('.briefing-glance')!.getBoundingClientRect();
+      return {
+        scrollTop: body.scrollTop,
+        cardInBody: card.top >= view.top - 1 && card.bottom <= view.bottom + 1,
+        continueOnScreen: go.top >= 0 && go.bottom <= window.innerHeight,
+        frequencyFirst: select.bottom <= glance.top,
+      };
+    });
+    expect(layout.scrollTop).toBe(0);
+    expect(layout.cardInBody).toBe(true);
+    expect(layout.continueOnScreen).toBe(true);
+    expect(layout.frequencyFirst).toBe(true);
+    await expect(continueButton(sheet)).toBeInViewport();
+    await expect(sheet.locator('.briefing-card').first()).toBeInViewport({ ratio: 1 });
+    // The company name leads the subtitle.
+    const company = await page.evaluate(() => window.__lst!.getState().company.name);
+    await expect(sheet.locator('.sheet-subtitle')).toContainText(`${company} · game paused.`);
+    expect((await sheet.locator('.sheet-subtitle').textContent())!.startsWith(`${company} · `)).toBe(true);
     expect(errors).toEqual([]);
   });
 });

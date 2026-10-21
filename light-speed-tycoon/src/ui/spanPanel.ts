@@ -1,9 +1,10 @@
 // The span panel, opened by clicking a live cable span with the inspect tool:
-// what the span is and what it cost, whether it is out of service or being
-// rebuilt, the storms that hit it, its expected storm repairs as aerial and
-// as underground plant, its pole rent, and for aerial spans the button that
-// rebuilds it underground (convertSpan) at quoteConvert's price, with the
-// reasons when it cannot. A non-modal dialog like the OLT panel: the map
+// what the span is and what it cost, how exposed its street is to storms
+// (round 4b), whether it is out of service or being rebuilt, the storms that
+// hit it, its expected storm repairs as aerial and as underground plant, its
+// pole rent, and for aerial spans the button that rebuilds it underground
+// (convertSpan) at quoteConvert's price (with the street's exposure), with
+// the reasons when it cannot. A non-modal dialog like the OLT panel: the map
 // keeps running behind it; Esc, a map press (routed by MapControls) or the
 // close button shuts it.
 //
@@ -19,7 +20,7 @@ import { el, icon, setText } from './dom';
 import { cashAfterRow, creditHint, fundsOf } from './funding';
 import { METHOD_LABEL, formatDayRange, formatFeet, formatMoney, formatStage, plural } from './format';
 import { ICONS } from './icons';
-import { outageText, rebuildText, spanPoleRent, stormRiskText } from './tools';
+import { EXPOSURE_LABEL, exposureRow, outageText, rebuildText, spanPoleRent, stormRiskText } from './tools';
 import type { CardRow } from './tools';
 
 /** One storm that hit the span (newest first). */
@@ -127,6 +128,7 @@ export function spanPanelModel(state: GameState, spanId: SpanId): SpanPanelModel
     span.method === 'aerial'
       ? { label: 'Pole rent', value: `${formatMoney(spanPoleRent(state, span))}/mo`, sub: plural(poles, 'pole') }
       : { label: 'Pole rent', value: 'None', tone: 'muted' },
+    exposureRow(state, segment.id),
   ];
 
   const status: SpanPanelModel['status'] = [];
@@ -150,6 +152,11 @@ export function spanPanelModel(state: GameState, spanId: SpanId): SpanPanelModel
         { label: 'Build', value: plural(quote.constructDays, 'day') },
         { label: 'Pole rent saved', value: `${formatMoney(quote.poleRentSaved)}/mo` },
         { label: 'Repairs avoided', value: quote.repairsAvoidedPerYear > 0 ? `about ${formatMoney(quote.repairsAvoidedPerYear)} a year` : 'little', sub: 'expected' },
+        {
+          label: 'Street exposure',
+          value: EXPOSURE_LABEL[quote.exposure],
+          ...(quote.exposure === 'exposed' ? { tone: 'exposed' as const, sub: 'where burying pays most' } : {}),
+        },
         cashAfterRow(funds, quote.cost),
       ],
       credit: quote.ok ? undefined : creditHint(funds, quote.cost),

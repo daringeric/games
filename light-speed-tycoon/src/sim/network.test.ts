@@ -53,6 +53,7 @@ import {
   ponPortsUsed,
   quoteCabinet,
   quoteCable,
+  cableStormRisk,
   quoteConvert,
   quoteOltCard,
   quoteRemoveCabinet,
@@ -67,9 +68,9 @@ import {
 } from './network';
 import { Rng } from './rng';
 import { polesOnSegment, shortestPath } from './streets';
-import { makeGridCity, makeTestState } from './testing/fixtures';
+import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
 import type { BuildStage, CableMethod, City, CommandResult, GameState, SegmentId, StreetSegment } from './types';
-import { stormRisk } from './weather';
+import { exposureBand, segmentExposure, stormRisk } from './weather';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
 // Horizontal segment (i, j) = j * 3 + i (240 ft, "1st St".."3rd St");
@@ -1942,5 +1943,90 @@ describe('convertSpan', () => {
     expect(removeSpan(state, span)).toEqual({ ok: true, cost: 0 });
     expect(state.network.spans).toEqual([]);
     expect(state.finance.cash).toBe(cash);
+  });
+});
+
+describe('cable quotes: storm risk (round 4b)', () => {
+  it('sums weather.stormRisk over the new segments and names the most exposed band', () => {
+    const state = makeTestState(makeGridCity());
+    const segments = [0, 1];
+    for (const method of ['aerial', 'underground'] as const) {
+      const quote = quoteCable(state, segments, method);
+      const risk = quote.stormRisk;
+      expect(risk).not.toBeNull();
+      let repairs = 0;
+      let outages = 0;
+      let days = 0;
+      let exposedFt = 0;
+      for (const id of quote.newSegments) {
+        const segment = state.city.segments[id]!;
+        const r = stormRisk(state, segment, method);
+        repairs += r.repairCostPerYear;
+        outages += r.outagesPerYear;
+        days += r.outageDaysPerYear;
+        if (exposureBand(segmentExposure(state.city, id)) === 'exposed') exposedFt += segment.lengthFt;
+      }
+      expect(risk).toMatchObject({ method, exposedFt });
+      expect(risk!.repairCostPerYear).toBeCloseTo(repairs, 6);
+      expect(risk!.outagesPerYear).toBeCloseTo(outages, 9);
+      expect(risk!.outageDaysPerYear).toBeCloseTo(days, 9);
+      expect(cableStormRisk(state, quote.newSegments, method)).toEqual(risk);
+    }
+    expect(quoteCable(state, [], 'aerial').stormRisk).toBeNull();
+  });
+
+  it('a rebuild quote names the street\'s exposure band', () => {
+    const state = makeTestState(makeGridCity());
+    addLivePlant(state, { segments: [0] });
+    const span = state.network.spans[0]!;
+    span.method = 'aerial';
+    expect(quoteConvert(state, span.id).exposure).toBe(exposureBand(segmentExposure(state.city, span.segment)));
+  });
+});
+
+describe('cable quotes: storm exposure (round 4b, storms-balance)', () => {
+  /** The default grid with every street in `zone`, moved `inland` cells in from every map edge. */
+  function zonedState(zone: 'rural' | 'downtown', inland: number): GameState {
+    const city = makeGridCity();
+    for (const segment of city.segments) segment.zone = zone;
+    for (const node of city.nodes) {
+      node.x += inland;
+      node.y += inland;
+    }
+    for (const parcel of city.parcels) {
+      parcel.x += inland;
+      parcel.y += inland;
+    }
+    city.width += 2 * inland;
+    city.height += 2 * inland;
+    return makeTestState(city);
+  }
+
+  it('names an exposed rural run exposed, with its feet, and a sheltered downtown run sheltered', () => {
+    const rural = zonedState('rural', 0);
+    const exposed = quoteCable(rural, [0, 1, 2], 'aerial').stormRisk!;
+    expect(exposed.band).toBe('exposed');
+    expect(exposed.exposedFt).toBe([0, 1, 2].reduce((ft, id) => ft + rural.city.segments[id]!.lengthFt, 0));
+    const downtown = zonedState('downtown', 40);
+    const sheltered = quoteCable(downtown, [0, 1, 2], 'aerial').stormRisk!;
+    expect(sheltered.band).toBe('sheltered');
+    expect(sheltered.exposedFt).toBe(0);
+  });
+
+  it('expects more storm repairs a year on exposed aerial plant than on the same run sheltered, and burying it saves more there', () => {
+    const rural = zonedState('rural', 0);
+    const downtown = zonedState('rural', 0);
+    for (const segment of downtown.city.segments) segment.zone = 'downtown';
+    const risk = (state: GameState) => quoteCable(state, [0, 1, 2], 'aerial').stormRisk!.repairCostPerYear;
+    expect(risk(rural)).toBeGreaterThan(1.5 * risk(downtown));
+    for (const state of [rural, downtown]) {
+      addLivePlant(state, { segments: [0] });
+      state.network.spans[0]!.method = 'aerial';
+    }
+    expect(quoteConvert(rural, rural.network.spans[0]!.id).repairsAvoidedPerYear).toBeGreaterThan(
+      quoteConvert(downtown, downtown.network.spans[0]!.id).repairsAvoidedPerYear,
+    );
+    expect(quoteConvert(rural, rural.network.spans[0]!.id).exposure).toBe('exposed');
+    expect(quoteConvert(downtown, downtown.network.spans[0]!.id).exposure).not.toBe('exposed');
   });
 });

@@ -4,6 +4,7 @@
 //
 // Owner: ui-economy workstream.
 
+import { formatDate } from '../sim/calendar';
 import { applyCommand, tick } from '../sim/game';
 import { noticesAfter } from '../sim/notices';
 import type { Command, CommandResult, GameOver, GameState, MonthlyReport, Notice } from '../sim/types';
@@ -13,6 +14,16 @@ export const SPEEDS: readonly Speed[] = [0, 1, 2, 4];
 
 /** Longest frame gap the clock will catch up on (a background tab shouldn't fast-forward months). */
 const MAX_FRAME_SECONDS = 0.25;
+
+/** Round 4b: a game as the replace confirms name it: "Otter Junction Fiber in Otter Junction (Mar 4, 2027)". */
+export function describeGame(state: GameState): string {
+  return `${state.company.name} in ${state.city.name} (${formatDate(state.day)})`;
+}
+
+/** Round 4b: the title of a confirm before something replaces the game in play: "Replace Otter Junction Fiber?" */
+export function replaceTitle(state: GameState): string {
+  return `Replace ${state.company.name}?`;
+}
 
 /** The newest notice id a state has ever issued (0 when none): history the player has already seen. */
 export function latestNoticeId(state: GameState): number {
