@@ -30,6 +30,14 @@ export class GameSession {
   revision = 0;
   /** Speed to resume when unpausing. */
   private resumeSpeed: Exclude<Speed, 0> = 1;
+  /**
+   * While interrupted (the month-end briefing is up): the speed in effect
+   * when interrupt() stopped the clock (0 if it was already paused), which
+   * resume() restores. Null when not interrupted.
+   */
+  private interruptedAt: Speed | null = null;
+  /** Set by interrupt(): the advanceDays loop in progress stops after its current tick. */
+  private stopAdvance = false;
   /** Fraction of a day accumulated toward the next tick. */
   private carry = 0;
   /** Highest notice id already handed to the notice listeners. */
@@ -56,8 +64,14 @@ export class GameSession {
     return result;
   }
 
-  /** Advance whole days immediately, regardless of speed (stops early if the game ends). */
+  /**
+   * Advance whole days immediately, regardless of speed. Stops early if the
+   * game ends, or after the tick during which a listener called interrupt()
+   * (a month close that opened the briefing), so a long advance stops at that
+   * close.
+   */
   advanceDays(days: number): void {
+    this.stopAdvance = false;
     for (let i = 0; i < days && !this.state.gameOver; i++) {
       const state = this.state;
       const before = state.finance.reports.length;
@@ -74,7 +88,9 @@ export class GameSession {
         this.halt();
         for (const fn of this.gameOverListeners) fn(state.gameOver);
       }
+      if (this.stopAdvance) break;
     }
+    this.stopAdvance = false;
   }
 
   /** Called every animation frame with the elapsed real time. One day per second at 1x. */
@@ -86,8 +102,9 @@ export class GameSession {
     if (days > 0) this.advanceDays(days);
   }
 
-  /** Change the clock speed. A no-op once the game is over: the day is frozen. */
+  /** Change the clock speed (this ends an interrupt). A no-op once the game is over: the day is frozen. */
   setSpeed(speed: Speed): void {
+    this.clearInterrupt();
     if (this.state.gameOver) {
       this.halt();
       return;
@@ -101,9 +118,35 @@ export class GameSession {
     this.setSpeed(this.speed === 0 ? this.resumeSpeed : 0);
   }
 
-  /** Put another game in play, paused. Its notice history is not re-announced. */
+  /**
+   * Stop the clock for something the player must see (the month-end
+   * briefing): like a pause, but it remembers the speed in effect (0 if
+   * already paused) for resume(), and an advanceDays loop in progress stops
+   * after its current tick. Interrupting again while interrupted keeps the
+   * first remembered speed. setSpeed, togglePause and replace end it.
+   */
+  interrupt(): void {
+    if (this.interruptedAt === null) this.interruptedAt = this.speed;
+    this.halt();
+    this.stopAdvance = true;
+  }
+
+  /** End an interrupt, restoring the speed it stopped (paused stays paused; a game that ended stays stopped). */
+  resume(): void {
+    const speed = this.interruptedAt;
+    if (speed === null) return;
+    this.setSpeed(speed);
+  }
+
+  /** True between interrupt() and resume() (or anything else that sets the speed). */
+  get interrupted(): boolean {
+    return this.interruptedAt !== null;
+  }
+
+  /** Put another game in play, paused (this ends an interrupt). Its notice history is not re-announced. */
   replace(state: GameState): void {
     this.state = state;
+    this.clearInterrupt();
     this.halt();
     this.lastNoticeId = latestNoticeId(state);
     this.revision++;
@@ -131,6 +174,11 @@ export class GameSession {
   private halt(): void {
     this.speed = 0;
     this.carry = 0;
+  }
+
+  private clearInterrupt(): void {
+    this.interruptedAt = null;
+    this.stopAdvance = false;
   }
 
   private flushNotices(): void {

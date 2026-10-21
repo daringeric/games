@@ -39,11 +39,22 @@ export function noticeTone(notice: Notice): ToastTone {
     case 'installsResumed':
     case 'covenantCured':
     case 'loanPaidOff':
+    case 'serviceRestored':
+    case 'incumbentPromoEnded':
       return 'ok';
     case 'gameOver':
     case 'paymentMissed':
     case 'creditFrozen':
+    case 'loansCalled':
       return 'err';
+    case 'debtSwept':
+    case 'accelerationWarning':
+    case 'tierRetired':
+    case 'priceStep':
+    case 'incumbentPromo':
+    case 'storm':
+    case 'digIn':
+      return 'warn';
     case 'insolvencyWarning':
     case 'installsPaused':
     case 'cabinetFull':

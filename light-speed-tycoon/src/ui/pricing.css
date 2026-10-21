@@ -1,0 +1,105 @@
+/* Round 4: pricing panel changes: grandfathering, the intro promo, tier retirement and incumbent promo previews (sim-pricing workstream).
+   Imported by main.ts after style.css and mapTools.css, so rules here may
+   override theirs; style.css itself is frozen for round 4. Colors and sizes come
+   from the theme variables themeCss.ts publishes (--card, --text, --accent,
+   --danger, --radius, --touch, ...), never literals. */
+
+/* Hints under the round-4 controls run to a sentence or two: read them left to right. */
+.pricing .grandfather-hint,
+.pricing .promo-hint {
+  text-align: left;
+}
+
+.pricing .mult-field .per,
+.pricing .promo-fields .per {
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+/* Intro promo: a switch, then "[20] % off for [3] mo". */
+.pricing .promo-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--touch);
+  cursor: pointer;
+}
+
+.pricing .promo-fields {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-weight: 800;
+}
+
+.pricing .promo-fields .field {
+  width: 64px;
+}
+
+.pricing .field:disabled {
+  border-style: dashed;
+  background: var(--hover);
+  color: var(--text-2);
+  cursor: not-allowed;
+}
+
+/* Today's subscribers: who keeps what until when, then MRR now / after / cancellations. */
+.pricing-impact .impact-lines,
+.incumbent-promos .incumbent-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.pricing-impact .impact-lines li + li,
+.incumbent-promos .incumbent-list li + li {
+  margin-top: 4px;
+}
+
+.impact-figures {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px dashed var(--card-border);
+}
+
+.impact-figure dt {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.impact-figure dd {
+  margin: 0;
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+
+/* The incumbent's promos: a warning tint, so a local price war stands out. */
+.incumbent-promos {
+  border: 2px dashed var(--danger);
+  background: var(--danger-bg);
+}
+
+.incumbent-promos h3 {
+  color: var(--danger);
+}
+
+.pricing .preview[hidden] {
+  display: none;
+}
+
+@media (max-width: 480px) {
+  .pricing .promo-fields .field {
+    width: 56px;
+  }
+
+  .impact-figure dd {
+    font-size: 15px;
+  }
+}

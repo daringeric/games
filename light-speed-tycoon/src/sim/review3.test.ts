@@ -6,8 +6,10 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_CLOSES,
   ARR_TRAILING_MONTHS,
   COVENANT_CURE_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
   COVENANT_MAX_LEVERAGE,
   INSOLVENCY_GRACE_MONTHS,
   LEVERAGE_SPREAD_BANDS,
@@ -149,9 +151,10 @@ function sum(xs: readonly number[]): number {
 
 describe('#1 term loans stay level through penalty months and missed payments', () => {
   it('re-amortizes when the penalty starts and stops, so the last payment is no balloon', () => {
-    // Breaches walk the stage up to frozen and hold it there for 36 closes, then
-    // compliant closes cure it back down; the loan then runs to the end.
-    const bad = 36;
+    // Breaches walk the stage up to frozen (3 closes) and hold it there as long
+    // as a cure can still lift it before the bank calls the loans (round 4),
+    // then compliant closes cure it back down; the loan then runs to the end.
+    const bad = 3 + FROZEN_ACCELERATION_CLOSES - COVENANT_CURE_CLOSES - 1;
     const run = runLoan((i) => (i < bad ? BAD : GOOD));
     const last = run.charges.at(-1)!;
     const paymentBefore = run.payments.at(-1)!;
@@ -162,6 +165,14 @@ describe('#1 term loans stay level through penalty months and missed payments', 
     expect(Math.max(...run.payments)).toBeGreaterThan(run.payments[0]!);
     // Coverage counts what the last year really charges.
     expect(run.serviceAt12).toBe(sum(run.charges.slice(-12)));
+  });
+
+  it('round 4: a freeze held too long gets the loan called, repaid in full within the closes the bank allows', () => {
+    const run = runLoan((i) => (i < 36 ? BAD : GOOD));
+    // Three breaches to frozen, FROZEN_ACCELERATION_CLOSES frozen closes to the call, then the closes it allows.
+    expect(run.charges.length).toBeLessThanOrEqual(2 + FROZEN_ACCELERATION_CLOSES + ACCELERATION_CLOSES);
+    expect(run.missedCloses).toBe(0);
+    expect(Math.max(...run.charges)).toBeGreaterThan(run.payments[0]! * 10);
   });
 
   it('re-amortizes after a missed payment capitalizes its interest: the schedule slips a month, no lump at the end', () => {
@@ -376,6 +387,8 @@ describe('#5 repaying everything while frozen', () => {
   it('says the freeze lifts at the next close, not after two compliant closes', () => {
     const state = makeTradingState(100_000, 0);
     state.finance.cash = 1_000_000;
+    // The month bills like the trailing ones, so the smoothed lending ARR holds through the close.
+    state.sales.month.revenueDollarDays = 100_000 * (MONTH_LENGTHS[dateOf(state.day).month - 1] as number);
     apply(state, { type: 'drawCredit', amount: 50_000 });
     state.debt.covenant.stage = 'frozen';
     apply(state, { type: 'repayCredit', amount: 50_000 });

@@ -44,6 +44,13 @@
 //   its nearest active cabinet (ties -> lower id). Parcels are passed only via
 //   their own Parcel.segment (never via another street they touch).
 // - cableRoute caps aerial detours at AERIAL_DETOUR_MAX_RATIO x the shortest route.
+// - Round 4: a live span with an outage (weather.ts) carries no light. The
+//   snapshot's interruptedSegments runs the coverage rule again without the
+//   out spans (same cabinets): lit segments it no longer lights are
+//   interrupted. litSegments, passings and everything else stay
+//   outage-agnostic (scorecards ignore outages, accounts are never dropped
+//   for one). convertSpan rebuilds a live aerial span underground in place
+//   (its own permit and construction; the aerial cable serves until then).
 
 import {
   AERIAL_COST_PER_FT,
@@ -72,6 +79,7 @@ import {
   PERMIT_FEE_AERIAL,
   PERMIT_FEE_UNDERGROUND,
   PERMITTING_CANCEL_REFUND,
+  POLE_RENT_PER_POLE_PER_MONTH,
   SPLIT_RATIO,
   SPLITTER_COST,
   UNDERGROUND_COST_PER_FT,
@@ -96,6 +104,7 @@ import {
   segmentsWithin,
   shortestPath,
 } from './streets';
+import { stormRisk } from './weather';
 import type {
   Cabinet,
   CabinetCoverage,
@@ -106,6 +115,7 @@ import type {
   CableSpan,
   City,
   CommandResult,
+  ConvertQuote,
   GameState,
   MakeReadyMemo,
   Network,
@@ -573,6 +583,24 @@ export function quoteCable(state: GameState, segments: readonly SegmentId[], met
   return quote;
 }
 
+/**
+ * Prune expired memos, remember a fresh permitting draw of `days` for each of
+ * `segments` (method `method`, drawn today), keep one per pair, sorted by
+ * segment then method. layCable and convertSpan share it.
+ */
+function recordMemos(state: GameState, method: CableMethod, segments: readonly SegmentId[], days: number): void {
+  const { network } = state;
+  const keyOf = (segment: SegmentId, m: CableMethod) => segment * 2 + (m === 'aerial' ? 0 : 1);
+  const kept = new Map<number, MakeReadyMemo>();
+  for (const memo of network.makeReady) {
+    if (memoActive(state, memo)) kept.set(keyOf(memo.segment, memo.method), memo);
+  }
+  for (const segment of segments) {
+    kept.set(keyOf(segment, method), { segment, method, days, drawnDay: state.day });
+  }
+  network.makeReady = [...kept].sort((a, b) => a[0] - b[0]).map(([, memo]) => memo);
+}
+
 /** Order cable. `rng` is the events stream (used for the permitting draw). */
 export function layCable(
   state: GameState,
@@ -612,19 +640,12 @@ export function layCable(
       refundable: charges.refundable,
       orderedDay: state.day,
       liveDay: null,
+      outage: null,
+      conversion: null,
     });
   });
 
-  // Prune expired memos, record the fresh draws, keep one per pair, sorted.
-  const keyOf = (segment: SegmentId, m: CableMethod) => segment * 2 + (m === 'aerial' ? 0 : 1);
-  const kept = new Map<number, MakeReadyMemo>();
-  for (const memo of network.makeReady) {
-    if (memoActive(state, memo)) kept.set(keyOf(memo.segment, memo.method), memo);
-  }
-  for (const segment of freshSegments) {
-    kept.set(keyOf(segment, method), { segment, method, days: freshDays, drawnDay: state.day });
-  }
-  network.makeReady = [...kept].sort((a, b) => a[0] - b[0]).map(([, memo]) => memo);
+  recordMemos(state, method, freshSegments, freshDays);
   network.version++;
 
   const label = method === 'aerial' ? 'Aerial' : 'Underground';
@@ -1030,16 +1051,49 @@ function advanceOne(asset: Buildable, constructDays: number, day: number): boole
 }
 
 /**
+ * One day of an aerial span's rebuild underground; true when its stage
+ * changed. permitting -> constructing (stageDaysLeft = constructDays) ->
+ * done: method 'underground', conversion null, any outage cleared (the new
+ * cable is in service). A stage left at 0 days (a hand-edited save) moves on
+ * the next day.
+ */
+function advanceConversion(span: CableSpan): boolean {
+  const conversion = span.conversion;
+  if (conversion === null) return false;
+  if (span.stage !== 'live' || span.method !== 'aerial') {
+    // Only live aerial plant is rebuilt (save validation holds it); never leave one stuck.
+    span.conversion = null;
+    return true;
+  }
+  conversion.stageDaysLeft--;
+  if (conversion.stageDaysLeft > 0) return false;
+  if (conversion.stage === 'permitting') {
+    conversion.stage = 'constructing';
+    conversion.stageDaysLeft = Math.max(1, conversion.constructDays);
+    return true;
+  }
+  span.method = 'underground';
+  span.conversion = null;
+  span.outage = null;
+  return true;
+}
+
+/**
  * Advance every span and cabinet by one day: decrement stageDaysLeft; at 0,
  * permitting -> constructing (stageDaysLeft = constructDays for spans,
  * CABINET_CONSTRUCT_DAYS for cabinets), constructing -> live (liveDay = state.day).
- * Bumps network.version if any stage changed. Called by tick() after state.day
- * has been incremented.
+ * Round 4: a live span's underground rebuild (CableSpan.conversion) moves
+ * the same way, permitting -> constructing -> done, when the span becomes
+ * underground (conversion null, any outage cleared): pole rent stops at the
+ * next close and storms use the underground chances from then on. An outage
+ * does not hold the rebuild up. Bumps network.version if any stage changed.
+ * Called by tick() after state.day has been incremented.
  */
 export function advanceNetwork(state: GameState): void {
   let changed = false;
   for (const span of state.network.spans) {
     changed = advanceOne(span, span.constructDays, state.day) || changed;
+    changed = advanceConversion(span) || changed;
   }
   for (const cabinet of state.network.cabinets) {
     changed = advanceOne(cabinet, CABINET_CONSTRUCT_DAYS, state.day) || changed;
@@ -1065,16 +1119,40 @@ export function computeService(state: GameState): ServiceSnapshot {
   return snapshotFrom(state, liveReach(state));
 }
 
-/** The coverage rule on the network as it stands: live spans and live cabinets. */
-function liveReach(state: GameState): Reach {
+/** A network's reach today and the lit segments its outages cut off (both day-independent). */
+interface LiveReach {
+  reach: Reach;
+  interrupted: Set<SegmentId>;
+}
+
+/**
+ * The coverage rule on the network as it stands: live spans and live
+ * cabinets. Round 4: when any live span is out (CableSpan.outage), the rule
+ * runs again on the live spans minus those, with the same cabinets; the
+ * segments lit in the first run but not in the second are interrupted.
+ */
+function liveReach(state: GameState): LiveReach {
   const { city, network } = state;
   const liveSegments = new Set<SegmentId>();
-  for (const span of network.spans) if (span.stage === 'live') liveSegments.add(span.segment);
-  return computeReach(city, liveSegments, network.cabinets.filter((c) => c.stage === 'live'));
+  const workingSegments = new Set<SegmentId>();
+  for (const span of network.spans) {
+    if (span.stage !== 'live') continue;
+    liveSegments.add(span.segment);
+    if (span.outage === null) workingSegments.add(span.segment);
+  }
+  const cabinets = network.cabinets.filter((c) => c.stage === 'live');
+  const reach = computeReach(city, liveSegments, cabinets);
+  const interrupted = new Set<SegmentId>();
+  if (workingSegments.size < liveSegments.size) {
+    const working = computeReach(city, workingSegments, cabinets);
+    // reach.serving is ascending by segment, so the set comes out ascending.
+    for (const segment of reach.serving.keys()) if (!working.serving.has(segment)) interrupted.add(segment);
+  }
+  return { reach, interrupted };
 }
 
 /** Snapshot for today from a network's reach (the only day-dependent part is which parcels exist). */
-function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
+function snapshotFrom(state: GameState, { reach, interrupted }: LiveReach): ServiceSnapshot {
   const { city, network, day } = state;
   const litSegments = new Set<SegmentId>();
   const servingCabinet = new Map<SegmentId, CabinetId>();
@@ -1120,6 +1198,7 @@ function snapshotFrom(state: GameState, reach: Reach): ServiceSnapshot {
     cabinetCoverage,
     passedParcels,
     passings,
+    interruptedSegments: new Set(interrupted),
   };
 }
 
@@ -1183,7 +1262,7 @@ export function plannedService(state: GameState): PlannedService {
   return planned;
 }
 
-const serviceCache = new WeakMap<GameState, { network: Network; reach: Reach; snapshot: ServiceSnapshot }>();
+const serviceCache = new WeakMap<GameState, { network: Network; reach: LiveReach; snapshot: ServiceSnapshot }>();
 
 /**
  * computeService memoized on (state, network.version, day). Safe to call every
@@ -1205,4 +1284,165 @@ export function getService(state: GameState): ServiceSnapshot {
 
 export function spanOnSegment(state: GameState, segment: SegmentId): CableSpan | undefined {
   return state.network.spans.find((s) => s.segment === segment);
+}
+
+// ---------------------------------------------------------------------------
+// Round 4 (sim-storms): converting aerial spans to underground
+// ---------------------------------------------------------------------------
+
+/**
+ * What convertSpan(span) would take now: see ConvertQuote. Allowed for a
+ * live aerial span with no conversion running (an outage does not block
+ * it). Cost lines like quoteCable's for one underground order on that
+ * segment: underground bore + rock (refundable: false here, a conversion
+ * cannot be cancelled), engineering and the city permit; no make-ready.
+ * Permit days PERMIT_DAYS_MIN..MAX (a remembered underground draw for the
+ * segment applies, as in layCable); construction days as an underground
+ * span of that length. poleRentSaved = polesOnSegment x
+ * POLE_RENT_PER_POLE_PER_MONTH; repairsAvoidedPerYear = round(weather.stormRisk
+ * aerial minus underground repair dollars a year). Blockers, in order:
+ * unknown span ("Unknown cable span: 7"), not live yet, already
+ * underground, already being rebuilt, not enough cash. Never throws for bad
+ * input. Pure.
+ */
+export function quoteConvert(state: GameState, span: SpanId): ConvertQuote {
+  const quote: ConvertQuote = {
+    ok: false,
+    reasons: [],
+    span,
+    cost: 0,
+    lines: [],
+    permitDaysMin: 0,
+    permitDaysMax: 0,
+    constructDays: 0,
+    poleRentSaved: 0,
+    repairsAvoidedPerYear: 0,
+  };
+  const target = state.network.spans.find((s) => s.id === span);
+  const segment = target ? state.city.segments[target.segment] : undefined;
+  if (!target || !segment) {
+    quote.reasons.push(`Unknown cable span: ${String(span)}`);
+    return quote;
+  }
+  const street = segment.name;
+  if (target.stage !== 'live') quote.reasons.push(`The cable on ${street} is still being built: rebuild it underground once it is live`);
+  else if (target.method !== 'aerial') quote.reasons.push(`The cable on ${street} is already underground`);
+  else if (target.conversion !== null) quote.reasons.push(`The cable on ${street} is already being rebuilt underground`);
+
+  const charges = spanCharges(segment, 'underground');
+  const lines: QuoteLine[] = [
+    {
+      kind: 'cable',
+      label: 'Underground bore',
+      quantity: segment.lengthFt,
+      unit: 'ft',
+      rate: UNDERGROUND_COST_PER_FT,
+      amount: charges.construction,
+      refundable: false,
+    },
+    {
+      kind: 'rock',
+      label: 'Rock surcharge',
+      quantity: charges.rock > 0 ? segment.lengthFt : 0,
+      unit: 'ft',
+      rate: UNDERGROUND_ROCK_SURCHARGE_PER_FT,
+      amount: charges.rock,
+      refundable: false,
+    },
+    { kind: 'engineering', label: 'Engineering', quantity: 1, unit: 'order', rate: ENGINEERING_FEE, amount: ENGINEERING_FEE, refundable: false },
+    {
+      kind: 'permit',
+      label: 'City permit',
+      quantity: 1,
+      unit: 'order',
+      rate: PERMIT_FEE_UNDERGROUND,
+      amount: PERMIT_FEE_UNDERGROUND,
+      refundable: false,
+    },
+  ];
+  quote.lines = lines.filter((line) => line.quantity > 0);
+  for (const line of quote.lines) quote.cost += line.amount;
+
+  const remembered = rememberedPermitDays(state, segment.id, 'underground');
+  [quote.permitDaysMin, quote.permitDaysMax] = remembered === null ? permitRange('underground') : [remembered, remembered];
+  quote.constructDays = constructDaysFor(segment, 'underground');
+  quote.poleRentSaved = target.method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH : 0;
+  const aerial = stormRisk(state, segment, 'aerial').repairCostPerYear;
+  const underground = stormRisk(state, segment, 'underground').repairCostPerYear;
+  quote.repairsAvoidedPerYear = Math.round(aerial - underground);
+
+  if (quote.reasons.length === 0 && !canAfford(state, quote.cost)) quote.reasons.push(notEnoughCash(state, quote.cost));
+  quote.ok = quote.reasons.length === 0;
+  return quote;
+}
+
+/**
+ * convertSpan command: rejects with quoteConvert's first reason (state
+ * untouched) unless ok and cash covers the cost. On success: posts one
+ * 'construction' entry ("Underground rebuild: Elm St (240 ft)"), adds the
+ * cost to span.cost and finance.capex.osp, sets span.conversion = { stage:
+ * 'permitting', stageDaysLeft: the permit draw (events rng; a remembered
+ * memo is reused and a fresh draw remembered, as layCable does),
+ * constructDays, cost, orderedDay } and bumps network.version. The daily
+ * build step (advanceNetwork) moves it through permitting and construction
+ * like a span; when it completes, method = 'underground', conversion = null,
+ * any outage cleared, network.version++ (pole rent stops at the next close,
+ * storms now use the underground chances). The span's refundable part is
+ * unchanged: it is live, so removeSpan on a converting span removes it whole
+ * with no refund. Cost = quote cost.
+ */
+export function convertSpan(state: GameState, span: SpanId, rng: Rng): CommandResult {
+  const quote = quoteConvert(state, span);
+  const target = state.network.spans.find((s) => s.id === span);
+  const segment = target ? state.city.segments[target.segment] : undefined;
+  if (!quote.ok || !target || !segment) return { ok: false, reason: quote.reasons[0] ?? 'This span cannot be converted' };
+
+  const remembered = rememberedPermitDays(state, segment.id, 'underground');
+  const permitDays = remembered ?? drawPermitDays('underground', rng);
+  recordMemos(state, 'underground', remembered === null ? [segment.id] : [], permitDays);
+  target.conversion = {
+    stage: 'permitting',
+    stageDaysLeft: Math.max(1, permitDays),
+    constructDays: quote.constructDays,
+    cost: quote.cost,
+    orderedDay: state.day,
+  };
+  target.cost += quote.cost;
+  state.network.version++;
+  state.finance.capex.osp += quote.cost;
+  postEntry(state, 'construction', -quote.cost, `Underground rebuild: ${segment.name} (${groupThousands(segment.lengthFt)} ft)`);
+  return { ok: true, cost: quote.cost };
+}
+
+/** What one span's outage cuts off today (outageImpact). */
+export interface OutageImpact {
+  /** Interrupted segments this span's repair alone would bring back, ascending. */
+  segments: SegmentId[];
+  /** Subscribed units on parcels those segments serve. */
+  subscribers: number;
+}
+
+/**
+ * What the outage on `span` cuts off today: the coverage rule run with that
+ * span repaired (every other outage kept), and the interrupted segments it
+ * would light again, with their subscribers. Empty for a span without an
+ * outage or an unknown id. A street cut off by two outages in a row is
+ * counted for neither (it needs both repaired). For the inspect card, the
+ * span panel and the advisor. Pure.
+ */
+export function outageImpact(state: GameState, span: SpanId): OutageImpact {
+  const target = state.network.spans.find((s) => s.id === span);
+  const service = getService(state);
+  if (!target || target.outage === null || service.interruptedSegments.size === 0) return { segments: [], subscribers: 0 };
+  const working = new Set<SegmentId>();
+  for (const s of state.network.spans) if (s.stage === 'live' && (s.outage === null || s.id === span)) working.add(s.segment);
+  const reach = computeReach(state.city, working, state.network.cabinets.filter((c) => c.stage === 'live'));
+  const segments = [...service.interruptedSegments].filter((segment) => reach.serving.has(segment)).sort((a, b) => a - b);
+  const cut = new Set(segments);
+  let subscribers = 0;
+  for (const account of state.sales.accounts) {
+    const parcel = state.city.parcels[account.parcel];
+    if (parcel && cut.has(parcel.segment)) subscribers += accountUnits(account);
+  }
+  return { segments, subscribers };
 }

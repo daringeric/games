@@ -1,7 +1,11 @@
 // The Bank end to end: no credit in a fresh town, drawing from the credit line,
 // the term-loan builder on a phone, prepaying, the financing rows of the
 // monthly report, covenants stepping up to a frozen line and a default that
-// ends the game, and the quote cards' cash-after and credit hints.
+// ends the game, and the quote cards' cash-after and credit hints. Round 4:
+// the Bank leads with covenant status, the builder starts at the largest
+// covenant-safe amount, a draw previews its covenants, and a frozen line
+// shows the sweep and the countdown to the bank calling the loans (then what
+// falls due once it has).
 //
 // Conditions are set up through window.__lst the way economy.spec.ts does:
 // closed months with revenue pushed into finance.reports give the town
@@ -12,9 +16,10 @@
 
 import { expect, test } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
-import { LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
-import { creditLimit, termCapacity } from '../src/sim/debt';
+import { ACCELERATION_CLOSES, FROZEN_ACCELERATION_CLOSES, LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
+import { closesUntilAcceleration, creditLimit, maxSafeTermLoan, quoteDraw, termCapacity } from '../src/sim/debt';
 import type { GameState } from '../src/sim/types';
+import { formatRatio } from '../src/ui/format';
 import { nodeOnScreen, open, routeFromCo, watchErrors } from './helpers';
 
 const money = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(Math.round(n)).toLocaleString('en-US')}`;
@@ -321,7 +326,8 @@ test('covenant breaches step the stage up to a frozen line, and a payment missed
   await expect.poll(toasts).toContainEqual(toast('warn', await notice('covenantPenalty')));
 
   await tickToNextClose(page);
-  await expect(chip).toHaveText('Credit frozen');
+  // Frozen: the chip counts the frozen closes left before the bank calls the loans.
+  await expect(chip).toHaveText(`Credit frozen: ${FROZEN_ACCELERATION_CLOSES - 1} closes to call`);
   await expect(chip).toHaveClass(/chip-danger/);
   expect((await state(page)).debt.covenant.stage).toBe('frozen');
   await expect.poll(toasts).toContainEqual(toast('err', await notice('creditFrozen')));
@@ -375,7 +381,112 @@ test('a quote card shows the cash an order leaves, and the credit line when cash
     window.__lst!.tick(1);
   });
   await page.mouse.move(p.x + 1, p.y + 1);
-  await expect(card.locator('.card-credit')).toHaveText(/^Draw \$[\d,]+ from your credit line to afford it$/);
+  // The hint keeps a cash cushion (a month of costs and the next loan payment): never a draw that leaves about $0.
+  await expect(card.locator('.card-credit')).toHaveText(/^Draw \$[\d,]+ from your credit line to afford it and keep a \$[\d,]+ cushion$/);
   await expect(card.locator('.tone-negative')).toHaveText(/^-\$[\d,]+$/);
+  expect(errors).toEqual([]);
+});
+
+test('the Bank leads with covenant status, starts the builder at the safe amount and previews a draw\'s covenants', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  // Thin cash flow on healthy revenue: the bank lends a lot, but not all of it keeps the covenants.
+  await giveRevenue(page, 40_000, 36_000);
+  const s = await state(page);
+  const safe = maxSafeTermLoan(s, 5);
+  expect(safe).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+  expect(safe).toBeLessThan(termCapacity(s));
+
+  await bankButton(page).click();
+  const bank = bankDialog(page);
+  // Covenant status comes first, right under the summary.
+  const sections = bank.locator('.bank-section');
+  await expect(sections.first()).toHaveAttribute('data-testid', 'bank-covenant');
+  await expect(sections.first()).toContainText('Covenant status');
+  await expect(bank.getByTestId('bank-covenant-checks')).toContainText('Leverage');
+  await expect(bank.getByTestId('bank-cov-lending-arr')).toHaveText(/^\$[\d,]+\/yr$/);
+
+  // The builder starts at the largest covenant-safe amount, and says so.
+  const term = bank.getByTestId('bank-term');
+  const amountField = term.getByLabel('Term loan amount');
+  await expect(amountField).toHaveValue(String(safe));
+  await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe)} over 5 years.`);
+  await expect(bank.getByTestId('bank-term-warning')).toBeHidden();
+  // The 7-year term has its own safe amount, and the builder follows it until the player picks one.
+  const safe7 = maxSafeTermLoan(s, 7);
+  expect(safe7).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+  await term.getByRole('radio', { name: '7 years' }).click();
+  await expect(amountField).toHaveValue(String(safe7));
+  await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe7)} over 7 years.`);
+  // The presets still reach the whole capacity: the reckless path is one tap away, with the breach warning.
+  await term.getByRole('button', { name: /^100% of what you can borrow/ }).click();
+  await expect(amountField).toHaveValue(String(termCapacity(s)));
+  await expect(bank.getByTestId('bank-term-warning')).toBeVisible();
+
+  // A draw previews its covenants before it is made.
+  const amount = Math.floor(creditLimit(s) / 2);
+  await bank.getByLabel('Amount to draw').fill(String(amount));
+  const preview = bank.getByTestId('bank-draw-preview');
+  await expect(preview).toBeVisible();
+  const quote = quoteDraw(await state(page), amount);
+  await expect(preview.locator('[data-check="leverage"]')).toContainText('→');
+  await expect(preview.locator('[data-check="leverage"]')).toContainText(`→ ${quote.after.leverage === null ? 'not measurable' : formatRatio(quote.after.leverage)}`);
+  await expect(bank.getByTestId('bank-draw-warning')).toBeHidden();
+  await bank.getByLabel('Amount to draw').fill('');
+  await expect(preview).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
+test('a frozen line shows the sweep and the countdown, then what falls due once the bank calls the loans', async ({ page }) => {
+  test.setTimeout(90_000);
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await giveRevenue(page, 40_000, 20_000);
+  // Test-only: a frozen line owing money, a month that bills well (so the close sweeps part of its operating cash flow).
+  await page.evaluate(() => {
+    const s = window.__lst!.getState();
+    s.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+    s.debt.credit.balance = 150_000;
+    s.debt.frozenCloses = 1;
+    s.finance.cash = 400_000;
+    s.sales.month.revenueDollarDays = 60_000 * 31;
+  });
+  await tickToNextClose(page);
+  let s = await state(page);
+  const sweep = s.finance.reports.at(-1)!.debt!.sweep!;
+  expect(sweep).toBeGreaterThan(0);
+  expect(s.notices.some((n) => n.kind === 'debtSwept')).toBe(true);
+  const left = closesUntilAcceleration(s)!;
+  expect(left).toBe(FROZEN_ACCELERATION_CLOSES - 2);
+  const chip = page.getByTestId('hud-covenant');
+  await expect(chip).toHaveText(`Credit frozen: ${left} closes to call`);
+
+  await chip.click();
+  const bank = bankDialog(page);
+  const frozen = bank.getByTestId('bank-frozen');
+  await expect(frozen).toBeVisible();
+  await expect(frozen).toContainText('the sweep and the countdown');
+  await expect(bank.getByTestId('bank-frozen-last-sweep')).toHaveText(money(sweep));
+  await expect(bank.getByTestId('bank-frozen-before-the-bank-calls-the-loans')).toHaveText(`${left} frozen closes`);
+  await expect(bank.getByTestId('bank-frozen-next-sweep')).toHaveText(/^(≈ \$[\d,]+|None expected)$/);
+  // The sweep notice can be reread in the Bank.
+  await expect(bank.getByTestId('bank-notice-list')).toContainText('The bank swept');
+  await page.keyboard.press('Escape');
+
+  // Test-only: one frozen close short of the call (and no compliant close toward a cure). The next close calls the loans.
+  await page.evaluate((n) => {
+    const debt = window.__lst!.getState().debt;
+    debt.frozenCloses = n;
+    debt.covenant.compliantCloses = 0;
+  }, FROZEN_ACCELERATION_CLOSES - 1);
+  await tickToNextClose(page);
+  s = await state(page);
+  expect(s.debt.acceleration?.closesLeft).toBe(ACCELERATION_CLOSES);
+  await expect(chip).toHaveText(`Loans called: ${ACCELERATION_CLOSES} closes left`);
+  await chip.click();
+  await expect(frozen).toContainText('Loans called');
+  await expect(frozen.locator('.bank-fig').filter({ hasText: /^Due at the/ })).toHaveCount(ACCELERATION_CLOSES);
+  await expect(bank.getByTestId('bank-draw')).toBeDisabled();
+  await expect(bank.getByTestId('bank-borrow')).toBeDisabled();
   expect(errors).toEqual([]);
 });

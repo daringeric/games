@@ -68,6 +68,113 @@ describe('GameSession clock', () => {
   });
 });
 
+describe('GameSession interrupt (the month-end briefing)', () => {
+  it('stops a multi-day advance after the tick whose close interrupted, and stops the clock', () => {
+    const s = session();
+    s.setSpeed(2);
+    const closes: number[] = [];
+    s.onMonthClosed((r) => {
+      closes.push(r.month);
+      s.interrupt();
+    });
+    s.advanceDays(60);
+    // Day 31 is Feb 1: the January close ran on that tick, and nothing after it.
+    expect(s.state.day).toBe(31);
+    expect(closes).toEqual([1]);
+    expect(s.interrupted).toBe(true);
+    expect(s.speed).toBe(0);
+    // The clock stays stopped while interrupted.
+    for (let i = 0; i < 20; i++) s.update(0.25);
+    expect(s.state.day).toBe(31);
+  });
+
+  it('resumes the speed in effect when it interrupted', () => {
+    const s = session();
+    s.setSpeed(2);
+    s.interrupt();
+    expect(s.speed).toBe(0);
+    s.resume();
+    expect(s.interrupted).toBe(false);
+    expect(s.speed).toBe(2);
+    s.update(1);
+    expect(s.state.day).toBe(0);
+    for (let i = 0; i < 4; i++) s.update(0.25);
+    expect(s.state.day).toBe(2);
+  });
+
+  it('remembers paused as paused, and the first speed when interrupted twice', () => {
+    const s = session();
+    s.interrupt();
+    expect(s.interrupted).toBe(true);
+    s.resume();
+    expect(s.speed).toBe(0);
+
+    s.setSpeed(4);
+    s.interrupt();
+    s.interrupt();
+    s.resume();
+    expect(s.speed).toBe(4);
+    // Nothing to resume: a no-op.
+    s.setSpeed(1);
+    s.resume();
+    expect(s.speed).toBe(1);
+  });
+
+  it('keeps the unpause speed, so play after a pause from the briefing goes back to it', () => {
+    const s = session();
+    s.setSpeed(2);
+    s.interrupt();
+    // "Show me" ends the interrupt but stays paused.
+    s.setSpeed(0);
+    expect(s.interrupted).toBe(false);
+    s.togglePause();
+    expect(s.speed).toBe(2);
+  });
+
+  it('is ended by setSpeed and replace', () => {
+    const s = session();
+    s.setSpeed(4);
+    s.interrupt();
+    s.setSpeed(1);
+    expect(s.interrupted).toBe(false);
+    s.resume();
+    expect(s.speed).toBe(1);
+
+    s.interrupt();
+    s.replace(newGame(4, { city: makeGridCity() }));
+    expect(s.interrupted).toBe(false);
+    s.resume();
+    expect(s.speed).toBe(0);
+  });
+
+  it('lets a later advance run in full once the briefing is dealt with', () => {
+    const s = session();
+    let stop = true;
+    s.onMonthClosed(() => {
+      if (stop) s.interrupt();
+    });
+    s.advanceDays(45);
+    expect(s.state.day).toBe(31);
+    s.resume();
+    stop = false;
+    s.advanceDays(45);
+    expect(s.state.day).toBe(76);
+  });
+
+  it('does not resume a game that ended at the close', () => {
+    const s = session();
+    s.state.day = 30;
+    s.state.finance.cash = -1_000_000;
+    s.state.finance.negativeMonths = INSOLVENCY_GRACE_MONTHS - 1;
+    s.setSpeed(2);
+    s.interrupt();
+    s.advanceDays(1);
+    expect(s.isOver).toBe(true);
+    s.resume();
+    expect(s.speed).toBe(0);
+  });
+});
+
 describe('GameSession notices', () => {
   /** A game whose cash is deep in the red, so every month close posts a notice. */
   const broke = () => {

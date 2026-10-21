@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_WARNING_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
   INSOLVENCY_GRACE_MONTHS,
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
@@ -11,7 +13,8 @@ import {
   TIER_DEFAULTS,
   TIER_PRICE_MAX,
 } from './balance';
-import { creditAvailable, newDebt, termCapacity, totalDebt, trailingArr } from './debt';
+import { dateOf, MONTH_LENGTHS } from './calendar';
+import { closesUntilAcceleration, creditAvailable, newDebt, termCapacity, totalDebt, trailingArr } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
 import { deserialize, fnv1a, hashState, SaveError, serialize } from './save';
@@ -21,6 +24,7 @@ import { nearestNode, nearestSegment } from './streets';
 import { makeGridCity } from './testing/fixtures';
 import type { GridCityOptions } from './testing/fixtures';
 import type { GameState } from './types';
+import { newWeather } from './weather';
 
 // Parsed saves are untyped JSON; the corruption tests poke at them freely.
 type Save = any;
@@ -50,7 +54,10 @@ function playedGame(cityOpts: GridCityOptions = {}): GameState {
 
 /**
  * playedGame on credit: the closed months are given TERM_LOAN_MIN more
- * revenue each (something to lend against), then the real commands draw half
+ * revenue each (something to lend against), and so is the March under way
+ * (so the March close does not dip lending ARR below the drawn line: round 4
+ * smooths ARR to at most ARR_SPIKE_CAP x the weakest trailing month), then
+ * the real commands draw half
  * the credit line and take a term loan, the game closes March with debt
  * service and report.debt, and a little more is drawn in April so the line
  * has dollar-days. `max` borrows everything the bank offers instead.
@@ -61,6 +68,7 @@ function borrowedGame(cityOpts: GridCityOptions = {}, max = false): GameState {
     report.totals.revenue = (report.totals.revenue ?? 0) + TERM_LOAN_MIN;
     report.net += TERM_LOAN_MIN;
   }
+  state.sales.month.revenueDollarDays += TERM_LOAN_MIN * MONTH_LENGTHS[dateOf(state.day).month]!;
   const draw = max ? creditAvailable(state) : Math.floor(creditAvailable(state) / 2);
   const loan = max ? termCapacity(state) : TERM_LOAN_MIN;
   expect(applyCommand(state, { type: 'drawCredit', amount: draw })).toEqual({ ok: true, cost: -draw });
@@ -75,6 +83,44 @@ function borrowedGame(cityOpts: GridCityOptions = {}, max = false): GameState {
 /** The default lineup as setPricing tiers, with optional price overrides. */
 function tierSettings(prices: Record<string, number> = {}): Array<{ id: string; price: number; offered: boolean }> {
   return TIER_DEFAULTS.map((t) => ({ id: t.id, price: prices[t.id] ?? t.price, offered: true }));
+}
+
+/** A storm outage on a live span, as weather.stepWeather writes one. */
+function outage(storm = 1): Save {
+  return { cause: 'storm', storm, startDay: 0, daysLeft: 3, repairCost: 1_500 };
+}
+
+/**
+ * Give a parsed current-version save every round-4 record, shaped as the
+ * round-4 rules write them: a logged storm and its outage on a live span
+ * (made aerial) that is also being converted underground, the month's outage
+ * totals and repair entry, a grandfathered price lock, an intro promo, an
+ * incumbent promo on the first cabinet, a frozen line the bank has called,
+ * and the first report's ops and round-4 debt figures.
+ */
+function populateRound4(s: Save): void {
+  const span = s.network.spans.find((x: Save) => x.stage === 'live');
+  span.method = 'aerial';
+  span.outage = outage(1);
+  span.conversion = { stage: 'permitting', stageDaysLeft: 10, constructDays: 2, cost: 9_000, orderedDay: s.day };
+  s.weather = {
+    storms: [{ id: 1, day: Math.max(0, s.day - 1), x: 1, y: 1, radius: 8, severity: 2, spans: [span.id], repairCost: 1_500 }],
+    nextStormId: 2,
+    month: { segmentOutageDays: [{ segment: 0, days: 1 }, { segment: 1, days: 2 }], outageUnitDays: 5, storms: 1, spansDamaged: 1, repairs: 1_500 },
+  };
+  s.finance.monthToDate.push({ day: s.day, category: 'repair', amount: -1_500, memo: 'Storm repairs' });
+  s.finance.cash -= 1_500;
+  const account = s.sales.accounts[0];
+  const tier = (['fiber500', 'fiber1g', 'fiber2g'] as const).find((t) => account.tierUnits[t] > 0);
+  account.locks = [{ tier, price: 50, untilDay: s.day + 40, reason: 'grandfather' }];
+  s.sales.promo = { percentOff: 20, months: 3 };
+  s.sales.incumbentPromos = [{ cabinet: s.network.cabinets[0].id, startDay: s.day, endDay: s.day + 90, price: 55, quietUntil: s.day + 270 }];
+  s.debt.credit.balance = 5_000;
+  s.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+  s.debt.frozenCloses = 6;
+  s.debt.acceleration = { day: s.day, closesLeft: 2 };
+  Object.assign(s.finance.reports[0].ops, { storms: 1, spansDamaged: 1, repairs: 1_500, outageUnitDays: 5 });
+  Object.assign(s.finance.reports[0].debt, { sweep: 1_000, frozenCloses: 6, accelerationClosesLeft: 2 });
 }
 
 function expectSaveError(json: string, message: RegExp): void {
@@ -277,7 +323,7 @@ describe('deserialize errors', () => {
 
   it('rejects a missing or unsupported schemaVersion', () => {
     expectSaveError(corrupted((s) => delete s.schemaVersion), /no schemaVersion/);
-    expectSaveError(corrupted((s) => (s.schemaVersion = 4)), /Unsupported save version 4 \(this build reads version 3\)/);
+    expectSaveError(corrupted((s) => (s.schemaVersion = 5)), /Unsupported save version 5 \(this build reads version 4\)/);
     expectSaveError(corrupted((s) => (s.schemaVersion = 0)), /Unsupported save version 0 /);
     expectSaveError(corrupted((s) => (s.schemaVersion = '1')), /Unsupported save version "1" /);
     expectSaveError(corrupted((s) => (s.schemaVersion = null)), /Unsupported save version null /);
@@ -495,6 +541,22 @@ describe('deserialize errors', () => {
     ['an unknown covenant stage', (s) => (s.debt.covenant.stage = 'doomed'), /debt\.covenant\.stage should be one of "compliant", "warning", "penalty", "frozen", got "doomed"/],
     ['negative compliant closes', (s) => (s.debt.covenant.compliantCloses = -1), /debt\.covenant\.compliantCloses should be an integer in 0\.\.1000, got -1/],
     ['an unknown notice kind (round-3 kinds listed)', (s) => (s.notices[0].kind = 'loanShark'), /notices\[0\]\.kind should be one of .*"paymentMissed".*got "loanShark"/],
+    // Round 4 (schemaVersion 4)
+    ['missing weather stream', (s) => delete s.rng.weather, /rng\.weather should be an integer in 0\.\.4294967295, got nothing/],
+    ['missing weather', (s) => delete s.weather, /weather should be an object, got nothing/],
+    ['zero nextStormId', (s) => (s.weather.nextStormId = 0), /weather\.nextStormId should be an integer >= 1, got 0/],
+    ['storms not a list', (s) => (s.weather.storms = {}), /weather\.storms should be an array, got an object/],
+    ['missing weather month', (s) => delete s.weather.month, /weather\.month should be an object, got nothing/],
+    ['negative outage subscriber-days', (s) => (s.weather.month.outageUnitDays = -1), /weather\.month\.outageUnitDays should be an integer >= 0, got -1/],
+    ['a span without its outage field', (s) => delete s.network.spans[0].outage, /network\.spans\[0\]\.outage should be an object, got nothing/],
+    ['a span without its conversion field', (s) => delete s.network.spans[0].conversion, /network\.spans\[0\]\.conversion should be an object, got nothing/],
+    ['an account without locks', (s) => delete s.sales.accounts[0].locks, /sales\.accounts\[0\]\.locks should be an array, got nothing/],
+    ['missing intro promo field', (s) => delete s.sales.promo, /sales\.promo should be an object, got nothing/],
+    ['incumbent promos not a list', (s) => (s.sales.incumbentPromos = null), /sales\.incumbentPromos should be an array, got null/],
+    ['missing frozen closes', (s) => delete s.debt.frozenCloses, /debt\.frozenCloses should be an integer in 0\.\.10000, got nothing/],
+    ['missing acceleration field', (s) => delete s.debt.acceleration, /debt\.acceleration should be an object, got nothing/],
+    ['a repair entry category typo', (s) => (s.finance.monthToDate[0].category = 'repairs'), /finance\.monthToDate\[0\]\.category should be one of .*"repair".*got "repairs"/],
+    ['an unknown notice kind (round-4 kinds listed)', (s) => (s.notices[0].kind = 'tornado'), /notices\[0\]\.kind should be one of .*"storm".*got "tornado"/],
   ];
 
   it.each(cases)('rejects %s', (_name, mutate, message) => {
@@ -568,6 +630,71 @@ describe('deserialize errors', () => {
 
     it.each(loanCases)('rejects %s', (_name, mutate, message) => {
       expectSaveError(withLoans(mutate), message);
+    });
+  });
+
+  describe('round-4 records', () => {
+    /** The good save with every round-4 record populated (as the round-4 rules will write them). */
+    const withRound4 = (mutate: (save: Save) => void = () => {}): string =>
+      corrupted((s) => {
+        populateRound4(s);
+        mutate(s);
+      });
+
+    it('loads and round-trips storms, outages, a conversion, locks, promos, acceleration and report ops', () => {
+      const text = withRound4();
+      const state = deserialize(text);
+      expect(state.weather.storms).toHaveLength(1);
+      expect(state.network.spans.find((x) => x.outage !== null)?.outage?.cause).toBe('storm');
+      expect(state.network.spans.some((x) => x.conversion !== null)).toBe(true);
+      expect(state.sales.accounts[0]?.locks[0]?.reason).toBe('grandfather');
+      expect(state.sales.promo).toEqual({ percentOff: 20, months: 3 });
+      expect(state.sales.incumbentPromos).toHaveLength(1);
+      expect(state.debt.acceleration?.closesLeft).toBe(2);
+      expect(state.finance.reports[0]?.ops?.storms).toBe(1);
+      expect(deserialize(serialize(state))).toEqual(state);
+      expect(serialize(deserialize(text))).toBe(text);
+    });
+
+    const round4Cases: Array<[string, (save: Save) => void, RegExp]> = [
+      ['a storm id not below nextStormId', (s) => (s.weather.storms[0].id = s.weather.nextStormId), /weather\.storms\[0\]\.id should be an integer in 1\.\.\d+/],
+      ['a storm from the future', (s) => (s.weather.storms[0].day = s.day + 1), /weather\.storms\[0\]\.day should be an integer in 0\.\.\d+/],
+      ['a storm off the map', (s) => (s.weather.storms[0].x = s.city.width + 1), /weather\.storms\[0\]\.x should be an integer in 0\.\.\d+/],
+      ['a zero storm radius', (s) => (s.weather.storms[0].radius = 0), /weather\.storms\[0\]\.radius should be an integer in 1\.\./],
+      ['a zero storm severity', (s) => (s.weather.storms[0].severity = 0), /weather\.storms\[0\]\.severity should be an integer in 1\.\.100, got 0/],
+      ['storm spans out of order', (s) => (s.weather.storms[0].spans = [3, 2]), /weather\.storms\[0\]\.spans\[1\] should be greater than the entry before it/],
+      ['a storm span id never issued', (s) => (s.weather.storms[0].spans = [s.nextId]), /weather\.storms\[0\]\.spans\[0\] should be an integer in 1\.\./],
+      ['outage days on an unknown segment', (s) => (s.weather.month.segmentOutageDays[0].segment = 999), /weather\.month\.segmentOutageDays\[0\]\.segment should be an integer in 0\.\./],
+      ['outage days past a month', (s) => (s.weather.month.segmentOutageDays[0].days = 32), /weather\.month\.segmentOutageDays\[0\]\.days should be an integer in 1\.\.31, got 32/],
+      ['outage days out of order', (s) => s.weather.month.segmentOutageDays.reverse(), /weather\.month\.segmentOutageDays \(by segment\)\[1\] should be greater/],
+      ['an outage on a permitting span', (s) => (s.network.spans.find((x: Save) => x.stage === 'permitting').outage = outage()), /network\.spans\[\d+\]\.outage should be null while permitting/],
+      ['an outage with an unknown cause', (s) => (s.network.spans.find((x: Save) => x.outage).outage.cause = 'alien'), /\.outage\.cause should be one of "storm", "digIn", got "alien"/],
+      ['an outage from a storm never logged', (s) => (s.network.spans.find((x: Save) => x.outage).outage.storm = 99), /\.outage\.storm should be an integer in 1\.\.\d+, got 99/],
+      ['an outage with no days left', (s) => (s.network.spans.find((x: Save) => x.outage).outage.daysLeft = 0), /\.outage\.daysLeft should be an integer >= 1, got 0/],
+      ['a negative repair cost', (s) => (s.network.spans.find((x: Save) => x.outage).outage.repairCost = -1), /\.outage\.repairCost should be an integer >= 0, got -1/],
+      ['a conversion of an underground span', (s) => (s.network.spans.find((x: Save) => x.conversion).method = 'underground'), /\.conversion should be null except on a live aerial span/],
+      ['a conversion in an unknown stage', (s) => (s.network.spans.find((x: Save) => x.conversion).conversion.stage = 'live'), /\.conversion\.stage should be one of "permitting", "constructing", got "live"/],
+      ['a conversion of zero construction days', (s) => (s.network.spans.find((x: Save) => x.conversion).conversion.constructDays = 0), /\.conversion\.constructDays should be an integer >= 1/],
+      ['a lock on an unknown tier', (s) => (s.sales.accounts[0].locks[0].tier = 'fiber10g'), /sales\.accounts\[0\]\.locks\[0\]\.tier should be one of/],
+      ['a zero lock price', (s) => (s.sales.accounts[0].locks[0].price = 0), /sales\.accounts\[0\]\.locks\[0\]\.price should be an integer in 1\.\./],
+      ['a lock for an unknown reason', (s) => (s.sales.accounts[0].locks[0].reason = 'friend'), /sales\.accounts\[0\]\.locks\[0\]\.reason should be one of "grandfather", "notice", "promo"/],
+      ['two locks on one tier', (s) => s.sales.accounts[0].locks.push({ ...s.sales.accounts[0].locks[0] }), /sales\.accounts\[0\]\.locks \(by tier\)\[1\] should be greater/],
+      ['a promo of zero percent', (s) => (s.sales.promo.percentOff = 0), /sales\.promo\.percentOff should be an integer in 1\.\.100, got 0/],
+      ['a promo of zero months', (s) => (s.sales.promo.months = 0), /sales\.promo\.months should be an integer in 1\.\./],
+      ['an incumbent promo on a cabinet id never issued', (s) => (s.sales.incumbentPromos[0].cabinet = s.nextId), /sales\.incumbentPromos\[0\]\.cabinet should be an integer in 1\.\./],
+      ['an incumbent promo ending before it starts', (s) => (s.sales.incumbentPromos[0].endDay = s.sales.incumbentPromos[0].startDay), /sales\.incumbentPromos\[0\]\.endDay should be an integer >= \d+/],
+      ['an incumbent promo quiet before it ends', (s) => (s.sales.incumbentPromos[0].quietUntil = s.sales.incumbentPromos[0].endDay - 1), /sales\.incumbentPromos\[0\]\.quietUntil should be an integer >= \d+/],
+      ['negative frozen closes', (s) => (s.debt.frozenCloses = -1), /debt\.frozenCloses should be an integer in 0\.\.10000, got -1/],
+      ['an acceleration with no closes left', (s) => (s.debt.acceleration.closesLeft = 0), /debt\.acceleration\.closesLeft should be an integer in 1\.\./],
+      ['an acceleration from the future', (s) => (s.debt.acceleration.day = s.day + 1), /debt\.acceleration\.day should be an integer in 0\.\.\d+/],
+      ['report ops missing a field', (s) => delete s.finance.reports[0].ops.mrr, /finance\.reports\[0\]\.ops\.mrr should be an integer >= 0, got nothing/],
+      ['report ops with negative repairs', (s) => (s.finance.reports[0].ops.repairs = -5), /finance\.reports\[0\]\.ops\.repairs should be an integer >= 0, got -5/],
+      ['report debt with a negative sweep', (s) => (s.finance.reports[0].debt.sweep = -1), /finance\.reports\[0\]\.debt\.sweep should be an integer in 0\.\./],
+      ['report debt with zero acceleration closes left', (s) => (s.finance.reports[0].debt.accelerationClosesLeft = 0), /finance\.reports\[0\]\.debt\.accelerationClosesLeft should be an integer in 1\.\./],
+    ];
+
+    it.each(round4Cases)('rejects %s', (_name, mutate, message) => {
+      expectSaveError(withRound4(mutate), message);
     });
   });
 
@@ -659,6 +786,59 @@ describe('deserialize errors', () => {
     }
     expect(failures).toEqual([]);
   });
+
+  it('either rejects or loads a playable game for any single-field corruption of a round-4 record', () => {
+    // The tiny town on credit with every round-4 record populated; only the
+    // round-4 paths are swept (the sweep above covers the rest).
+    const save0: Save = JSON.parse(serialize(borrowedGame({ cols: 1, rows: 1, blockW: 2, blockH: 2 })));
+    populateRound4(save0);
+    const text = JSON.stringify(save0);
+    expect(() => deserialize(text)).not.toThrow();
+    const ROUND4 = new Set(['weather', 'outage', 'conversion', 'locks', 'promo', 'incumbentPromos', 'frozenCloses', 'acceleration', 'ops', 'sweep', 'accelerationClosesLeft']);
+    const paths: Array<Array<string | number>> = [];
+    const walk = (value: unknown, path: Array<string | number>): void => {
+      if (path.some((key) => typeof key === 'string' && ROUND4.has(key))) paths.push(path);
+      if (Array.isArray(value)) value.forEach((v, i) => walk(v, [...path, i]));
+      else if (typeof value === 'object' && value !== null) {
+        for (const [key, v] of Object.entries(value)) walk(v, [...path, key]);
+      }
+    };
+    walk(save0, []);
+    expect(paths.length).toBeGreaterThan(40);
+
+    const DELETE = Symbol('delete');
+    const replacements: unknown[] = [DELETE, null, 'x', -1, 0, 1, 1.5, true, {}, [], 1e9];
+    const failures: string[] = [];
+    for (const path of paths) {
+      for (const replacement of replacements) {
+        const save: Save = JSON.parse(text);
+        const parent = path.slice(0, -1).reduce((node: Save, key) => node[key], save);
+        const key = path[path.length - 1] as string | number;
+        if (replacement === DELETE) delete parent[key];
+        else parent[key] = replacement;
+        const label = `${path.join('.')} = ${replacement === DELETE ? '<deleted>' : JSON.stringify(replacement)}`;
+        let state: GameState;
+        try {
+          state = deserialize(JSON.stringify(save));
+        } catch (err) {
+          if (!(err instanceof SaveError)) failures.push(`${label}: threw ${String(err)}`);
+          continue;
+        }
+        try {
+          applyCommand(state, { type: 'setPricing', tiers: tierSettings({ fiber500: 70 }) as never, smbMultiplier: 1.5, grandfatherMonths: 1 });
+          applyCommand(state, { type: 'setPromo', promo: { percentOff: 10, months: 2 } });
+          applyCommand(state, { type: 'convertSpan', span: state.network.spans[0]?.id ?? 1 });
+          applyCommand(state, { type: 'repayCredit', amount: 500 });
+          runDays(state, 70);
+          getService(state);
+          deserialize(serialize(state));
+        } catch (err) {
+          failures.push(`${label}: loaded, then ${String(err)}`);
+        }
+      }
+    }
+    expect(failures).toEqual([]);
+  });
 });
 
 /** Saves written by the round-1 (schemaVersion 1) build, frozen before round 2 began. */
@@ -672,7 +852,7 @@ describe('schemaVersion 1 saves', () => {
     const v1: Save = JSON.parse(text);
     expect(v1.schemaVersion).toBe(1);
     const state = deserialize(text);
-    expect(state.schemaVersion).toBe(3);
+    expect(state.schemaVersion).toBe(4);
 
     // The town, plant, money and history are the player's own.
     expect(state.city).toEqual(v1.city);
@@ -680,11 +860,12 @@ describe('schemaVersion 1 saves', () => {
     expect(state.nextId).toBe(v1.nextId);
     expect(state.rng.events).toBe(v1.rng.events);
     expect(state.rng.sales).toBe(deriveSeed(v1.seed, 'sales'));
+    expect(state.rng.weather).toBe(deriveSeed(v1.seed, 'weather'));
     expect(state.finance.cash).toBe(v1.finance.cash);
     expect(state.finance.reports).toEqual(v1.finance.reports);
     expect(state.finance.monthToDate).toEqual(v1.finance.monthToDate);
     expect(state.network.cabinets).toEqual(v1.network.cabinets);
-    expect(state.network.spans).toEqual(v1.network.spans.map((s: Save) => ({ ...s, refundable: s.cost })));
+    expect(state.network.spans).toEqual(v1.network.spans.map((s: Save) => ({ ...s, refundable: s.cost, outage: null, conversion: null })));
     expect(state.network.olt).toEqual({ ...v1.network.olt, cards: Math.ceil(v1.network.olt.ponPorts / OLT_PORTS_PER_CARD) });
     expect(state.network.makeReady).toEqual([]);
 
@@ -703,10 +884,11 @@ describe('schemaVersion 1 saves', () => {
     expect(state.notices).toEqual([]);
     expect(state.nextNoticeId).toBe(1);
     expect(state.gameOver).toBeNull();
-    // ...and on through v2 to v3: nothing borrowed.
+    // ...and on through v2 to v3: nothing borrowed; and to v4: no storms yet.
     expect(state.debt).toEqual(newDebt());
+    expect(state.weather).toEqual(newWeather());
 
-    // Service is unchanged by the migration, and the migrated game saves as v3.
+    // Service is unchanged by the migration, and the migrated game saves as v4.
     const again = deserialize(serialize(state));
     expect(again).toEqual(state);
     expect(getService(again).passings).toBe(getService(state).passings);
@@ -780,6 +962,34 @@ function v2Fixture(name: 'v2-grid' | 'v2-town'): string {
   return readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8');
 }
 
+/**
+ * A migrated game with everything round 4 added taken out again (the weather
+ * stream and state, span outages and conversions, price locks, the promo
+ * settings, the frozen counters), to compare with the save it came from.
+ */
+function withoutRound4(state: GameState): Save {
+  const copy: Save = structuredClone(state);
+  delete copy.rng.weather;
+  delete copy.weather;
+  for (const span of copy.network.spans) {
+    expect(span.outage).toBeNull();
+    expect(span.conversion).toBeNull();
+    delete span.outage;
+    delete span.conversion;
+  }
+  for (const account of copy.sales.accounts) {
+    expect(account.locks).toEqual([]);
+    delete account.locks;
+  }
+  expect(copy.sales.promo).toBeNull();
+  expect(copy.sales.incumbentPromos).toEqual([]);
+  delete copy.sales.promo;
+  delete copy.sales.incumbentPromos;
+  delete copy.debt.frozenCloses;
+  delete copy.debt.acceleration;
+  return copy;
+}
+
 describe('schemaVersion 2 saves', () => {
   it.each(['v2-grid', 'v2-town'] as const)('migrates the frozen %s save with no debt and keeps everything else', (name) => {
     const text = v2Fixture(name);
@@ -793,10 +1003,11 @@ describe('schemaVersion 2 saves', () => {
     expect(v2.finance.monthToDate.length).toBeGreaterThan(0);
 
     const state = deserialize(text);
-    expect(state.schemaVersion).toBe(3);
+    expect(state.schemaVersion).toBe(4);
     expect(state.debt).toEqual(newDebt());
+    expect(state.weather).toEqual(newWeather());
     const { schemaVersion: _from, ...kept } = v2;
-    const { schemaVersion: _to, debt: _debt, ...rest } = state;
+    const { schemaVersion: _to, debt: _debt, ...rest } = withoutRound4(state);
     expect(rest).toEqual(kept);
     expect(state.finance.reports.every((r) => r.debt === undefined)).toBe(true);
     // Nothing to explain: the rules that changed in round 3 do not take anything away.
@@ -880,5 +1091,161 @@ describe('schemaVersion 2 saves', () => {
     expectSaveError(bad((s) => (s.gameOver = { day: 1, reason: 'default', message: 'x' })), /gameOver\.reason should be one of "insolvent", got "default"/);
     // A stray debt object in a v2 save is replaced by the migration, not trusted.
     expect(deserialize(bad((s) => (s.debt = { junk: true }))).debt).toEqual(newDebt());
+  });
+});
+
+/**
+ * Saves written by the round-3 (schemaVersion 3) build, frozen before round 4
+ * changed GameState: v3-town is the borrowing SMART bot on the seed-2027 town
+ * for 30 months plus 11 days (mid-month, 339 subscribers, a drawn credit line
+ * and 10 term loans, compliant); v3-grid is a hand-played 4 x 3 Gridville
+ * (seed 7, mixed lots, aerial and underground cable, two cabinets) that
+ * borrowed all the bank offered, went warning, penalty and frozen, and sits on
+ * its cash: frozen for the last two closes, mid-month on day 440, with its
+ * 2 Gig tier no longer offered.
+ */
+function v3Fixture(name: 'v3-grid' | 'v3-town'): string {
+  return readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8');
+}
+
+describe('schemaVersion 3 saves', () => {
+  it.each(['v3-grid', 'v3-town'] as const)('migrates the frozen %s save, keeping the game and adding round 4 empty', (name) => {
+    const text = v3Fixture(name);
+    const v3: Save = JSON.parse(text);
+    expect(v3.schemaVersion).toBe(3);
+    expect(v3.weather).toBeUndefined();
+    // A real mid-game save on credit: subscribers, loans, closed months with debt stats, an open month.
+    expect(v3.sales.accounts.length).toBeGreaterThan(0);
+    expect(v3.debt.loans.length).toBeGreaterThan(0);
+    expect(v3.finance.reports.length).toBeGreaterThan(6);
+    expect(v3.finance.reports.every((r: Save) => r.stats !== undefined && r.debt !== undefined)).toBe(true);
+    expect(v3.finance.monthToDate.length).toBeGreaterThan(0);
+
+    const state = deserialize(text);
+    expect(state.schemaVersion).toBe(4);
+    expect(state.rng).toEqual({ events: v3.rng.events, sales: v3.rng.sales, weather: deriveSeed(v3.seed, 'weather') });
+    expect(state.weather).toEqual(newWeather());
+    expect(state.debt.acceleration).toBeNull();
+    expect(state.finance.reports.every((r) => r.ops === undefined && r.debt?.sweep === undefined)).toBe(true);
+
+    // Everything else is the player's own, untouched (but the notice explaining the new frozen rules).
+    const frozen = v3.debt.covenant.stage === 'frozen';
+    const { schemaVersion: _from, ...kept } = v3;
+    const { schemaVersion: _to, ...rest } = withoutRound4(state);
+    const added = frozen ? 1 : 0;
+    expect(rest.notices.slice(0, v3.notices.length)).toEqual(kept.notices);
+    expect({ ...rest, notices: kept.notices, nextNoticeId: kept.nextNoticeId }).toEqual(kept);
+    expect(rest.nextNoticeId).toBe(v3.nextNoticeId + added);
+    expect(state.notices.slice(v3.notices.length).map((n) => n.kind)).toEqual(frozen ? ['rulesUpdated'] : []);
+
+    // Same key order as a fresh game everywhere round 4 added keys, so a migrated game hashes like a fresh one.
+    const fresh = newGame(state.seed, { city: state.city });
+    applyCommand(fresh, { type: 'layCable', segments: [0], method: 'aerial' });
+    expect(Object.keys(state)).toEqual(Object.keys(fresh));
+    expect(Object.keys(state.rng)).toEqual(Object.keys(fresh.rng));
+    expect(Object.keys(state.network.spans[0]!)).toEqual(Object.keys(fresh.network.spans[0]!));
+    expect(Object.keys(state.sales)).toEqual(Object.keys(newSales()));
+    expect(Object.keys(state.debt)).toEqual(Object.keys(newDebt()));
+    expect(deserialize(serialize(state))).toEqual(state);
+    expect(serialize(deserialize(serialize(state)))).toBe(serialize(state));
+  });
+
+  it('counts a frozen line\'s trailing frozen closes, and tells the player the new rules once', () => {
+    const grid = deserialize(v3Fixture('v3-grid'));
+    expect(grid.debt.covenant.stage).toBe('frozen');
+    expect(grid.debt.frozenCloses).toBe(2);
+    expect(closesUntilAcceleration(grid)).toBe(FROZEN_ACCELERATION_CLOSES - 2);
+    const note = grid.notices.at(-1)!;
+    expect(note.kind).toBe('rulesUpdated');
+    expect(note.message).toMatch(/while your credit line is frozen, the bank takes \d+% of each month's operating cash flow/);
+    expect(note.message).toContain(`after ${FROZEN_ACCELERATION_CLOSES} frozen month closes in a row it calls the loans`);
+    // Saving and loading the migrated game doesn't repeat it.
+    expect(deserialize(serialize(grid)).notices.filter((n) => n.kind === 'rulesUpdated')).toHaveLength(1);
+
+    const town = deserialize(v3Fixture('v3-town'));
+    expect(town.debt.covenant.stage).toBe('compliant');
+    expect(town.debt.frozenCloses).toBe(0);
+    expect(closesUntilAcceleration(town)).toBeNull();
+  });
+
+  it('leaves a game frozen for years its warning closes before the bank calls the loans', () => {
+    const save: Save = JSON.parse(v3Fixture('v3-grid'));
+    for (const report of save.finance.reports.slice(-8)) report.debt.stage = 'frozen';
+    const state = deserialize(JSON.stringify(save));
+    expect(state.debt.frozenCloses).toBe(FROZEN_ACCELERATION_CLOSES - ACCELERATION_WARNING_CLOSES - 1);
+    expect(closesUntilAcceleration(state)).toBe(ACCELERATION_WARNING_CLOSES + 1);
+    // Frozen with nothing owed counts nothing (the next close lifts the freeze).
+    const paid: Save = JSON.parse(v3Fixture('v3-grid'));
+    paid.debt.credit.balance = 0;
+    paid.debt.credit.balanceDollarDays = 0;
+    paid.debt.loans = [];
+    const cleared = deserialize(JSON.stringify(paid));
+    expect(cleared.debt.frozenCloses).toBe(0);
+    expect(cleared.notices.some((n) => n.kind === 'rulesUpdated')).toBe(false);
+  });
+
+  it.each(['v3-grid', 'v3-town'] as const)('keeps playing the frozen %s save through month closes', (name) => {
+    const state = deserialize(v3Fixture(name));
+    const passings = getService(state).passings;
+    const reports = state.finance.reports.length;
+    expect(passings).toBeGreaterThan(0);
+    expect(subscriberUnits(state)).toBeGreaterThan(0);
+    runDays(state, 62);
+    expect(state.gameOver).toBeNull();
+    expect(state.finance.reports.length).toBe(reports + 2);
+    const last = state.finance.reports.at(-1)!;
+    expect(last.stats?.subscribers).toBeGreaterThan(0);
+    // Round-4 closes write ops and the round-4 debt figures.
+    expect(last.ops).toBeDefined();
+    expect(last.ops?.lastNoticeId).toBe(state.nextNoticeId - 1);
+    expect(last.debt?.frozenCloses).toBe(state.debt.frozenCloses);
+    expect(getService(state).passings).toBeGreaterThanOrEqual(passings);
+    expect(deserialize(serialize(state))).toEqual(state);
+  });
+
+  it.each(['v3-grid', 'v3-town'] as const)('plays the migrated %s save exactly like the same game saved and reloaded', (name) => {
+    const play = (reloadAfter: number | null): GameState => {
+      let state = deserialize(v3Fixture(name));
+      applyCommand(state, { type: 'setMarketing', perMonth: 4_000 });
+      for (let month = 1; month <= 6; month++) {
+        runDays(state, 30);
+        if (month === reloadAfter) state = deserialize(serialize(state));
+      }
+      return state;
+    };
+    const straight = play(null);
+    expect(hashState(play(3))).toBe(hashState(straight));
+    expect(hashState(play(null))).toBe(hashState(straight));
+  });
+
+  it('validates a v3 save as v3 before migrating it, naming the bad field', () => {
+    const bad = (mutate: (save: Save) => void): string => {
+      const save: Save = JSON.parse(v3Fixture('v3-town'));
+      mutate(save);
+      return JSON.stringify(save);
+    };
+    expectSaveError(bad((s) => (s.network.spans[0].segment = 1e6)), /network\.spans\[0\]\.segment should be an integer in 0\.\.\d+, got 1000000/);
+    expectSaveError(bad((s) => (s.debt.loans[0].balance = 0)), /debt\.loans\[0\]\.balance should be an integer in 1\.\./);
+    // Round-4 records cannot appear in a round-3 save.
+    expectSaveError(bad((s) => (s.notices[0].kind = 'storm')), /notices\[0\]\.kind should be one of .*got "storm"/);
+    expectSaveError(bad((s) => (s.finance.monthToDate[0].category = 'repair')), /finance\.monthToDate\[0\]\.category should be one of .*got "repair"/);
+    expectSaveError(bad((s) => delete s.rng.sales), /rng\.sales should be an integer/);
+    // Stray round-4 fields in a v3 save are replaced by the migration, not trusted.
+    const stray = deserialize(
+      bad((s) => {
+        s.weather = { junk: true };
+        s.rng.weather = 5;
+        s.debt.frozenCloses = 99;
+        s.sales.promo = { percentOff: 90, months: 99 };
+        s.network.spans[0].outage = { junk: true };
+        s.sales.accounts[0].locks = [{ junk: true }];
+      }),
+    );
+    expect(stray.weather).toEqual(newWeather());
+    expect(stray.rng.weather).toBe(deriveSeed(stray.seed, 'weather'));
+    expect(stray.debt.frozenCloses).toBe(0);
+    expect(stray.sales.promo).toBeNull();
+    expect(stray.network.spans[0]?.outage).toBeNull();
+    expect(stray.sales.accounts[0]?.locks).toEqual([]);
   });
 });

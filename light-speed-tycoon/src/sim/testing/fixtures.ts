@@ -4,6 +4,7 @@ import { ARR_TRAILING_MONTHS, BASE_RATE_BPS, CABINET_START_SPLITTERS, START_YEAR
 import { dayOf } from '../calendar';
 import { annualOperatingCashFlow, creditLimit, levelPayment, trailingArr } from '../debt';
 import { newGame } from '../game';
+import { monthlyRecurringRevenue } from '../sales';
 import type {
   CabinetId,
   City,
@@ -12,6 +13,7 @@ import type {
   LedgerCategory,
   MonthlyReport,
   NodeId,
+  OpsStats,
   Parcel,
   ParcelKind,
   SegmentId,
@@ -157,6 +159,8 @@ export interface TestStateOptions {
   rngEvents?: number;
   /** Override rng.sales (default 54321). */
   rngSales?: number;
+  /** Override rng.weather (default 24680). */
+  rngWeather?: number;
 }
 
 /**
@@ -166,7 +170,7 @@ export interface TestStateOptions {
  */
 export function makeTestState(city: City = makeGridCity(), opts: TestStateOptions = {}): GameState {
   const state = newGame(opts.seed ?? 1, { city });
-  state.rng = { events: opts.rngEvents ?? 12345, sales: opts.rngSales ?? 54321 };
+  state.rng = { events: opts.rngEvents ?? 12345, sales: opts.rngSales ?? 54321, weather: opts.rngWeather ?? 24680 };
   return state;
 }
 
@@ -201,6 +205,8 @@ export function addLivePlant(state: GameState, opts: LivePlantOptions = {}): Cab
       refundable: 0,
       orderedDay: 0,
       liveDay: 0,
+      outage: null,
+      conversion: null,
     });
   }
   let cabinet: CabinetId | null = null;
@@ -297,6 +303,30 @@ export function noDebtStats(state: GameState): DebtStats {
     stage: 'compliant',
     averageRateBps: null,
     missedPayment: false,
+    sweep: 0,
+    frozenCloses: 0,
+    accelerationClosesLeft: null,
+  };
+}
+
+/**
+ * The report.ops a round-4 close writes when none of the round-4 events
+ * happened (no storms, tier moves, price steps or incumbent promos), from the
+ * state right after that close.
+ */
+export function quietOpsStats(state: GameState): OpsStats {
+  return {
+    lastNoticeId: state.nextNoticeId - 1,
+    tierMoves: 0,
+    priceChurn: 0,
+    outageChurn: 0,
+    incumbentChurn: 0,
+    outageUnitDays: 0,
+    storms: 0,
+    spansDamaged: 0,
+    repairs: 0,
+    incumbentPromos: 0,
+    mrr: monthlyRecurringRevenue(state),
   };
 }
 

@@ -1,9 +1,10 @@
 // The map scene. Layers, bottom to top: board, roads, rock stipple, trees,
 // strong rock texture (underground tool), $/ft cost overlay, pole overlay,
-// parcels, cables, coverage shading and route preview, central office,
-// cabinets, tool marks. The world container is a render group, so panning and
-// zooming only change its transform; each layer is redrawn only when the
-// state it shows changes.
+// parcels, recent storms' clouds, cables, coverage shading and route preview,
+// central office, cabinets, storm badges, tool marks. The world container is
+// a render group, so panning and zooming only change its transform; each
+// layer is redrawn only when the state it shows changes (the storm clouds on
+// a new storm or a new day, while they fade).
 
 import { Container, Graphics } from 'pixi.js';
 import type { Application } from 'pixi.js';
@@ -15,7 +16,7 @@ import { boardBounds, drawBoard, drawCostOverlay, drawPoleOverlay, drawRoads, dr
 import type { CostOverlayMode } from './cityLayer';
 import { buildCentralOffice } from './coLayer';
 import { placeTrees } from './decor';
-import { NetworkLayer } from './networkLayer';
+import { NetworkLayer, StormLayer } from './networkLayer';
 import { OverlayLayer } from './overlay';
 import type { OverlaySpec } from './overlay';
 import { ParcelLayer } from './parcelLayer';
@@ -42,6 +43,12 @@ export interface SceneStats {
   costOverlay: CostOverlayMode | null;
   /** The strong rock texture is showing (underground tool). */
   rockEmphasis: boolean;
+  /** Live spans drawn out of service (storm or dig-in damage). */
+  outageSpans: number;
+  /** Aerial spans drawn being rebuilt underground. */
+  rebuildSpans: number;
+  /** Recent storms whose area the map shows (STORM_SHOW_DAYS). */
+  stormsShown: number;
 }
 
 export class Scene {
@@ -55,6 +62,7 @@ export class Scene {
   private costDrawn: { city: City; mode: CostOverlayMode } | null = null;
   private readonly parcels: ParcelLayer;
   private readonly network: NetworkLayer;
+  private readonly storms: StormLayer;
   private readonly overlay: OverlayLayer;
   private co: Container | null = null;
   private city: City | null = null;
@@ -75,6 +83,7 @@ export class Scene {
   ) {
     this.parcels = new ParcelLayer(theme);
     this.network = new NetworkLayer(theme);
+    this.storms = new StormLayer(theme);
     this.overlay = new OverlayLayer(theme);
     this.poles.visible = false;
     this.rockStrong.visible = false;
@@ -85,9 +94,11 @@ export class Scene {
       this.cost,
       this.poles,
       this.parcels.container,
+      this.storms.under,
       this.network.below,
       this.overlay.under,
       this.network.above,
+      this.storms.over,
       this.overlay.over,
     );
     app.stage.addChild(this.world);
@@ -130,6 +141,7 @@ export class Scene {
       this.network.sync(state, service);
       this.dirty = true;
     }
+    if (this.storms.sync(state)) this.dirty = true;
   }
 
   /** Subscribed units per parcel (from Sales.accounts), recomputed once per state and day. */
@@ -215,6 +227,9 @@ export class Scene {
       fullCabinets: this.network.fullRings,
       costOverlay: this.cost.visible ? this.costMode : null,
       rockEmphasis: this.rockStrong.visible,
+      outageSpans: this.network.outageSpans,
+      rebuildSpans: this.network.rebuildSpans,
+      stormsShown: this.storms.shown,
     };
   }
 

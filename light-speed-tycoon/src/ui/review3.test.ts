@@ -50,6 +50,14 @@ function closeAfter(day: number): number {
   return day - dateOf(day).day + 1 + (MONTH_LENGTHS[dateOf(day).month - 1] as number);
 }
 
+/**
+ * Make the open month bill `revenue` at its close, as if every day had billed
+ * revenue / days (so the smoothed lending ARR holds through a real close).
+ */
+function billMonth(state: GameState, revenue: number): void {
+  state.sales.month.revenueDollarDays = revenue * (MONTH_LENGTHS[dateOf(state.day).month - 1] as number);
+}
+
 /** A real month close (closeMonth) on the 1st after state.day. */
 function closeNext(state: GameState): MonthlyReport {
   state.day = closeAfter(state.day);
@@ -193,6 +201,7 @@ describe('#8 the credit-line breakdown is dated', () => {
   it('never says "no debt yet" with a loan outstanding, and names the close it was priced at', () => {
     const state = makeTradingState(25_000, 0);
     state.finance.cash = 1_000_000;
+    billMonth(state, 25_000);
     const report = closeNext(state);
     apply(state, { type: 'takeTermLoan', amount: 45_000, termYears: 7 });
     const offer = creditOffer(state);

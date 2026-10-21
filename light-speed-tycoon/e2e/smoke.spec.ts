@@ -489,3 +489,23 @@ test('replacing the town asks first, and a stray double Space can never wipe it'
   expect((await currentGame(page)).seed).not.toBe(before.seed);
   expect(errors).toEqual([]);
 });
+
+test('a debug page never shows the month-end briefing unless asked, whatever the stored preference', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await page.evaluate(() => localStorage.setItem('lst:briefing', 'monthly'));
+  await page.reload();
+  await page.waitForFunction(() => window.__lst !== undefined);
+  await page.evaluate(() => window.__lst!.tick(31));
+  expect(await page.evaluate(() => window.__lst!.briefingOpen())).toBe(false);
+  await expect(page.locator('dialog.briefing')).toHaveCount(0);
+  // The month close is told by its toast instead, and the clock is not interrupted.
+  await expect(page.locator('.toast').filter({ hasText: 'Jan 2027 closed' })).toBeVisible();
+  expect(await page.evaluate(() => window.__lst!.getState().day)).toBe(31);
+  // The debug hook turns it on for this page.
+  await page.evaluate(() => window.__lst!.setBriefing('monthly'));
+  await page.evaluate(() => window.__lst!.tick(40));
+  await expect(page.getByRole('dialog', { name: 'February 2027 briefing' })).toBeVisible();
+  expect(await page.evaluate(() => window.__lst!.getState().day)).toBe(59);
+  expect(errors).toEqual([]);
+});

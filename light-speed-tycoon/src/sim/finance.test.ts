@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_CLOSES,
   COVENANT_CURE_CLOSES,
   CPP_AMBER_MULTIPLIER,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_SHARE,
   CPP_SPREAD_BPS,
   CPP_TARGET,
   INSOLVENCY_GRACE_MONTHS,
@@ -38,19 +41,21 @@ import {
   canAfford,
   checkInsolvency,
   closeMonth,
+  estimateMonthOperatingCashFlow,
   formatMoney,
   groupThousands,
   monthlyPoleRent,
   postEntry,
   postEntryOn,
+  monthlyBurn,
   runwayMonths,
 } from './finance';
 import { applyCommand, runDays, tick } from './game';
-import { operatingCashFlow } from './metrics';
+import { operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService } from './network';
 import { Rng } from './rng';
 import { subscriberUnits } from './sales';
-import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats } from './testing/fixtures';
+import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats, quietOpsStats } from './testing/fixtures';
 import type { BuildStage, CableMethod, City, Command, CovenantStage, GameState, LedgerEntry, MonthlyReport, SegmentId, TermLoan } from './types';
 
 // Default grid: horizontal segments 0..8 are 240 ft (2 poles), vertical 9..16 are 120 ft (1 pole).
@@ -71,6 +76,8 @@ function addSpan(state: GameState, segment: SegmentId, method: CableMethod, stag
     refundable: 0,
     orderedDay: 0,
     liveDay: stage === 'live' ? 0 : null,
+    outage: null,
+    conversion: null,
   });
 }
 
@@ -205,6 +212,8 @@ describe('closeMonth', () => {
       stats: ZERO_STATS,
       // Every round-3 close records financing, debt or not.
       debt: noDebtStats(state),
+      // Every round-4 close records its operating figures.
+      ops: quietOpsStats(state),
     });
     expect(Object.keys(report.totals)).toEqual(['construction', 'equipment', 'refund', 'poleRent', 'overhead']);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -239,6 +248,7 @@ describe('closeMonth', () => {
       passings: 0,
       stats: ZERO_STATS,
       debt: noDebtStats(state),
+      ops: quietOpsStats(state),
     });
   });
 
@@ -265,8 +275,8 @@ describe('closeMonth', () => {
     const cabinet = addLivePlant(state, { splitters: 3 })!;
     addLivePlant(state, { segments: [], node: 5, splitters: 2 });
     state.sales.accounts = [
-      { parcel: 0, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 3 },
-      { parcel: 2, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 9 },
+      { parcel: 0, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 3, locks: [] },
+      { parcel: 2, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 9, locks: [] },
     ];
     state.sales.connectsTotal = 5;
     state.sales.fullCabinets = [cabinet];
@@ -423,6 +433,22 @@ describe('runwayMonths with debt (round 3)', () => {
     expect(runwayMonths(borrowed)).toBe(Math.floor(60_000 / 6_000));
     expect(runwayMonths(withReport({ revenue: 10_000, overhead: -8_000, interest: -2_000 }, 5))).toBeNull();
   });
+
+  it('round 4: counts the scheduled debt service, not a voluntary repayment, and storm repairs at their yearly average', () => {
+    // Operations earn $2,000; the month also repaid $30,000 of the line by choice; $1,500 a month is scheduled.
+    const state = withReport({ revenue: 10_000, overhead: -8_000, interest: -1_500, principal: -30_000 }, 9_000);
+    const report = state.finance.reports[0]!;
+    report.debt = { ...noDebtStats(state), creditBalance: 50_000, annualDebtService: 12 * 1_500 };
+    expect(monthlyBurn(state)).toBe(0);
+    expect(runwayMonths(state)).toBeNull();
+    report.debt.annualDebtService = 12 * 3_000;
+    expect(monthlyBurn(state)).toBe(1_000);
+    expect(runwayMonths(state)).toBe(9);
+    // A storm month's repairs count at a twelfth of the year's repairs.
+    report.totals.repair = -12_000;
+    report.net -= 12_000;
+    expect(monthlyBurn(state)).toBe(1_000 + 12_000 / REPAIR_TRAILING_MONTHS);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -448,6 +474,14 @@ function monthStartOf(state: GameState): number {
 /** The 1st of the month after state.day. */
 function nextCloseDay(state: GameState): number {
   return monthStartOf(state) + (MONTH_LENGTHS[dateOf(state.day).month - 1] as number);
+}
+
+/**
+ * Make the open month bill `revenue` at its close (its revenue accrual set as
+ * if every day had billed revenue / days), with no subscribers to show for it.
+ */
+function billMonth(state: GameState, revenue: number): void {
+  state.sales.month.revenueDollarDays = revenue * (MONTH_LENGTHS[dateOf(state.day).month - 1] as number);
 }
 
 /** closeMonth on the 1st after state.day (no daily steps in between), with a throwaway sales stream. */
@@ -511,6 +545,8 @@ describe('closeMonth: credit-line interest', () => {
 
   it('is predicted exactly by estimateNextDebtService when nothing changes before the close', () => {
     const state = trading();
+    // The month bills like the trailing ones, so the smoothed lending ARR (and term capacity) holds through the close.
+    billMonth(state, REVENUE);
     apply(state, { type: 'drawCredit', amount: 30_000 });
     apply(state, { type: 'takeTermLoan', amount: TERM_LOAN_MIN * 2, termYears: 5 });
     tickThroughClose(state);
@@ -823,6 +859,9 @@ describe('closeMonth: pricing and report.debt', () => {
       stage: state.debt.covenant.stage,
       averageRateBps: Math.round(weighted / total),
       missedPayment: false,
+      sweep: 0,
+      frozenCloses: 0,
+      accelerationClosesLeft: null,
     });
     expect(state.debt.covenant.stage).toBe('compliant');
     // With no debt: zeros, null coverage and rate.
@@ -849,5 +888,100 @@ describe('closeMonth: pricing and report.debt', () => {
     expect(report.net - capex - financing).toBe(operatingCashFlow(report));
     expect(report.stats!.capexOsp).toBe(40_000);
     expect(state.finance.capex.osp).toBe(40_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 4: the frozen-line sweep and called loans through real closes
+// ---------------------------------------------------------------------------
+
+describe('closeMonth: the frozen-line sweep and called loans (round 4)', () => {
+  /** Frozen with a credit-line balance, the month billing like the trailing ones. */
+  function frozen(balance: number, frozenCloses = 1): GameState {
+    const state = trading();
+    state.debt.covenant.stage = 'frozen';
+    state.debt.frozenCloses = frozenCloses;
+    state.debt.credit.balance = balance;
+    billMonth(state, REVENUE);
+    return state;
+  }
+
+  it('takes the sweep after the debt service, in the ended month\'s principal, and the books balance', () => {
+    const state = frozen(150_000);
+    const cashBefore = state.finance.cash;
+    const posted = state.finance.monthToDate.reduce((a, e) => a + e.amount, 0);
+    const { report, entries } = tickThroughClose(state);
+    const sweep = report.debt!.sweep!;
+    // Its share of the month's operating cash flow (financing is not operating: the sweep leaves it alone).
+    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * operatingCashFlow(report)));
+    expect(sweep).toBeGreaterThan(0);
+    const sweepEntry = entries.find((e) => e.memo.startsWith('Frozen-line sweep'))!;
+    expect(sweepEntry).toMatchObject({ category: 'principal', amount: -sweep, day: state.day - 1 });
+    // The debt service is posted first, the sweep after it.
+    expect(entries.indexOf(sweepEntry)).toBe(entries.length - 1);
+    expect(report.totals.principal).toBe(-sweep);
+    expect(report.net).toBe(Object.values(report.totals).reduce((a, b) => a + (b ?? 0), 0));
+    expect(report.cashEnd).toBe(state.finance.cash);
+    expect(cashBefore - posted + report.net).toBe(state.finance.cash);
+    expect(state.debt.credit.balance).toBe(150_000 - sweep);
+    expect(report.debt!.creditBalance).toBe(150_000 - sweep);
+    expect(state.notices.some((n) => n.kind === 'debtSwept')).toBe(true);
+  });
+
+  it('estimates the month\'s operating cash flow the sweep will take its share of', () => {
+    const state = frozen(150_000);
+    while (dateOf(state.day + 1).day !== 1) tick(state);
+    const estimate = estimateMonthOperatingCashFlow(state);
+    const { report } = tickThroughClose(state);
+    expect(operatingCashFlow(report)).toBe(estimate);
+  });
+
+  it(`calls the loans after ${FROZEN_ACCELERATION_CLOSES} frozen closes, then collects everything within ${ACCELERATION_CLOSES} closes`, () => {
+    const state = frozen(120_000, FROZEN_ACCELERATION_CLOSES - 1);
+    state.debt.loans = [makeLoan({ id: 1, principal: 90_000, balance: 80_000, monthsLeft: 48, originatedDay: 0 })];
+    state.debt.nextLoanId = 2;
+    const first = tickThroughClose(state).report;
+    expect(first.debt).toMatchObject({ stage: 'frozen', frozenCloses: FROZEN_ACCELERATION_CLOSES, accelerationClosesLeft: ACCELERATION_CLOSES });
+    expect(state.notices.filter((n) => n.kind === 'loansCalled')).toHaveLength(1);
+    const lefts: Array<number | null | undefined> = [];
+    for (let i = 0; i < ACCELERATION_CLOSES && totalDebt(state) > 0; i++) {
+      billMonth(state, REVENUE);
+      const owed = totalDebt(state);
+      const { report } = tickThroughClose(state);
+      expect(report.debt!.missedPayment).toBe(false);
+      expect(-(report.totals.principal ?? 0)).toBeGreaterThan(0);
+      expect(totalDebt(state)).toBeLessThan(owed);
+      lefts.push(report.debt!.accelerationClosesLeft);
+    }
+    expect(totalDebt(state)).toBe(0);
+    expect(state.debt.acceleration).toBeNull();
+    expect(state.debt.covenant.stage).toBe('compliant');
+    expect(state.gameOver).toBeNull();
+    // Counted down while anything was owed, cleared with nothing left.
+    expect(lefts.at(-1)).toBeNull();
+    for (let i = 1; i < lefts.length - 1; i++) expect(lefts[i]).toBe((lefts[i - 1] as number) - 1);
+  });
+
+  it('defaults a called close that cannot pay, and words the runway and insolvency for called loans', () => {
+    const state = frozen(400_000);
+    state.debt.acceleration = { day: 0, closesLeft: 2 };
+    state.finance.reports.at(-1)!.totals.interest = -1_000;
+    state.finance.cash = 100_000;
+    // The runway counts what falls due at the next close, not last month's payments.
+    const flow = operatingCashFlow(state.finance.reports.at(-1)!) - estimateNextDebtService(state);
+    expect(flow).toBeLessThan(0);
+    expect(runwayMonths(state)).toBe(Math.floor(100_000 / -flow));
+    // An overdraft warning while called says the next close in the red is a default.
+    const warned = trading();
+    warned.debt.credit.balance = 1_000;
+    warned.debt.acceleration = { day: 0, closesLeft: 3 };
+    warned.debt.covenant.stage = 'penalty';
+    warned.finance.cash = -5;
+    checkInsolvency(warned);
+    expect(warned.notices.at(-1)!.message).toContain('The bank has called your loans, so the next close in the red is a default');
+    // And the close that cannot pay is a default.
+    tickThroughClose(state);
+    expect(state.gameOver?.reason).toBe('default');
+    expect(state.gameOver?.message).toMatch(/^Default: the bank called your loans/);
   });
 });

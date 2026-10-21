@@ -154,13 +154,36 @@ export interface Theme {
       crewCab: string;
       crewWheel: string;
     };
-    /** Fiber cut burst (outages arrive in a later milestone). */
-    cut: { burst: string; core: string };
+    /**
+     * A span out of service (storm or dig-in damage): its tube washed out
+     * (`wash` at `washAlpha`), red dashes (`burst`) over it, and a pulsing
+     * red badge with a white (`core`) bolt and yellow sparks.
+     */
+    cut: {
+      burst: string;
+      core: string;
+      wash: string;
+      washAlpha: number;
+      dash: number;
+      gap: number;
+      badgeRadius: number;
+      spark: string;
+      /** One pulse of the dashes and badge, ms. */
+      pulseMs: number;
+    };
+    /** An aerial span being rebuilt underground: the planned bore drawn dashed beside it in the underground color. */
+    rebuild: { alpha: number; width: number; dash: number; gap: number; offset: number };
     /** Wash over live cable that reaches the CO but no cabinet's reach (it lights nothing). */
     dim: { color: string; alpha: number };
   };
   /** Rocky ground under a street: a subtle stipple, emphasized while planning underground runs. */
   rock: { stipple: string; alpha: number; strong: string; strongAlpha: number };
+  /**
+   * A recent storm's area: a translucent cloud disc with a rim, and a cloud
+   * badge with a lightning bolt at its center. Alphas are for a storm that
+   * hit today; older ones fade out over STORM_SHOW_DAYS.
+   */
+  storm: { cloud: string; alpha: number; rim: string; rimAlpha: number; badge: string; badgeRim: string; bolt: string; badgeRadius: number };
   /** Cabinet tool shading: placement preview and existing cabinets' coverage. */
   coverage: {
     /** In-reach streets of a planned cabinet (once cabled), strongest near it. */
@@ -350,10 +373,31 @@ export const toyTown: Theme = {
       crewCab: '#FFFFFF',
       crewWheel: '#23303A',
     },
-    cut: { burst: '#E11D48', core: '#FFFFFF' },
+    cut: {
+      burst: '#E11D48',
+      core: '#FFFFFF',
+      wash: '#F6F0E2',
+      washAlpha: 0.85,
+      dash: 6,
+      gap: 4,
+      badgeRadius: 8,
+      spark: '#FACC15',
+      pulseMs: 1400,
+    },
+    rebuild: { alpha: 0.75, width: 3, dash: 5, gap: 4, offset: 7 },
     dim: { color: '#F6F0E2', alpha: 0.62 },
   },
   rock: { stipple: '#B9A88A', alpha: 0.55, strong: '#7D6A4E', strongAlpha: 0.9 },
+  storm: {
+    cloud: '#5B6B8C',
+    alpha: 0.22,
+    rim: '#5B6B8C',
+    rimAlpha: 0.45,
+    badge: '#3D4A63',
+    badgeRim: '#FFFFFF',
+    bolt: '#FACC15',
+    badgeRadius: 13,
+  },
   coverage: {
     // Toy Town teal (the CO and cabinet family), deep enough to read over the
     // cream roads and the pale lawns at the far band's alpha.

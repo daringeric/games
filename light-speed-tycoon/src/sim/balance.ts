@@ -56,12 +56,12 @@ export const AERIAL_DETOUR_MAX_RATIO = 1.5;
 // ---------------------------------------------------------------------------
 
 // Aerial needs pole attachment + make-ready, underground needs a city permit.
-export const MAKE_READY_DAYS_MIN = 30;
-export const MAKE_READY_DAYS_MAX = 90;
+export const MAKE_READY_DAYS_MIN = 45;
+export const MAKE_READY_DAYS_MAX = 120;
 /** Chance a make-ready job hits a long delay (pole replacement, utility backlog). */
-export const MAKE_READY_LONG_CHANCE = 0.15;
-export const MAKE_READY_LONG_DAYS_MIN = 120;
-export const MAKE_READY_LONG_DAYS_MAX = 210;
+export const MAKE_READY_LONG_CHANCE = 0.2;
+export const MAKE_READY_LONG_DAYS_MIN = 150;
+export const MAKE_READY_LONG_DAYS_MAX = 270;
 export const PERMIT_DAYS_MIN = 14;
 export const PERMIT_DAYS_MAX = 45;
 /**
@@ -81,7 +81,7 @@ export const PERMITTING_CANCEL_REFUND = 1;
 // ---------------------------------------------------------------------------
 
 export const POLE_SPACING_FT = 150;
-export const POLE_RENT_PER_POLE_PER_MONTH = 2;
+export const POLE_RENT_PER_POLE_PER_MONTH = 8;
 
 // ---------------------------------------------------------------------------
 // Cabinets (fiber distribution hubs), splitters and coverage
@@ -150,8 +150,8 @@ export interface TierDefault {
 
 /** The fixed tier lineup and its starting prices, in display order. */
 export const TIER_DEFAULTS: readonly TierDefault[] = [
-  { id: 'fiber500', name: '500 Mbps', downMbps: 500, upMbps: 500, price: 55, popularity: 1 },
-  { id: 'fiber1g', name: '1 Gig', downMbps: 1_000, upMbps: 1_000, price: 70, popularity: 0.8 },
+  { id: 'fiber500', name: '500 Mbps', downMbps: 500, upMbps: 500, price: 60, popularity: 1 },
+  { id: 'fiber1g', name: '1 Gig', downMbps: 1_000, upMbps: 1_000, price: 75, popularity: 0.8 },
   { id: 'fiber2g', name: '2 Gig', downMbps: 2_000, upMbps: 2_000, price: 95, popularity: 0.35 },
 ];
 export const TIER_PRICE_MIN = 20;
@@ -185,9 +185,9 @@ export const TAKE_SPEED_WEIGHT = 0.2;
 export const TAKE_SPEED_RATIO_CAP = 4;
 export const TAKE_UPLOAD_WEIGHT = 0.02;
 export const TAKE_UPLOAD_RATIO_CAP = 10;
-export const TAKE_PRICE_WEIGHT = 1;
-export const TAKE_RATE_BASE = 0.31;
-export const TAKE_RATE_PER_ADVANTAGE = 0.25;
+export const TAKE_PRICE_WEIGHT = 0.7;
+export const TAKE_RATE_BASE = 0.08;
+export const TAKE_RATE_PER_ADVANTAGE = 0.62;
 export const TAKE_RATE_MIN = 0.03;
 export const TAKE_RATE_MAX = 0.6;
 /** Target take rate multiplier by building kind. */
@@ -365,5 +365,139 @@ export const PAYMENT_REMINDER_DAYS = 5;
 
 /** Bank panel: fixed credit-line draw presets in whole dollars (the panel adds "Half" and "All" of what is available). */
 export const DRAW_PRESETS: readonly number[] = [10_000, 25_000];
-/** Bank panel: the term-loan builder's default amount is the capacity rounded down to a multiple of this (at least TERM_LOAN_MIN). */
-export const TERM_DEFAULT_ROUNDING = 10_000;
+
+// ---------------------------------------------------------------------------
+// Round 4 (architect's initial guesses; the round-4 tuner owns these values).
+// Every rule they feed is documented in the module that applies it.
+// Integrator's interim values (marked "interim"): ARR_SPIKE_CAP,
+// INCUMBENT_PROMO_TAKE_RATE and the storm radius were eased from the first
+// guesses so the round-2/3 balance targets (tuning/targets.test.ts) hold with
+// storms and incumbent promos on. The SMART bot still builds all-aerial and
+// never converts, so this is not the round-4 tune (see DESIGN.md, Round 4).
+// ---------------------------------------------------------------------------
+
+// Loan polish (debt.ts) ------------------------------------------------------
+
+/**
+ * Smoothed ARR (debt.trailingArr): the trailing months' mean revenue counts
+ * for at most this multiple of the lowest of those months, so a one-month
+ * price spike cannot inflate borrowing capacity (honest growth of a few
+ * percent a month is untouched).
+ */
+export const ARR_SPIKE_CAP = 1.5; // interim (first guess 1.1: it also capped honest ramp-up growth)
+/** While frozen, each close sweeps this share of the month's positive operating cash flow to repay debt. */
+export const FROZEN_SWEEP_SHARE = 0.5;
+/** ...but never takes cash below this reserve. */
+export const FROZEN_SWEEP_RESERVE = 25_000;
+/** Consecutive frozen closes after which the bank calls the loans (acceleration). */
+export const FROZEN_ACCELERATION_CLOSES = 6;
+/** Closes over which everything owed falls due once the loans are called. */
+export const ACCELERATION_CLOSES = 3;
+/** A frozen close with this many or fewer closes left before the call posts an 'accelerationWarning'. */
+export const ACCELERATION_WARNING_CLOSES = 2;
+/** Funding hints and cure advice keep this many months of fixed costs (overhead + marketing) in cash, beyond the next debt service. */
+export const FUNDING_CUSHION_MONTHS = 1;
+
+// Pricing realism (sales.ts, incumbent.ts) ------------------------------------
+
+/** Month closes a price rise waits before it reaches today's subscribers, when setPricing does not say. */
+export const GRANDFATHER_MONTHS_DEFAULT = 6;
+/** Most month closes setPricing may grandfather a rise for. */
+export const GRANDFATHER_MONTHS_MAX = 24;
+/**
+ * One-off churn when a unit's price steps up at a close (a lock ending):
+ * p = min(PRICE_STEP_CHURN_MAX, PRICE_STEP_CHURN_PER_RISE x rise / old price x share),
+ * share by the lock's reason: 1 for 'notice' (a rise passed on at the next
+ * bill, grandfatherMonths 0), GRANDFATHER_STEP_SHARE for 'grandfather',
+ * PROMO_STEP_SHARE for 'promo' (an intro promo ending).
+ */
+export const PRICE_STEP_CHURN_PER_RISE = 0.4;
+export const PRICE_STEP_CHURN_MAX = 0.5;
+export const GRANDFATHER_STEP_SHARE = 0.5;
+export const PROMO_STEP_SHARE = 0.5;
+/**
+ * A tier no longer offered: at the next close each of its units moves to the
+ * offered tier nearest in price (ties: the cheaper) or cancels, with
+ * p = min(TIER_RETIRE_CHURN_MAX, TIER_RETIRE_CHURN_BASE + TIER_RETIRE_CHURN_PER_RISE x max(0, new / old - 1)).
+ */
+export const TIER_RETIRE_CHURN_BASE = 0.05;
+export const TIER_RETIRE_CHURN_PER_RISE = 0.6;
+export const TIER_RETIRE_CHURN_MAX = 0.6;
+/** Intro promo limits (setPromo). */
+export const PROMO_MAX_PERCENT_OFF = 50;
+export const PROMO_MAX_MONTHS = 12;
+/**
+ * The take-rate model values an intro promo as its discount spread over this
+ * many months of service (percentOff x min(months, horizon) / horizon off the
+ * price a new signup weighs).
+ */
+export const PROMO_HORIZON_MONTHS = 24;
+/** The incumbent answers when your take rate in a cabinet area reaches this ... */
+export const INCUMBENT_PROMO_TAKE_RATE = 0.45; // interim (first guess 0.35, below the ~49% default target take rate: promos ran nearly everywhere)
+/** ... on at least this many passings there. */
+export const INCUMBENT_PROMO_MIN_PASSINGS = 100;
+/** Dollars a month the incumbent's promo price is below INCUMBENT_PRICE. */
+export const INCUMBENT_PROMO_DISCOUNT = 20;
+/** Month closes an incumbent promo runs, and the quiet months after it before another can start there. */
+export const INCUMBENT_PROMO_MONTHS = 6;
+export const INCUMBENT_PROMO_QUIET_MONTHS = 6;
+/** Monthly churn probability added for subscribers in an area while the incumbent's promo runs there. */
+export const INCUMBENT_PROMO_CHURN = 0.01;
+/**
+ * The most a unit's total churn probability at a close may be (regular +
+ * price step + outage + incumbent), so a bad month never empties a network
+ * on one close. Each component's share of a capped total shrinks in
+ * proportion (sales.totalChurn).
+ */
+export const CHURN_TOTAL_MAX = 0.8;
+
+// Storms, dig-ins and conversions (weather.ts, network.ts) --------------------
+
+/** No storms or dig-ins before this day (the first year is for building). */
+export const STORM_START_DAY = 365;
+/** Chance a storm hits on any day from STORM_START_DAY. */
+export const STORM_CHANCE_PER_DAY = 1 / 60;
+/** Radius of the area a storm hits, map cells. */
+export const STORM_RADIUS_MIN = 5; // interim (first guess 8)
+export const STORM_RADIUS_MAX = 15; // interim (first guess 30: a storm covered up to half a 96x64 town, ~9% of revenue in repairs for all-aerial play)
+/** Storm severity 1..this (uniform), scaling the damage chances. */
+export const STORM_SEVERITY_MAX = 3;
+/** Chance per unit of severity that a storm damages a live span in its area: aerial ... */
+export const STORM_AERIAL_DAMAGE_CHANCE = 0.12;
+/** ... and underground (washouts; rare). */
+export const STORM_UNDERGROUND_DAMAGE_CHANCE = 0.002;
+/** Dig-ins a year per mile (5,280 ft) of live underground cable. */
+export const DIG_INS_PER_MILE_PER_YEAR = 0.15;
+/** Days a damaged span is out of service (uniform): aerial ... */
+export const OUTAGE_DAYS_AERIAL_MIN = 2;
+export const OUTAGE_DAYS_AERIAL_MAX = 6;
+/** ... and underground (digging to the break takes longer). */
+export const OUTAGE_DAYS_UNDERGROUND_MIN = 4;
+export const OUTAGE_DAYS_UNDERGROUND_MAX = 12;
+/** Repair cost of a damaged span: base + per ft of the span, by method. */
+export const REPAIR_BASE_AERIAL = 2_000;
+export const REPAIR_PER_FT_AERIAL = 4;
+export const REPAIR_BASE_UNDERGROUND = 4_000;
+export const REPAIR_PER_FT_UNDERGROUND = 1;
+/**
+ * Extra churn at the close for a subscribed unit whose street was interrupted
+ * d days in the month: min(OUTAGE_CHURN_MAX, OUTAGE_CHURN_BASE + OUTAGE_CHURN_PER_DAY x d), 0 when d is 0.
+ */
+export const OUTAGE_CHURN_BASE = 0.05;
+export const OUTAGE_CHURN_PER_DAY = 0.01;
+export const OUTAGE_CHURN_MAX = 0.25;
+/** Storms are kept in Weather.storms this long (the advisor's storm-prone test looks back as far). */
+export const STORM_LOG_DAYS = 730;
+/** The map shows a storm's area this many days after it hit. */
+export const STORM_SHOW_DAYS = 10;
+
+// Advisor (advisor.ts) ----------------------------------------------------------
+
+/** stormUnderground: repairs on an aerial span of at least this share of rebuilding it underground make it storm-prone (as do STORM_HITS_MIN hits). */
+export const STORM_REPAIRS_CONVERT_SHARE = 0.5;
+/** stormUnderground: a rebuild is suggested when what it saves a year (repairs avoided + pole rent) pays for it within this many years. */
+export const CONVERT_PAYBACK_YEARS = 10;
+/** takeRate: marketing below this many dollars per passing a month counts as under-marketed (the signup model's "about $2 per passing"). */
+export const MARKETING_PER_PASSING_GOOD = 2;
+/** expand: months of fixed costs (overhead + marketing) kept in reserve on top of the funding cushion. */
+export const EXPAND_RESERVE_MONTHS = 3;

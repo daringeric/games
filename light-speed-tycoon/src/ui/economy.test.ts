@@ -1,7 +1,8 @@
-// Pure models behind the economy UI: report rows (financing included), the
-// month-close toast, the pricing preview, milestone progress, the rate card,
-// HUD chips (debt and covenant included), notice tones, the game-over
-// subtitle and the debug-hook gate. Money is checked against balance.ts constants and
+// Pure models behind the economy UI: report rows (financing and round-4
+// operations included), the month-close toast, milestone progress, the rate
+// card (round-4 rules included), notice tones, the
+// game-over subtitle and the debug-hook gate (the pricing preview moved to
+// pricingPanel.test.ts and the HUD chips to hud.test.ts in round 4). Money is checked against balance.ts constants and
 // sim results, never literal dollar amounts.
 
 import { describe, expect, it } from 'vitest';
@@ -10,14 +11,10 @@ import {
   CPP_AMBER_MULTIPLIER,
   CPP_TARGET,
   ENGINEERING_FEE,
-  INCUMBENT_DOWN_MBPS,
-  INCUMBENT_PRICE,
-  INSOLVENCY_GRACE_MONTHS,
   INSTALL_COST_HOME,
   INSTALL_COST_MDU_UNIT,
   INSTALL_COST_SMB,
   MAKE_READY_COST_PER_POLE,
-  MARKETING_MAX_PER_MONTH,
   MDU_ROUTER_COST,
   OLT_CARD_COST,
   OLT_START_PON_PORTS,
@@ -25,12 +22,8 @@ import {
   PERMIT_FEE_AERIAL,
   PERMIT_FEE_UNDERGROUND,
   POLE_RENT_PER_POLE_PER_MONTH,
-  SMB_MULTIPLIER_MAX,
-  SMB_MULTIPLIER_MIN,
   SPLITTER_COST,
   SUPPORT_COST_PER_SUB_PER_MONTH,
-  TIER_PRICE_MAX,
-  TIER_PRICE_MIN,
   UNDERGROUND_COST_PER_FT,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
   AERIAL_COST_PER_FT,
@@ -46,25 +39,65 @@ import {
   PENALTY_STEP_UP_BPS,
   TERM_EXTRA_BPS,
   TERM_LOAN_YEARS,
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_RESERVE,
+  FROZEN_SWEEP_SHARE,
+  FUNDING_CUSHION_MONTHS,
+  GRANDFATHER_MONTHS_DEFAULT,
+  GRANDFATHER_MONTHS_MAX,
+  GRANDFATHER_STEP_SHARE,
+  INCUMBENT_PROMO_CHURN,
+  INCUMBENT_PROMO_DISCOUNT,
+  INCUMBENT_PROMO_MONTHS,
+  INCUMBENT_PROMO_QUIET_MONTHS,
+  INCUMBENT_PROMO_TAKE_RATE,
+  OUTAGE_CHURN_BASE,
+  OUTAGE_CHURN_MAX,
+  OUTAGE_CHURN_PER_DAY,
+  OUTAGE_DAYS_AERIAL_MAX,
+  OUTAGE_DAYS_AERIAL_MIN,
+  OUTAGE_DAYS_UNDERGROUND_MAX,
+  OUTAGE_DAYS_UNDERGROUND_MIN,
+  PRICE_STEP_CHURN_PER_RISE,
+  PROMO_MAX_PERCENT_OFF,
+  PROMO_STEP_SHARE,
+  REPAIR_BASE_AERIAL,
+  REPAIR_BASE_UNDERGROUND,
+  REPAIR_PER_FT_AERIAL,
+  REPAIR_PER_FT_UNDERGROUND,
+  STORM_AERIAL_DAMAGE_CHANCE,
+  STORM_CHANCE_PER_DAY,
+  STORM_START_DAY,
+  STORM_UNDERGROUND_DAMAGE_CHANCE,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
-import { applyCommand, newGame, runDays } from '../sim/game';
-import { cppBand, operatingCashFlow, reportKpis } from '../sim/metrics';
-import { getService } from '../sim/network';
+import { runDays } from '../sim/game';
+import { operatingCashFlow, reportKpis } from '../sim/metrics';
 import { MILESTONES } from '../sim/milestones';
-import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, defaultPricing, marketingBoost, targetTakeRate, tierMix, unitPrice } from '../sim/sales';
+import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX } from '../sim/sales';
 import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
-import type { DebtStats, GameState, MonthlyReport, Notice, NoticeKind, TermLoan, TierSetting } from '../sim/types';
+import type { DebtStats, GameState, MonthlyReport, Notice, NoticeKind, OpsStats } from '../sim/types';
 import { debugHookEnabled, searchWithoutSeed } from './debugHook';
-import { formatBpsDelta, formatFeet, formatMoney, formatPerFt, formatPercent, formatRate, formatRatio, formatSignedMoney, plural } from './format';
+import {
+  formatBpsDelta,
+  formatDayRange,
+  formatFeet,
+  formatMoney,
+  formatPerFt,
+  formatPercent,
+  formatPercentFine,
+  formatRate,
+  formatRatio,
+  formatSignedMoney,
+  plural,
+} from './format';
 import { gameOverSubtitle } from './gameOverDialog';
-import { covenantStatus, cppStatus, debtStatus, overdraftStatus, ponStatus, runwayHint } from './hud';
 import { milestoneRows } from './milestonesPanel';
 import { noticeTone, toastLayout } from './overlays';
 import { financingRows, monthClosedMessage, reportRows, subscriberMovements } from './panel';
 import type { ReportRow } from './panel';
-import { boostHint, draftFrom, incumbentOffer, parseNumberField, pricingPreview } from './pricingPanel';
-import type { PricingDraft } from './pricingPanel';
 import { rateCardSections } from './rateCard';
 
 /** A grid town fully lit from the CO with plenty of ports, run long enough to have subscribers and closed months. */
@@ -99,9 +132,15 @@ describe('report rows', () => {
       'costPerConnection',
       'operatingCashFlow',
       'poleRent',
+      'repairs',
       'passings',
+      'outages',
+      'priceChurn',
+      'tierMoves',
+      'incumbentPromos',
       'interest',
       'principal',
+      'sweep',
       'proceeds',
       'debt',
       'leverage',
@@ -181,6 +220,101 @@ describe('report rows', () => {
     expect(row(rows, 'poleRent').value).toBe(formatMoney(20));
     expect(row(rows, 'passings').value).toBe('12');
     for (const key of ['interest', 'principal', 'proceeds', 'debt', 'leverage', 'coverage'] as const) expect(row(rows, key).value).toBe('–');
+    // Round-4 figures read – too, and the panel leaves them out.
+    for (const key of ['repairs', 'outages', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
+      expect(row(rows, key)).toMatchObject({ value: '–', quiet: true });
+    }
+  });
+});
+
+describe('round-4 report rows', () => {
+  const ops = (over: Partial<OpsStats> = {}): OpsStats => ({
+    lastNoticeId: 12,
+    tierMoves: 0,
+    priceChurn: 0,
+    outageChurn: 0,
+    incumbentChurn: 0,
+    outageUnitDays: 0,
+    storms: 0,
+    spansDamaged: 0,
+    repairs: 0,
+    incumbentPromos: 0,
+    mrr: 0,
+    ...over,
+  });
+  const report = (o: OpsStats | undefined, totals: MonthlyReport['totals'] = {}, debt?: DebtStats): MonthlyReport => ({
+    year: 2028,
+    month: 5,
+    totals,
+    net: 0,
+    cashEnd: 0,
+    passings: 10,
+    ops: o,
+    debt,
+  });
+
+  it('shows repairs, outages, price steps, tier moves and incumbent promos from report.ops', () => {
+    const o = ops({ outageUnitDays: 340, storms: 2, spansDamaged: 3, outageChurn: 4, priceChurn: 6, tierMoves: 21, incumbentPromos: 1, incumbentChurn: 5, repairs: 7_300 });
+    const rows = reportRows(report(o, { repair: -7_300 }));
+    expect(row(rows, 'repairs')).toMatchObject({ value: formatMoney(7_300), detail: '3 spans damaged', quiet: false });
+    expect(row(rows, 'outages')).toMatchObject({ value: '340 sub-days', detail: '2 storms, 4 cancelled', quiet: false });
+    expect(row(rows, 'priceChurn')).toMatchObject({ value: '6', quiet: false });
+    expect(row(rows, 'tierMoves')).toMatchObject({ value: '21', quiet: false });
+    expect(row(rows, 'incumbentPromos')).toMatchObject({ value: '1', detail: '5 cancelled', quiet: false });
+    for (const r of rows) expect(`${r.value} ${r.detail ?? ''}`).not.toMatch(/NaN|undefined|null|Infinity/);
+  });
+
+  it('reads zero for a quiet round-4 month, and the panel leaves those rows out', () => {
+    const rows = reportRows(report(ops()));
+    expect(row(rows, 'repairs')).toMatchObject({ value: '$0', detail: null, quiet: true });
+    expect(row(rows, 'outages')).toMatchObject({ value: '0 sub-days', quiet: true });
+    for (const key of ['priceChurn', 'tierMoves', 'incumbentPromos'] as const) expect(row(rows, key)).toMatchObject({ value: '0', quiet: true });
+    // Rows from before round 4 never go quiet.
+    for (const r of rows) if (!['repairs', 'outages', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'].includes(r.key)) expect(r.quiet).toBeUndefined();
+  });
+
+  it('shows the frozen line’s sweep, or – on a report from before round 4', () => {
+    const debt: DebtStats = {
+      creditBalance: 90_000,
+      termBalance: 0,
+      creditLimit: 0,
+      arr: 100_000,
+      annualOperatingCashFlow: 50_000,
+      annualDebtService: 10_000,
+      leverageX100: 180,
+      coverageX100: 500,
+      stage: 'frozen',
+      averageRateBps: 1_000,
+      missedPayment: false,
+      sweep: 6_500,
+      frozenCloses: 3,
+      accelerationClosesLeft: null,
+    };
+    expect(row(financingRows(report(ops(), {}, debt)), 'sweep')).toMatchObject({ value: formatMoney(6_500), detail: '3 frozen closes in a row', quiet: false });
+    expect(row(financingRows(report(ops(), {}, { ...debt, sweep: 0, frozenCloses: 0 })), 'sweep')).toMatchObject({ value: '$0', detail: null, quiet: true });
+    const { sweep: _sweep, frozenCloses: _closes, accelerationClosesLeft: _left, ...round3 } = debt;
+    expect(row(financingRows(report(undefined, {}, round3)), 'sweep')).toMatchObject({ value: '–', quiet: true });
+  });
+
+  it('mentions storms and a sweep in the month-close toast', () => {
+    const base = report(ops({ storms: 2 }));
+    expect(monthClosedMessage(base)).toBe('May 2028 closed: net $0, 10 passings, 2 storms');
+    const swept = report(ops(), {}, {
+      creditBalance: 1,
+      termBalance: 0,
+      creditLimit: 0,
+      arr: 0,
+      annualOperatingCashFlow: 0,
+      annualDebtService: 0,
+      leverageX100: null,
+      coverageX100: null,
+      stage: 'frozen',
+      averageRateBps: null,
+      missedPayment: false,
+      sweep: 4_000,
+    });
+    expect(monthClosedMessage(swept)).toBe(`May 2028 closed: net $0, 10 passings, ${formatMoney(4_000)} swept`);
+    expect(monthClosedMessage(report(ops()))).toBe('May 2028 closed: net $0, 10 passings');
   });
 });
 
@@ -301,121 +435,6 @@ describe('month-close toast', () => {
   });
 });
 
-describe('pricing preview', () => {
-  const pricing = defaultPricing();
-  const draft = (edit: (d: PricingDraft) => void = () => {}): PricingDraft => {
-    const d = draftFrom(pricing, 1_000);
-    edit(d);
-    return d;
-  };
-
-  it('previews the take rate, tier mix, business prices and marketing boost of the edited values', () => {
-    const d = draft((x) => {
-      x.tiers[1]!.price = TIER_PRICE_MIN + 10;
-      x.smbMultiplier = SMB_MULTIPLIER_MAX;
-      x.marketingPerMonth = 2_500;
-    });
-    const edited = { ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX, tiers: pricing.tiers.map((t, i) => (i === 1 ? { ...t, price: TIER_PRICE_MIN + 10 } : t)) };
-    const p = pricingPreview(pricing, d, 800);
-    expect(p.valid).toBe(true);
-    expect(p.problems).toEqual([]);
-    expect(p.takeRate).toEqual({ home: targetTakeRate(edited, 'home'), mdu: targetTakeRate(edited, 'mdu'), smb: targetTakeRate(edited, 'smb') });
-    expect(p.mix).toEqual(tierMix(edited));
-    expect(p.smbPrices).toEqual({
-      fiber500: unitPrice(edited, 'fiber500', 'smb'),
-      fiber1g: unitPrice(edited, 'fiber1g', 'smb'),
-      fiber2g: unitPrice(edited, 'fiber2g', 'smb'),
-    });
-    expect(p.boost).toBe(marketingBoost(2_500, 800));
-    // A cheaper gig tier raises the target take rate.
-    expect(p.takeRate!.home).toBeGreaterThan(targetTakeRate(pricing, 'home'));
-  });
-
-  it('lowers the business take rate as the business multiplier rises, leaving households alone', () => {
-    const at = (m: number) => pricingPreview(pricing, draft((x) => (x.smbMultiplier = m)), 100).takeRate!;
-    const low = at(SMB_MULTIPLIER_MIN);
-    const high = at(SMB_MULTIPLIER_MAX);
-    expect(high.smb).toBeLessThan(low.smb);
-    expect(high.home).toBe(low.home);
-    expect(high.mdu).toBe(low.mdu);
-  });
-
-  it('flags an out-of-range or missing price and previews nothing for the tiers', () => {
-    for (const bad of [TIER_PRICE_MAX + 1, TIER_PRICE_MIN - 1, 55.5, Number.NaN]) {
-      const p = pricingPreview(pricing, draft((x) => (x.tiers[0]!.price = bad)), 100);
-      expect(p.valid).toBe(false);
-      expect(p.problems[0]).toContain('500 Mbps');
-      expect(p.takeRate).toBeNull();
-      expect(p.mix).toBeNull();
-      // The marketing half still previews.
-      expect(p.boost).toBe(marketingBoost(1_000, 100));
-    }
-  });
-
-  it('needs at least one tier offered', () => {
-    const p = pricingPreview(pricing, draft((x) => x.tiers.forEach((t) => (t.offered = false))), 100);
-    expect(p.valid).toBe(false);
-    expect(p.problems).toContain('Offer at least one tier');
-  });
-
-  it('keeps the take-rate preview when only the multiplier or the budget is wrong', () => {
-    const smb = pricingPreview(pricing, draft((x) => (x.smbMultiplier = SMB_MULTIPLIER_MAX + 1)), 100);
-    expect(smb.valid).toBe(false);
-    expect(smb.takeRate).not.toBeNull();
-    expect(smb.smbPrices).toBeNull();
-    const marketing = pricingPreview(pricing, draft((x) => (x.marketingPerMonth = MARKETING_MAX_PER_MONTH + 1)), 100);
-    expect(marketing.valid).toBe(false);
-    expect(marketing.boost).toBeNull();
-    expect(marketing.takeRate).not.toBeNull();
-  });
-
-  it('calls a draft valid exactly when the sim accepts setPricing and setMarketing', () => {
-    const prices = [TIER_PRICE_MIN - 1, TIER_PRICE_MIN, 64, TIER_PRICE_MAX, TIER_PRICE_MAX + 1, 70.5, Number.NaN];
-    const multipliers = [0.5, 1, 1.25, SMB_MULTIPLIER_MAX, SMB_MULTIPLIER_MAX + 0.01, Number.NaN];
-    const budgets = [-1, 0, 1_500, MARKETING_MAX_PER_MONTH, MARKETING_MAX_PER_MONTH + 1, 10.5, Number.NaN];
-    let checked = 0;
-    for (const price of prices) {
-      for (const smbMultiplier of multipliers) {
-        for (const marketingPerMonth of budgets) {
-          for (const offered of [true, false]) {
-            const tiers: TierSetting[] = pricing.tiers.map((t, i) => ({ id: t.id, price: i === 2 ? price : t.price, offered: i === 0 ? offered : false }));
-            const d: PricingDraft = { tiers, smbMultiplier, marketingPerMonth };
-            const state = newGame(1, { city: makeGridCity() });
-            const a = applyCommand(state, { type: 'setPricing', tiers, smbMultiplier });
-            const b = applyCommand(state, { type: 'setMarketing', perMonth: marketingPerMonth });
-            expect(pricingPreview(state.sales.pricing, d, 0).valid, JSON.stringify(d)).toBe(a.ok && b.ok);
-            checked++;
-          }
-        }
-      }
-    }
-    expect(checked).toBeGreaterThan(500);
-  });
-
-  it('reads number fields, with empty or junk as NaN', () => {
-    expect(parseNumberField(' 55 ')).toBe(55);
-    expect(parseNumberField('1.5')).toBe(1.5);
-    expect(parseNumberField('')).toBeNaN();
-    expect(parseNumberField('   ')).toBeNaN();
-    expect(parseNumberField('abc')).toBeNaN();
-  });
-
-  it('starts from the game pricing and quotes the incumbent', () => {
-    const d = draftFrom(pricing, 1_234);
-    expect(d.tiers).toEqual(pricing.tiers.map((t) => ({ id: t.id, price: t.price, offered: t.offered })));
-    expect(d).toMatchObject({ smbMultiplier: pricing.smbMultiplier, marketingPerMonth: 1_234 });
-    expect(incumbentOffer()).toBe(`Incumbent cable: ${INCUMBENT_DOWN_MBPS} Mbps for ${formatMoney(INCUMBENT_PRICE)}/mo`);
-  });
-
-  it('explains what the marketing budget does', () => {
-    expect(boostHint(null, -5, 10)).toBe('');
-    expect(boostHint(0, 0, 10)).toContain('natural pace');
-    expect(boostHint(marketingBoost(500, 0), 500, 0)).toContain('No homes passed yet');
-    const boost = marketingBoost(500, 300);
-    expect(boostHint(boost, 500, 300)).toBe(`Signups come ${formatPercent(boost)} faster at today's 300 passings.`);
-  });
-});
-
 describe('milestone rows', () => {
   it('lists every milestone in order, none achieved in a new game, each with a progress hint', () => {
     const rows = milestoneRows(makeTestState());
@@ -494,6 +513,37 @@ describe('rate card', () => {
     expect(financing.rows.filter((r) => r.label.startsWith('Leverage ') && !r.label.includes('covenant')).length).toBe(LEVERAGE_SPREAD_BANDS.length + 1);
   });
 
+  it('lists the round-4 rules: storms, pricing and the frozen line, from balance.ts', () => {
+    expect(sections.map((s) => s.title)).toEqual(expect.arrayContaining(['Storms and dig-ins', 'Pricing', 'Frozen line and loan rules']));
+    expect(value('Storm season')).toBe(`from ${formatDate(STORM_START_DAY)}`);
+    expect(value('Storm chance')).toBe(`1 in ${Math.round(1 / STORM_CHANCE_PER_DAY)} a day`);
+    expect(value('Aerial span damaged')).toBe(`${formatPercentFine(STORM_AERIAL_DAMAGE_CHANCE)} per severity`);
+    expect(value('Underground span damaged')).toBe(`${formatPercentFine(STORM_UNDERGROUND_DAMAGE_CHANCE)} per severity`);
+    expect(value('Aerial outage')).toBe(formatDayRange(OUTAGE_DAYS_AERIAL_MIN, OUTAGE_DAYS_AERIAL_MAX));
+    expect(value('Underground outage')).toBe(formatDayRange(OUTAGE_DAYS_UNDERGROUND_MIN, OUTAGE_DAYS_UNDERGROUND_MAX));
+    expect(value('Aerial repair')).toBe(`${formatMoney(REPAIR_BASE_AERIAL)} + ${formatPerFt(REPAIR_PER_FT_AERIAL)}`);
+    expect(value('Underground repair')).toBe(`${formatMoney(REPAIR_BASE_UNDERGROUND)} + ${formatPerFt(REPAIR_PER_FT_UNDERGROUND)}`);
+    expect(value('Outage churn')).toBe(`${formatPercentFine(OUTAGE_CHURN_BASE)} + ${formatPercentFine(OUTAGE_CHURN_PER_DAY)} a day out`);
+    expect(value('Price lock on a rise')).toBe(plural(GRANDFATHER_MONTHS_DEFAULT, 'month'));
+    expect(value('Price-step churn')).toBe(`${formatPercentFine(PRICE_STEP_CHURN_PER_RISE / 10)} per 10% rise`);
+    expect(value('After a price lock')).toBe(`${formatPercent(GRANDFATHER_STEP_SHARE)} of that`);
+    expect(value('After an intro promo')).toBe(`${formatPercent(PROMO_STEP_SHARE)} of that`);
+    expect(value('Intro promo')).toBe(`up to ${PROMO_MAX_PERCENT_OFF}% off`);
+    expect(value('Incumbent promo trigger')).toBe(`${formatPercent(INCUMBENT_PROMO_TAKE_RATE)} take rate`);
+    expect(value('Incumbent promo')).toBe(`${formatMoney(INCUMBENT_PROMO_DISCOUNT)} off for ${plural(INCUMBENT_PROMO_MONTHS, 'month')}`);
+    expect(value('Incumbent promo churn')).toBe(`+${formatPercentFine(INCUMBENT_PROMO_CHURN)} a month`);
+    expect(value('Frozen sweep')).toBe(`${formatPercent(FROZEN_SWEEP_SHARE)} of cash flow`);
+    expect(value('Loans called')).toBe(`after ${plural(FROZEN_ACCELERATION_CLOSES, 'frozen close')}`);
+    expect(value('Call warning')).toBe(`${plural(ACCELERATION_WARNING_CLOSES, 'close')} ahead`);
+    expect(value('Funding cushion')).toBe(plural(FUNDING_CUSHION_MONTHS, 'month'));
+    const notes = sections.flatMap((s) => s.rows).map((r) => r.note ?? '');
+    expect(notes.some((n) => n.includes(formatMoney(FROZEN_SWEEP_RESERVE)))).toBe(true);
+    expect(notes.some((n) => n.includes(plural(ACCELERATION_CLOSES, 'close')))).toBe(true);
+    expect(notes.some((n) => n.includes(String(GRANDFATHER_MONTHS_MAX)))).toBe(true);
+    expect(notes.some((n) => n.includes(formatPercent(OUTAGE_CHURN_MAX)))).toBe(true);
+    expect(notes.some((n) => n.includes(plural(INCUMBENT_PROMO_QUIET_MONTHS, 'month')))).toBe(true);
+  });
+
   it('has no empty or broken values', () => {
     for (const s of sections) {
       expect(s.rows.length).toBeGreaterThan(0);
@@ -502,114 +552,6 @@ describe('rate card', () => {
         expect(`${r.label} ${r.value} ${r.note ?? ''}`).not.toMatch(/NaN|undefined|Infinity/);
       }
     }
-  });
-});
-
-describe('HUD chips', () => {
-  it('counts PON ports in use against the OLT, amber from 90% and red when full', () => {
-    const state = makeTestState();
-    expect(ponStatus(state)).toMatchObject({ text: `PON 0/${OLT_START_PON_PORTS}`, level: 'ok' });
-    state.network.olt.ponPorts = 10;
-    addLivePlant(state, { segments: [], node: 0, splitters: 8 });
-    expect(ponStatus(state)).toMatchObject({ text: 'PON 8/10', level: 'ok' });
-    addLivePlant(state, { segments: [], node: 1, splitters: 1 });
-    expect(ponStatus(state)).toMatchObject({ text: 'PON 9/10', level: 'warn' });
-    addLivePlant(state, { segments: [], node: 2, splitters: 1 });
-    expect(ponStatus(state).level).toBe('full');
-    expect(ponStatus(state).tip).toContain('line card');
-  });
-
-  it('warns about an overdraft with the closes the bank still allows', () => {
-    const state = makeTestState();
-    expect(overdraftStatus(state)).toBeNull();
-    state.finance.cash = -1;
-    expect(overdraftStatus(state)).toMatchObject({ text: `Overdrawn: ${plural(INSOLVENCY_GRACE_MONTHS, 'close')} left`, tone: 'danger' });
-    state.finance.negativeMonths = INSOLVENCY_GRACE_MONTHS - 1;
-    expect(overdraftStatus(state)!.text).toBe(`Overdrawn: ${plural(1, 'close')} left`);
-    state.finance.cash = 0;
-    expect(overdraftStatus(state)).toMatchObject({ text: `Recovering: ${plural(1, 'close')} left`, tone: 'warn' });
-    // Frozen with debt owed, the bank tolerates no close in the red: it would be a default.
-    state.debt.covenant.stage = 'frozen';
-    state.debt.credit.balance = 1_000;
-    expect(overdraftStatus(state)).toMatchObject({ text: 'Recovering: no closes left', tone: 'warn' });
-    state.finance.cash = -1;
-    expect(overdraftStatus(state)).toMatchObject({ text: 'Overdrawn: no closes left', tone: 'danger' });
-    expect(overdraftStatus(state)!.tip).toMatch(/default/);
-    state.gameOver = { day: 31, reason: 'insolvent', message: 'Out of cash.' };
-    expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: out of cash', tone: 'danger', tip: 'Out of cash.' });
-    state.gameOver = { day: 31, reason: 'default', message: 'Defaulted.' };
-    expect(overdraftStatus(state)).toMatchObject({ text: 'Game over: loan default', tone: 'danger', tip: 'Defaulted.' });
-  });
-
-  const loan = (id: number, balance: number): TermLoan => ({
-    id,
-    principal: balance,
-    balance,
-    rateBps: BASE_RATE_BPS,
-    termMonths: 84,
-    payment: 1,
-    monthsLeft: 84,
-    originatedDay: 0,
-  });
-
-  it('shows total debt only while something is owed, splitting line and loans in the tooltip', () => {
-    const state = makeTestState();
-    expect(debtStatus(state)).toBeNull();
-    state.debt.credit.balance = 12_000;
-    expect(debtStatus(state)).toMatchObject({ text: `Debt ${formatMoney(12_000)}`, total: 12_000 });
-    state.debt.loans = [loan(1, 150_000), loan(2, 250_000)];
-    const status = debtStatus(state)!;
-    expect(status.text).toBe(`Debt ${formatMoney(412_000)}`);
-    expect(status.tip).toContain(`Credit line ${formatMoney(12_000)}`);
-    expect(status.tip).toContain(`term loans ${formatMoney(400_000)} (2 loans)`);
-    state.debt.credit.balance = 0;
-    expect(debtStatus(state)!.tip).toContain(`Credit line ${formatMoney(0)}`);
-  });
-
-  it('shows the covenant stage only when not compliant, warn then danger, with what it means and how to cure', () => {
-    const state = makeTestState();
-    expect(covenantStatus(state)).toBeNull();
-    state.debt.covenant = { stage: 'warning', compliantCloses: 0 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Covenant warning', tone: 'warn' });
-    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MAX_LEVERAGE));
-    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MIN_COVERAGE));
-    expect(covenantStatus(state)!.tip).toContain(plural(COVENANT_CURE_CLOSES, 'compliant month close'));
-    state.debt.covenant = { stage: 'penalty', compliantCloses: 1 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Penalty rate', tone: 'warn' });
-    expect(covenantStatus(state)!.tip).toContain(formatBpsDelta(PENALTY_STEP_UP_BPS));
-    expect(covenantStatus(state)!.tip).toContain(`1 of ${COVENANT_CURE_CLOSES} so far`);
-    state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Credit frozen', tone: 'danger' });
-    expect(covenantStatus(state)!.tip).toContain('default');
-  });
-
-  it('shows the live cost per passing by the same formula as the report, banded against the target', () => {
-    const state = makeTestState();
-    expect(cppStatus(state)).toBeNull();
-    const lit = litGame(31);
-    lit.finance.capex.osp = CPP_TARGET * getService(lit).passings;
-    expect(cppStatus(lit)).toMatchObject({ text: formatMoney(CPP_TARGET), band: 'green' });
-    // Right after a month close the chip and the report's KPI agree.
-    const closing = makeTestState(makeGridCity({ cols: 3, rows: 2 }));
-    addLivePlant(closing, { splitters: 4 });
-    closing.finance.capex.osp = 123_457;
-    runDays(closing, 31);
-    const kpis = reportKpis(closing.finance.reports.at(-1)!)!;
-    expect(kpis.cpp).toBeGreaterThan(0);
-    expect(cppStatus(closing)!.text).toBe(formatMoney(kpis.cpp!));
-    expect(cppStatus(closing)!.band).toBe(kpis.cppBand);
-    lit.finance.capex.osp = CPP_TARGET * CPP_AMBER_MULTIPLIER * getService(lit).passings + getService(lit).passings;
-    expect(cppStatus(lit)!.band).toBe(cppBand(lit.finance.capex.osp / getService(lit).passings));
-    expect(cppStatus(lit)!.band).toBe('red');
-    expect(cppStatus(lit)!.tip).toContain(`Target ${formatMoney(CPP_TARGET)}`);
-  });
-
-  it('gives the runway at last month’s burn in the cash tooltip', () => {
-    const state = makeTestState();
-    expect(runwayHint(state)).toBe('Cash on hand');
-    runDays(state, 31);
-    const months = Math.floor(state.finance.cash / -operatingCashFlow(state.finance.reports[0]!));
-    expect(runwayHint(state)).toBe(`Cash on hand: about ${plural(months, 'month')} of runway at last month's operating loss`);
   });
 });
 
@@ -626,6 +568,14 @@ describe('notice tones', () => {
     for (const kind of ['covenantCured', 'loanPaidOff'] as const) expect(noticeTone(notice(kind))).toBe('ok');
     for (const kind of ['paymentMissed', 'creditFrozen', 'gameOver'] as const) expect(noticeTone(notice(kind))).toBe('err');
     for (const kind of ['paymentDue', 'covenantWarning', 'covenantPenalty'] as const) expect(noticeTone(notice(kind))).toBe('warn');
+  });
+
+  it('tones the round-4 notices: restored service and ended promos are good news, called loans an error, the rest warnings', () => {
+    for (const kind of ['serviceRestored', 'incumbentPromoEnded'] as const) expect(noticeTone(notice(kind))).toBe('ok');
+    expect(noticeTone(notice('loansCalled'))).toBe('err');
+    for (const kind of ['debtSwept', 'accelerationWarning', 'tierRetired', 'priceStep', 'incumbentPromo', 'storm', 'digIn'] as const) {
+      expect(noticeTone(notice(kind))).toBe('warn');
+    }
   });
 
   it('tells install pauses (trouble) from resumes (good news) by kind, not by wording', () => {

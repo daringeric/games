@@ -97,3 +97,46 @@ export function formatRatio(x: number | null): string {
   const abs = Math.abs(hundredths);
   return `${sign}${formatNumber(Math.floor(abs / 100))}.${String(abs % 100).padStart(2, '0')}×`;
 }
+
+// Round 4 (ui-briefing): the month-end briefing's titles and finer rates.
+
+export const MONTH_NAMES: readonly string[] = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+/** "March 2028" */
+export function formatMonthLong(year: number, month: number): string {
+  return `${MONTH_NAMES[month - 1] ?? '?'} ${year}`;
+}
+
+/**
+ * A 0..1 fraction as a percent that keeps small rates readable (up to two
+ * decimals, trailing zeros dropped): 0.06 -> "6%", 0.002 -> "0.2%",
+ * 0.0125 -> "1.25%". formatPercent rounds to whole percents.
+ */
+export function formatPercentFine(fraction: number): string {
+  const percent = Number((fraction * 100).toFixed(2));
+  return `${percent.toLocaleString('en-US', { maximumFractionDigits: 2 })}%`;
+}
+
+/** A change in a 0..1 ratio as percentage points, unsigned, one decimal: 0.021 -> "2.1 pts", 0.01 -> "1.0 pt". */
+export function formatPoints(fractionDelta: number): string {
+  const tenths = Math.round(Math.abs(fractionDelta) * 1000);
+  return `${Math.floor(tenths / 10)}.${tenths % 10} ${tenths === 10 ? 'pt' : 'pts'}`;
+}
+
+/** "1 in 60" for a chance of 1/60 (rounded to a whole "in"). */
+export function formatOdds(chance: number): string {
+  return chance > 0 ? `1 in ${formatNumber(1 / chance)}` : 'never';
+}

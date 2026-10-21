@@ -17,10 +17,20 @@
 // Cabinets carry a splitter-count badge, and a red ring while they are turning
 // signups away (Sales.fullCabinets). Live cable that reaches the CO but lies
 // beyond every cabinet's reach is washed out: it lights nothing.
+//
+// Round 4: a span out of service (storm or dig-in damage) is drawn broken: its
+// tube washed out under red dashes, with a red bolt badge; the dashes and
+// badges pulse in a render group of their own (an alpha change per frame, no
+// redraw). An aerial span being rebuilt underground shows the planned bore
+// dashed beside it in the underground color, with the permit clipboard while
+// permitting and the crew truck while crews dig. StormLayer draws the areas
+// of recent storms as translucent clouds with a lightning badge, fading by
+// age, redrawn only when the set of storms shown or their ages change.
 
 import { Container, Graphics, Text } from 'pixi.js';
+import { STORM_SHOW_DAYS } from '../sim/balance';
 import { polesOnSegment } from '../sim/streets';
-import type { CableMethod, CableSpan, CabinetId, City, GameState, NodeId, ServiceSnapshot } from '../sim/types';
+import type { CableMethod, CableSpan, CabinetId, City, GameState, NodeId, ServiceSnapshot, Storm } from '../sim/types';
 import { addDashes, highlightLine, midpoint, pointsAlong, segmentLine, strokeLines } from './shapes';
 import type { Line } from './shapes';
 import type { Theme } from './theme';
@@ -48,6 +58,9 @@ export class NetworkLayer {
   private readonly glowGroup = new Container({ isRenderGroup: true });
   private readonly glow = new Graphics();
   private readonly markers = new Graphics();
+  /** Out-of-service dashes and bolt badges: pulsed by alpha in animate(). */
+  private readonly outageGroup = new Container({ isRenderGroup: true });
+  private readonly outageMarks = new Graphics();
   private readonly cabinets = new Graphics();
   /** Splitter-count labels, one per cabinet, reused across redraws. */
   private readonly badges = new Container();
@@ -67,11 +80,15 @@ export class NetworkLayer {
   /** Live spans drawn washed out (connected to the CO, out of every cabinet's reach), and cabinets ringed as full. */
   dimSpans = 0;
   fullRings = 0;
+  /** Live spans drawn out of service, and aerial spans drawn being rebuilt underground. */
+  outageSpans = 0;
+  rebuildSpans = 0;
 
   constructor(private readonly theme: Theme) {
     this.stripeGroup.addChild(this.stripes);
     this.glowGroup.addChild(this.glow);
-    this.below.addChild(this.live, this.cables, this.stripeGroup, this.markers);
+    this.outageGroup.addChild(this.outageMarks);
+    this.below.addChild(this.live, this.cables, this.stripeGroup, this.markers, this.outageGroup);
     this.above.addChild(this.glowGroup, this.cabinets, this.badges);
   }
 
@@ -85,7 +102,7 @@ export class NetworkLayer {
     }
     const theme = this.theme;
     const { cable } = theme;
-    for (const g of [this.cables, this.markers, this.cabinets, this.glow]) g.clear();
+    for (const g of [this.cables, this.markers, this.cabinets, this.glow, this.outageMarks]) g.clear();
 
     const byStage = { permitting: [] as CableSpan[], constructing: [] as CableSpan[], live: [] as CableSpan[] };
     for (const span of network.spans) byStage[span.stage].push(span);
@@ -110,8 +127,9 @@ export class NetworkLayer {
     }
 
     // Live: candy tubes with a highlight stripe, redrawn only when the live set changes.
-    // A span's segment and method never change, so its id stands for its drawing.
-    const liveKey = byStage.live.map((s) => s.id).join(',');
+    // A span's segment never changes and its method only when an underground
+    // rebuild finishes, so its id and method stand for its drawing.
+    const liveKey = byStage.live.map((s) => (s.method === 'aerial' ? s.id : -s.id)).join(',');
     if (liveKey !== this.liveKey) {
       this.liveKey = liveKey;
       this.liveRedraws++;
@@ -141,22 +159,54 @@ export class NetworkLayer {
     // Peg poles carry every aerial span that is being built (live ones are drawn with the live cable).
     this.drawPoles(this.cables, this.polesOf(city, byStage.constructing));
 
+    // Underground rebuilds of live aerial spans: the planned bore, dashed beside the aerial cable.
+    const rebuilding = byStage.live.filter((s) => s.conversion !== null);
+    this.rebuildSpans = rebuilding.length;
+    const { rebuild } = cable;
+    let bores = 0;
+    for (const span of rebuilding) bores += addDashes(this.cables, offsetLine(lineOf(span), rebuild.offset), rebuild.dash, rebuild.gap, 2);
+    if (bores > 0) this.cables.stroke({ width: rebuild.width, color: cable.underground.tube, alpha: rebuild.alpha, cap: 'round' });
+
+    // Out of service: the tube washed out under pulsing red dashes, with a bolt badge.
+    const out = byStage.live.filter((s) => s.outage !== null);
+    this.outageSpans = out.length;
+    const { cut } = cable;
+    for (const method of ['underground', 'aerial'] as const) {
+      const lines = out.filter((s) => s.method === method).map(lineOf);
+      strokeLines(this.cables, lines, { width: cable[method].width + 2, color: cut.wash, alpha: cut.washAlpha, cap: 'round', join: 'round' });
+      let dashes = 0;
+      for (const l of lines) dashes += addDashes(this.outageMarks, l, cut.dash, cut.gap, 2);
+      if (dashes > 0) this.outageMarks.stroke({ width: Math.max(3, cable[method].width - 1), color: cut.burst, cap: 'round' });
+    }
+
     for (const span of byStage.permitting) this.drawPermitBadge(midpoint(lineOf(span)), span.method);
     for (const span of byStage.constructing) this.drawCrewTruck(lineOf(span));
+    for (const span of rebuilding) {
+      const line = lineOf(span);
+      if (span.conversion?.stage === 'constructing') this.drawCrewTruck(line);
+      else this.drawPermitBadge(alongLine(line, 0.25), 'underground');
+    }
+    for (const span of out) this.drawOutageBadge(midpoint(lineOf(span)));
 
     this.drawCabinets(city, state, service, now);
     // Stripes for the new set of crews (or none, clearing finished ones).
     this.animate(now);
   }
 
-  /** True while something on the map moves (construction stripes, a cabinet that just lit up). */
+  /** True while something on the map moves (construction stripes, a cabinet that just lit up, a span out of service). */
   get animating(): boolean {
-    return this.constructing.length > 0 || !this.glowSettled;
+    return this.constructing.length > 0 || !this.glowSettled || this.outageSpans > 0;
   }
 
-  /** Per-frame: march the construction stripes and pulse newly lit cabinet glows. */
+  /** Per-frame: march the construction stripes, pulse newly lit cabinet glows and out-of-service marks. */
   animate(ms: number): void {
     const { cable } = this.theme;
+    if (this.outageSpans > 0) {
+      const t = (ms % cable.cut.pulseMs) / cable.cut.pulseMs;
+      this.outageGroup.alpha = 0.55 + 0.45 * (0.5 + 0.5 * Math.cos(t * Math.PI * 2));
+    } else {
+      this.outageGroup.alpha = 1;
+    }
     const style = cable.constructing;
     this.stripes.clear();
     const phase = (ms / 1000) * style.stripeSpeed;
@@ -215,6 +265,27 @@ export class NetworkLayer {
       g.moveTo(p.x - 1.6, p.y).lineTo(p.x + 1.6, p.y).moveTo(p.x - 1.6, p.y + 2).lineTo(p.x + 1.6, p.y + 2);
       g.stroke({ width: 0.9, color: permitting.badge });
     }
+  }
+
+  /** Red badge with a white bolt and yellow sparks: this span is out of service. */
+  private drawOutageBadge(p: { x: number; y: number }): void {
+    const g = this.outageMarks;
+    const { cut } = this.theme.cable;
+    const r = cut.badgeRadius;
+    // Sparks first, so the badge sits on top of them.
+    for (const [dx, dy] of [
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+      [-1, -1],
+    ] as const) {
+      g.moveTo(p.x + dx * r * 0.85, p.y + dy * r * 0.85).lineTo(p.x + dx * r * 1.45, p.y + dy * r * 1.45);
+    }
+    g.stroke({ width: 2, color: cut.spark, cap: 'round' });
+    g.circle(p.x + 0.8, p.y + 1.5, r).fill({ color: this.theme.house.shadow, alpha: 0.9 });
+    g.circle(p.x, p.y, r).fill(cut.burst).stroke({ width: 1.8, color: cut.core });
+    const s = r * 0.62;
+    g.poly([p.x + s * 0.15, p.y - s, p.x - s * 0.55, p.y + s * 0.12, p.x - s * 0.02, p.y + s * 0.12, p.x - s * 0.2, p.y + s, p.x + s * 0.58, p.y - s * 0.18, p.x + s * 0.05, p.y - s * 0.18]).fill(cut.core);
   }
 
   /** Little orange crew truck parked beside the trench mid-span, nose along the street. */
@@ -304,5 +375,95 @@ export class NetworkLayer {
     const label = String(splitters);
     if (text.text !== label) text.text = label;
     text.position.set(x, y + 0.5);
+  }
+}
+
+/** The line shifted sideways by `d`: horizontal lines down, vertical ones right (the planned bore beside a cable). */
+function offsetLine(l: Line, d: number): Line {
+  const horizontal = Math.abs(l.bx - l.ax) >= Math.abs(l.by - l.ay);
+  return horizontal ? { ...l, ay: l.ay + d, by: l.by + d } : { ...l, ax: l.ax + d, bx: l.bx + d };
+}
+
+/** The point `t` (0..1) of the way along a line. */
+function alongLine(l: Line, t: number): { x: number; y: number } {
+  return { x: l.ax + (l.bx - l.ax) * t, y: l.ay + (l.by - l.ay) * t };
+}
+
+/** Storms the map shows today: those that hit within STORM_SHOW_DAYS days, oldest first. */
+export function stormsToShow(state: GameState): Storm[] {
+  return (state.weather?.storms ?? []).filter((s) => s.day <= state.day && state.day - s.day < STORM_SHOW_DAYS);
+}
+
+/** How strongly a storm `age` days old is drawn: 1 the day it hit, fading toward 0 at STORM_SHOW_DAYS. */
+export function stormFade(age: number): number {
+  return Math.max(0, Math.min(1, 1 - age / STORM_SHOW_DAYS));
+}
+
+/**
+ * The areas of recent storms: translucent cloud discs (`under`, beneath the
+ * cables, so damage stays crisp) and their lightning badges (`over`, above
+ * cabinets). Redrawn only when the storms shown or their ages change.
+ */
+export class StormLayer {
+  readonly under = new Container({ isRenderGroup: true });
+  readonly over = new Container({ isRenderGroup: true });
+  private readonly discs = new Graphics();
+  private readonly badges = new Graphics();
+  private key: string | null = null;
+  private game: GameState | null = null;
+  /** Storms drawn (debug and test read-out). */
+  shown = 0;
+  redraws = 0;
+
+  constructor(private readonly theme: Theme) {
+    this.under.addChild(this.discs);
+    this.over.addChild(this.badges);
+  }
+
+  /** Bring the clouds up to date; true when anything was redrawn. */
+  sync(state: GameState): boolean {
+    const storms = stormsToShow(state);
+    const key = storms.map((s) => `${s.id}:${state.day - s.day}`).join(',');
+    if (state === this.game && key === this.key) return false;
+    this.game = state;
+    this.key = key;
+    this.redraws++;
+    this.discs.clear();
+    this.badges.clear();
+    const { cell, storm } = this.theme;
+    for (const s of storms) {
+      const fade = stormFade(state.day - s.day);
+      const x = s.x * cell;
+      const y = s.y * cell;
+      const r = Math.max(1, s.radius) * cell;
+      this.discs.circle(x, y, r).fill({ color: storm.cloud, alpha: storm.alpha * fade });
+      this.discs.circle(x, y, r).stroke({ width: 4, color: storm.rim, alpha: storm.rimAlpha * fade });
+      this.drawBadge(x, y, Math.max(0.35, fade));
+    }
+    this.shown = storms.length;
+    return true;
+  }
+
+  /** A puffy cloud with a yellow bolt under it. */
+  private drawBadge(x: number, y: number, alpha: number): void {
+    const g = this.badges;
+    const { storm, house } = this.theme;
+    const r = storm.badgeRadius;
+    const puffs: [number, number, number][] = [
+      [-r * 0.55, r * 0.1, r * 0.55],
+      [0, -r * 0.2, r * 0.72],
+      [r * 0.6, r * 0.12, r * 0.5],
+    ];
+    for (const [dx, dy, pr] of puffs) g.circle(x + dx + 1, y + dy + 2, pr);
+    g.fill({ color: house.shadow, alpha });
+    for (const [dx, dy, pr] of puffs) g.circle(x + dx, y + dy, pr + 1.6);
+    g.fill({ color: storm.badgeRim, alpha });
+    for (const [dx, dy, pr] of puffs) g.circle(x + dx, y + dy, pr);
+    g.fill({ color: storm.badge, alpha });
+    const s = r * 0.7;
+    const by = y + r * 0.35;
+    g.poly([x + s * 0.2, by - s * 0.4, x - s * 0.45, by + s * 0.45, x - s * 0.02, by + s * 0.45, x - s * 0.25, by + s * 1.2, x + s * 0.5, by + s * 0.25, x + s * 0.06, by + s * 0.25])
+      .fill({ color: storm.bolt, alpha })
+      .stroke({ width: 1, color: storm.badgeRim, alpha });
   }
 }

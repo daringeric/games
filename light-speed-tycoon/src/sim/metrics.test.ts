@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CPP_AMBER_MULTIPLIER, CPP_TARGET } from './balance';
-import { CAPEX_CATEGORIES, cppBand, FINANCING_CATEGORIES, operatingCashFlow, reportKpis } from './metrics';
+import { CAPEX_CATEGORIES, cppBand, FINANCING_CATEGORIES, operatingCashFlow, passingsWeightedRate, reportKpis } from './metrics';
 import type { MonthlyReport, MonthlyStats } from './types';
 
 function stats(overrides: Partial<MonthlyStats> = {}): MonthlyStats {
@@ -128,5 +128,18 @@ describe('reportKpis', () => {
     expect(at(CPP_TARGET * 1_000).cppBand).toBe('green');
     expect(at(CPP_TARGET * CPP_AMBER_MULTIPLIER * 1_000).cppBand).toBe('amber');
     expect(at(CPP_TARGET * CPP_AMBER_MULTIPLIER * 1_000 + 1).cppBand).toBe('red');
+  });
+});
+
+describe('passingsWeightedRate', () => {
+  it("weights each group's rate by its units", () => {
+    expect(passingsWeightedRate([{ units: 300, rate: 0.5 }, { units: 100, rate: 0.3 }])).toBeCloseTo((300 * 0.5 + 100 * 0.3) / 400, 12);
+    expect(passingsWeightedRate([{ units: 10, rate: 0.42 }])).toBeCloseTo(0.42, 12);
+  });
+
+  it('ignores groups with no units, and is null with none at all', () => {
+    expect(passingsWeightedRate([{ units: 0, rate: 0.9 }, { units: 5, rate: 0.2 }])).toBeCloseTo(0.2, 12);
+    expect(passingsWeightedRate([{ units: 0, rate: 0.9 }])).toBeNull();
+    expect(passingsWeightedRate([])).toBeNull();
   });
 });

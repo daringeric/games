@@ -1,0 +1,340 @@
+// The pricing panel's pure model (pricingPanel.ts): draft checks and the
+// preview of take rates, tier mix, business prices and the marketing boost.
+// Moved out of economy.test.ts by the round-4 contract. Money is checked
+// against balance.ts constants and sim results, never literal dollar amounts.
+
+import { describe, expect, it } from 'vitest';
+import {
+  GRANDFATHER_MONTHS_DEFAULT,
+  GRANDFATHER_MONTHS_MAX,
+  GRANDFATHER_STEP_SHARE,
+  INCUMBENT_DOWN_MBPS,
+  INCUMBENT_PRICE,
+  INCUMBENT_PROMO_DISCOUNT,
+  MARKETING_MAX_PER_MONTH,
+  PROMO_MAX_MONTHS,
+  PROMO_MAX_PERCENT_OFF,
+  SMB_MULTIPLIER_MAX,
+  SMB_MULTIPLIER_MIN,
+  TIER_PRICE_MAX,
+  TIER_PRICE_MIN,
+} from '../sim/balance';
+import { formatDate } from '../sim/calendar';
+import { applyCommand, newGame } from '../sim/game';
+import {
+  defaultPricing,
+  lockEndDay,
+  marketingBoost,
+  monthlyRecurringRevenue,
+  promoPrice,
+  quotePricing,
+  stepChurnProbability,
+  targetTakeRate,
+  tierMix,
+  unitPrice,
+} from '../sim/sales';
+import { cornerName } from '../sim/streets';
+import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
+import type { Account, CabinetId, GameState, TierId, TierSetting } from '../sim/types';
+import { formatMoney, formatPercent } from './format';
+import {
+  boostHint,
+  draftFrom,
+  draftPromo,
+  grandfatherHint,
+  incumbentLine,
+  incumbentOffer,
+  incumbentRows,
+  parseNumberField,
+  pricingImpact,
+  pricingPreview,
+  PROMO_DRAFT_START,
+  promoHint,
+  samePromo,
+} from './pricingPanel';
+import type { PricingDraft } from './pricingPanel';
+
+describe('pricing preview', () => {
+  const pricing = defaultPricing();
+  const draft = (edit: (d: PricingDraft) => void = () => {}): PricingDraft => {
+    const d = draftFrom(pricing, 1_000);
+    edit(d);
+    return d;
+  };
+
+  it('previews the take rate, tier mix, business prices and marketing boost of the edited values', () => {
+    const d = draft((x) => {
+      x.tiers[1]!.price = TIER_PRICE_MIN + 10;
+      x.smbMultiplier = SMB_MULTIPLIER_MAX;
+      x.marketingPerMonth = 2_500;
+    });
+    const edited = { ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX, tiers: pricing.tiers.map((t, i) => (i === 1 ? { ...t, price: TIER_PRICE_MIN + 10 } : t)) };
+    const p = pricingPreview(pricing, d, 800);
+    expect(p.valid).toBe(true);
+    expect(p.problems).toEqual([]);
+    expect(p.takeRate).toEqual({ home: targetTakeRate(edited, 'home'), mdu: targetTakeRate(edited, 'mdu'), smb: targetTakeRate(edited, 'smb') });
+    expect(p.mix).toEqual(tierMix(edited));
+    expect(p.smbPrices).toEqual({
+      fiber500: unitPrice(edited, 'fiber500', 'smb'),
+      fiber1g: unitPrice(edited, 'fiber1g', 'smb'),
+      fiber2g: unitPrice(edited, 'fiber2g', 'smb'),
+    });
+    expect(p.boost).toBe(marketingBoost(2_500, 800));
+    // A cheaper gig tier raises the target take rate.
+    expect(p.takeRate!.home).toBeGreaterThan(targetTakeRate(pricing, 'home'));
+  });
+
+  it('lowers the business take rate as the business multiplier rises, leaving households alone', () => {
+    const at = (m: number) => pricingPreview(pricing, draft((x) => (x.smbMultiplier = m)), 100).takeRate!;
+    const low = at(SMB_MULTIPLIER_MIN);
+    const high = at(SMB_MULTIPLIER_MAX);
+    expect(high.smb).toBeLessThan(low.smb);
+    expect(high.home).toBe(low.home);
+    expect(high.mdu).toBe(low.mdu);
+  });
+
+  it('flags an out-of-range or missing price and previews nothing for the tiers', () => {
+    for (const bad of [TIER_PRICE_MAX + 1, TIER_PRICE_MIN - 1, 55.5, Number.NaN]) {
+      const p = pricingPreview(pricing, draft((x) => (x.tiers[0]!.price = bad)), 100);
+      expect(p.valid).toBe(false);
+      expect(p.problems[0]).toContain('500 Mbps');
+      expect(p.takeRate).toBeNull();
+      expect(p.mix).toBeNull();
+      // The marketing half still previews.
+      expect(p.boost).toBe(marketingBoost(1_000, 100));
+    }
+  });
+
+  it('needs at least one tier offered', () => {
+    const p = pricingPreview(pricing, draft((x) => x.tiers.forEach((t) => (t.offered = false))), 100);
+    expect(p.valid).toBe(false);
+    expect(p.problems).toContain('Offer at least one tier');
+  });
+
+  it('keeps the take-rate preview when only the multiplier or the budget is wrong', () => {
+    const smb = pricingPreview(pricing, draft((x) => (x.smbMultiplier = SMB_MULTIPLIER_MAX + 1)), 100);
+    expect(smb.valid).toBe(false);
+    expect(smb.takeRate).not.toBeNull();
+    expect(smb.smbPrices).toBeNull();
+    const marketing = pricingPreview(pricing, draft((x) => (x.marketingPerMonth = MARKETING_MAX_PER_MONTH + 1)), 100);
+    expect(marketing.valid).toBe(false);
+    expect(marketing.boost).toBeNull();
+    expect(marketing.takeRate).not.toBeNull();
+  });
+
+  it('calls a draft valid exactly when the sim accepts setPricing and setMarketing', () => {
+    const prices = [TIER_PRICE_MIN - 1, TIER_PRICE_MIN, 64, TIER_PRICE_MAX, TIER_PRICE_MAX + 1, 70.5, Number.NaN];
+    const multipliers = [0.5, 1, 1.25, SMB_MULTIPLIER_MAX, SMB_MULTIPLIER_MAX + 0.01, Number.NaN];
+    const budgets = [-1, 0, 1_500, MARKETING_MAX_PER_MONTH, MARKETING_MAX_PER_MONTH + 1, 10.5, Number.NaN];
+    let checked = 0;
+    for (const price of prices) {
+      for (const smbMultiplier of multipliers) {
+        for (const marketingPerMonth of budgets) {
+          for (const offered of [true, false]) {
+            const tiers: TierSetting[] = pricing.tiers.map((t, i) => ({ id: t.id, price: i === 2 ? price : t.price, offered: i === 0 ? offered : false }));
+            const d: PricingDraft = { ...draftFrom(pricing, marketingPerMonth), tiers, smbMultiplier };
+            const state = newGame(1, { city: makeGridCity() });
+            const a = applyCommand(state, { type: 'setPricing', tiers, smbMultiplier, grandfatherMonths: d.grandfatherMonths });
+            const b = applyCommand(state, { type: 'setMarketing', perMonth: marketingPerMonth });
+            expect(pricingPreview(state.sales.pricing, d, 0).valid, JSON.stringify(d)).toBe(a.ok && b.ok);
+            checked++;
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(500);
+  });
+
+  it('reads number fields, with empty or junk as NaN', () => {
+    expect(parseNumberField(' 55 ')).toBe(55);
+    expect(parseNumberField('1.5')).toBe(1.5);
+    expect(parseNumberField('')).toBeNaN();
+    expect(parseNumberField('   ')).toBeNaN();
+    expect(parseNumberField('abc')).toBeNaN();
+  });
+
+  it('starts from the game pricing and quotes the incumbent', () => {
+    const d = draftFrom(pricing, 1_234);
+    expect(d.tiers).toEqual(pricing.tiers.map((t) => ({ id: t.id, price: t.price, offered: t.offered })));
+    expect(d).toMatchObject({ smbMultiplier: pricing.smbMultiplier, marketingPerMonth: 1_234, grandfatherMonths: GRANDFATHER_MONTHS_DEFAULT });
+    expect(d.promo).toEqual({ enabled: false, ...PROMO_DRAFT_START });
+    expect(draftFrom(pricing, 0, { percentOff: 15, months: 2 }).promo).toEqual({ enabled: true, percentOff: 15, months: 2 });
+    expect(incumbentOffer()).toBe(`Incumbent cable: ${INCUMBENT_DOWN_MBPS} Mbps for ${formatMoney(INCUMBENT_PRICE)}/mo`);
+  });
+
+  it('explains what the marketing budget does', () => {
+    expect(boostHint(null, -5, 10)).toBe('');
+    expect(boostHint(0, 0, 10)).toContain('natural pace');
+    expect(boostHint(marketingBoost(500, 0), 500, 0)).toContain('No homes passed yet');
+    const boost = marketingBoost(500, 300);
+    expect(boostHint(boost, 500, 300)).toBe(`Signups come ${formatPercent(boost)} faster at today's 300 passings.`);
+  });
+});
+
+describe('grandfathering and the intro promo in the draft', () => {
+  const pricing = defaultPricing();
+  const draft = (edit: (d: PricingDraft) => void = () => {}): PricingDraft => {
+    const d = draftFrom(pricing, 1_000);
+    edit(d);
+    return d;
+  };
+
+  it('checks grandfathering the way setPricing does, and explains it', () => {
+    for (const months of [0, 1, GRANDFATHER_MONTHS_DEFAULT, GRANDFATHER_MONTHS_MAX]) {
+      expect(pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months)), 0).valid).toBe(true);
+    }
+    for (const months of [-1, 1.5, GRANDFATHER_MONTHS_MAX + 1, Number.NaN]) {
+      const p = pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months)), 0);
+      expect(p.valid).toBe(false);
+      expect(p.problems).toContain(`Grandfathering must be a whole number of months from 0 to ${GRANDFATHER_MONTHS_MAX}`);
+      // The rest still previews.
+      expect(p.takeRate).not.toBeNull();
+      expect(grandfatherHint(months)).toBe('');
+    }
+    expect(grandfatherHint(6)).toBe('Existing subscribers keep their price for 6 months; 0 = from the next bill. Cuts reach everyone at once.');
+    expect(grandfatherHint(1)).toContain('for 1 month;');
+    expect(grandfatherHint(0)).toContain('from the next bill');
+  });
+
+  it('checks the promo the way setPromo does, values it in the take rate and prices it', () => {
+    const off = pricingPreview(pricing, draft(), 0);
+    expect(off.promoPrices).toBeNull();
+    expect(promoHint(pricing, draft(), off)).toBe('No intro promo: new subscribers pay the list price.');
+    // Switched off, whatever is typed in it does not count.
+    expect(pricingPreview(pricing, draft((d) => (d.promo = { enabled: false, percentOff: Number.NaN, months: 99 })), 0).valid).toBe(true);
+
+    const on = draft((d) => (d.promo = { enabled: true, percentOff: 20, months: 3 }));
+    const p = pricingPreview(pricing, on, 0);
+    expect(p.valid).toBe(true);
+    const promo = draftPromo(on)!;
+    expect(promo).toEqual({ percentOff: 20, months: 3 });
+    expect(p.takeRate!.home).toBe(targetTakeRate(pricing, 'home', INCUMBENT_PRICE, promo));
+    expect(p.takeRate!.home).toBeGreaterThan(off.takeRate!.home);
+    expect(p.mix).toEqual(tierMix(pricing, 'home', INCUMBENT_PRICE, promo));
+    for (const tier of pricing.tiers) expect(p.promoPrices![tier.id]).toBe(promoPrice(tier.price, 20));
+    const hint = promoHint(pricing, on, p);
+    expect(hint).toContain('20% off for the rest of their first month and 3 more months');
+    expect(hint).toContain(`1 Gig ${formatMoney(promoPrice(pricing.tiers[1]!.price, 20))}`);
+
+    for (const bad of [
+      { enabled: true, percentOff: 0, months: 3 },
+      { enabled: true, percentOff: PROMO_MAX_PERCENT_OFF + 1, months: 3 },
+      { enabled: true, percentOff: 10, months: 0 },
+      { enabled: true, percentOff: 10, months: PROMO_MAX_MONTHS + 1 },
+      { enabled: true, percentOff: 10.5, months: 2 },
+    ]) {
+      const state = newGame(1, { city: makeGridCity() });
+      const d = draft((x) => (x.promo = bad));
+      const accepted = applyCommand(state, { type: 'setPromo', promo: draftPromo(d) }).ok;
+      const q = pricingPreview(pricing, d, 0);
+      expect(q.valid, JSON.stringify(bad)).toBe(accepted);
+      expect(q.valid).toBe(false);
+      expect(q.problems.join(' ')).toMatch(/Intro promo must/);
+    }
+  });
+
+  it('knows when the promo changed', () => {
+    expect(samePromo(null, null)).toBe(true);
+    expect(samePromo({ percentOff: 10, months: 2 }, { percentOff: 10, months: 2 })).toBe(true);
+    expect(samePromo({ percentOff: 10, months: 2 }, null)).toBe(false);
+    expect(samePromo({ percentOff: 10, months: 2 }, { percentOff: 10, months: 3 })).toBe(false);
+  });
+});
+
+describe('the preview of today\'s subscribers', () => {
+  function account(parcel: number, units: Partial<Record<TierId, number>>): Account {
+    return { parcel, cabinet: 1, tierUnits: { fiber500: units.fiber500 ?? 0, fiber1g: units.fiber1g ?? 0, fiber2g: units.fiber2g ?? 0 }, since: 0, locks: [] };
+  }
+  function market(): GameState {
+    const state = makeTestState(makeGridCity());
+    state.day = 70; // Mar 12, 2027
+    const accounts: Account[] = [];
+    for (let p = 0; p < 12; p++) accounts.push(account(p, { fiber1g: 1 }));
+    for (let p = 12; p < 17; p++) accounts.push(account(p, { fiber500: 1 }));
+    for (let p = 17; p < 20; p++) accounts.push(account(p, { fiber2g: 1 }));
+    state.sales.accounts = accounts;
+    return state;
+  }
+
+  it('says who keeps what until when, who pays less at once, and quotes MRR and cancellations', () => {
+    const state = market();
+    const d = draftFrom(state.sales.pricing, 1_000);
+    const old1g = d.tiers[1]!.price;
+    const old500 = d.tiers[0]!.price;
+    d.tiers[1]!.price = old1g + 10;
+    d.tiers[0]!.price = old500 - 5;
+    d.grandfatherMonths = 4;
+    const impact = pricingImpact(state, d);
+    const until = lockEndDay(state.day, 4);
+    expect(impact.quote).toEqual(quotePricing(state, d.tiers, d.smbMultiplier, 4));
+    expect(impact.lines).toEqual([
+      `5 subscribers on 500 Mbps pay ${formatMoney(old500 - 5)}/mo at once.`,
+      `12 subscribers on 1 Gig keep ${formatMoney(old1g)}/mo until ${formatDate(until)}, then pay ${formatMoney(old1g + 10)}/mo.`,
+    ]);
+    expect(impact.quote!.mrrAfterLocks).toBeGreaterThan(impact.quote!.mrrNow);
+    expect(impact.quote!.expectedChurn).toBe(Math.round(12 * stepChurnProbability(old1g, old1g + 10, GRANDFATHER_STEP_SHARE)));
+
+    d.grandfatherMonths = 0;
+    expect(pricingImpact(state, d).lines[1]).toBe(`12 subscribers on 1 Gig pay ${formatMoney(old1g + 10)}/mo from the next bill (${formatDate(lockEndDay(state.day, 0))}).`);
+
+    // A subscriber already on an intro promo keeps it until its own end.
+    state.sales.accounts[0]!.locks = [{ tier: 'fiber1g', price: old1g - 20, untilDay: lockEndDay(state.day, 1), reason: 'promo' }];
+    d.grandfatherMonths = 4;
+    expect(pricingImpact(state, d).lines.slice(1)).toEqual([
+      `11 subscribers on 1 Gig keep ${formatMoney(old1g)}/mo until ${formatDate(until)}, then pay ${formatMoney(old1g + 10)}/mo.`,
+      `1 subscriber on 1 Gig keeps its current offer until it ends, then pays ${formatMoney(old1g + 10)}/mo.`,
+    ]);
+  });
+
+  it('says where a retired tier\'s subscribers move at the close', () => {
+    const state = market();
+    const d = draftFrom(state.sales.pricing, 1_000);
+    d.tiers[2]!.offered = false;
+    const impact = pricingImpact(state, d);
+    expect(impact.lines).toEqual([`At the month close 3 subscribers on 2 Gig move to 1 Gig (${formatMoney(d.tiers[1]!.price)}/mo).`]);
+    expect(impact.quote!.unitsMoving).toBe(3);
+  });
+
+  it('has nothing to quote for an invalid draft, and little to say with no subscribers', () => {
+    const state = market();
+    const bad = draftFrom(state.sales.pricing, 1_000);
+    bad.tiers[0]!.price = Number.NaN;
+    expect(pricingImpact(state, bad)).toEqual({ quote: null, lines: [] });
+    const empty = makeTestState(makeGridCity());
+    const impact = pricingImpact(empty, draftFrom(empty.sales.pricing, 0));
+    expect(impact.lines).toEqual(['No subscribers yet: everyone who signs up pays the new prices.']);
+    expect(impact.quote!.mrrNow).toBe(monthlyRecurringRevenue(empty));
+    expect(pricingImpact(state, draftFrom(state.sales.pricing, 0)).lines).toEqual(["No change for today's subscribers."]);
+  });
+});
+
+describe('the incumbent\'s promos in the panel', () => {
+  it('lists each running promo with its corner, price, end and your target there vs elsewhere, at the draft prices', () => {
+    const state = makeTestState(makeGridCity());
+    const cabinet = addLivePlant(state) as CabinetId;
+    state.day = 100;
+    const price = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
+    state.sales.incumbentPromos = [{ cabinet, startDay: 90, endDay: 151, price, quietUntil: 334 }];
+    const d = draftFrom(state.sales.pricing, 1_000);
+    const [row] = incumbentRows(state, d);
+    const corner = cornerName(state.city, state.network.cabinets[0]!.node);
+    expect(row).toEqual({
+      cabinet,
+      place: corner,
+      price,
+      endDay: 151,
+      takeThere: targetTakeRate(state.sales.pricing, 'home', price),
+      takeElsewhere: targetTakeRate(state.sales.pricing, 'home'),
+    });
+    expect(row!.takeThere).toBeLessThan(row!.takeElsewhere);
+    expect(incumbentLine(row!)).toBe(
+      `Around ${corner}: cable at ${formatMoney(price)}/mo until ${formatDate(151)}. Your target take rate there ${formatPercent(row!.takeThere)} (elsewhere ${formatPercent(row!.takeElsewhere)}).`,
+    );
+    // A cut in the draft answers it.
+    d.tiers = d.tiers.map((t) => ({ ...t, price: t.price - 10 }));
+    expect(incumbentRows(state, d)[0]!.takeThere).toBeGreaterThan(row!.takeThere);
+    // Nothing running, nothing listed.
+    state.day = 151;
+    expect(incumbentRows(state, d)).toEqual([]);
+  });
+});

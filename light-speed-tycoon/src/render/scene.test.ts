@@ -17,6 +17,8 @@ import type { ParcelLook } from './parcelLayer';
 import { streetLattice } from './geometry';
 import { Scene } from './scene';
 import { toyTown } from './theme';
+import { STORM_SHOW_DAYS } from '../sim/balance';
+import { stormFade, stormsToShow } from './networkLayer';
 
 function scene(): Scene {
   return new Scene({ stage: new Container() } as unknown as Application, toyTown);
@@ -415,5 +417,112 @@ describe('cost overlay bands', () => {
     expect(overlayBand(street(true, true), 'cheapest')).toBe('green');
     expect(overlayBand(street(false, false), 'cheapest')).toBe('amber');
     expect(overlayBand(street(false, true), 'cheapest')).toBe('red');
+  });
+});
+
+describe('storms and outages on the map', () => {
+  /** litGame with its span live (and aerial), on a day well into the game. */
+  function liveGame(): GameState {
+    const state = litGame();
+    runDays(state, 120);
+    state.network.spans[0]!.method = 'aerial';
+    state.network.version++;
+    return state;
+  }
+
+  it('draws a span out of service broken, and pulses it without redrawing the cable', () => {
+    const state = liveGame();
+    const s = scene();
+    s.sync(state);
+    const { liveRedraws } = s.stats();
+    expect(s.stats()).toMatchObject({ outageSpans: 0 });
+    // Let the new cabinet's glow settle: an idle map draws nothing.
+    const t0 = 1e9;
+    s.animate(t0);
+    s.takeDirty();
+    s.animate(t0 + 100);
+    expect(s.takeDirty()).toBe(false);
+
+    state.network.spans[0]!.outage = { cause: 'storm', storm: null, startDay: state.day, daysLeft: 3, repairCost: 1_000 };
+    state.network.version++;
+    s.sync(state);
+    expect(s.stats()).toMatchObject({ outageSpans: 1, liveSpans: 1, liveRedraws });
+    s.takeDirty();
+    // The pulse: frames move, the cable is not redrawn.
+    s.animate(t0 + 200);
+    expect(s.takeDirty()).toBe(true);
+    s.animate(t0 + 300);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().liveRedraws).toBe(liveRedraws);
+
+    // Repaired: no broken span, and nothing left to animate.
+    state.network.spans[0]!.outage = null;
+    state.network.version++;
+    s.sync(state);
+    expect(s.stats().outageSpans).toBe(0);
+    s.takeDirty();
+    s.animate(t0 + 400);
+    expect(s.takeDirty()).toBe(false);
+  });
+
+  it('marks an underground rebuild, and redraws the cable once the span is underground', () => {
+    const state = liveGame();
+    const s = scene();
+    s.sync(state);
+    const { liveRedraws } = s.stats();
+    const span = state.network.spans[0]!;
+    span.conversion = { stage: 'permitting', stageDaysLeft: 5, constructDays: 2, cost: 0, orderedDay: state.day };
+    state.network.version++;
+    s.sync(state);
+    expect(s.stats()).toMatchObject({ rebuildSpans: 1, liveRedraws });
+    span.conversion.stage = 'constructing';
+    state.network.version++;
+    s.sync(state);
+    expect(s.stats().rebuildSpans).toBe(1);
+    // Done: the same span id, now underground.
+    span.conversion = null;
+    span.method = 'underground';
+    state.network.version++;
+    s.sync(state);
+    expect(s.stats()).toMatchObject({ rebuildSpans: 0, liveSpans: 1, liveRedraws: liveRedraws + 1 });
+  });
+
+  it('shows the clouds of recent storms, fading, redrawn only on a new storm or a new day', () => {
+    const state = liveGame();
+    const s = scene();
+    s.sync(state);
+    expect(s.stats().stormsShown).toBe(0);
+    s.takeDirty();
+    const storm = (id: number, day: number) => ({ id, day, x: 4, y: 2, radius: 9, severity: 2, spans: [], repairCost: 0 });
+    state.weather.storms = [storm(1, state.day - STORM_SHOW_DAYS), storm(2, state.day - 1)];
+    state.weather.nextStormId = 3;
+    s.sync(state);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().stormsShown).toBe(1);
+    expect(stormsToShow(state).map((x) => x.id)).toEqual([2]);
+    s.sync(state);
+    expect(s.takeDirty()).toBe(false);
+
+    // Another storm today.
+    state.weather.storms.push(storm(3, state.day));
+    state.weather.nextStormId = 4;
+    s.sync(state);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().stormsShown).toBe(2);
+    // A day later both fade a step: redrawn.
+    state.day++;
+    s.sync(state);
+    expect(s.takeDirty()).toBe(true);
+    // Long after, none.
+    state.day += STORM_SHOW_DAYS;
+    s.sync(state);
+    expect(s.stats().stormsShown).toBe(0);
+  });
+
+  it('fades a storm from full strength the day it hits to nothing at STORM_SHOW_DAYS', () => {
+    expect(stormFade(0)).toBe(1);
+    expect(stormFade(STORM_SHOW_DAYS / 2)).toBeCloseTo(0.5);
+    expect(stormFade(STORM_SHOW_DAYS)).toBe(0);
+    expect(stormFade(STORM_SHOW_DAYS * 3)).toBe(0);
   });
 });

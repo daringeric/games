@@ -25,14 +25,16 @@ import {
   PERMIT_FEE_AERIAL,
   PERMIT_FEE_UNDERGROUND,
   PERMITTING_CANCEL_REFUND,
+  POLE_RENT_PER_POLE_PER_MONTH,
   SPLIT_RATIO,
   SPLITTER_COST,
   START_CASH,
   TILE_FT,
   UNDERGROUND_COST_PER_FT,
+  UNDERGROUND_FT_PER_DAY,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from './balance';
-import { formatMoney } from './finance';
+import { formatMoney, monthlyPoleRent } from './finance';
 import { applyCommand, newGame } from './game';
 import { cppBand } from './metrics';
 import {
@@ -42,13 +44,16 @@ import {
   cableCost,
   cableRoute,
   computeService,
+  convertSpan,
   getService,
+  outageImpact,
   layCable,
   orderFees,
   placeCabinet,
   ponPortsUsed,
   quoteCabinet,
   quoteCable,
+  quoteConvert,
   quoteOltCard,
   quoteRemoveCabinet,
   quoteRemoveSpan,
@@ -64,6 +69,7 @@ import { Rng } from './rng';
 import { polesOnSegment, shortestPath } from './streets';
 import { makeGridCity, makeTestState } from './testing/fixtures';
 import type { BuildStage, CableMethod, City, CommandResult, GameState, SegmentId, StreetSegment } from './types';
+import { stormRisk } from './weather';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
 // Horizontal segment (i, j) = j * 3 + i (240 ft, "1st St".."3rd St");
@@ -116,6 +122,8 @@ function addSpan(state: GameState, segment: SegmentId, stage: BuildStage = 'live
     refundable: 0,
     orderedDay: 0,
     liveDay: stage === 'live' ? 0 : null,
+    outage: null,
+    conversion: null,
   });
   state.network.version++;
   return id;
@@ -1005,9 +1013,9 @@ describe('splitters', () => {
 describe('removeCabinet', () => {
   function withAccounts(state: GameState, cabinet: number): void {
     state.sales.accounts = [
-      { parcel: 0, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 },
-      { parcel: 2, cabinet: cabinet + 100, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0 },
-      { parcel: 4, cabinet, tierUnits: { fiber500: 3, fiber1g: 2, fiber2g: 1 }, since: 0 },
+      { parcel: 0, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] },
+      { parcel: 2, cabinet: cabinet + 100, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] },
+      { parcel: 4, cabinet, tierUnits: { fiber500: 3, fiber1g: 2, fiber2g: 1 }, since: 0, locks: [] },
     ];
   }
 
@@ -1243,7 +1251,7 @@ describe('quoteRemoveSpan', () => {
     const on = new Set([H(0, 0), H(1, 0), H(2, 0)]);
     state.sales.accounts = state.city.parcels
       .filter((p) => on.has(p.segment))
-      .map((p) => ({ parcel: p.id, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }));
+      .map((p) => ({ parcel: p.id, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }));
     return { state, spans, cabinet };
   }
 
@@ -1287,7 +1295,7 @@ describe('quoteRemoveSpan', () => {
     // The cabinet stands at the far end of 2nd span: cut that and the cabinet loses the CO.
     const cabinet = addCabinet(state, 2);
     const parcel = state.city.parcels.find((p) => p.segment === H(0, 0))!;
-    state.sales.accounts = [{ parcel: parcel.id, cabinet, tierUnits: { fiber500: 0, fiber1g: 2, fiber2g: 0 }, since: 0 }];
+    state.sales.accounts = [{ parcel: parcel.id, cabinet, tierUnits: { fiber500: 0, fiber1g: 2, fiber2g: 0 }, since: 0, locks: [] }];
     expect(computeService(state).litSegments.has(H(0, 0))).toBe(true);
     expect(quoteRemoveSpan(state, feeder).subscribersAffected).toBe(2);
   });
@@ -1645,5 +1653,294 @@ describe('cableRoute', () => {
     expect(quoteCable(state, plain, 'aerial').reasons).toEqual(['No poles on Water St - lay underground instead']);
     const route = cableRoute(state, 68, 97, 'aerial')!;
     expect(quoteCable(state, route, 'aerial')).toMatchObject({ ok: true, reasons: [], lengthFt: 1_500 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 4: outages and underground rebuilds
+// ---------------------------------------------------------------------------
+
+/** Put an outage on the span on `segment` (as a storm would) and bump the version. */
+function knockOut(state: GameState, segment: SegmentId, daysLeft = 3): void {
+  const span = spanOnSegment(state, segment)!;
+  span.outage = { cause: 'storm', storm: null, startDay: state.day, daysLeft, repairCost: 0 };
+  state.network.version++;
+}
+
+describe('interrupted segments', () => {
+  /** 1st St cabled from the CO (node 0) to node 3, a cabinet at the CO. */
+  function firstStreet(): GameState {
+    const state = makeState();
+    for (const id of [H(0, 0), H(1, 0), H(2, 0)]) addSpan(state, id);
+    addCabinet(state, 0);
+    return state;
+  }
+
+  it('cuts off everything beyond an out feeder, while it stays lit and passed', () => {
+    const state = firstStreet();
+    const before = computeService(state);
+    expect(before.interruptedSegments.size).toBe(0);
+    knockOut(state, H(0, 0));
+    const after = computeService(state);
+    expect(sorted(after.interruptedSegments)).toEqual([H(0, 0), H(1, 0), H(2, 0)]);
+    // Scorecards ignore outages: the same streets lit, the same homes passed, the same serving cabinets.
+    expect(sorted(after.litSegments)).toEqual(sorted(before.litSegments));
+    expect(after.passedParcels).toEqual(before.passedParcels);
+    expect(after.passings).toBe(before.passings);
+    expect(after.servingCabinet).toEqual(before.servingCabinet);
+    expect(sorted(after.connectedSegments)).toEqual(sorted(before.connectedSegments));
+  });
+
+  it('cuts off only its own street when an out leaf feeds nothing', () => {
+    const state = firstStreet();
+    knockOut(state, H(2, 0));
+    expect(sorted(computeService(state).interruptedSegments)).toEqual([H(2, 0)]);
+  });
+
+  it('keeps streets with another live path lit', () => {
+    // The first block's loop: 1st St, B Ave, 2nd St, A Ave.
+    const state = makeState();
+    for (const id of [H(0, 0), V(1, 0), H(0, 1), V(0, 0)]) addSpan(state, id);
+    addCabinet(state, 0);
+    knockOut(state, H(0, 0));
+    expect(sorted(computeService(state).interruptedSegments)).toEqual([H(0, 0)]);
+  });
+
+  it('cuts off what a cabinet serves when the outage cuts the cabinet off from the CO', () => {
+    const state = makeState();
+    for (const id of [H(0, 0), H(1, 0), H(2, 0)]) addSpan(state, id);
+    addCabinet(state, 3);
+    knockOut(state, H(0, 0));
+    const service = computeService(state);
+    expect(sorted(service.interruptedSegments)).toEqual(sorted(service.litSegments));
+    expect(service.litSegments.size).toBe(3);
+  });
+
+  it('is memoized with the snapshot, follows the network version, and matches a fresh computation', () => {
+    const state = firstStreet();
+    const clear = getService(state);
+    expect(clear.interruptedSegments.size).toBe(0);
+    knockOut(state, H(1, 0));
+    const out = getService(state);
+    expect(out).not.toBe(clear);
+    expect(sorted(out.interruptedSegments)).toEqual([H(1, 0), H(2, 0)]);
+    expect(getService(state)).toBe(out);
+    // A new day on the same network keeps the outage.
+    state.day++;
+    expect(sorted(getService(state).interruptedSegments)).toEqual([H(1, 0), H(2, 0)]);
+    expect(sorted(computeService(state).interruptedSegments)).toEqual([H(1, 0), H(2, 0)]);
+    // Repaired: gone with the next version.
+    spanOnSegment(state, H(1, 0))!.outage = null;
+    state.network.version++;
+    expect(getService(state).interruptedSegments.size).toBe(0);
+  });
+});
+
+describe('outageImpact', () => {
+  it('names what one outage cuts off and its subscribers, and nothing for a span in service', () => {
+    const state = makeState();
+    for (const id of [H(0, 0), H(1, 0), H(2, 0)]) addSpan(state, id);
+    const cabinet = addCabinet(state, 0);
+    // A subscriber on the middle block of 1st St (lots 8.. front H(1, 0)).
+    const parcel = state.city.parcels.find((p) => p.segment === H(1, 0))!.id;
+    state.sales.accounts = [{ parcel, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }];
+    const feeder = spanOnSegment(state, H(0, 0))!;
+    const leaf = spanOnSegment(state, H(2, 0))!;
+    expect(outageImpact(state, feeder.id)).toEqual({ segments: [], subscribers: 0 });
+    knockOut(state, H(0, 0));
+    expect(outageImpact(state, feeder.id)).toEqual({ segments: [H(0, 0), H(1, 0), H(2, 0)], subscribers: 1 });
+    // With the leaf out too, the feeder's repair alone brings back all but the leaf.
+    knockOut(state, H(2, 0));
+    expect(outageImpact(state, feeder.id)).toEqual({ segments: [H(0, 0), H(1, 0)], subscribers: 1 });
+    expect(outageImpact(state, leaf.id)).toEqual({ segments: [], subscribers: 0 });
+    expect(outageImpact(state, 999)).toEqual({ segments: [], subscribers: 0 });
+  });
+});
+
+describe('quoteConvert', () => {
+  it('quotes the underground bore, rock, engineering and the city permit for a live aerial span, no make-ready', () => {
+    const state = makeState(makeGridCity({ rock: true }));
+    const span = addSpan(state, H(0, 0));
+    const street = seg(state, H(0, 0));
+    const quote = quoteConvert(state, span);
+    const ug = spanCharges(street, 'underground');
+    expect(quote.ok).toBe(true);
+    expect(quote.reasons).toEqual([]);
+    expect(quote.span).toBe(span);
+    expect(quote.lines.map((l) => l.kind)).toEqual(['cable', 'rock', 'engineering', 'permit']);
+    expect(quote.lines.every((l) => !l.refundable)).toBe(true);
+    expect(quote.lines[0]).toMatchObject({ quantity: street.lengthFt, unit: 'ft', rate: UNDERGROUND_COST_PER_FT, amount: ug.construction });
+    expect(quote.lines[1]).toMatchObject({ quantity: street.lengthFt, rate: UNDERGROUND_ROCK_SURCHARGE_PER_FT, amount: ug.rock });
+    expect(quote.cost).toBe(ug.total + ENGINEERING_FEE + PERMIT_FEE_UNDERGROUND);
+    expect(quote.lines.reduce((sum, l) => sum + l.amount, 0)).toBe(quote.cost);
+    expect([quote.permitDaysMin, quote.permitDaysMax]).toEqual([PERMIT_DAYS_MIN, PERMIT_DAYS_MAX]);
+    expect(quote.constructDays).toBe(Math.max(1, Math.ceil(street.lengthFt / UNDERGROUND_FT_PER_DAY)));
+    expect(quote.poleRentSaved).toBe(polesOnSegment(street) * POLE_RENT_PER_POLE_PER_MONTH);
+    expect(quote.poleRentSaved).toBeGreaterThan(0);
+    const avoided = stormRisk(state, street, 'aerial').repairCostPerYear - stormRisk(state, street, 'underground').repairCostPerYear;
+    expect(quote.repairsAvoidedPerYear).toBe(Math.round(avoided));
+    expect(quote.repairsAvoidedPerYear).toBeGreaterThan(0);
+    // No rock under the street: no rock line.
+    const soil = makeState();
+    expect(quoteConvert(soil, addSpan(soil, H(0, 0))).lines.map((l) => l.kind)).toEqual(['cable', 'engineering', 'permit']);
+  });
+
+  it('is allowed while the span is out of service', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    knockOut(state, H(0, 0));
+    expect(quoteConvert(state, span).ok).toBe(true);
+  });
+
+  it('pins the permit days to a remembered underground draw for the segment', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    state.network.makeReady = [{ segment: H(0, 0), method: 'underground', days: 20, drawnDay: 0 }];
+    expect(quoteConvert(state, span)).toMatchObject({ permitDaysMin: 20, permitDaysMax: 20 });
+    // An aerial memo for the segment is not an underground permit.
+    state.network.makeReady = [{ segment: H(0, 0), method: 'aerial', days: 99, drawnDay: 0 }];
+    expect(quoteConvert(state, span)).toMatchObject({ permitDaysMin: PERMIT_DAYS_MIN, permitDaysMax: PERMIT_DAYS_MAX });
+  });
+
+  it('names what blocks it, structural reasons before cash, and never throws for junk', () => {
+    const state = makeState();
+    const building = addSpan(state, H(0, 0), 'constructing');
+    const underground = addSpan(state, H(1, 0));
+    spanOnSegment(state, H(1, 0))!.method = 'underground';
+    const converting = addSpan(state, H(2, 0));
+    spanOnSegment(state, H(2, 0))!.conversion = { stage: 'permitting', stageDaysLeft: 5, constructDays: 1, cost: 0, orderedDay: 0 };
+    const fine = addSpan(state, H(0, 1));
+    expect(quoteConvert(state, 999).reasons).toEqual(['Unknown cable span: 999']);
+    expect(quoteConvert(state, building).reasons).toEqual(['The cable on 1st St is still being built: rebuild it underground once it is live']);
+    expect(quoteConvert(state, underground).reasons).toEqual(['The cable on 1st St is already underground']);
+    expect(quoteConvert(state, converting).reasons).toEqual(['The cable on 1st St is already being rebuilt underground']);
+    state.finance.cash = 10;
+    const broke = quoteConvert(state, fine);
+    expect(broke.ok).toBe(false);
+    expect(broke.reasons).toEqual([`Not enough cash: need ${formatMoney(broke.cost)}, have ${formatMoney(10)}`]);
+    expect(quoteConvert(state, underground).reasons).toHaveLength(1);
+    for (const junk of [Number.NaN, -1, 1.5, 'x', null, undefined, {}]) {
+      expect(quoteConvert(state, junk as never).ok).toBe(false);
+    }
+  });
+});
+
+describe('convertSpan', () => {
+  it('pays for the rebuild, draws its permit from the events stream and remembers the draw', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    const target = spanOnSegment(state, H(0, 0))!;
+    target.cost = 5_000;
+    const quote = quoteConvert(state, span);
+    const version = state.network.version;
+    const rng = new Rng(77);
+    const result = convertSpan(state, span, rng);
+    expect(result).toEqual({ ok: true, cost: quote.cost });
+    const days = refDraw(new Rng(77), 'underground');
+    expect(rng.state).not.toBe(new Rng(77).state);
+    expect(target.conversion).toEqual({ stage: 'permitting', stageDaysLeft: days, constructDays: quote.constructDays, cost: quote.cost, orderedDay: 0 });
+    expect(target.method).toBe('aerial');
+    expect(target.stage).toBe('live');
+    expect(target.cost).toBe(5_000 + quote.cost);
+    expect(state.finance.cash).toBe(START_CASH - quote.cost);
+    expect(state.finance.capex.osp).toBe(quote.cost);
+    expect(state.finance.monthToDate).toEqual([
+      { day: 0, category: 'construction', amount: -quote.cost, memo: `Underground rebuild: 1st St (${seg(state, H(0, 0)).lengthFt} ft)` },
+    ]);
+    expect(state.network.makeReady).toEqual([{ segment: H(0, 0), method: 'underground', days, drawnDay: 0 }]);
+    expect(rememberedPermitDays(state, H(0, 0), 'underground')).toBe(days);
+    expect(state.network.version).toBeGreaterThan(version);
+  });
+
+  it('reuses a remembered underground draw without touching the rng', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    state.day = 10;
+    state.network.makeReady = [{ segment: H(0, 0), method: 'underground', days: 21, drawnDay: 5 }];
+    const rng = new Rng(77);
+    expect(convertSpan(state, span, rng).ok).toBe(true);
+    expect(rng.state).toBe(new Rng(77).state);
+    expect(spanOnSegment(state, H(0, 0))!.conversion?.stageDaysLeft).toBe(21);
+    expect(state.network.makeReady).toEqual([{ segment: H(0, 0), method: 'underground', days: 21, drawnDay: 5 }]);
+  });
+
+  it('rejects with the first reason and changes nothing, the rng included', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0), 'constructing');
+    expectRejected(state, (s) => convertSpan(s, span, new Rng(1)), 'The cable on 1st St is still being built: rebuild it underground once it is live');
+    const live = addSpan(state, H(1, 0));
+    state.finance.cash = 1;
+    expectRejected(state, (s) => convertSpan(s, live, new Rng(1)), /^Not enough cash/);
+    expectRejected(state, (s) => convertSpan(s, 12345, new Rng(1)), 'Unknown cable span: 12345');
+    const rng = new Rng(9);
+    convertSpan(state, live, rng);
+    expect(rng.state).toBe(new Rng(9).state);
+  });
+
+  it('goes through permitting and construction, then the span is underground: pole rent stops, the outage is cleared', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    const target = spanOnSegment(state, H(0, 0))!;
+    const rentBefore = monthlyPoleRent(state);
+    expect(rentBefore).toBe(polesOnSegment(seg(state, H(0, 0))) * POLE_RENT_PER_POLE_PER_MONTH);
+    expect(convertSpan(state, span, new Rng(3)).ok).toBe(true);
+    const conversion = target.conversion!;
+    const permit = conversion.stageDaysLeft;
+    // Storm damage during the rebuild does not hold it up.
+    knockOut(state, H(0, 0), 10_000);
+
+    for (let d = 1; d < permit; d++) {
+      const version = state.network.version;
+      tick(state);
+      expect(target.conversion?.stage).toBe('permitting');
+      expect(state.network.version).toBe(version);
+    }
+    let version = state.network.version;
+    tick(state);
+    expect(target.conversion).toMatchObject({ stage: 'constructing', stageDaysLeft: conversion.constructDays });
+    expect(state.network.version).toBeGreaterThan(version);
+    // The aerial cable serves (and pays pole rent) until the rebuild is live.
+    expect(target.method).toBe('aerial');
+    expect(monthlyPoleRent(state)).toBe(rentBefore);
+    for (let d = 1; d < conversion.constructDays; d++) tick(state);
+    expect(target.conversion?.stage).toBe('constructing');
+    version = state.network.version;
+    tick(state);
+    expect(target.method).toBe('underground');
+    expect(target.conversion).toBeNull();
+    expect(target.outage).toBeNull();
+    expect(target.stage).toBe('live');
+    expect(state.network.version).toBeGreaterThan(version);
+    expect(monthlyPoleRent(state)).toBe(0);
+    // It is an underground span now: nothing more to convert.
+    expect(quoteConvert(state, span).reasons).toEqual(['The cable on 1st St is already underground']);
+  });
+
+  it('moves a stage left at 0 days on the next day (a hand-edited save)', () => {
+    const state = makeState();
+    addSpan(state, H(0, 0));
+    const target = spanOnSegment(state, H(0, 0))!;
+    target.conversion = { stage: 'permitting', stageDaysLeft: 0, constructDays: 2, cost: 0, orderedDay: 0 };
+    tick(state);
+    expect(target.conversion).toMatchObject({ stage: 'constructing', stageDaysLeft: 2 });
+    target.conversion!.stageDaysLeft = 0;
+    tick(state);
+    expect(target.method).toBe('underground');
+  });
+
+  it('works through applyCommand on the events stream, and removeSpan takes a converting span away whole with no refund', () => {
+    const state = makeState();
+    const span = addSpan(state, H(0, 0));
+    const events = state.rng.events;
+    const sales = state.rng.sales;
+    const result = applyCommand(state, { type: 'convertSpan', span });
+    expect(result.ok).toBe(true);
+    expect(state.rng.events).not.toBe(events);
+    expect(state.rng.sales).toBe(sales);
+    const cash = state.finance.cash;
+    expect(quoteRemoveSpan(state, span).refund).toBe(0);
+    expect(removeSpan(state, span)).toEqual({ ok: true, cost: 0 });
+    expect(state.network.spans).toEqual([]);
+    expect(state.finance.cash).toBe(cash);
   });
 });
