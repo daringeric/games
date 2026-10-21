@@ -1,0 +1,78 @@
+/* Round 4: Bank panel changes: covenant status at the top, the frozen-line sweep and countdown, draw previews, the safe term-loan default (sim-debt workstream).
+   Imported by main.ts after style.css and mapTools.css, so rules here may
+   override theirs; style.css itself is frozen for round 4. Colors and sizes come
+   from the theme variables themeCss.ts publishes (--card, --text, --accent,
+   --danger, --radius, --touch, ...), never literals. */
+
+/* The verified cure under today's covenant tests. */
+.bank-remedy {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: var(--chip);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+/* The frozen line: the sweep, the countdown to the call, or the called loans. */
+.bank-frozen {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--chip);
+  box-shadow: inset 0 0 0 2px var(--card-border);
+}
+
+.bank-frozen.bank-frozen-warn {
+  background: color-mix(in srgb, var(--cpp-amber) 12%, var(--card));
+  box-shadow: inset 0 0 0 2px var(--cpp-amber);
+}
+
+.bank-frozen.bank-frozen-danger {
+  background: var(--danger-bg);
+  box-shadow: inset 0 0 0 2px var(--danger);
+}
+
+.sheet .bank-frozen-title {
+  margin: 0;
+}
+
+.bank-frozen.bank-frozen-danger .bank-frozen-title {
+  color: var(--danger);
+}
+
+/* The covenant preview under the draw form. */
+.bank-draw-preview {
+  display: grid;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--chip);
+}
+
+.bank-draw-preview .bank-subhead {
+  margin: 0;
+}
+
+/* The builder's largest covenant-safe amount. */
+.bank-safe {
+  color: var(--text);
+}
+
+/* Same-month loans a new loan re-prices. */
+.bank-repriced {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 12px 8px 28px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cpp-amber) 12%, var(--card));
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}

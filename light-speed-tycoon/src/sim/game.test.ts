@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  GRANDFATHER_MONTHS_MAX,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
   CABINET_START_SPLITTERS,
@@ -16,6 +17,7 @@ import {
   POLE_RENT_PER_POLE_PER_MONTH,
   SPLITTER_COST,
   START_CASH,
+  STORM_START_DAY,
   TERM_LOAN_MIN,
 } from './balance';
 import { dayOf, MONTH_LENGTHS } from './calendar';
@@ -25,7 +27,8 @@ import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng, withRng } from './rng';
 import { defaultPricing, newSales, stepSales } from './sales';
-import { addLivePlant, makeGridCity, noDebtStats } from './testing/fixtures';
+import { addLivePlant, makeGridCity, noDebtStats, quietOpsStats } from './testing/fixtures';
+import { newWeather } from './weather';
 import type { City, Command, GameState, MonthlyReport } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells, CO at node 0. Horizontal segments
@@ -48,10 +51,10 @@ describe('newGame', () => {
     const city = makeGridCity();
     const state = newGame(42, { city });
     expect(state).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       seed: 42,
       day: 0,
-      rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales') },
+      rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales'), weather: deriveSeed(42, 'weather') },
       nextId: 1,
       city,
       network: {
@@ -64,6 +67,7 @@ describe('newGame', () => {
       finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
       debt: newDebt(),
       sales: newSales(),
+      weather: newWeather(),
       milestones: [],
       notices: [],
       nextNoticeId: 1,
@@ -435,6 +439,7 @@ describe('tick and runDays', () => {
           fullCabinets: 0,
         },
         debt: noDebtStats(state),
+        ops: quietOpsStats(state),
       },
     ]);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -559,6 +564,31 @@ describe('pricing and marketing commands', () => {
     expect(state.sales.marketingPerMonth).toBe(4_000);
     expect(state.finance.cash).toBe(START_CASH);
     expect(state.finance.monthToDate).toEqual([]);
+  });
+});
+
+describe('round-4 commands: field checks (contract)', () => {
+  it('checks the shapes of setPricing grandfatherMonths, setPromo and convertSpan before the sim sees them', () => {
+    const state = game();
+    const tiers = tierSettings({ fiber500: 60 }) as never;
+    expect(applyCommand(state, { type: 'setPricing', tiers, smbMultiplier: 1.5, grandfatherMonths: '6' } as never)).toEqual({
+      ok: false,
+      reason: 'setPricing grandfatherMonths must be a number of months',
+    });
+    // The range is the sim's to check, naming it.
+    const tooLong = applyCommand(state, { type: 'setPricing', tiers, smbMultiplier: 1.5, grandfatherMonths: GRANDFATHER_MONTHS_MAX + 1 });
+    expect(tooLong.ok).toBe(false);
+    expect(!tooLong.ok && tooLong.reason).toContain(`0 to ${GRANDFATHER_MONTHS_MAX}`);
+    expect(applyCommand(state, { type: 'setPricing', tiers, smbMultiplier: 1.5, grandfatherMonths: 0 })).toEqual({ ok: true, cost: 0 });
+    expect(applyCommand(state, { type: 'setPromo', promo: { percentOff: '10', months: 2 } } as never)).toEqual({
+      ok: false,
+      reason: 'setPromo needs promo: null or { percentOff, months }',
+    });
+    expect(applyCommand(state, { type: 'setPromo' } as never).ok).toBe(false);
+    expect(applyCommand(state, { type: 'convertSpan', span: 'x' } as never)).toEqual({ ok: false, reason: 'convertSpan needs a cable span id' });
+    // Nothing changed but the accepted prices.
+    expect(state.sales.promo).toBeNull();
+    expect(state.finance.cash).toBe(START_CASH);
   });
 });
 
@@ -721,5 +751,80 @@ describe('the daily tick with debt (round 3)', () => {
         }
       }
     }
+  });
+});
+
+describe('the daily tick with weather (round 4)', () => {
+  /**
+   * The day before storm season: A Ave (no homes) live from the CO with a
+   * cabinet there, and 1st St's first block (four homes) aerial and one day
+   * from going live, with marketing loud enough that its homes sign up.
+   */
+  function eveOfStorms(): GameState {
+    const state = game();
+    state.finance.cash = 10_000_000;
+    addLivePlant(state, { segments: [9] });
+    state.network.spans.push({
+      id: state.nextId++,
+      segment: 0,
+      method: 'aerial',
+      stage: 'constructing',
+      stageDaysLeft: 1,
+      constructDays: 1,
+      cost: 0,
+      refundable: 0,
+      orderedDay: 0,
+      liveDay: null,
+      outage: null,
+      conversion: null,
+    });
+    state.network.version++;
+    state.sales.marketingPerMonth = MARKETING_MAX_PER_MONTH;
+    state.day = STORM_START_DAY - 1;
+    return state;
+  }
+
+  /** The first weather seed (from 1) whose first storm-season day does or does not knock out the new span. */
+  function weatherSeed(knockOut: boolean): number {
+    for (let seed = 1; seed < 200_000; seed++) {
+      const trial = eveOfStorms();
+      trial.rng.weather = seed;
+      tick(trial);
+      const out = trial.network.spans.find((s) => s.segment === 0)!.outage !== null;
+      if (out === knockOut && (knockOut || trial.weather.storms.length === 0)) return seed;
+    }
+    throw new Error('no such weather seed');
+  }
+
+  it('runs the weather after network progress and before sales', () => {
+    const stormy = eveOfStorms();
+    stormy.rng.weather = weatherSeed(true);
+    const calm = eveOfStorms();
+    calm.rng.weather = weatherSeed(false);
+    tick(stormy);
+    tick(calm);
+    const span = stormy.network.spans.find((s) => s.segment === 0)!;
+    // The weather saw the span that went live today: network progress came first.
+    expect(span.liveDay).toBe(STORM_START_DAY);
+    expect(span.outage).toMatchObject({ cause: 'storm', startDay: STORM_START_DAY });
+    expect(getService(stormy).interruptedSegments.has(0)).toBe(true);
+    // Sales saw the outage the same day: no signup draws on the cut-off street, so
+    // the sales stream stands where it did, unlike the calm day's.
+    expect(calm.rng.sales).not.toBe(stormy.rng.sales);
+    expect(stormy.sales.accounts).toEqual([]);
+    expect(stormy.rng.sales).toBe(eveOfStorms().rng.sales);
+    // Both took the same make-ready and events draws (none today).
+    expect(stormy.rng.events).toBe(calm.rng.events);
+  });
+
+  it('rebuilds a live aerial span underground through applyCommand', () => {
+    const state = game();
+    addLivePlant(state, { segments: [0] });
+    const span = state.network.spans[0]!;
+    span.method = 'aerial';
+    const result = applyCommand(state, { type: 'convertSpan', span: span.id });
+    expect(result.ok).toBe(true);
+    expect(span.conversion?.stage).toBe('permitting');
+    expect(applyCommand(state, { type: 'convertSpan', span: span.id })).toEqual({ ok: false, reason: 'The cable on 1st St is already being rebuilt underground' });
   });
 });

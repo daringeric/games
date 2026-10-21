@@ -28,6 +28,8 @@ function addSpan(state: GameState, segment: SegmentId, stage: BuildStage = 'live
     refundable: 0,
     orderedDay: 0,
     liveDay: stage === 'live' ? 0 : null,
+    outage: null,
+    conversion: null,
   });
   state.network.version++;
   return id;

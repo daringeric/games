@@ -10,13 +10,16 @@ import type { Command, CommandResult, GameState } from '../sim/types';
 import { el, icon, setText } from './dom';
 import { formatMoney, formatNumber, formatStage, plural } from './format';
 import { ICONS } from './icons';
-import { cashAfterRow, cornerLabel, creditHint, fundsOf } from './tools';
+import { cashAfterRow, creditHint, fundsOf } from './funding';
+import { cornerLabel } from './tools';
 
 export interface OltPanelDeps {
   /** The game in play when the button is pressed. */
   getState(): GameState;
   dispatch(cmd: Command): CommandResult;
   toast(message: string, ok: boolean): void;
+  /** Called whenever the panel opens (MapControls closes the other map panels: one shows at a time). */
+  onOpen?(): void;
 }
 
 let panelIds = 0;
@@ -107,6 +110,7 @@ export class OltPanel {
   }
 
   open(state: GameState): void {
+    this.deps.onOpen?.();
     this.root.hidden = false;
     this.update(state, true);
     this.root.focus({ preventScroll: true });

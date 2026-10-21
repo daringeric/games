@@ -6,6 +6,14 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
+  ARR_SPIKE_CAP,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_RESERVE,
+  FROZEN_SWEEP_SHARE,
+  FUNDING_CUSHION_MONTHS,
+  OVERHEAD_PER_MONTH,
   ARR_TRAILING_MONTHS,
   BASE_RATE_BPS,
   COVENANT_CURE_CLOSES,
@@ -29,8 +37,15 @@ import {
 } from './balance';
 import { dateOf, dayOf, DAYS_PER_YEAR, MONTH_ABBR, MONTH_LENGTHS } from './calendar';
 import {
+  acceleratedSchedule,
   amortize,
   annualDebtService,
+  calledLinePrincipal,
+  closeDebtMonth,
+  cureOptions,
+  estimateSweep,
+  fundingHint,
+  closesUntilAcceleration,
   annualOperatingCashFlow,
   covenantMetrics,
   creditAvailable,
@@ -43,12 +58,14 @@ import {
   formatRateBps,
   frozenReason,
   levelPayment,
+  maxSafeTermLoan,
   leverageSpreadBps,
   newDebt,
   penaltyBps,
   prepayLoan,
   priceRate,
   pricingCpp,
+  quoteDraw,
   quotePrepay,
   quoteTermLoan,
   rateOf,
@@ -59,8 +76,8 @@ import {
   totalDebt,
   trailingArr,
 } from './debt';
-import { closeMonth, estimateCashAtClose, formatMoney } from './finance';
-import { cppBand, operatingCashFlow } from './metrics';
+import { closeMonth, estimateCashAtClose, formatMoney, postEntry } from './finance';
+import { cppBand, operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService } from './network';
 import { Rng } from './rng';
 import { addLivePlant, closedMonth, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
@@ -88,6 +105,8 @@ describe('newDebt', () => {
       loans: [],
       nextLoanId: 1,
       covenant: { stage: 'compliant', compliantCloses: 0 },
+      frozenCloses: 0,
+      acceleration: null,
     });
     // Fresh objects every time: a game must never share debt state with another.
     expect(newDebt()).not.toBe(newDebt());
@@ -128,14 +147,15 @@ describe('trailingArr and the credit limit', () => {
     expect(creditAvailable(makeTestState())).toBe(0);
   });
 
-  it('annualizes the trailing closed months, however many there are so far', () => {
+  it('annualizes the trailing closed months, however many there are so far, smoothed against the weakest of them', () => {
     expect(trailingArr(withRevenue(1_000))).toBe(12_000);
     const revenues = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000];
     for (let n = 1; n <= revenues.length; n++) {
       const months = revenues.slice(0, n);
       const window = months.slice(-ARR_TRAILING_MONTHS);
-      const expected = Math.round((window.reduce((a, b) => a + b, 0) * 12) / window.length);
-      expect(trailingArr(withRevenue(...months)), `${n} months`).toBe(expected);
+      const mean = (window.reduce((a, b) => a + b, 0) * 12) / window.length;
+      const cap = ARR_SPIKE_CAP * Math.min(...window) * 12;
+      expect(trailingArr(withRevenue(...months)), `${n} months`).toBe(Math.round(Math.min(mean, cap)));
     }
   });
 
@@ -263,6 +283,24 @@ describe('annualOperatingCashFlow', () => {
       expect(annualOperatingCashFlow(state), `${n} months`).toBe(Math.round((flow * 12) / window.length));
       const viaMetrics = state.finance.reports.slice(-ARR_TRAILING_MONTHS).reduce((sum, r) => sum + operatingCashFlow(r), 0);
       expect(annualOperatingCashFlow(state)).toBe(Math.round((viaMetrics * 12) / window.length));
+    }
+  });
+
+  it('counts storm repairs once, at their total over the last REPAIR_TRAILING_MONTHS closes, not annualized', () => {
+    const REVENUE = 20_000;
+    const COSTS = 12_000;
+    const REPAIR = 7_000;
+    const months = REPAIR_TRAILING_MONTHS + ARR_TRAILING_MONTHS;
+    // The repair month is the latest close, then ages out of the trailing window, then out of the year.
+    for (let age = 0; age < months; age++) {
+      const reports = Array.from({ length: months }, (_, i) => closedMonth(2027 + Math.floor(i / 12), (i % 12) + 1, REVENUE, COSTS));
+      const hit = reports[months - 1 - age] as MonthlyReport;
+      hit.totals.repair = -REPAIR;
+      hit.net -= REPAIR;
+      const state = makeTestState();
+      state.finance.reports = reports;
+      const within = age < REPAIR_TRAILING_MONTHS ? REPAIR : 0;
+      expect(annualOperatingCashFlow(state), `repair ${age} closes ago`).toBe((REVENUE - COSTS) * 12 - within);
     }
   });
 });
@@ -733,6 +771,8 @@ describe('quoteTermLoan', () => {
         after,
         breachesCovenant: !after.compliant,
         cashAfter: state.finance.cash + amount,
+        repriced: [],
+        safeMaxAmount: maxSafeTermLoan(state, years),
       });
       expect(q.rate.cppBand).toBe('amber');
       expect(q.rate.cppBps).toBe(CPP_SPREAD_BPS.amber);
@@ -1241,3 +1281,644 @@ describe('frozenReason', () => {
   });
 });
 
+
+describe('round-4 reads (contract)', () => {
+  it('previews a draw: the covenants with it, and the reasons drawCredit would give', () => {
+    const state = trading();
+    const available = creditAvailable(state);
+    expect(available).toBeGreaterThan(0);
+    const q = quoteDraw(state, available);
+    expect(q).toMatchObject({ ok: true, reasons: [], amount: available, cashAfter: state.finance.cash + available });
+    expect(q.before).toEqual(covenantMetrics(state));
+    expect(q.after.totalDebt).toBe(q.before.totalDebt + available);
+    expect(q.after.annualDebtService).toBeGreaterThan(q.before.annualDebtService);
+    expect(q.breachesCovenant).toBe(!q.after.compliant);
+    expect(q.interestToClose).toBeGreaterThan(0);
+    // The reasons are drawCredit's own.
+    for (const amount of [available + 1, 0, 1.5]) {
+      const quote = quoteDraw(state, amount);
+      const result = drawCredit(structuredClone(state), amount);
+      expect(quote.ok).toBe(false);
+      expect(result.ok).toBe(false);
+      expect(quote.reasons[0]).toBe(!result.ok ? result.reason : '');
+    }
+    state.debt.covenant.stage = 'frozen';
+    expect(quoteDraw(state, 1).reasons).toEqual([frozenReason(state)]);
+  });
+
+  it('counts the closes left before the bank calls the loans, only while frozen with debt', () => {
+    const state = trading();
+    expect(closesUntilAcceleration(state)).toBeNull();
+    state.debt.covenant.stage = 'frozen';
+    expect(closesUntilAcceleration(state)).toBeNull();
+    state.debt.credit.balance = 5_000;
+    state.debt.frozenCloses = 2;
+    expect(closesUntilAcceleration(state)).toBe(FROZEN_ACCELERATION_CLOSES - 2);
+    state.debt.acceleration = { day: state.day, closesLeft: 3 };
+    expect(closesUntilAcceleration(state)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 4, sim-debt: smoothed ARR, the frozen-line sweep, called loans,
+// same-month pricing, safe borrowing, funding hints, cures, the sweep estimate
+// ---------------------------------------------------------------------------
+
+/** Close the month through finance.closeMonth with `revenue` billed for it (no subscribers: only overhead besides). */
+function closeWith(state: GameState, revenue = 0): MonthlyReport {
+  state.day = nextCloseDay(state);
+  const ended = dateOf(state.day - 1);
+  state.sales.month.revenueDollarDays = revenue * (MONTH_LENGTHS[ended.month - 1] as number);
+  return closeMonth(state, 0, new Rng(1));
+}
+
+/** Notices posted since the notice id `after`, of `kind` (all when omitted). */
+function noticesAfter(state: GameState, after: number, kind?: string) {
+  return state.notices.filter((n) => n.id > after && (kind === undefined || n.kind === kind));
+}
+
+function lastId(state: GameState): number {
+  return state.nextNoticeId - 1;
+}
+
+describe('smoothed lending ARR', () => {
+  it('lifts ARR at most to the cap after a one-month spike, wherever it falls in the window', () => {
+    const base = 20_000;
+    expect(trailingArr(withRevenue(base, base, base))).toBe(base * 12);
+    const cap = Math.round(ARR_SPIKE_CAP * base * 12);
+    // The spec's promise: a one-month spike never doubles borrowing capacity.
+    expect(ARR_SPIKE_CAP).toBeLessThan(2);
+    // A spike of s x lifts the window's mean past the cap once s > n x (cap - 1) + 1.
+    const capping = ARR_TRAILING_MONTHS * (ARR_SPIKE_CAP - 1) + 1;
+    for (const spike of [capping * 1.1, capping * 2, capping * 10]) {
+      for (let at = 0; at < ARR_TRAILING_MONTHS; at++) {
+        const months = Array.from({ length: ARR_TRAILING_MONTHS }, (_, i) => (i === at ? Math.round(base * spike) : base));
+        const state = withRevenue(...months);
+        expect(trailingArr(state), `x${spike} at ${at}`).toBe(cap);
+        // Every capacity built on it follows.
+        expect(creditLimit(state)).toBe(Math.floor((cap * CREDIT_LIMIT_ARR_MULTIPLE) / LOAN_ROUNDING) * LOAN_ROUNDING);
+        expect(covenantMetrics(state).arr).toBe(cap);
+      }
+    }
+  });
+
+  it('leaves equal months and steady growth of a few percent a month unchanged', () => {
+    // Growth well inside the cap: a third of its headroom a month.
+    const growth = (ARR_SPIKE_CAP - 1) / 3;
+    for (const start of [9_000, 25_000, 120_000]) {
+      const months = [start, Math.round(start * (1 + growth)), Math.round(start * (1 + growth) * (1 + growth))];
+      const window = months.slice(-ARR_TRAILING_MONTHS);
+      expect(trailingArr(withRevenue(...months))).toBe(Math.round((window.reduce((a, b) => a + b, 0) * 12) / window.length));
+      expect(trailingArr(withRevenue(start, start, start))).toBe(start * 12);
+    }
+  });
+
+  it('is never negative', () => {
+    expect(trailingArr(withRevenue(-5_000, 10_000, 10_000))).toBe(0);
+  });
+});
+
+describe('the frozen-line sweep (closeDebtMonth)', () => {
+  /**
+   * A frozen line with a $4,000 balance and two loans, $500,000 in cash, and
+   * the month's operating entries posted as closeMonth steps 1-3 would
+   * (revenue 30,000, overhead) plus capex, which the sweep ignores.
+   */
+  function frozenBooks(line = 4_000): GameState {
+    const state = trading();
+    state.finance.cash = 500_000;
+    state.debt.covenant.stage = 'frozen';
+    state.debt.credit.balance = line;
+    state.debt.loans = [
+      makeLoan({ id: 1, principal: 60_000, balance: 40_000, rateBps: 800, monthsLeft: 50 }),
+      makeLoan({ id: 2, principal: 30_000, balance: 30_000, rateBps: 900, monthsLeft: 60 }),
+    ];
+    state.debt.nextLoanId = 3;
+    state.day = nextCloseDay(state) - 1;
+    postEntry(state, 'revenue', 30_000, 'Billing');
+    postEntry(state, 'overhead', -OVERHEAD_PER_MONTH, 'Overhead');
+    postEntry(state, 'install', -7_000, 'Installs');
+    return state;
+  }
+  const FLOW = 30_000 - OVERHEAD_PER_MONTH;
+
+  it('sweeps its share of the month\'s operating cash flow after the debt service: the line first, then loans by id, re-amortized', () => {
+    const state = frozenBooks();
+    const before = structuredClone(state.debt.loans);
+    const lastDay = state.day;
+    const label = `${MONTH_ABBR[dateOf(lastDay).month - 1]} ${dateOf(lastDay).year}`;
+    const mark = state.finance.monthToDate.length;
+    const close = closeDebtMonth(state, lastDay);
+    expect(close.missed).toBe(false);
+    const sweep = Math.round(FROZEN_SWEEP_SHARE * FLOW);
+    expect(sweep).toBeGreaterThan(4_000);
+    expect(close.sweep).toBe(sweep);
+    expect(close.sweptFrom).toBe(FLOW);
+    const posted = state.finance.monthToDate.slice(mark);
+    const sweptEntry = posted.at(-1)!;
+    expect(sweptEntry).toEqual({
+      day: lastDay,
+      category: 'principal',
+      amount: -sweep,
+      memo: `Frozen-line sweep for ${label}: credit line ${formatMoney(4_000)}, loan #1 ${formatMoney(sweep - 4_000)}`,
+    });
+    // Scheduled principal plus the sweep.
+    const scheduled = posted.filter((e) => e.category === 'principal' && e !== sweptEntry).reduce((a, e) => a - e.amount, 0);
+    expect(close.principalPaid).toBe(scheduled + sweep);
+    expect(state.debt.credit.balance).toBe(0);
+    const loan1 = state.debt.loans[0]!;
+    const regular1 = before[0]!.payment - Math.round((before[0]!.balance * (before[0]!.rateBps + PENALTY_STEP_UP_BPS)) / 120_000);
+    expect(loan1.balance).toBe(before[0]!.balance - regular1 - (sweep - 4_000));
+    expect(loan1.monthsLeft).toBe(before[0]!.monthsLeft - 1);
+    expect(loan1.payment).toBe(levelPayment(loan1.balance, loan1.rateBps + PENALTY_STEP_UP_BPS, loan1.monthsLeft));
+    // Loan #2 kept its schedule.
+    expect(state.debt.loans[1]!.payment).toBe(before[1]!.payment);
+    expect(close.swept).toEqual([
+      { loan: null, amount: 4_000 },
+      { loan: 1, amount: sweep - 4_000 },
+    ]);
+  });
+
+  it('never takes cash below the reserve, nor more than is owed (removing what it pays off)', () => {
+    const tight = frozenBooks();
+    tight.finance.cash = FROZEN_SWEEP_RESERVE + 1_234;
+    const cashBefore = tight.finance.cash;
+    const close = closeDebtMonth(tight, tight.day);
+    expect(close.sweep).toBe(Math.max(0, cashBefore - close.due - FROZEN_SWEEP_RESERVE));
+    expect(tight.finance.cash).toBe(Math.min(cashBefore - close.due, FROZEN_SWEEP_RESERVE));
+
+    const small = frozenBooks(1_000);
+    small.debt.loans = [makeLoan({ id: 3, principal: 2_000, balance: 2_000, monthsLeft: 30 })];
+    const owedAfterService = () => totalDebt(small);
+    const c = closeDebtMonth(small, small.day);
+    expect(c.sweep).toBeGreaterThan(0);
+    expect(owedAfterService()).toBe(0);
+    expect(small.debt.loans).toEqual([]);
+    expect(c.paidOff).toEqual([3]);
+    expect(c.sweep).toBeLessThan(Math.round(FROZEN_SWEEP_SHARE * FLOW));
+  });
+
+  it('sweeps nothing when the close began unfrozen, the month burned cash, nothing is owed or the payment was missed', () => {
+    const penalty = frozenBooks();
+    penalty.debt.covenant.stage = 'penalty';
+    expect(closeDebtMonth(penalty, penalty.day).sweep).toBe(0);
+
+    const burning = frozenBooks();
+    postEntry(burning, 'marketing', -FLOW - 1, 'Marketing');
+    expect(closeDebtMonth(burning, burning.day).sweep).toBe(0);
+
+    const missed = frozenBooks();
+    missed.finance.cash = 10;
+    const close = closeDebtMonth(missed, missed.day);
+    expect(close).toMatchObject({ missed: true, defaulted: true, sweep: 0 });
+
+    const none = trading();
+    none.debt.covenant.stage = 'frozen';
+    postEntry(none, 'revenue', 30_000, 'Billing');
+    expect(closeDebtMonth(none, nextCloseDay(none) - 1)).toMatchObject({ due: 0, sweep: 0 });
+  });
+
+  it('is in the ended month\'s principal and is announced, with the countdown, through a real close', () => {
+    const state = trading();
+    state.finance.cash = 500_000;
+    state.debt.covenant.stage = 'frozen';
+    state.debt.frozenCloses = 1;
+    state.debt.credit.balance = 80_000;
+    const mark = lastId(state);
+    const report = closeWith(state, 30_000);
+    const sweep = report.debt!.sweep!;
+    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * (30_000 - OVERHEAD_PER_MONTH)));
+    expect(report.totals.principal).toBe(-sweep);
+    expect(state.debt.credit.balance).toBe(80_000 - sweep);
+    const notice = noticesAfter(state, mark, 'debtSwept')[0]!;
+    expect(notice.message).toContain(formatMoney(sweep));
+    expect(notice.message).toContain(`${FROZEN_ACCELERATION_CLOSES - 2} more frozen closes and the bank calls the loans`);
+    expect(notice.message).toContain(`${COVENANT_CURE_CLOSES} compliant closes in a row`);
+  });
+
+  it('is estimated exactly on the month\'s last day', () => {
+    const state = trading();
+    state.finance.cash = 300_000;
+    state.debt.covenant.stage = 'frozen';
+    state.debt.credit.balance = 60_000;
+    state.debt.loans = [makeLoan({ id: 1, balance: 50_000, monthsLeft: 40 })];
+    state.debt.nextLoanId = 2;
+    state.day = nextCloseDay(state) - 1;
+    const ended = dateOf(state.day);
+    state.sales.month.revenueDollarDays = 28_000 * (MONTH_LENGTHS[ended.month - 1] as number);
+    postEntry(state, 'repair', -1_500, 'Storm repairs');
+    const estimate = estimateSweep(state);
+    expect(estimate).toBeGreaterThan(0);
+    const report = closeWith(state, 28_000);
+    expect(report.debt!.sweep).toBe(estimate);
+    // Not frozen, or nothing owed: nothing to estimate.
+    const open = trading();
+    open.debt.credit.balance = 5_000;
+    expect(estimateSweep(open)).toBe(0);
+    const clear = trading();
+    clear.debt.covenant.stage = 'frozen';
+    expect(estimateSweep(clear)).toBe(0);
+  });
+});
+
+describe('called loans (acceleration)', () => {
+  /** Frozen one close short of the call, owing a line and two loans, with plenty of cash and revenue. */
+  function nearCall(): GameState {
+    const state = trading();
+    state.finance.cash = 2_000_000;
+    state.debt.covenant.stage = 'frozen';
+    state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES - 1;
+    state.debt.credit.balance = 90_000;
+    state.debt.loans = [
+      makeLoan({ id: 1, principal: 200_000, balance: 150_000, rateBps: 800, monthsLeft: 40 }),
+      makeLoan({ id: 2, principal: 20_000, balance: 1_500, rateBps: 700, monthsLeft: 2 }),
+    ];
+    state.debt.nextLoanId = 3;
+    return state;
+  }
+
+  it(`calls the loans at ${FROZEN_ACCELERATION_CLOSES} frozen closes in a row, then everything falls due over the closes left`, () => {
+    const state = nearCall();
+    const mark = lastId(state);
+    // A burning month: no sweep, so the call alone is tested.
+    const report = closeWith(state, 0);
+    expect(state.debt.frozenCloses).toBe(FROZEN_ACCELERATION_CLOSES);
+    expect(state.debt.acceleration).toEqual({ day: state.day, closesLeft: ACCELERATION_CLOSES });
+    expect(report.debt).toMatchObject({ frozenCloses: FROZEN_ACCELERATION_CLOSES, accelerationClosesLeft: ACCELERATION_CLOSES, sweep: 0 });
+    for (const loan of state.debt.loans) {
+      expect(loan.monthsLeft).toBeLessThanOrEqual(ACCELERATION_CLOSES);
+      expect(loan.payment).toBe(levelPayment(loan.balance, loan.rateBps + PENALTY_STEP_UP_BPS, loan.monthsLeft));
+    }
+    const called = noticesAfter(state, mark, 'loansCalled');
+    expect(called).toHaveLength(1);
+    const schedule = acceleratedSchedule(state);
+    expect(schedule.length).toBeLessThanOrEqual(ACCELERATION_CLOSES);
+    expect(schedule.reduce((a, b) => a + b, 0)).toBeGreaterThan(totalDebt(state));
+    expect(called[0]!.message).toContain(formatMoney(totalDebt(state)));
+    for (const amount of schedule) expect(called[0]!.message).toContain(formatMoney(amount));
+    // No new borrowing once called; repaying still works.
+    expect(creditAvailable(state)).toBe(0);
+    expect(termCapacity(state)).toBe(0);
+    expect(closesUntilAcceleration(state)).toBeNull();
+    // The annual debt service and the next payment count what falls due.
+    expect(annualDebtService(state)).toBe(schedule.reduce((a, b) => a + b, 0));
+
+    for (let k = ACCELERATION_CLOSES; k >= 1 && totalDebt(state) > 0; k--) {
+      expect(state.debt.acceleration?.closesLeft).toBe(k);
+      const line = state.debt.credit.balance;
+      // The next payment estimate counts the line's called principal.
+      const probe = structuredClone(state);
+      probe.day = nextCloseDay(probe) - 1;
+      const expectedLine = calledLinePrincipal(line, k);
+      expect(expectedLine).toBe(k === 1 ? line : Math.ceil(line / k));
+      const estimate = estimateNextDebtService(probe);
+      // The tick that closes the month first holds the last day's balance.
+      endDebtDay(probe);
+      const close = closeDebtMonth(probe, probe.day);
+      expect(close.due).toBe(estimate);
+      const r = closeWith(state, 0);
+      expect(r.debt?.missedPayment).toBe(false);
+      if (expectedLine > 0) {
+        expect(state.finance.reports.at(-1)!.totals.principal).toBeLessThan(0);
+        expect(state.debt.credit.balance).toBe(line - expectedLine);
+      }
+    }
+    expect(totalDebt(state)).toBe(0);
+    expect(state.debt.acceleration).toBeNull();
+    expect(state.debt.covenant.stage).toBe('compliant');
+    expect(state.debt.frozenCloses).toBe(0);
+    expect(state.gameOver).toBeNull();
+  });
+
+  it('is a default when what falls due cannot be paid, whatever the stage, naming the called loans', () => {
+    for (const stage of ['frozen', 'penalty'] as CovenantStage[]) {
+      const state = nearCall();
+      state.debt.covenant.stage = stage;
+      state.debt.acceleration = { day: 0, closesLeft: 2 };
+      state.finance.cash = 1_000;
+      closeWith(state, 0);
+      expect(state.gameOver?.reason, stage).toBe('default');
+      expect(state.gameOver?.message).toMatch(/^Default: the bank called your loans/);
+      expect(state.gameOver?.message).toContain('loan #1');
+      expect(state.finance.reports.at(-1)!.totals.interest ?? 0).toBe(0);
+    }
+  });
+
+  it('survives a covenant cure, counting down until everything is repaid', () => {
+    const state = trading();
+    state.finance.cash = 1_000_000;
+    state.debt.covenant = { stage: 'frozen', compliantCloses: COVENANT_CURE_CLOSES - 1 };
+    state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES + 1;
+    state.debt.acceleration = { day: 0, closesLeft: ACCELERATION_CLOSES };
+    state.debt.credit.balance = 30_000;
+    closeWith(state, 25_000);
+    expect(totalDebt(state)).toBeGreaterThan(0);
+    // Compliant: the freeze steps down, the call stays.
+    expect(state.debt.covenant.stage).toBe('penalty');
+    expect(state.debt.frozenCloses).toBe(0);
+    expect(state.debt.acceleration?.closesLeft).toBe(ACCELERATION_CLOSES - 1);
+    expect(creditAvailable(state)).toBe(0);
+    expect(quoteTermLoan(state, TERM_LOAN_MIN, 5).reasons[0]).toMatch(/^No new borrowing: the bank has called your loans/);
+    expect(drawCredit(structuredClone(state), 1)).toEqual({ ok: false, reason: quoteDraw(state, 1).reasons[0] });
+    while (totalDebt(state) > 0) closeWith(state, 25_000);
+    expect(state.debt.acceleration).toBeNull();
+  });
+
+  it(`warns at the frozen closes that leave 1..${ACCELERATION_WARNING_CLOSES} before the call, with advice that can still work`, () => {
+    const state = trading();
+    state.finance.cash = 5_000_000;
+    state.debt.covenant.stage = 'frozen';
+    state.debt.credit.balance = 2_000_000;
+    const warnedAt: number[] = [];
+    const messages: string[] = [];
+    for (let close = 1; close <= FROZEN_ACCELERATION_CLOSES; close++) {
+      const mark = lastId(state);
+      closeWith(state, 0);
+      expect(state.debt.frozenCloses).toBe(close);
+      const warnings = noticesAfter(state, mark, 'accelerationWarning');
+      if (warnings.length > 0) {
+        warnedAt.push(close);
+        messages.push(warnings[0]!.message);
+      }
+      expect(noticesAfter(state, mark, 'loansCalled').length).toBe(close === FROZEN_ACCELERATION_CLOSES ? 1 : 0);
+    }
+    const expected: number[] = [];
+    for (let left = ACCELERATION_WARNING_CLOSES; left >= 1; left--) expected.push(FROZEN_ACCELERATION_CLOSES - left);
+    expect(warnedAt).toEqual(expected);
+    // With fewer closes left than a cure needs, only repaying everything stops the call.
+    for (const [i, message] of messages.entries()) {
+      const left = ACCELERATION_WARNING_CLOSES - i;
+      if (left < COVENANT_CURE_CLOSES) expect(message).toContain('only repaying everything you owe');
+      else expect(message).toContain('lift the freeze in time');
+    }
+  });
+
+  it('reminds of a payment that falls due once called, as a default', () => {
+    const state = nearCall();
+    state.debt.acceleration = { day: 0, closesLeft: 2 };
+    state.finance.cash = 5_000;
+    state.day = nextCloseDay(state) - PAYMENT_REMINDER_DAYS;
+    endDebtDay(state);
+    const notice = state.notices.at(-1)!;
+    expect(notice.kind).toBe('paymentDue');
+    expect(notice.message).toContain('the bank has called your loans');
+    // The amount reminded includes the line's called principal.
+    expect(estimateNextDebtService(state)).toBeGreaterThan(calledLinePrincipal(state.debt.credit.balance, 2));
+  });
+
+  it('applies the call to a loaded save whose loans run past the closes left', () => {
+    const state = nearCall();
+    state.debt.acceleration = { day: 0, closesLeft: 1 };
+    state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES + 3;
+    closeWith(state, 0);
+    expect(state.gameOver).toBeNull();
+    expect(totalDebt(state)).toBe(0);
+    expect(state.debt.acceleration).toBeNull();
+  });
+});
+
+describe('same-month term loans are priced together', () => {
+  /** A slice small enough to price below the leverage band the two slices together reach. */
+  const FIRST = 500_000;
+  const SECOND = 300_000;
+
+  it.each(TERM_LOAN_YEARS.map((y) => [y]))('two %i-year slices end at the rate and payments of one loan of the sum', (years) => {
+    const one = trading();
+    const two = trading();
+    expect(FIRST + SECOND).toBeLessThanOrEqual(termCapacity(one));
+    const whole = quoteTermLoan(one, FIRST + SECOND, years as TermYears);
+    okCost(takeTermLoan(one, FIRST + SECOND, years as TermYears));
+
+    const firstQuote = quoteTermLoan(two, FIRST, years as TermYears);
+    expect(firstQuote.repriced).toEqual([]);
+    okCost(takeTermLoan(two, FIRST, years as TermYears));
+    const second = quoteTermLoan(two, SECOND, years as TermYears);
+    // The slices really are priced in different leverage bands alone.
+    expect(firstQuote.rate.rateBps).toBeLessThan(whole.rate.rateBps);
+    expect(second.rate.rateBps).toBe(whole.rate.rateBps);
+    expect(second.repriced).toEqual([
+      {
+        loan: 1,
+        rateBps: firstQuote.rate.rateBps,
+        rateBpsAfter: whole.rate.rateBps,
+        payment: firstQuote.payment,
+        paymentAfter: levelPayment(FIRST, whole.rate.effectiveRateBps, years * 12),
+      },
+    ]);
+    okCost(takeTermLoan(two, SECOND, years as TermYears));
+    expect(two.debt.loans.map((l) => l.rateBps)).toEqual([whole.rate.rateBps, whole.rate.rateBps]);
+    const slices = two.debt.loans[0]!.payment + two.debt.loans[1]!.payment;
+    expect(slices - one.debt.loans[0]!.payment).toBeGreaterThanOrEqual(0);
+    expect(slices - one.debt.loans[0]!.payment).toBeLessThanOrEqual(1);
+    // The quote's covenants counted the re-pricing exactly.
+    expect(covenantMetrics(two)).toEqual(second.after);
+    expect(two.finance.monthToDate.at(-1)!.memo).toBe(
+      `Term loan #2: ${years} years at ${formatRateBps(whole.rate.rateBps)}; loan #1 to ${formatRateBps(whole.rate.rateBps)} taken this month re-priced: same-month loans are priced together`,
+    );
+  });
+
+  it('re-prices nothing taken in an earlier month', () => {
+    const state = trading();
+    okCost(takeTermLoan(state, FIRST, 5));
+    state.day = nextCloseDay(state) + 3;
+    const q = quoteTermLoan(state, SECOND, 5);
+    expect(q.repriced).toEqual([]);
+    okCost(takeTermLoan(state, SECOND, 5));
+    expect(state.debt.loans[0]!.rateBps).not.toBe(state.debt.loans[1]!.rateBps);
+  });
+});
+
+describe('maxSafeTermLoan', () => {
+  /** Costs that make the coverage test bind well inside term capacity. */
+  const COSTS = 20_000;
+
+  it.each(TERM_LOAN_YEARS.map((y) => [y]))('is the largest covenant-safe %i-year amount, and the quote\'s default', (years) => {
+    const state = trading(COSTS);
+    const capacity = termCapacity(state);
+    const safe = maxSafeTermLoan(state, years as TermYears);
+    expect(safe % LOAN_ROUNDING).toBe(0);
+    expect(safe).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+    expect(safe).toBeLessThan(capacity);
+    expect(quoteTermLoan(state, safe, years as TermYears).after.compliant).toBe(true);
+    expect(quoteTermLoan(state, safe + LOAN_ROUNDING, years as TermYears).after.compliant).toBe(false);
+    expect(quoteTermLoan(state, TERM_LOAN_MIN, years as TermYears).safeMaxAmount).toBe(safe);
+    expect(quoteTermLoan(state, capacity, years as TermYears).safeMaxAmount).toBe(safe);
+  });
+
+  it('is capacity when nothing breaches, counts same-month re-pricing, and is 0 when frozen, without room or when the smallest loan breaches', () => {
+    const roomy = trading();
+    expect(maxSafeTermLoan(roomy, 7)).toBe(termCapacity(roomy));
+
+    const sameMonth = trading(COSTS);
+    okCost(takeTermLoan(sameMonth, TERM_LOAN_MIN * 10, 7));
+    const safe = maxSafeTermLoan(sameMonth, 7);
+    expect(safe).toBeGreaterThan(0);
+    expect(quoteTermLoan(sameMonth, safe, 7).after.compliant).toBe(true);
+    if (safe + LOAN_ROUNDING <= termCapacity(sameMonth)) expect(quoteTermLoan(sameMonth, safe + LOAN_ROUNDING, 7).after.compliant).toBe(false);
+
+    const frozen = trading();
+    frozen.debt.covenant.stage = 'frozen';
+    expect(maxSafeTermLoan(frozen, 5)).toBe(0);
+    expect(maxSafeTermLoan(makeTestState(), 5)).toBe(0);
+    const loaded = trading(COSTS);
+    loaded.debt.credit.balance = covenantMetrics(loaded).underwritingCashFlow * COVENANT_MAX_LEVERAGE;
+    expect(quoteTermLoan(loaded, TERM_LOAN_MIN, 5).after.compliant).toBe(false);
+    expect(maxSafeTermLoan(loaded, 5)).toBe(0);
+    expect(maxSafeTermLoan(roomy, 6 as TermYears)).toBe(0);
+  });
+});
+
+describe('fundingHint', () => {
+  function cushionOf(state: GameState): number {
+    return FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth) + estimateNextDebtService(state);
+  }
+
+  it('says cash when cash covers the cost and the cushion', () => {
+    const state = trading();
+    state.sales.marketingPerMonth = 3_000;
+    state.debt.credit.balance = 10_000;
+    const cushion = cushionOf(state);
+    state.finance.cash = 100_000 + cushion;
+    expect(fundingHint(state, 100_000)).toEqual({ cost: 100_000, cushion, shortfall: 0, kind: 'cash', draw: 0, termLoan: 0, termYears: TERM_LOAN_YEARS.at(-1) });
+  });
+
+  it('suggests a covenant-safe draw that keeps the cushion, even when cash alone covers the cost', () => {
+    const state = trading();
+    const cushion = cushionOf(state);
+    for (const cash of [50_000, 100_000 + cushion - 1]) {
+      state.finance.cash = cash;
+      const hint = fundingHint(state, 100_000);
+      expect(hint.kind).toBe('draw');
+      expect(hint.shortfall).toBe(100_000 + cushion - cash);
+      expect(hint.draw % LOAN_ROUNDING).toBe(0);
+      expect(hint.draw).toBeGreaterThanOrEqual(hint.shortfall);
+      expect(hint.draw - hint.shortfall).toBeLessThan(LOAN_ROUNDING);
+      expect(quoteDraw(state, hint.draw).after.compliant).toBe(true);
+      expect(cash + hint.draw - 100_000).toBeGreaterThanOrEqual(cushion);
+    }
+  });
+
+  it('turns to a term loan of the longest term when the line cannot cover it, then to both, then says short', () => {
+    const state = trading();
+    state.finance.cash = 50_000;
+    const available = creditAvailable(state);
+    const years = TERM_LOAN_YEARS.at(-1) as TermYears;
+    const cost = 50_000 + available * 2;
+    const term = fundingHint(state, cost);
+    expect(term.kind).toBe('term');
+    expect(term.termYears).toBe(years);
+    expect(term.draw).toBe(0);
+    expect(term.termLoan).toBeGreaterThanOrEqual(term.shortfall);
+    expect(term.termLoan % LOAN_ROUNDING).toBe(0);
+    expect(quoteTermLoan(state, term.termLoan, years).after.compliant).toBe(true);
+
+    // More than the loan capacity: the line and a loan together, safe together.
+    const capacity = termCapacity(state);
+    const both = fundingHint(state, 50_000 + capacity + Math.floor(available / 2));
+    expect(both.kind).toBe('drawAndTerm');
+    expect(both.draw).toBeGreaterThan(0);
+    expect(both.draw + both.termLoan).toBeGreaterThanOrEqual(both.shortfall);
+    const after = structuredClone(state);
+    okCost(drawCredit(after, both.draw));
+    expect(quoteTermLoan(after, both.termLoan, years)).toMatchObject({ ok: true, breachesCovenant: false });
+
+    // More than everything: the most there is, safe.
+    const short = fundingHint(state, 50_000 + capacity + available * 3);
+    expect(short.kind).toBe('short');
+    expect(short.draw + short.termLoan).toBeLessThan(short.shortfall);
+    expect(short.draw + short.termLoan).toBeGreaterThan(0);
+
+    // Frozen: nothing to borrow.
+    state.debt.covenant.stage = 'frozen';
+    state.debt.credit.balance = 1_000;
+    expect(fundingHint(state, cost)).toMatchObject({ kind: 'short', draw: 0, termLoan: 0 });
+  });
+
+  it('never suggests a draw that breaches a covenant', () => {
+    const state = trading(20_000);
+    const uw = covenantMetrics(state).underwritingCashFlow;
+    state.debt.credit.balance = Math.floor(uw * COVENANT_MAX_LEVERAGE) - 2 * LOAN_ROUNDING;
+    state.finance.cash = 0;
+    const hint = fundingHint(state, 5 * LOAN_ROUNDING);
+    if (hint.draw > 0) expect(quoteDraw(state, hint.draw).after.compliant).toBe(true);
+    expect(hint.kind).toBe('short');
+  });
+
+  it('never throws for junk costs', () => {
+    const state = trading();
+    for (const junk of JUNK_AMOUNTS) expect(() => fundingHint(state, junk as number)).not.toThrow();
+  });
+});
+
+describe('cureOptions', () => {
+  /** A leverage breach on the line: trailing cash flow covers a fraction of what is owed. */
+  function breached(): GameState {
+    const state = trading(20_000);
+    state.finance.cash = 2_000_000;
+    const uw = covenantMetrics(state).underwritingCashFlow;
+    state.debt.credit.balance = Math.round(uw * (COVENANT_MAX_LEVERAGE - 1));
+    state.debt.loans = [
+      makeLoan({ id: 1, balance: Math.round(uw * 0.6), principal: Math.round(uw * 0.6), rateBps: 750 }),
+      makeLoan({ id: 2, balance: Math.round(uw * 0.8), principal: Math.round(uw * 0.8), rateBps: 950 }),
+    ];
+    state.debt.nextLoanId = 3;
+    expect(covenantMetrics(state).compliant).toBe(false);
+    return state;
+  }
+
+  function keep(state: GameState): number {
+    return estimateNextDebtService(state) + FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth);
+  }
+
+  it('is empty with no debt or when the covenants pass', () => {
+    expect(cureOptions(trading())).toEqual([]);
+    const fine = trading();
+    fine.debt.credit.balance = 10_000;
+    expect(cureOptions(fine)).toEqual([]);
+  });
+
+  it('offers the smallest repayment that cures, the line first, then loans by rate, each verified by doing it', () => {
+    const state = breached();
+    const options = cureOptions(state);
+    expect(options.length).toBeGreaterThan(0);
+    expect(options[0]!.kind).toBe('repayCredit');
+    const loanOrder = options.filter((o) => o.kind === 'prepayLoan').map((o) => o.loan);
+    expect(loanOrder).toEqual([...loanOrder].sort((a, b) => state.debt.loans.find((l) => l.id === b)!.rateBps - state.debt.loans.find((l) => l.id === a)!.rateBps));
+    for (const option of options) {
+      const done = structuredClone(state);
+      const run = (s: GameState, amount: number): CommandResult =>
+        option.kind === 'repayCredit' ? repayCredit(s, amount) : prepayLoan(s, option.loan!, amount);
+      okCost(run(done, option.amount));
+      expect(covenantMetrics(done)).toEqual(option.after);
+      expect(option.after.compliant).toBe(true);
+      expect(done.finance.cash).toBe(option.cashAfter);
+      expect(done.finance.cash).toBeGreaterThanOrEqual(keep(done));
+      expect(option.amount % LOAN_ROUNDING === 0 || option.amount === (option.kind === 'repayCredit' ? state.debt.credit.balance : state.debt.loans.find((l) => l.id === option.loan)!.balance)).toBe(true);
+      // One step less does not cure.
+      if (option.amount > LOAN_ROUNDING) {
+        const less = structuredClone(state);
+        const amount = option.amount % LOAN_ROUNDING === 0 ? option.amount - LOAN_ROUNDING : Math.floor(option.amount / LOAN_ROUNDING) * LOAN_ROUNDING;
+        okCost(run(less, amount));
+        expect(covenantMetrics(less).compliant).toBe(false);
+      }
+      expect(option.text).toContain("at today's figures");
+      expect(option.text).toContain(formatMoney(option.amount));
+    }
+  });
+
+  it('offers nothing that would leave too little cash, and then the operating cash flow that would cure it', () => {
+    const state = breached();
+    state.finance.cash = keep(state) + LOAN_ROUNDING;
+    const options = cureOptions(state);
+    expect(options).toHaveLength(1);
+    const grow = options[0]!;
+    expect(grow).toMatchObject({ kind: 'grow', loan: null, cashAfter: state.finance.cash });
+    expect(grow.amount % LOAN_ROUNDING).toBe(0);
+    const pro = (amount: number) => covenantMetrics(state, { addDebt: 0, addAnnualDebtService: 0, addAnnualOperatingCashFlow: amount });
+    expect(pro(grow.amount)).toEqual(grow.after);
+    expect(grow.after.compliant).toBe(true);
+    expect(pro(grow.amount - LOAN_ROUNDING).compliant).toBe(false);
+    expect(grow.text).toMatch(/^No single repayment cures it: about \$[\d,]+ a year more operating cash flow/);
+    expect(grow.text).toContain("at today's figures");
+  });
+});

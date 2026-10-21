@@ -4,7 +4,11 @@ import {
   formatDayRange,
   formatMaybeMoney,
   formatMoney,
+  formatMonthLong,
+  formatOdds,
   formatPercent,
+  formatPercentFine,
+  formatPoints,
   formatPerFt,
   formatRate,
   formatRatio,
@@ -66,5 +70,19 @@ describe('format', () => {
     expect(formatRatio(1234.5)).toBe('1,234.50×');
     expect(formatRatio(null)).toBe('–');
     expect(formatRatio(Number.POSITIVE_INFINITY)).toBe('–');
+  });
+
+  it('names months in full and keeps small rates readable (round 4)', () => {
+    expect(formatMonthLong(2028, 3)).toBe('March 2028');
+    expect(formatMonthLong(2027, 12)).toBe('December 2027');
+    expect(formatPercentFine(0.06)).toBe('6%');
+    expect(formatPercentFine(0.002)).toBe('0.2%');
+    expect(formatPercentFine(0.0125)).toBe('1.25%');
+    expect(formatPercentFine(0.5)).toBe('50%');
+    expect(formatPoints(0.021)).toBe('2.1 pts');
+    expect(formatPoints(-0.01)).toBe('1.0 pt');
+    expect(formatPoints(0.0004)).toBe('0.0 pts');
+    expect(formatOdds(1 / 60)).toBe('1 in 60');
+    expect(formatOdds(0)).toBe('never');
   });
 });

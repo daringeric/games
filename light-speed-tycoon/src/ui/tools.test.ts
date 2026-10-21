@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { CABINET_REACH_FT, CPP_TARGET, LOAN_ROUNDING, SPLIT_RATIO } from '../sim/balance';
+import { CABINET_REACH_FT, CPP_TARGET, POLE_RENT_PER_POLE_PER_MONTH, SPLIT_RATIO } from '../sim/balance';
+import { formatDate } from '../sim/calendar';
+import { polesOnSegment } from '../sim/streets';
+import { addLivePlant } from '../sim/testing/fixtures';
+import { stormRisk } from '../sim/weather';
 import { coveragePreview } from '../sim/coverage';
-import { creditAvailable, creditLimit } from '../sim/debt';
 import { applyCommand, newGame, runDays } from '../sim/game';
 import {
   getService,
@@ -17,7 +20,7 @@ import {
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { Command, CommandResult, GameState } from '../sim/types';
 import { formatMoney, formatNumber, formatPerFt } from './format';
-import { ToolController, accountAt, cancelRefund, cashAfterRow, cornerLabel, creditHint, fundsOf, wrongSideWarning } from './tools';
+import { ToolController, accountAt, cableExposure, cancelRefund, cornerLabel, stormRiskText, wrongSideWarning } from './tools';
 import type { CardModel } from './tools';
 
 // Grid town: nodes (i, j) at (4i, 2j), id j * 4 + i; the CO is node 0 at (0, 0).
@@ -441,7 +444,7 @@ describe('remove tool', () => {
     const cabinet = state.network.cabinets[0]!.id;
     const far = state.city.parcels.filter((p) => p.segment === 2).map((p) => p.id);
     expect(far.length).toBeGreaterThan(1);
-    state.sales.accounts = far.map((parcel) => ({ parcel, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }));
+    state.sales.accounts = far.map((parcel) => ({ parcel, cabinet, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }));
     const feeder = spanOnSegment(state, 0)!;
     const quote = quoteRemoveSpan(state, feeder.id);
     expect(quote.subscribersAffected).toBe(far.length);
@@ -492,10 +495,10 @@ describe('remove tool', () => {
     const state = game();
     applyCommand(state, { type: 'placeCabinet', node: 0 });
     const cabinet = state.network.cabinets[0]!;
-    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }];
+    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }];
     runDays(state, 30);
     // (The account disconnects at the next daily step because nothing is lit; put it back for the quote.)
-    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0 }];
+    state.sales.accounts = [{ parcel: 0, cabinet: cabinet.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }];
     const tools = new ToolController();
     tools.setTool('remove');
     tools.hoverAt(0.1, 0.1);
@@ -579,7 +582,7 @@ describe('inspect tool', () => {
     // An apartment building counts its subscribing units.
     const mdus = newGame(7, { city: makeGridCity({ parcelKinds: (p) => (p.id === 2 ? { kind: 'mdu', units: 12 } : undefined) }) });
     applyCommand(mdus, { type: 'placeCabinet', node: 0 });
-    mdus.sales.accounts = [{ parcel: 2, cabinet: mdus.network.cabinets[0]!.id, tierUnits: { fiber500: 2, fiber1g: 1, fiber2g: 0 }, since: 0 }];
+    mdus.sales.accounts = [{ parcel: 2, cabinet: mdus.network.cabinets[0]!.id, tierUnits: { fiber500: 2, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] }];
     tools.hoverAt(1.5, 0.6);
     const card = tools.view(mdus).card;
     expect(card?.title).toBe('Apartment building');
@@ -640,92 +643,6 @@ describe('inspect tool', () => {
     const blockers = tools.view(state).card?.blockers;
     expect(blockers).toEqual(quoteCabinet(state, 5).reasons);
     expect(blockers?.join(' ')).toMatch(/Not enough cash/);
-  });
-});
-
-describe('cash after an order, and the credit line when cash is short', () => {
-  /** Closed months with `revenue` each, so the town has ARR and a credit limit. */
-  function withRevenue(state: GameState, revenue: number, months = 3): GameState {
-    for (let m = 1; m <= months; m++) {
-      state.finance.reports.push({ year: 2027, month: m, totals: { revenue }, net: revenue, cashEnd: state.finance.cash, passings: 0 });
-    }
-    return state;
-  }
-
-  it('shows cash after (red below $0) and how the credit line could cover a shortfall', () => {
-    expect(cashAfterRow({ cash: 1_000, creditAvailable: 0 }, 400)).toEqual({ label: 'Cash after', value: formatMoney(600) });
-    expect(cashAfterRow({ cash: 1_000, creditAvailable: 0 }, 1_500)).toEqual({ label: 'Cash after', value: formatMoney(-500), tone: 'negative' });
-
-    // Cash covers it: nothing to say.
-    expect(creditHint({ cash: 1_000, creditAvailable: 50_000 }, 1_000)).toBeUndefined();
-    // No credit: nothing to offer.
-    expect(creditHint({ cash: 1_000, creditAvailable: 0 }, 5_000)).toBeUndefined();
-    // The shortfall rounds up to LOAN_ROUNDING...
-    const shortfall = LOAN_ROUNDING + 1;
-    expect(creditHint({ cash: 1_000, creditAvailable: 10 * LOAN_ROUNDING }, 1_000 + shortfall)).toBe(
-      `Draw ${formatMoney(2 * LOAN_ROUNDING)} from your credit line to afford it`,
-    );
-    // ...capped at what is available.
-    expect(creditHint({ cash: 0, creditAvailable: shortfall }, shortfall)).toBe(`Draw ${formatMoney(shortfall)} from your credit line to afford it`);
-    // Some credit, not enough.
-    expect(creditHint({ cash: 0, creditAvailable: shortfall - 1 }, shortfall)).toBe(`Your credit line has only ${formatMoney(shortfall - 1)} available`);
-    // Overdrawn already: the whole cost plus the hole is the shortfall.
-    expect(creditHint({ cash: -LOAN_ROUNDING, creditAvailable: 10 * LOAN_ROUNDING }, LOAN_ROUNDING)).toBe(
-      `Draw ${formatMoney(2 * LOAN_ROUNDING)} from your credit line to afford it`,
-    );
-  });
-
-  it('puts cash after and the credit hint on the cabinet, splitter and cable quote cards', () => {
-    const state = withRevenue(game(), 100 * LOAN_ROUNDING);
-    expect(creditAvailable(state)).toBeGreaterThan(0);
-    const tools = new ToolController();
-    tools.setTool('cabinet');
-    tools.hoverAt(4.1, 2.1);
-    const cabinet = quoteCabinet(state, 5);
-    let card = tools.view(state).card!;
-    expect(card.rows.find((r) => r.label === 'Cash after')).toEqual({ label: 'Cash after', value: formatMoney(state.finance.cash - cabinet.cost) });
-    expect(card.credit).toBeUndefined();
-
-    state.finance.cash = 100;
-    card = tools.view(state).card!;
-    expect(card.rows.find((r) => r.label === 'Cash after')).toMatchObject({ value: formatMoney(100 - cabinet.cost), tone: 'negative' });
-    expect(card.credit).toBe(creditHint(fundsOf(state), cabinet.cost));
-    expect(card.credit).toMatch(/^Draw \$[\d,]+ from your credit line to afford it$/);
-
-    state.finance.cash = 1_000_000;
-    expect(applyCommand(state, { type: 'placeCabinet', node: 0 }).ok).toBe(true);
-    state.finance.cash = 10;
-    tools.hoverAt(0.1, 0.1);
-    const splitter = quoteSplitter(state, state.network.cabinets[0]!.id);
-    card = tools.view(state).card!;
-    expect(card.title).toBe('Add a splitter');
-    expect(row(card, 'Cash after')).toBe(formatMoney(10 - splitter.cost));
-    expect(card.credit).toBe(creditHint(fundsOf(state), splitter.cost));
-
-    tools.setTool('underground');
-    tools.click(state, dispatcher(state), 0, 0);
-    tools.hoverAt(8, 0);
-    const cable = quoteCable(state, [0, 1], 'underground');
-    card = tools.view(state).card!;
-    expect(row(card, 'Cash after')).toBe(formatMoney(10 - cable.cost));
-    expect(card.credit).toBe(creditHint(fundsOf(state), cable.cost));
-  });
-
-  it('recomputes the card when only the credit line or the covenant stage changes', () => {
-    const state = withRevenue(game(), 100 * LOAN_ROUNDING);
-    state.finance.cash = 100;
-    const tools = new ToolController();
-    tools.setTool('cabinet');
-    tools.hoverAt(4.1, 2.1);
-    expect(tools.view(state).card?.credit).toMatch(/^Draw/);
-    // The line fully drawn (cash unchanged): nothing left to offer.
-    state.debt.credit.balance = creditLimit(state);
-    expect(tools.view(state).card?.credit).toBeUndefined();
-    state.debt.credit.balance = 0;
-    expect(tools.view(state).card?.credit).toMatch(/^Draw/);
-    // Frozen: no draws.
-    state.debt.covenant.stage = 'frozen';
-    expect(tools.view(state).card?.credit).toBeUndefined();
   });
 });
 
@@ -826,5 +743,120 @@ describe('touch taps', () => {
     tools.dragStart(state, 0, 0);
     tools.dragMove(state, 4, 0);
     expect(tools.view(state).card?.hint).toMatch(/^Lift your finger to order/);
+  });
+});
+
+describe('storms, outages and rebuilds (round 4)', () => {
+  /** The grid with every street cabled live (aerial on 1st St's first block) and a cabinet at the CO. */
+  function wired(): GameState {
+    const state = game();
+    addLivePlant(state);
+    spanOnSegment(state, 0)!.method = 'aerial';
+    state.network.version++;
+    return state;
+  }
+
+  it('shows a live span’s pole rent and storm risk, and offers its panel', () => {
+    const state = wired();
+    const seg = state.city.segments[0]!;
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    const card = tools.view(state).card;
+    expect(row(card, 'Cable')).toMatch(/^Aerial, live/);
+    expect(row(card, 'Pole rent')).toBe(`${formatMoney(polesOnSegment(seg) * POLE_RENT_PER_POLE_PER_MONTH)}/mo`);
+    expect(row(card, 'Storm risk')).toBe(stormRiskText(stormRisk(state, seg, 'aerial').repairCostPerYear));
+    expect(card?.hint).toBe('Click for its storm history and the underground rebuild.');
+    expect(card?.warnings).toEqual([]);
+    // Underground plant pays no pole rent.
+    tools.hoverAt(6, 0.1);
+    const ug = tools.view(state).card;
+    expect(row(ug, 'Pole rent')).toBeUndefined();
+    expect(ug?.hint).toBe('Click for its storm history.');
+  });
+
+  it('says a span is out of service: cause, days to repair, the bill and who is cut off', () => {
+    const state = wired();
+    const parcel = state.city.parcels.find((p) => p.segment === 0)!.id;
+    state.sales.accounts = [{ parcel, cabinet: state.network.cabinets[0]!.id, tierUnits: { fiber500: 1, fiber1g: 0, fiber2g: 0 }, since: 0, locks: [] }];
+    spanOnSegment(state, 0)!.outage = { cause: 'storm', storm: null, startDay: 0, daysLeft: 3, repairCost: 1_500 };
+    state.network.version++;
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    const card = tools.view(state).card;
+    expect(card?.warnings).toEqual([`Out of service: storm damage, 3 days to repair, ${formatMoney(1_500)}; 1 subscriber cut off`]);
+    expect(row(card, 'Service')).toBe('Out, 3 days to repair');
+    // A dig-in on underground cable reads as one.
+    spanOnSegment(state, 1)!.outage = { cause: 'digIn', storm: null, startDay: 0, daysLeft: 1, repairCost: 4_200 };
+    state.network.version++;
+    tools.hoverAt(6, 0.1);
+    expect(tools.view(state).card?.warnings).toEqual([`Out of service: cut by an excavator, 1 day to repair, ${formatMoney(4_200)}`]);
+  });
+
+  it('shows an underground rebuild in progress', () => {
+    const state = wired();
+    spanOnSegment(state, 0)!.conversion = { stage: 'permitting', stageDaysLeft: 12, constructDays: 4, cost: 9_000, orderedDay: 0 };
+    state.network.version++;
+    const tools = new ToolController();
+    tools.hoverAt(2, 0.1);
+    expect(row(tools.view(state).card, 'Underground rebuild')).toBe('City permit, 12 days left');
+    spanOnSegment(state, 0)!.conversion = { stage: 'constructing', stageDaysLeft: 4, constructDays: 4, cost: 9_000, orderedDay: 0 };
+    state.network.version++;
+    expect(row(tools.view(state).card, 'Underground rebuild')).toBe('Crews digging, 4 days left');
+  });
+
+  it('opens the span panel from a click on a live span, not on cable still being built or on a cabinet', () => {
+    const state = wired();
+    const tools = new ToolController();
+    const span = spanOnSegment(state, 0)!;
+    expect(tools.click(state, dispatcher(state), 2, 0.1)).toEqual({ ok: true, message: '', open: 'span', span: span.id });
+    expect(tools.tap(state, dispatcher(state), 2, 0.1)).toEqual({ ok: true, message: '', open: 'span', span: span.id });
+    // The CO corner still opens the OLT panel.
+    expect(tools.click(state, dispatcher(state), 0.1, 0.1)).toEqual({ ok: true, message: '', open: 'olt' });
+    Object.assign(span, { stage: 'constructing', stageDaysLeft: 2, liveDay: null });
+    state.network.version++;
+    expect(tools.click(state, dispatcher(state), 2, 0.1)).toBeNull();
+    // A cabinet's corner belongs to the cabinet card.
+    applyCommand(state, { type: 'placeCabinet', node: 1 });
+    expect(tools.click(state, dispatcher(state), 4, 0.1)).toBeNull();
+  });
+
+  it('adds the expected storm repairs a year to aerial and underground quotes', () => {
+    const state = game();
+    const tools = new ToolController();
+    const quoteRow = (method: 'aerial' | 'underground') => {
+      tools.setTool(method);
+      tools.click(state, dispatcher(state), 0.1, 0.2);
+      tools.hoverAt(7.8, 0.3);
+      const card = tools.view(state).card;
+      return card?.rows.find((r) => r.label === 'Storm risk');
+    };
+    const aerial = cableExposure(state, [0, 1], 'aerial');
+    const underground = cableExposure(state, [0, 1], 'underground');
+    expect(quoteRow('aerial')).toEqual({ label: 'Storm risk', value: stormRiskText(aerial.repairsPerYear), sub: `+ ${formatMoney(aerial.poleRentPerMonth)}/mo pole rent` });
+    expect(quoteRow('underground')).toEqual({ label: 'Storm risk', value: stormRiskText(underground.repairsPerYear), sub: 'no pole rent' });
+    expect(aerial.repairsPerYear).toBeGreaterThan(underground.repairsPerYear);
+    expect(underground.poleRentPerMonth).toBe(0);
+    expect(aerial.poleRentPerMonth).toBe((polesOnSegment(state.city.segments[0]!) + polesOnSegment(state.city.segments[1]!)) * POLE_RENT_PER_POLE_PER_MONTH);
+    expect(stormRiskText(0.4)).toBe('under $1 a year in repairs');
+    expect(stormRiskText(340.4)).toBe(`about ${formatMoney(340)} a year in repairs`);
+  });
+
+  it('shows an incumbent promo running in a cabinet’s area', () => {
+    const state = wired();
+    applyCommand(state, { type: 'placeCabinet', node: 1 });
+    const cabinet = state.network.cabinets.find((c) => c.node === 1)!;
+    const tools = new ToolController();
+    tools.hoverAt(4, 0.05);
+    expect(row(tools.view(state).card, 'Incumbent promo')).toBeUndefined();
+    // Promos start and end at month closes, which the view's day key follows; here the hover moves instead.
+    state.sales.incumbentPromos = [{ cabinet: cabinet.id, startDay: 0, endDay: 181, price: 55, quietUntil: 362 }];
+    tools.hoverAt(4, 0.06);
+    const promoCard = tools.view(state).card;
+    expect(promoCard?.title).toBe('Cabinet');
+    expect(row(promoCard, 'Incumbent promo')).toBe(`${formatMoney(55)}/mo until ${formatDate(181)}`);
+    expect(promoCard?.warnings?.some((w) => w.includes('promo'))).toBe(true);
+    // Over: no row.
+    state.day = 181;
+    expect(row(tools.view(state).card, 'Incumbent promo')).toBeUndefined();
   });
 });

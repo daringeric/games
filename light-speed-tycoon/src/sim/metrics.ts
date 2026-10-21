@@ -3,7 +3,8 @@
 // a pure function of its arguments; nothing is saved.
 //
 // Owner: sim-economy workstream (cppBand is implemented by the contract so the
-// network and UI workstreams can use it from day one).
+// network and UI workstreams can use it from day one). Round 4 (sim-advisor):
+// passingsWeightedRate; (integrator) REPAIR_TRAILING_MONTHS and trailingRepairs.
 
 import { CPP_AMBER_MULTIPLIER, CPP_TARGET } from './balance';
 import { MONTH_LENGTHS } from './calendar';
@@ -77,6 +78,49 @@ export function operatingCashFlow(report: MonthlyReport): number {
   for (const category of CAPEX_CATEGORIES) excluded += report.totals[category] ?? 0;
   for (const category of FINANCING_CATEGORIES) excluded += report.totals[category] ?? 0;
   return report.net - excluded;
+}
+
+/**
+ * Storm and dig-in repairs are one-off and lumpy (a storm month), so where a
+ * month's flow stands for a lasting rate (the covenants' annual cash flow,
+ * the runway's burn) they count at their total over this many trailing
+ * closed months (a year) instead (round 4, integrator).
+ */
+export const REPAIR_TRAILING_MONTHS = 12;
+
+/** Sum of the 'repair' totals (<= 0) of the last REPAIR_TRAILING_MONTHS closed months. */
+export function trailingRepairs(reports: readonly MonthlyReport[]): number {
+  let repairs = 0;
+  for (let i = Math.max(0, reports.length - REPAIR_TRAILING_MONTHS); i < reports.length; i++) {
+    repairs += (reports[i] as MonthlyReport).totals.repair ?? 0;
+  }
+  return repairs;
+}
+
+/** One group of passings (a building kind in an area) and the take rate that applies to it. */
+export interface RatedPassings {
+  /** Units passed in the group (>= 0). */
+  units: number;
+  /** The group's take rate, a fraction (a target from sales.targetTakeRate, or an actual one). */
+  rate: number;
+}
+
+/**
+ * Take rate weighted by passings: sum of units x rate over the groups, over
+ * their units (groups with no units count for nothing); null when there are
+ * no units. The advisor compares an area's actual take rate with its target
+ * this way: the target per building kind (and incumbent price) weighted by
+ * the units of each kind passed there (round 4).
+ */
+export function passingsWeightedRate(groups: readonly RatedPassings[]): number | null {
+  let units = 0;
+  let weighted = 0;
+  for (const group of groups) {
+    if (!(group.units > 0)) continue;
+    units += group.units;
+    weighted += group.units * group.rate;
+  }
+  return units > 0 ? weighted / units : null;
 }
 
 /**

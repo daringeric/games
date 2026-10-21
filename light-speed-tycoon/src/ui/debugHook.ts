@@ -6,6 +6,7 @@
 
 import type { SceneStats } from '../render/scene';
 import type { Command, CommandResult, GameState } from '../sim/types';
+import type { BriefingSetting } from './briefing';
 import type { Speed } from './session';
 
 /** Test and debugging hook. Coordinates are map grid units and CSS client pixels. */
@@ -22,6 +23,15 @@ export interface DebugHook {
    * spans drawn, live cable redraws, and whatever else the scene reports).
    */
   stats(): { frames: number; renders: number } & SceneStats;
+  /**
+   * Round 4: switch this page's month-end briefing to a frequency
+   * ('monthly' | 'quarterly' | 'attention') or 'off', without storing it as
+   * the player's preference. Debug pages start with briefings off unless the
+   * URL has ?briefing=1 (the stored preference) or ?briefing=<frequency>.
+   */
+  setBriefing(setting: BriefingSetting): void;
+  /** Round 4: whether the month-end briefing sheet is open. */
+  briefingOpen(): boolean;
 }
 
 declare global {

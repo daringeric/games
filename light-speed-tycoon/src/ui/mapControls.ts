@@ -1,10 +1,12 @@
 // Everything the player does on the map: the tool palette, pointer and
 // keyboard input routed to tools (clicks, taps and drag-to-draw), the tool
 // overlay and the floating quote card, the $/ft cost overlay and its legend,
-// and the OLT panel. main.ts builds one MapControls, appends its toolbar and
-// card, and calls update() every frame; it never reaches into the tools
-// itself. Panels of our own (the OLT panel, the legend) are mounted here,
-// next to the map canvas.
+// the OLT panel and the span panel. main.ts builds one MapControls, appends
+// its toolbar and card, and calls update() every frame; it never reaches into
+// the tools itself. Panels of our own (the OLT panel, the span panel, the
+// legend) are mounted here, next to the map canvas. One map panel shows at a
+// time; Esc or a right-click closes it, and a map press closes the span panel
+// (a press on another span shows that one instead).
 //
 // Owner: ui-map workstream. main.ts is owned by the ui-economy workstream and
 // only uses the public members below.
@@ -20,6 +22,7 @@ import { FloatingCard } from './floatingCard';
 import { formatPerFt } from './format';
 import { Input } from './input';
 import { OltPanel } from './oltPanel';
+import { SpanPanel } from './spanPanel';
 import type { HintCard, Toasts } from './overlays';
 import type { GameSession } from './session';
 import { Toolbar } from './toolbar';
@@ -55,6 +58,8 @@ export class MapControls {
   readonly card = new FloatingCard();
   /** The OLT panel (opened by clicking the CO); mounted next to the map by MapControls. */
   readonly olt: OltPanel;
+  /** The span panel (opened by clicking a live span with the inspect tool); mounted next to the map by MapControls. */
+  readonly span: SpanPanel;
   /** Legend of the $/ft cost overlay; mounted next to the map by MapControls. */
   readonly legend: HTMLElement;
   private readonly legendMode: HTMLElement;
@@ -78,6 +83,14 @@ export class MapControls {
       getState: () => deps.session.state,
       dispatch: (cmd) => deps.session.dispatch(cmd),
       toast: (message, ok) => deps.toasts.show(message, ok),
+      // One map panel at a time, however it was opened (the map, or the briefing's "Open OLT").
+      onOpen: () => this.span.close(),
+    });
+    this.span = new SpanPanel({
+      getState: () => deps.session.state,
+      dispatch: (cmd) => deps.session.dispatch(cmd),
+      toast: (message, ok) => deps.toasts.show(message, ok),
+      onOpen: () => this.olt.close(),
     });
     this.legendMode = el('span', { class: 'cost-legend-mode' });
     this.legendNone = legendItem(deps.theme.costOverlay.none, 'no poles');
@@ -87,9 +100,9 @@ export class MapControls {
 
   /** Put our own panels next to the map canvas (once it is in the page). */
   private mount(): void {
-    if (this.olt.root.isConnected) return;
+    if (this.olt.root.isConnected && this.span.root.isConnected) return;
     const host = this.deps.canvas.parentElement ?? document.getElementById('app');
-    if (host) host.append(this.legend, this.olt.root);
+    if (host) host.append(this.legend, this.olt.root, this.span.root);
   }
 
   /** Start routing pointer and keyboard input to the map (once, after the menu exists). */
@@ -113,6 +126,8 @@ export class MapControls {
       },
       click: (grid, touch) => {
         tools.touch = touch;
+        // A map press puts the span panel away (a press on a span opens that one again below).
+        this.span.close();
         this.report(touch ? tools.tap(session.state, dispatch, grid.x, grid.y) : tools.click(session.state, dispatch, grid.x, grid.y));
       },
       dragStart(start, pick, touch) {
@@ -141,6 +156,10 @@ export class MapControls {
           this.olt.close();
           return true;
         }
+        if (this.span.isOpen) {
+          this.span.close();
+          return true;
+        }
         return tools.cancel();
       },
       escape: () => {
@@ -160,6 +179,10 @@ export class MapControls {
     if (outcome.open === 'olt') {
       this.olt.open(this.deps.session.state);
       // The panel says it all: put the hover card away until the pointer moves again.
+      this.pointer.onMap = false;
+      this.cardHold = 'next';
+    } else if (outcome.open === 'span' && outcome.span !== undefined) {
+      this.span.open(this.deps.session.state, outcome.span);
       this.pointer.onMap = false;
       this.cardHold = 'next';
     }
@@ -232,6 +255,7 @@ export class MapControls {
   reset(): void {
     this.tools.cancel();
     this.olt.close();
+    this.span.close();
     this.cardHold = null;
   }
 
@@ -243,6 +267,7 @@ export class MapControls {
     const { pointer } = this;
     this.card.render(pointer.onMap ? view.card : null, pointer.x, pointer.y, window.innerWidth, window.innerHeight, this.cardSafeArea());
     this.olt.update(state);
+    this.span.update(state);
     this.placeLegend();
   }
 }

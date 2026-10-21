@@ -30,6 +30,15 @@
 //       'loanProceeds', MonthlyReport.debt, debt notices and the 'default'
 //       game over. v2 saves migrate with no debt (save.ts migrateV2toV3); v1
 //       saves migrate v1 -> v2 -> v3.
+//   4 - round 4: weather (GameState.weather: storms, rng.weather) and span
+//       outages and aerial -> underground conversions (CableSpan.outage,
+//       CableSpan.conversion), price locks on accounts (grandfathering and
+//       intro promos), the intro promo setting, incumbent promos per cabinet
+//       area, the frozen-line sweep and loan acceleration (Debt.frozenCloses,
+//       Debt.acceleration), ledger category 'repair', MonthlyReport.ops and
+//       the new DebtStats fields, and the round-4 notice kinds. v3 saves
+//       migrate with no storms, locks or promos (save.ts migrateV3toV4); v1
+//       and v2 saves migrate v1 -> v2 -> v3 -> v4.
 
 export type NodeId = number;
 export type SegmentId = number;
@@ -151,6 +160,52 @@ export interface CableSpan {
   orderedDay: number;
   /** Day the span went live, or null if not live yet. */
   liveDay: number | null;
+  /**
+   * Round 4: storm or dig-in damage keeping this live span out of service
+   * until repaired, else null. Only a live span can have one. While it lasts
+   * the span carries no light: streets cut off by it are interrupted
+   * (ServiceSnapshot.interruptedSegments) but still passed, and their
+   * subscribers keep their accounts (they are not dropped as 'dark').
+   */
+  outage: SpanOutage | null;
+  /**
+   * Round 4: an aerial span being rebuilt underground (convertSpan), else
+   * null. Only a live aerial span can have one; the aerial cable stays in
+   * service (and exposed to storms) until the rebuild goes live, when
+   * `method` becomes 'underground' and this is cleared.
+   */
+  conversion: SpanConversion | null;
+}
+
+/** What took a span out of service: a storm (aerial plant mostly) or a dig-in (underground plant). */
+export type OutageCause = 'storm' | 'digIn';
+
+/** Damage on a live span (CableSpan.outage). */
+export interface SpanOutage {
+  cause: OutageCause;
+  /** The storm that did it (Storm.id), or null for a dig-in. */
+  storm: number | null;
+  /** Day the damage happened. */
+  startDay: number;
+  /**
+   * Whole days until repaired, >= 1. weather.stepWeather counts it down once
+   * a day and clears the outage (service restored) the day it would reach 0.
+   */
+  daysLeft: number;
+  /** Repair cost posted as a 'repair' ledger entry the day the damage happened, whole dollars >= 0. */
+  repairCost: number;
+}
+
+/** An aerial span's rebuild underground (CableSpan.conversion), with its own permit and construction. */
+export interface SpanConversion {
+  stage: 'permitting' | 'constructing';
+  /** Whole days left in the current stage, >= 0. */
+  stageDaysLeft: number;
+  /** Construction-stage duration, fixed when ordered, >= 1. */
+  constructDays: number;
+  /** What the rebuild cost (paid when ordered, added to CableSpan.cost and Capex.osp then), whole dollars >= 0. */
+  cost: number;
+  orderedDay: number;
 }
 
 export type PonTech = 'gpon' | 'xgspon';
@@ -214,9 +269,95 @@ export interface Network {
   makeReady: MakeReadyMemo[];
   /**
    * Bumped whenever topology, any build stage, splitter count or OLT capacity
-   * changes. Derived caches (see ServiceSnapshot) key off this.
+   * changes, and (round 4) whenever a span's outage starts or ends or a
+   * conversion goes live. Derived caches (see ServiceSnapshot) key off this.
    */
   version: number;
+}
+
+// ---------------------------------------------------------------------------
+// Weather (round 4): seeded storms that damage aerial plant far more than
+// underground, and dig-ins on underground plant. weather.ts owns the rules;
+// the damage itself lives on the spans (CableSpan.outage).
+// ---------------------------------------------------------------------------
+
+/** One storm that hit the town (kept STORM_LOG_DAYS for the map, the briefing and the advisor). */
+export interface Storm {
+  /** From Weather.nextStormId; strictly increasing through the log. */
+  id: number;
+  /** Day it hit. */
+  day: number;
+  /** Center of the area it hit, map grid units (integers inside the map). */
+  x: number;
+  y: number;
+  /** Radius of the area it hit, map cells, >= 1. Spans whose segment midpoint lies within it were exposed. */
+  radius: number;
+  /** 1 (squall) .. STORM_SEVERITY_MAX (major storm): scales the damage chance. */
+  severity: number;
+  /** Spans it damaged (any method), ascending ids (a span removed since stays listed). */
+  spans: SpanId[];
+  /** Repair dollars it caused (sum of those outages' repairCost). */
+  repairCost: number;
+}
+
+/** Running weather totals for the open month, reset by each close (weather.closeWeatherMonth). */
+export interface WeatherMonth {
+  /**
+   * Days each lit segment spent interrupted (ServiceSnapshot.interruptedSegments:
+   * no cabinet reaches it) this month, sorted by segment ascending, one entry
+   * per segment, days >= 1 (segments never interrupted are absent). The
+   * street's record (weather.outageDaysOn); churn goes by each subscriber's
+   * own days (Weather.cutOff).
+   */
+  segmentOutageDays: { segment: SegmentId; days: number }[];
+  /**
+   * Subscriber-days without service this month: over the month's days, the
+   * subscribed units of accounts cut off (network.outageService: an outage
+   * cuts their own cabinet off from their street and no other cabinet that
+   * still reaches it has a port free for them).
+   */
+  outageUnitDays: number;
+  /** Storms that hit this month. */
+  storms: number;
+  /** Spans damaged this month (storms and dig-ins). */
+  spansDamaged: number;
+  /** Repair dollars posted this month (the month's 'repair' entries, as a positive number). */
+  repairs: number;
+}
+
+/**
+ * One subscriber's outage (Weather.cutOff): the account on `parcel` was cut
+ * off `days` days since the last close (not charged yet), after `charged`
+ * days of the same outage charged at earlier closes (it was still cut off at
+ * them), with at most `units` of its units cut off on one day (units it adds
+ * later were not cut off).
+ */
+export interface AccountOutage {
+  parcel: ParcelId;
+  /** >= 0; days + charged >= 1. */
+  days: number;
+  /** >= 0. */
+  charged: number;
+  /** >= 1. */
+  units: number;
+}
+
+export interface Weather {
+  /** Storms of the last STORM_LOG_DAYS days, oldest first. */
+  storms: Storm[];
+  /** Id the next storm gets (>= 1, greater than every id in storms). */
+  nextStormId: number;
+  month: WeatherMonth;
+  /**
+   * Round 4: subscribers cut off by outages this month, or still cut off at
+   * the last close, one entry per account (by parcel, ascending). Each day an
+   * account is cut off (network.outageService) adds a day; each close charges
+   * the days since the last one (sales.closeSalesMonth, weather.outageChargeOf)
+   * and keeps only the accounts still cut off, their days counted as charged
+   * (weather.closeWeatherMonth), so an outage over a close pays its base churn
+   * once.
+   */
+  cutOff: AccountOutage[];
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +374,7 @@ export type LedgerCategory =
   | 'overhead' // fixed monthly overhead plus per-subscriber support cost
   | 'payroll'
   | 'marketing'
+  | 'repair' // round 4: storm and dig-in repairs (operating cost, negative)
   | 'interest' // financing: credit-line and term-loan interest, accrued interest on a prepayment, late fees (negative)
   | 'principal' // financing: credit-line repayments, scheduled term-loan principal, prepayments (negative)
   | 'loanProceeds' // financing: credit-line draws and term-loan proceeds (positive)
@@ -304,6 +446,45 @@ export interface MonthlyReport {
    * Interest, principal and proceeds of the month are in `totals`.
    */
   debt?: DebtStats;
+  /**
+   * Round-4 operating figures (pricing, outages, the incumbent, the notice
+   * cursor the briefing reads). Absent on reports migrated from schemaVersion
+   * 1-3 saves; present on every report a round-4 close writes.
+   */
+  ops?: OpsStats;
+}
+
+/** Round-4 figures captured at a month close (finance.closeMonth assembles them). */
+export interface OpsStats {
+  /**
+   * Highest notice id issued by the end of this close (state.nextNoticeId - 1
+   * after every step of the close). The period's notices are those with an id
+   * above the previous report's lastNoticeId, up to this one.
+   */
+  lastNoticeId: number;
+  /** Subscriber units moved off tiers that are no longer offered, at this close (they kept service on another tier). */
+  tierMoves: number;
+  /**
+   * Of stats.churned: units that cancelled at this close because their price
+   * stepped up (a price lock ending, a retired tier's move to a dearer tier).
+   */
+  priceChurn: number;
+  /** Of stats.churned: units that cancelled because of outages in the month. */
+  outageChurn: number;
+  /** Of stats.churned: units that cancelled because the incumbent ran a promo in their area. */
+  incumbentChurn: number;
+  /** Subscriber-days without service because of outages (WeatherMonth.outageUnitDays). */
+  outageUnitDays: number;
+  /** Storms that hit in the month. */
+  storms: number;
+  /** Spans damaged in the month (storms and dig-ins). */
+  spansDamaged: number;
+  /** Repair spend in the month, dollars >= 0 (= -(totals.repair ?? 0)). */
+  repairs: number;
+  /** Incumbent promos that ran during the month (before this close's incumbent review). */
+  incumbentPromos: number;
+  /** What every subscriber pays for a full month at month end, price locks included (sales.monthlyRecurringRevenue after churn). */
+  mrr: number;
 }
 
 /**
@@ -333,6 +514,16 @@ export interface DebtStats {
   averageRateBps: number | null;
   /** This close's debt service could not be paid (see DebtClose.missed). */
   missedPayment: boolean;
+  /**
+   * Round 4 (absent on reports from older saves, present on every round-4
+   * close): principal the bank swept from this month's operating cash flow
+   * while the line was frozen (FROZEN_SWEEP_SHARE), dollars >= 0.
+   */
+  sweep?: number;
+  /** Round 4: consecutive closes ending 'frozen', after this close's review (Debt.frozenCloses). */
+  frozenCloses?: number;
+  /** Round 4: closes left to repay everything once the bank has called the loans (Acceleration.closesLeft after this close), else null. */
+  accelerationClosesLeft?: number | null;
 }
 
 /**
@@ -479,6 +670,19 @@ export interface CovenantState {
   compliantCloses: number;
 }
 
+/**
+ * Round 4: the bank has called the loans after FROZEN_ACCELERATION_CLOSES
+ * frozen closes in a row. Everything owed (term loans and the credit line)
+ * falls due over the next ACCELERATION_CLOSES closes; a close that cannot pay
+ * what falls due is a default (game over). It lasts until nothing is owed.
+ */
+export interface Acceleration {
+  /** Close day the bank called the loans. */
+  day: number;
+  /** Closes left to repay everything, ACCELERATION_CLOSES..1 (the close with 1 left takes all that remains). */
+  closesLeft: number;
+}
+
 export interface Debt {
   credit: CreditLine;
   /** Open term loans (balance >= 1), ascending id. */
@@ -486,6 +690,15 @@ export interface Debt {
   /** Id the next term loan gets (>= 1, greater than every id in loans). */
   nextLoanId: number;
   covenant: CovenantState;
+  /**
+   * Round 4: consecutive month closes whose review ended with the stage
+   * 'frozen' (0 whenever a close ends in any other stage, or nothing is
+   * owed). Reaching FROZEN_ACCELERATION_CLOSES calls the loans (acceleration).
+   * Migrated v3 saves count the trailing frozen closes of their reports.
+   */
+  frozenCloses: number;
+  /** Round 4: the loans have been called, else null (debt.reviewDebt starts it; it ends when nothing is owed). */
+  acceleration: Acceleration | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +717,12 @@ export interface Tier {
   upMbps: number;
   /** Monthly price for a household, whole dollars, TIER_PRICE_MIN..TIER_PRICE_MAX. */
   price: number;
-  /** Sold to new customers. Subscribers already on an unoffered tier keep it (grandfathered). */
+  /**
+   * Sold to new customers. Round 4: subscribers on a tier that is not offered
+   * move at the next close to the offered tier nearest in price, and some
+   * cancel (sales.closeSalesMonth step 4); round 3 let them keep it, so a v3
+   * save with such subscribers gets a 'rulesUpdated' notice at load.
+   */
   offered: boolean;
 }
 
@@ -539,6 +757,70 @@ export interface Account {
   tierUnits: Record<TierId, number>;
   /** Day the account's first unit connected. */
   since: number;
+  /**
+   * Round 4: prices this account pays that differ from the list price, at
+   * most one per tier, only for tiers it has units on, in TIER_IDS order. A
+   * unit on a locked tier pays min(lock.price, list price) (a price cut
+   * reaches everyone at once); others pay the list price. Every unit of an
+   * apartment building's account on that tier shares the lock.
+   */
+  locks: PriceLock[];
+}
+
+/**
+ * Why an account pays something other than the list price:
+ *   grandfather - a price rise grandfathered for months (setPricing grandfatherMonths >= 1)
+ *   notice      - a price rise passed on at the next bill (setPricing grandfatherMonths 0)
+ *   promo       - it signed up on the intro promo (Sales.promo)
+ * The reason sets the churn share of the price step when the lock ends.
+ */
+export type PriceLockReason = 'grandfather' | 'notice' | 'promo';
+
+/** A price an account's units on one tier pay until a month close (Account.locks). */
+export interface PriceLock {
+  tier: TierId;
+  /** Household monthly price while it lasts, whole dollars >= 1 (a business pays round(price x smbMultiplier)). */
+  price: number;
+  /**
+   * The month-close day (a 1st of the month, after the day it was set) whose
+   * close ends it: billing up to that close uses the lock, and that close
+   * moves the units to the list price (a price step: extra churn by the size
+   * of the rise, see sales.closeSalesMonth).
+   */
+  untilDay: number;
+  reason: PriceLockReason;
+}
+
+/** The intro offer new signups get (Sales.promo): a discount off the list price for their first months. */
+export interface IntroPromo {
+  /** Whole percent off the list price, 1..PROMO_MAX_PERCENT_OFF. */
+  percentOff: number;
+  /**
+   * Months each signup keeps it, 1..PROMO_MAX_MONTHS: its lock ends at the
+   * close `months` closes after the next one, so it covers the rest of the
+   * signup month and `months` full months.
+   */
+  months: number;
+}
+
+/**
+ * Round 4: the incumbent cable company answering a high take rate in one of
+ * your cabinet areas with a local promo (sales/incumbent.ts). While it runs
+ * (startDay <= day < endDay) the incumbent's price on streets that cabinet
+ * serves is `price`: your target take rate there falls and its subscribers
+ * churn more.
+ */
+export interface IncumbentPromo {
+  /** The cabinet whose serving area it targets. */
+  cabinet: CabinetId;
+  /** Close day it started. */
+  startDay: number;
+  /** Close day it ends (it runs while day < endDay), > startDay. */
+  endDay: number;
+  /** The incumbent's promo price there, whole dollars a month, 1..INCUMBENT_PRICE. */
+  price: number;
+  /** No new promo at this cabinet before this day (>= endDay); the record is dropped at the first close on or after it. */
+  quietUntil: number;
 }
 
 /**
@@ -589,6 +871,10 @@ export interface Sales {
    */
   installsPaused: boolean;
   month: MonthAccrual;
+  /** Round 4: the intro promo new signups get, or null for none (setPromo). */
+  promo: IntroPromo | null;
+  /** Round 4: incumbent promos running or cooling down, sorted by cabinet, at most one per cabinet. */
+  incumbentPromos: IncumbentPromo[];
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +911,16 @@ export type NoticeKind =
   | 'creditFrozen' // a covenant breach stepped the stage up to 'frozen' (no draws, no new term loans)
   | 'covenantCured' // compliant closes (or no debt left) stepped the stage down
   | 'loanPaidOff' // a term loan's last scheduled payment was made at a close
+  | 'debtSwept' // round 4: a close while frozen swept part of the month's operating cash flow to repay debt
+  | 'accelerationWarning' // round 4: a frozen close brought the bank within ACCELERATION_WARNING_CLOSES closes of calling the loans
+  | 'loansCalled' // round 4: FROZEN_ACCELERATION_CLOSES frozen closes in a row: everything owed falls due over ACCELERATION_CLOSES closes
+  | 'tierRetired' // round 4: subscribers on a tier no longer offered moved to another tier at a close (some cancelled)
+  | 'priceStep' // round 4: price locks ended at a close (grandfathering or intro promos): units now pay the list price (some cancelled)
+  | 'incumbentPromo' // round 4: the incumbent started a promo in a cabinet area (Notice.cabinet set)
+  | 'incumbentPromoEnded' // round 4: an incumbent promo ended (Notice.cabinet set)
+  | 'storm' // round 4: a storm hit and damaged spans (outages, repair cost)
+  | 'digIn' // round 4: an excavator cut an underground span
+  | 'serviceRestored' // round 4: repairs finished and interrupted streets have service again
   | 'gameOver' // insolvency or default ended the game
   | 'milestone';
 
@@ -641,7 +937,7 @@ export interface Notice {
   kind: NoticeKind;
   /** Player-facing sentence, e.g. "Cabinet at Elm St & 3rd Ave is full: add a splitter to keep signing up customers." */
   message: string;
-  /** The cabinet concerned (cabinetFull, serviceLost), else null. */
+  /** The cabinet concerned (cabinetFull, serviceLost, incumbentPromo, incumbentPromoEnded), else null. */
   cabinet: CabinetId | null;
   /** The milestone achieved (milestone), else null. */
   milestone: MilestoneId | null;
@@ -672,10 +968,12 @@ export interface RngStreams {
   events: number;
   /** uint32 state for subscriber signups, tier choice and churn (sales.ts only). */
   sales: number;
+  /** Round 4: uint32 state for storms, dig-ins and outage lengths (weather.ts only), deriveSeed(seed, 'weather'). */
+  weather: number;
 }
 
 export interface GameState {
-  schemaVersion: 3;
+  schemaVersion: 4;
   seed: number;
   day: number;
   rng: RngStreams;
@@ -687,6 +985,8 @@ export interface GameState {
   /** Credit line, term loans and covenant stage (debt.newDebt() for a new game: nothing borrowed). */
   debt: Debt;
   sales: Sales;
+  /** Round 4: storms and the month's outage totals (weather.newWeather() for a new game). */
+  weather: Weather;
   /** Achieved milestones, in the order achieved; each id at most once. */
   milestones: MilestoneRecord[];
   /** The newest NOTICE_LOG_MAX notices, oldest first. */
@@ -722,8 +1022,19 @@ export type Command =
   | { type: 'removeCabinet'; cabinet: CabinetId }
   /** Buy one OLT line card at the CO (+OLT_PORTS_PER_CARD PON ports). */
   | { type: 'addOltCard' }
-  /** Replace every tier's price and offered flag (each TierId exactly once) and the SMB multiplier. Free. */
-  | { type: 'setPricing'; tiers: TierSetting[]; smbMultiplier: number }
+  /**
+   * Replace every tier's price and offered flag (each TierId exactly once) and
+   * the SMB multiplier. Free. Round 4: a price rise reaches today's
+   * subscribers only after `grandfatherMonths` month closes (0: at the next
+   * close; omitted: GRANDFATHER_MONTHS_DEFAULT), through price locks; new
+   * subscribers pay the new price at once; a cut reaches everyone at once. A
+   * tier no longer offered moves its subscribers to another tier at the next close.
+   */
+  | { type: 'setPricing'; tiers: TierSetting[]; smbMultiplier: number; grandfatherMonths?: number }
+  /** Round 4: set the intro promo for new signups (null: none). Free. */
+  | { type: 'setPromo'; promo: IntroPromo | null }
+  /** Round 4: rebuild a live aerial span underground (permit, then construction; the aerial cable serves until it is live). Cost = quoteConvert(...).cost. */
+  | { type: 'convertSpan'; span: SpanId }
   /** Set the monthly marketing budget (whole dollars). Free; spend accrues daily. */
   | { type: 'setMarketing'; perMonth: number }
   /** Draw whole dollars (>= 1, <= available) from the credit line. Cost = -amount (cash in). */
@@ -968,7 +1279,7 @@ export interface CovenantMetrics {
   totalDebt: number;
   /** Annualized trailing recurring revenue (debt.trailingArr). */
   arr: number;
-  /** Annualized trailing operating cash flow (financing and capex excluded); may be negative. */
+  /** Annualized trailing operating cash flow (financing and capex excluded; round 4: repairs at their past-year total, debt.annualOperatingCashFlow); may be negative. */
   annualOperatingCashFlow: number;
   /**
    * Cash flow the lender counts: max(annualOperatingCashFlow, arr x
@@ -1058,6 +1369,100 @@ export interface TermLoanQuote {
   breachesCovenant: boolean;
   /** Cash after the proceeds arrive. */
   cashAfter: number;
+  /**
+   * Round 4: term loans taken earlier this month that this loan would
+   * re-price (same-month loans are priced together, on the leverage of all of
+   * them: no discount for splitting one loan into slices), ascending loan id;
+   * empty when there are none. `after` and `payment` already count them.
+   */
+  repriced: RepricedLoan[];
+  /**
+   * Round 4: the largest amount of this term whose pro forma covenants stay
+   * compliant (debt.maxSafeTermLoan), a multiple of LOAN_ROUNDING, 0 when no
+   * loan of at least TERM_LOAN_MIN would be. The Bank's builder starts there.
+   */
+  safeMaxAmount: number;
+}
+
+/** A same-month term loan re-priced by a new one (TermLoanQuote.repriced). */
+export interface RepricedLoan {
+  loan: LoanId;
+  /** Its fixed rate now and after (bps, no penalty). */
+  rateBps: number;
+  rateBpsAfter: number;
+  /** Its level payment now and after (at the effective rate). */
+  payment: number;
+  paymentAfter: number;
+}
+
+/** Round 4: what a credit-line draw would do (debt.quoteDraw), for the Bank's covenant preview. */
+export interface DrawQuote {
+  /** drawCredit would accept it (whole dollars, 1..available, not frozen); a covenant breach does not block it. */
+  ok: boolean;
+  reasons: string[];
+  amount: number;
+  /** Covenant figures today and with the draw (its year of interest added to the debt service). */
+  before: CovenantMetrics;
+  after: CovenantMetrics;
+  /** !after.compliant. */
+  breachesCovenant: boolean;
+  cashAfter: number;
+  /** Interest the draw adds to this month's close if held to month end (stub days at the effective rate). */
+  interestToClose: number;
+}
+
+/**
+ * Round 4: how to pay for something that costs more than the cash the player
+ * should keep (debt.fundingHint). Used by the quote cards and the advisor;
+ * never sizes financing that leaves cash near $0 or breaches a covenant.
+ */
+export interface FundingHint {
+  cost: number;
+  /** Cash the hint keeps after paying: FUNDING_CUSHION_MONTHS of fixed costs (overhead + marketing) plus the next close's debt service. */
+  cushion: number;
+  /** max(0, cost + cushion - cash): what financing must bring in. */
+  shortfall: number;
+  /**
+   *   cash        - cash covers it and the cushion (draw and termLoan 0)
+   *   draw        - a covenant-safe credit-line draw covers the shortfall
+   *   term        - a covenant-safe term loan covers it (the line cannot)
+   *   drawAndTerm - both together cover it
+   *   short       - no covenant-safe financing covers it (draw/termLoan show the most there is)
+   */
+  kind: 'cash' | 'draw' | 'term' | 'drawAndTerm' | 'short';
+  /** Suggested draw, whole dollars (a multiple of LOAN_ROUNDING unless it is all that is available), 0 for none. */
+  draw: number;
+  /** Suggested term loan (TERM_LOAN_MIN..its safe maximum, a multiple of LOAN_ROUNDING), 0 for none, and its term. */
+  termLoan: number;
+  termYears: TermYears;
+}
+
+/**
+ * Round 4: one way to bring the covenants back into compliance
+ * (debt.cureOptions). Every option is verified pro forma: it makes both
+ * tests pass at today's figures, and it leaves at least the next close's
+ * debt service plus FUNDING_CUSHION_MONTHS of fixed costs in cash (so it
+ * cannot turn into a missed payment). Advice that cannot be verified is
+ * never offered.
+ */
+export interface CureOption {
+  /**
+   * repayCredit / prepayLoan: a command that cures it now; grow: the yearly
+   * operating cash flow that would (no command); repayAll: repaying the line
+   * and every loan in full (debt.repayAllCure: never among cureOptions, only
+   * debt.cureFor).
+   */
+  kind: 'repayCredit' | 'prepayLoan' | 'grow' | 'repayAll';
+  /** The loan to prepay (prepayLoan), else null. */
+  loan: LoanId | null;
+  /** Dollars to repay or prepay (repayAll: everything owed); for grow, the extra annual operating cash flow needed. */
+  amount: number;
+  /** Covenant figures after it (for grow: with that cash flow). */
+  after: CovenantMetrics;
+  /** Cash after it (for grow: today's cash). */
+  cashAfter: number;
+  /** One plain-language sentence with the figures ("Repay $42,000 of the credit line: leverage 4.6x, coverage 1.3x"). */
+  text: string;
 }
 
 /** What prepaying a term loan would take (debt.quotePrepay). */
@@ -1075,6 +1480,182 @@ export interface PrepayQuote {
   paysOff: boolean;
   /** Re-amortized level payment over the same months left at the effective rate (0 when it pays off). */
   paymentAfter: number;
+}
+
+// ---------------------------------------------------------------------------
+// Round-4 quotes (pure functions of state; never saved)
+// ---------------------------------------------------------------------------
+
+/** What a setPricing would do to today's subscribers (sales.quotePricing), for the pricing panel. */
+export interface PricingQuote {
+  /** setPricing would accept it. */
+  ok: boolean;
+  reasons: string[];
+  /** grandfatherMonths as it would apply (the default when omitted). */
+  grandfatherMonths: number;
+  /** Subscriber units whose price rises: they keep their price until the locks end. */
+  unitsRising: number;
+  /** Subscriber units whose price falls at once. */
+  unitsFalling: number;
+  /** Close day the new locks end (their price step), or null when nothing rises. */
+  locksEndDay: number | null;
+  /** MRR right after the change (locks held) and once every lock it creates has ended, for today's subscribers. */
+  mrrNow: number;
+  mrrAfterLocks: number;
+  /** Units on tiers it stops offering: they move to another tier at the next close. */
+  unitsMoving: number;
+  /** Expected cancellations from its price steps and tier moves (an estimate, rounded), at the closes they happen. */
+  expectedChurn: number;
+}
+
+/** What converting an aerial span to underground would take (network.quoteConvert). */
+export interface ConvertQuote {
+  ok: boolean;
+  reasons: string[];
+  span: SpanId;
+  /** Whole dollars: underground construction and rock for the segment, engineering and the city permit (lines sum to it). */
+  cost: number;
+  lines: QuoteLine[];
+  permitDaysMin: number;
+  permitDaysMax: number;
+  constructDays: number;
+  /** Pole rent it stops once live, dollars a month. */
+  poleRentSaved: number;
+  /** Expected storm repair cost a year it avoids (weather.stormRisk aerial minus underground), dollars (an estimate). */
+  repairsAvoidedPerYear: number;
+}
+
+/** Expected yearly storm and dig-in exposure of a span of `method` on a segment (weather.stormRisk). */
+export interface StormRisk {
+  /** Expected outages a year. Not rounded. */
+  outagesPerYear: number;
+  /** Expected repair dollars a year. Not rounded. */
+  repairCostPerYear: number;
+  /** Expected days out of service a year. Not rounded. */
+  outageDaysPerYear: number;
+}
+
+// ---------------------------------------------------------------------------
+// Advisor and month-end briefing (round 4; advisor.ts; derived, never saved)
+// ---------------------------------------------------------------------------
+
+/** Which advisor rule produced an advice (each fires at most once per call). */
+export type AdviceId =
+  | 'paymentShort' // the next close's debt service is not covered: raise cash now or it is a missed payment / default
+  | 'loansCalled' // the bank has called the loans: what falls due at each close
+  | 'covenantCure' // a covenant is breached or at risk: a verified cure (debt.cureOptions)
+  | 'frozenSweep' // frozen: the sweep and the countdown to acceleration, and what lifts the freeze
+  | 'cashRunway' // runway short or installs paused: credit line / slow builds
+  | 'addSplitter' // a cabinet is full (or nearly): add a splitter there
+  | 'addOltCard' // OLT PON ports nearly or all used: buy a line card
+  | 'outages' // spans are out after a storm: what it is costing
+  | 'stormUnderground' // aerial spans hit repeatedly: convert or build underground there
+  | 'incumbentPromo' // the incumbent is running a promo in an area: price / marketing response
+  | 'takeRate' // take rate lagging its target: price or marketing
+  | 'pricing' // a tier priced far from what the market bears
+  | 'redCpp' // red-CPP builds are raising the rate on new debt
+  | 'expand'; // idle cash or safe borrowing room with green-CPP corners nearby: build there
+
+export type AdviceSeverity = 'urgent' | 'important' | 'tip';
+
+/** A panel the UI can open for an advice. */
+export type AdvicePanel = 'pricing' | 'bank' | 'olt';
+
+/** What "Show me" does: move the camera to a place (and highlight it), or open a panel. */
+export type AdviceAction =
+  | { kind: 'focusNode'; node: NodeId }
+  | { kind: 'focusSegment'; segment: SegmentId }
+  | { kind: 'focusCabinet'; cabinet: CabinetId }
+  | { kind: 'openPanel'; panel: AdvicePanel };
+
+/** One ranked suggestion (advisor.advise). */
+export interface Advice {
+  id: AdviceId;
+  /**
+   * Rank: higher first (ties by AdviceId order above). Bands: urgent 300-399,
+   * important 200-299, tip 100-199, so severity and priority always agree.
+   */
+  priority: number;
+  severity: AdviceSeverity;
+  /** Short imperative, e.g. "Add a splitter at Elm St & 3rd Ave". */
+  title: string;
+  /** Plain-language reason built from the game's figures, one or two sentences. */
+  why: string;
+  action: AdviceAction;
+  /** Button label: "Show me" for a place, "Open Pricing" / "Open Bank" / "Open OLT" for a panel. */
+  actionLabel: string;
+}
+
+/** Keys of the "what changed" rows of a briefing. */
+export type BriefingChangeKey = 'net' | 'cash' | 'subscribers' | 'passings' | 'takeRate' | 'cpp' | 'revenue' | 'operatingCashFlow' | 'debt';
+
+/** One "what changed" row: this period's figure against the one `span` months earlier. */
+export interface BriefingChange {
+  key: BriefingChangeKey;
+  label: string;
+  /** null where the figure does not exist (no stats on an old report, nothing passed). */
+  now: number | null;
+  before: number | null;
+  /** now - before, or null when either is null. */
+  delta: number | null;
+  /** Whether a rise is good news (cost per passing and debt: false), or null for neutral. */
+  upIsGood: boolean | null;
+  unit: 'money' | 'count' | 'ratio';
+}
+
+/** The month-end briefing (advisor.buildBriefing): everything pertinent about the period that just closed. */
+export interface Briefing {
+  /** The latest closed month, and the report `span` months before it (null when there is none). */
+  report: MonthlyReport;
+  previous: MonthlyReport | null;
+  /** Months it covers: 1 (a month) or 3 (a quarter). */
+  span: number;
+  /** "March 2028" or "Jan-Mar 2028". */
+  label: string;
+  headline: {
+    net: number;
+    cash: number;
+    subscribers: number | null;
+    passings: number;
+    takeRate: number | null;
+    cpp: number | null;
+    cppBand: CppBand | null;
+    /** CPP_TARGET, for "cost per passing $812 vs $1,000 target". */
+    cppTarget: number;
+    /** Total debt today, and the covenant stage and today's covenant figures. */
+    debt: number;
+    stage: CovenantStage;
+    covenant: CovenantMetrics;
+  };
+  changes: BriefingChange[];
+  /** The period's notices still in the log (ids after the previous report's ops.lastNoticeId), oldest first. */
+  notices: Notice[];
+  /** The period's ledger totals by category (revenue first, then costs), summed over its months. */
+  breakdown: { category: LedgerCategory; amount: number }[];
+  forward: {
+    /** Day of the next month close. */
+    nextCloseDay: number;
+    /** Estimated debt service at the next close (debt.estimateNextDebtService). */
+    nextPayment: number;
+    /**
+     * Cash projected after the next close: at its debt step
+     * (finance.estimateCashAtClose), less the next payment and, while the line
+     * is frozen, the sweep (debt.estimateSweep).
+     */
+    projectedCash: number;
+    /** The frozen-line sweep expected at the next close (debt.estimateSweep: 0 unless frozen), included in projectedCash. */
+    sweep: number;
+    /** finance.runwayMonths: null when not burning. */
+    runwayMonths: number | null;
+    /** Frozen: closes until the bank calls the loans (debt.closesUntilAcceleration), else null. */
+    closesUntilCalled: number | null;
+    /** Loans called: closes left to repay everything, else null. */
+    accelerationClosesLeft: number | null;
+  };
+  /** advisor.advise(state): at most ADVICE_MAX, ranked. */
+  advice: Advice[];
+  /** Something needs the player: urgent advice, or a period notice of a kind that needs action (advisor.noticeNeedsAttention). */
+  needsAttention: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,4 +1706,22 @@ export interface ServiceSnapshot {
   passedParcels: ParcelId[];
   /** Sum of units over passedParcels. */
   passings: number;
+  /**
+   * Round 4: lit segments with no light today because an outage cuts them off
+   * from every cabinet in segmentCabinets (their own span is out, or every
+   * live path from each cabinet to them, or from it to the CO, runs through a
+   * span that is out, or is too long). Still lit and passed (passings and
+   * scorecards ignore outages). Empty when no span is out.
+   */
+  interruptedSegments: Set<SegmentId>;
+  /**
+   * Round 4: for each lit segment an outage cuts off from one or more of its
+   * segmentCabinets, those cabinets (all of them for an interrupted
+   * segment). A subscriber whose own cabinet (Account.cabinet) is listed for
+   * its street is served meanwhile by another of them that still reaches it
+   * with a port free, else has no service (network.outageService); while
+   * the street's servingCabinet is listed, new signups there go only to such
+   * a cabinet. Empty when no span is out.
+   */
+  cutOffCabinets: Map<SegmentId, ReadonlySet<CabinetId>>;
 }

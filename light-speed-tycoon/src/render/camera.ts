@@ -26,6 +26,8 @@ export class Camera {
   viewH = 1;
   /** World area the camera keeps in view (the board). */
   private bounds: Bounds = { x: 0, y: 0, w: 1, h: 1 };
+  /** A glide in progress (glideTo), or null. */
+  private glide: { fromX: number; fromY: number; toX: number; toY: number; start: number; ms: number } | null = null;
 
   setViewport(w: number, h: number): void {
     this.viewW = Math.max(1, w);
@@ -50,6 +52,7 @@ export class Camera {
    * Zooming out is allowed until the whole bounds fit with room to spare.
    */
   fit(insets: Insets, target: Bounds = this.bounds): void {
+    this.glide = null;
     const b = this.bounds;
     const availW = Math.max(1, this.viewW - insets.left - insets.right);
     const availH = Math.max(1, this.viewH - insets.top - insets.bottom);
@@ -66,6 +69,7 @@ export class Camera {
   }
 
   panBy(dx: number, dy: number): void {
+    this.glide = null;
     this.x += dx;
     this.y += dy;
     this.clamp();
@@ -73,6 +77,7 @@ export class Camera {
 
   /** Multiply the zoom by `factor`, keeping the world point under (sx, sy) fixed. */
   zoomAt(sx: number, sy: number, factor: number): void {
+    this.glide = null;
     const before = this.screenToWorld(sx, sy);
     this.scale = Math.min(this.maxScale, Math.max(this.minScale, this.scale * factor));
     this.x = sx - before.x * this.scale;
@@ -80,11 +85,54 @@ export class Camera {
     this.clamp();
   }
 
-  /** Center the view on a world point. */
-  centerOn(wx: number, wy: number): void {
-    this.x = this.viewW / 2 - wx * this.scale;
-    this.y = this.viewH / 2 - wy * this.scale;
+  /**
+   * Center the view on a world point: put it at screen (sx, sy), by default
+   * the middle of the viewport (as far as the board's clamp allows).
+   */
+  centerOn(wx: number, wy: number, sx = this.viewW / 2, sy = this.viewH / 2): void {
+    this.glide = null;
+    this.x = sx - wx * this.scale;
+    this.y = sy - wy * this.scale;
     this.clamp();
+  }
+
+  /**
+   * Like centerOn, but move there over `ms` milliseconds (ease-out) from
+   * `now` (a performance.now() time); step() advances it each frame. A pan,
+   * zoom, fit or centerOn cancels it. ms <= 0 moves at once.
+   */
+  glideTo(wx: number, wy: number, now: number, ms: number, sx = this.viewW / 2, sy = this.viewH / 2): void {
+    const fromX = this.x;
+    const fromY = this.y;
+    this.centerOn(wx, wy, sx, sy);
+    if (ms <= 0 || (fromX === this.x && fromY === this.y)) return;
+    this.glide = { fromX, fromY, toX: this.x, toY: this.y, start: now, ms };
+    this.x = fromX;
+    this.y = fromY;
+  }
+
+  /** True while a glide is under way. */
+  get gliding(): boolean {
+    return this.glide !== null;
+  }
+
+  /** Advance a glide to time `now`; returns whether one is still under way. */
+  step(now: number): boolean {
+    const g = this.glide;
+    if (!g) return false;
+    const t = Math.min(1, Math.max(0, (now - g.start) / g.ms));
+    // Ease out (cubic): fast start, gentle arrival.
+    const k = 1 - (1 - t) * (1 - t) * (1 - t);
+    this.x = g.fromX + (g.toX - g.fromX) * k;
+    this.y = g.fromY + (g.toY - g.fromY) * k;
+    if (t >= 1) {
+      this.glide = null;
+      this.x = g.toX;
+      this.y = g.toY;
+      this.clamp();
+      return false;
+    }
+    return true;
   }
 
   /** Keep at least a third of the viewport over the board so it can't be lost off-screen. */

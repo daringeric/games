@@ -1,8 +1,9 @@
 // Build tools in the real app: drag-to-draw cable (mouse and touch), the
 // cabinet tool's coverage card and splitters, cabinet removal, the OLT panel
-// and the cost overlay switch.
+// and the cost overlay switch; round 4: storms and outages on the map, and the
+// span panel's underground rebuild.
 //
-// Owner: ui-map workstream.
+// Owner: ui-map workstream (round 4 additions: sim-storms).
 
 import { expect, test } from '@playwright/test';
 import type { CDPSession, Page } from '@playwright/test';
@@ -417,4 +418,149 @@ test.describe('on a touch phone', () => {
     expect(pinched.cabinets).toEqual(drawn.cabinets);
     expect(errors).toEqual([]);
   });
+});
+
+/**
+ * Cable a street out of the CO (aerial when it has poles) with a cabinet at
+ * the CO, and run the days until it is live. Returns the span, its street and
+ * the screen point of its middle (on open map).
+ */
+async function liveSpanFromCo(page: Page): Promise<{ span: number; segment: number; name: string; method: string; mid: { x: number; y: number } }> {
+  const placed = await page.evaluate(() => {
+    const lst = window.__lst!;
+    const { city } = lst.getState();
+    const onCanvas = (x: number, y: number) => {
+      const p = lst.worldToScreen(x, y);
+      return document.elementFromPoint(p.x, p.y)?.tagName === 'CANVAS';
+    };
+    const mid = (id: number) => {
+      const seg = city.segments[id]!;
+      return { x: (city.nodes[seg.a]!.x + city.nodes[seg.b]!.x) / 2, y: (city.nodes[seg.a]!.y + city.nodes[seg.b]!.y) / 2 };
+    };
+    const candidates = city.segments
+      .filter((s) => (s.a === city.coNode || s.b === city.coNode) && s.hasPoles)
+      .filter((s) => onCanvas(mid(s.id).x, mid(s.id).y));
+    const seg = candidates[0];
+    if (!seg) return null;
+    lst.dispatch({ type: 'placeCabinet', node: city.coNode });
+    const result = lst.dispatch({ type: 'layCable', segments: [seg.id], method: 'aerial' });
+    return result.ok ? seg.id : null;
+  });
+  expect(placed, 'a poled street out of the CO on screen').not.toBeNull();
+  // Make-ready can take months: run the days until the span is live.
+  await page.evaluate((segment) => {
+    const lst = window.__lst!;
+    for (let i = 0; i < 400 && lst.getState().network.spans.find((s) => s.segment === segment)?.stage !== 'live'; i++) lst.tick(1);
+  }, placed!);
+  return page.evaluate((segment) => {
+    const lst = window.__lst!;
+    const s = lst.getState();
+    const span = s.network.spans.find((x) => x.segment === segment)!;
+    const seg = s.city.segments[segment]!;
+    const a = s.city.nodes[seg.a]!;
+    const b = s.city.nodes[seg.b]!;
+    return { span: span.id, segment, name: seg.name, method: span.method, mid: lst.worldToScreen((a.x + b.x) / 2, (a.y + b.y) / 2) };
+  }, placed!);
+}
+
+test('a storm outage shows on the map and on the span card, until repairs finish', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await page.getByRole('button', { name: 'Got it' }).click();
+  const live = await liveSpanFromCo(page);
+  expect(live.method).toBe('aerial');
+  expect(await page.evaluate(() => window.__lst!.stats())).toMatchObject({ outageSpans: 0, stormsShown: 0 });
+
+  // A storm hits the street today (written into the state the way the sim records one).
+  await page.evaluate((spanId) => {
+    const s = window.__lst!.getState();
+    const span = s.network.spans.find((x) => x.id === spanId)!;
+    const seg = s.city.segments[span.segment]!;
+    const node = s.city.nodes[seg.a]!;
+    const id = s.weather.nextStormId++;
+    s.weather.storms.push({ id, day: s.day, x: node.x, y: node.y, radius: 9, severity: 2, spans: [span.id], repairCost: 1_500 });
+    span.outage = { cause: 'storm', storm: id, startDay: s.day, daysLeft: 3, repairCost: 1_500 };
+    s.network.version++;
+  }, live.span);
+  await expect.poll(() => page.evaluate(() => window.__lst!.stats().outageSpans)).toBe(1);
+  expect(await page.evaluate(() => window.__lst!.stats().stormsShown)).toBe(1);
+
+  // The inspect card says what happened.
+  await page.keyboard.press('i');
+  await page.mouse.move(live.mid.x, live.mid.y);
+  const card = page.locator('.float-card');
+  await expect(card).toContainText('Out of service: storm damage, 3 days to repair');
+  await expect(card).toContainText('Storm risk');
+
+  // Three days later the crews are done: the map shows the cable whole again.
+  await page.evaluate(() => window.__lst!.tick(3));
+  await expect.poll(() => page.evaluate(() => window.__lst!.stats().outageSpans)).toBe(0);
+  expect(await page.evaluate(() => window.__lst!.getState().notices.at(-1)?.kind)).toBe('serviceRestored');
+  expect(errors).toEqual([]);
+});
+
+test('the span panel shows a span’s storm exposure and rebuilds it underground', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  await page.getByRole('button', { name: 'Got it' }).click();
+  const live = await liveSpanFromCo(page);
+  await page.keyboard.press('i');
+  await page.mouse.click(live.mid.x, live.mid.y);
+
+  const panel = page.getByTestId('span-panel');
+  await expect(panel).toBeVisible();
+  await expect(panel).toHaveAttribute('role', 'dialog');
+  await expect(panel).toContainText(`Cable on ${live.name}`);
+  await expect(panel).toContainText('Storm history');
+  await expect(panel.getByTestId('span-risk')).toContainText('Aerial (now)');
+  await expect(panel.getByTestId('span-risk')).toContainText('Underground');
+
+  const quote = await page.evaluate((spanId) => {
+    const s = window.__lst!.getState();
+    return { cash: s.finance.cash, cost0: s.network.spans.find((x) => x.id === spanId)!.cost };
+  }, live.span);
+  const button = panel.getByTestId('span-convert');
+  await expect(button).toBeEnabled();
+  await expect(button).toContainText('Rebuild underground: $');
+  await button.click();
+  await expect.poll(() => page.evaluate((spanId) => window.__lst!.getState().network.spans.find((x) => x.id === spanId)!.conversion?.stage ?? null, live.span)).toBe('permitting');
+  const after = await page.evaluate((spanId) => {
+    const s = window.__lst!.getState();
+    const span = s.network.spans.find((x) => x.id === spanId)!;
+    return { cash: s.finance.cash, cost: span.cost, conversionCost: span.conversion!.cost };
+  }, live.span);
+  expect(after.cash).toBe(quote.cash - after.conversionCost);
+  expect(after.cost).toBe(quote.cost0 + after.conversionCost);
+  await expect(page.locator('.toast-ok').last()).toContainText(`Underground rebuild ordered on ${live.name}`);
+  // The panel follows: the rebuild is under way, the button can't order a second one.
+  await expect(panel.getByTestId('span-info')).toContainText('Being rebuilt underground');
+  await expect(button).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.__lst!.stats().rebuildSpans)).toBe(1);
+
+  // Esc closes it; once the rebuild is done the span is underground and pays no pole rent.
+  await page.keyboard.press('Escape');
+  await expect(panel).toBeHidden();
+  await page.evaluate((spanId) => {
+    const lst = window.__lst!;
+    for (let i = 0; i < 200 && lst.getState().network.spans.find((x) => x.id === spanId)!.conversion !== null; i++) lst.tick(1);
+  }, live.span);
+  expect(await page.evaluate((spanId) => window.__lst!.getState().network.spans.find((x) => x.id === spanId)!.method, live.span)).toBe('underground');
+  await expect.poll(() => page.evaluate(() => window.__lst!.stats().rebuildSpans)).toBe(0);
+  // Clicking it again shows an underground span: nothing to rebuild.
+  await page.mouse.click(live.mid.x, live.mid.y);
+  await expect(panel).toBeVisible();
+  await expect(panel.getByTestId('span-risk')).toContainText('Underground (now)');
+  await expect(button).toBeHidden();
+  // A press elsewhere on the open map puts it away.
+  const elsewhere = await page.evaluate((mid) => {
+    for (const [dx, dy] of [[-120, 0], [0, 120], [0, -120], [120, 0], [-200, 80], [80, 200]] as const) {
+      const p = { x: mid.x + dx, y: mid.y + dy };
+      if (document.elementFromPoint(p.x, p.y)?.tagName === 'CANVAS') return p;
+    }
+    return null;
+  }, live.mid);
+  expect(elsewhere, 'open map near the span').not.toBeNull();
+  await page.mouse.click(elsewhere!.x, elsewhere!.y);
+  await expect(panel).toBeHidden();
+  expect(errors).toEqual([]);
 });

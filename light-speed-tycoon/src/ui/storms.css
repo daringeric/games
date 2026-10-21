@@ -1,0 +1,225 @@
+/* Round 4: map UI outside the canvas: outage and storm cards, the convert-to-underground action, the storm legend (sim-storms workstream).
+   Imported by main.ts after style.css and mapTools.css, so rules here may
+   override theirs; style.css itself is frozen for round 4. Colors and sizes come
+   from the theme variables themeCss.ts publishes (--card, --text, --accent,
+   --danger, --radius, --touch, ...), never literals. */
+
+/* Span panel (opened by clicking a live span with the inspect tool) -------------- */
+
+.span-panel {
+  position: absolute;
+  z-index: 15;
+  /* Under the HUD, whose height main.ts publishes as --hud-bottom. */
+  top: calc(var(--hud-bottom, 116px) + 10px);
+  right: 12px;
+  width: 330px;
+  max-height: calc(100% - var(--hud-bottom, 116px) - 24px);
+  padding: 10px 14px 14px;
+  overflow: auto;
+  border-top: 5px solid var(--tone-aerial);
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.span-panel[data-method='underground'] {
+  border-top-color: var(--tone-underground);
+}
+
+.span-panel[hidden] {
+  display: none;
+}
+
+.span-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.span-icon {
+  color: var(--danger);
+}
+
+.span-title {
+  flex: 1;
+  margin: 0;
+  font: 600 16px / 1.2 var(--font-display);
+  overflow-wrap: anywhere;
+}
+
+.span-close {
+  background: var(--chip);
+}
+
+.span-close svg {
+  width: 18px;
+  height: 18px;
+}
+
+.span-facts {
+  display: grid;
+  gap: 3px;
+  margin: 0 0 8px;
+}
+
+.span-facts .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.span-facts dt {
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.span-facts dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 800;
+  text-align: right;
+}
+
+.span-facts dd.tone-negative {
+  color: var(--danger);
+}
+
+.span-facts dd.tone-muted,
+.span-sub-note {
+  color: var(--text-2);
+  font-weight: 700;
+}
+
+.span-sub-note {
+  font-size: 12px;
+}
+
+.span-note {
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.span-note-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.span-note-info {
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.span-sub {
+  margin: 10px 0 4px;
+  font: 600 14px / 1.2 var(--font-display);
+}
+
+.span-empty {
+  margin: 0 0 8px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.span-empty[hidden],
+.span-history[hidden],
+.span-rebuild[hidden] {
+  display: none;
+}
+
+.span-history {
+  max-height: 120px;
+  margin: 0 0 8px;
+  padding: 0;
+  overflow: auto;
+  font-size: 13px;
+  list-style: none;
+}
+
+.span-history li {
+  display: flex;
+  gap: 10px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--card-border);
+}
+
+.span-when {
+  flex: none;
+  color: var(--text-2);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.span-what {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.span-risk {
+  width: 100%;
+  margin: 0 0 8px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.span-risk th,
+.span-risk td {
+  padding: 3px 4px;
+  border-bottom: 1px dashed var(--card-border);
+  text-align: left;
+}
+
+.span-risk thead th {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.span-risk tbody th {
+  font-weight: 800;
+}
+
+.span-risk td {
+  font-weight: 700;
+}
+
+.span-risk tr.is-current th,
+.span-risk tr.is-current td {
+  background: var(--chip);
+}
+
+.btn.span-convert {
+  width: 100%;
+  min-height: var(--touch);
+  margin-top: 4px;
+  border-radius: 14px;
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+  font: 600 15px / 1.1 var(--font-display);
+}
+
+.btn.span-convert:disabled {
+  background: var(--chip);
+  color: var(--text-2);
+  box-shadow: none;
+  cursor: not-allowed;
+  transform: none;
+}
+
+@media (max-width: 880px) {
+  .span-panel {
+    top: auto;
+    right: 8px;
+    bottom: 84px;
+    left: 8px;
+    width: auto;
+    max-height: 58vh;
+  }
+}

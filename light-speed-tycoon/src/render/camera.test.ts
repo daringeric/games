@@ -79,4 +79,53 @@ describe('Camera', () => {
     const cover = 844 / 1800;
     expect(cam.scale).toBeCloseTo(Math.sqrt(contain * cover));
   });
+
+  it('centers a world point at the middle of the viewport, or at a given screen point', () => {
+    const cam = camera();
+    cam.fit(NO_INSETS);
+    cam.centerOn(1500, 1200);
+    const mid = cam.worldToScreen(1500, 1200);
+    expect(mid.x).toBeCloseTo(500);
+    expect(mid.y).toBeCloseTo(400);
+    cam.centerOn(1500, 1200, 560, 430);
+    const at = cam.worldToScreen(1500, 1200);
+    expect(at.x).toBeCloseTo(560);
+    expect(at.y).toBeCloseTo(430);
+  });
+
+  it('glides to a point over time, easing out, and a pan cancels the glide', () => {
+    const cam = camera();
+    cam.fit(NO_INSETS);
+    const start = { x: cam.x, y: cam.y };
+    cam.glideTo(2500, 2000, 1000, 400);
+    expect(cam.gliding).toBe(true);
+    // Nothing moves until the first step.
+    expect({ x: cam.x, y: cam.y }).toEqual(start);
+    expect(cam.step(1200)).toBe(true);
+    const half = cam.worldToScreen(2500, 2000);
+    expect(cam.step(1400)).toBe(false);
+    expect(cam.gliding).toBe(false);
+    const end = cam.worldToScreen(2500, 2000);
+    expect(end.x).toBeCloseTo(500);
+    expect(end.y).toBeCloseTo(400);
+    // Ease-out: past the midpoint of the way at half the time.
+    const startScreen = { x: 2500 * cam.scale + start.x, y: 2000 * cam.scale + start.y };
+    expect(Math.abs(half.x - startScreen.x)).toBeGreaterThan(Math.abs(end.x - startScreen.x) / 2);
+
+    cam.glideTo(500, 500, 2000, 400);
+    cam.step(2100);
+    cam.panBy(10, 0);
+    expect(cam.gliding).toBe(false);
+    const x = cam.x;
+    expect(cam.step(2500)).toBe(false);
+    expect(cam.x).toBe(x);
+  });
+
+  it('moves at once for a zero-length glide', () => {
+    const cam = camera();
+    cam.fit(NO_INSETS);
+    cam.glideTo(1500, 1200, 0, 0);
+    expect(cam.gliding).toBe(false);
+    expect(cam.worldToScreen(1500, 1200).x).toBeCloseTo(500);
+  });
 });

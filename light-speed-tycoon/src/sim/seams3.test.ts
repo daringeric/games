@@ -6,12 +6,18 @@
 // one stage at a time; a default freezes the game for good; financing never
 // touches operations (operating cash flow, cost per passing, subscribers);
 // saves round-trip and replay at every covenant stage; and every frozen save
-// (v1 and v2) migrates and then plays a year with loans.
+// (v1 and v2) migrates and then plays a year with loans. Round 4: a frozen
+// hoarder (the v3 saves) is swept, warned, called after
+// FROZEN_ACCELERATION_CLOSES frozen closes and repays within
+// ACCELERATION_CLOSES closes, or defaults.
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
   COVENANT_CURE_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
   LATE_FEE_MIN,
   LATE_FEE_SHARE,
   LEVERAGE_SPREAD_BANDS,
@@ -41,7 +47,7 @@ import { deserialize, hashState, serialize } from './save';
 import { closedMonth, makeTradingState } from './testing/fixtures';
 import type { Command, CommandResult, CovenantStage, GameState, LedgerCategory, MonthlyReport, NoticeKind } from './types';
 
-type Fixture = 'v1-grid' | 'v1-town' | 'v2-grid' | 'v2-town';
+type Fixture = 'v1-grid' | 'v1-town' | 'v2-grid' | 'v2-town' | 'v3-grid' | 'v3-town';
 
 /** A frozen save from an earlier build, migrated to the current schema. */
 function fixture(name: Fixture): GameState {
@@ -211,6 +217,8 @@ describe('month-close order with debt', () => {
 describe('term loans over their full lives, through real closes', () => {
   it('repay exactly the principal, charge exactly the quoted interest and level payments, 5 and 7 years side by side', () => {
     const state = fixture('v2-town');
+    // Test-only: a cash cushion so seven unattended years (installs, round-4 storm repairs) never miss a payment.
+    state.finance.cash += START_CASH;
     const amount5 = Math.max(TERM_LOAN_MIN, Math.floor(termCapacity(state) / 10 / 1000) * 1000);
     const q5 = quoteTermLoan(state, amount5, 5);
     expect(q5.ok).toBe(true);
@@ -450,6 +458,9 @@ describe('financing never touches operations', () => {
   it('a borrower and a non-borrower with the same plant have identical months, but for the financing lines', () => {
     const plain = fixture('v2-town');
     const borrower = fixture('v2-town');
+    // Test-only: the same cushion of cash for both, so neither runs short of an order or pauses
+    // installs (round-4 storm repairs and price rules cost the plain game money too), whatever it borrows.
+    for (const state of [plain, borrower]) state.finance.cash += START_CASH;
     const loan = Math.max(TERM_LOAN_MIN, Math.floor(termCapacity(borrower) / 5 / 1000) * 1000);
     apply(borrower, { type: 'takeTermLoan', amount: loan, termYears: 5 });
     const startReports = plain.finance.reports.length;
@@ -552,9 +563,115 @@ describe('the line is priced on the figures the Bank shows', () => {
     state.debt.credit.balance = Math.round(uw * (edge.maxLeverage + 0.004));
     const report = closedMonth(2027, 4, 40_000, 10_000);
     state.finance.reports.push(report);
-    reviewDebt(state, report, { due: 0, interestPaid: 0, principalPaid: 0, missed: false, defaulted: false, lateFee: 0, paidOff: [] });
+    reviewDebt(state, report, { due: 0, interestPaid: 0, principalPaid: 0, missed: false, defaulted: false, lateFee: 0, paidOff: [], sweep: 0 });
     expect(report.debt?.leverageX100).toBe(edge.maxLeverage * 100);
     expect(state.debt.credit.rate.leverageBps).toBe(edge.spreadBps);
     expectOfferExplainsRate(state);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 4: the frozen hoarder. A line frozen with debt owed no longer sits on
+// its cash forever: the bank sweeps half of each month's positive operating
+// cash flow, warns, calls the loans after FROZEN_ACCELERATION_CLOSES frozen
+// closes in a row, and collects everything within ACCELERATION_CLOSES closes
+// (or the game ends in default).
+// ---------------------------------------------------------------------------
+
+describe('a frozen hoarder (round 4)', () => {
+  interface CloseLog {
+    stage: CovenantStage;
+    frozenCloses: number;
+    closesLeft: number | null;
+    sweep: number;
+    kinds: NoticeKind[];
+    missed: boolean;
+  }
+
+  /** Close months with no commands until the debt is gone (and the call over) or the game ends; one log row per close. */
+  function sitOnCash(state: GameState, maxCloses: number): CloseLog[] {
+    const openingCash = state.finance.cash - posted(state);
+    const log: CloseLog[] = [];
+    for (let i = 0; i < maxCloses && !state.gameOver && (totalDebt(state) > 0 || state.debt.acceleration !== null); i++) {
+      const mark = lastNoticeId(state);
+      const report = closeNext(state);
+      log.push({
+        stage: report.debt!.stage,
+        frozenCloses: report.debt!.frozenCloses!,
+        closesLeft: report.debt!.accelerationClosesLeft ?? null,
+        sweep: report.debt!.sweep!,
+        kinds: kindsSince(state, mark),
+        missed: report.debt!.missedPayment,
+      });
+      // The books balance and the game saves and loads as itself at every close.
+      expect(openingCash + posted(state)).toBe(state.finance.cash);
+      expect(deserialize(serialize(state))).toEqual(state);
+    }
+    return log;
+  }
+
+  /** The closes (1-based) at which a notice of `kind` was posted. */
+  function closesWith(log: readonly CloseLog[], kind: NoticeKind): number[] {
+    return log.flatMap((row, i) => (row.kinds.includes(kind) ? [i + 1] : []));
+  }
+
+  it('v3-grid (frozen at load, burning cash): warned, called, then repaid in full within the closes the bank allows', () => {
+    const state = fixture('v3-grid');
+    expect(state.debt.covenant.stage).toBe('frozen');
+    const start = state.debt.frozenCloses;
+    expect(start).toBeGreaterThan(0);
+    const cash = state.finance.cash;
+    expect(cash).toBeGreaterThan(totalDebt(state));
+    const log = sitOnCash(state, 24);
+    expect(state.gameOver).toBeNull();
+    // Frozen at every close until the call: counted on from the migrated count.
+    const callAt = FROZEN_ACCELERATION_CLOSES - start;
+    for (let i = 0; i < callAt; i++) expect(log[i]).toMatchObject({ stage: 'frozen', frozenCloses: start + i + 1 });
+    // Warned at the closes leaving 1..ACCELERATION_WARNING_CLOSES before the call, called at the call.
+    const warnings: number[] = [];
+    for (let left = ACCELERATION_WARNING_CLOSES; left >= 1; left--) warnings.push(callAt - left);
+    expect(closesWith(log, 'accelerationWarning')).toEqual(warnings);
+    expect(closesWith(log, 'loansCalled')).toEqual([callAt]);
+    expect(log[callAt - 1]!.closesLeft).toBe(ACCELERATION_CLOSES);
+    // A burning month has nothing to sweep.
+    expect(log.every((row) => row.sweep === 0)).toBe(true);
+    // Everything repaid within the closes the bank allowed, the call cleared, the line back to good standing.
+    expect(log.length).toBeLessThanOrEqual(callAt + ACCELERATION_CLOSES);
+    expect(log.every((row) => !row.missed)).toBe(true);
+    expect(totalDebt(state)).toBe(0);
+    expect(state.debt.acceleration).toBeNull();
+    expect(state.debt.covenant.stage).toBe('compliant');
+    expect(log.at(-1)!.closesLeft).toBeNull();
+  });
+
+  it('v3-town borrowing everything and sitting on the cash: swept while frozen, warned, called, then repaid or in default', () => {
+    const state = fixture('v3-town');
+    apply(state, { type: 'drawCredit', amount: creditAvailable(state) });
+    const quote = quoteTermLoan(state, termCapacity(state), 7);
+    expect(quote).toMatchObject({ ok: true, breachesCovenant: true });
+    apply(state, { type: 'takeTermLoan', amount: quote.amount, termYears: 7 });
+    const log = sitOnCash(state, 30);
+    const frozenAt = log.findIndex((row) => row.stage === 'frozen') + 1;
+    expect(frozenAt).toBeGreaterThan(0);
+    expect(log.slice(0, frozenAt).map((row) => row.stage)).toEqual(['warning', 'penalty', 'frozen'].slice(-frozenAt));
+    // The close that froze the line did not sweep; every frozen close after it with cash flow to share did.
+    expect(log[frozenAt - 1]!.sweep).toBe(0);
+    const swept = closesWith(log, 'debtSwept');
+    expect(swept.length).toBeGreaterThan(0);
+    expect(Math.min(...swept)).toBeGreaterThan(frozenAt);
+    for (const close of swept) expect(log[close - 1]!.sweep).toBeGreaterThan(0);
+    // Warned, then called at the FROZEN_ACCELERATION_CLOSES-th frozen close in a row.
+    const callAt = frozenAt + FROZEN_ACCELERATION_CLOSES - 1;
+    expect(closesWith(log, 'loansCalled')).toEqual([callAt]);
+    expect(closesWith(log, 'accelerationWarning').length).toBe(ACCELERATION_WARNING_CLOSES);
+    // Then it ends one way or the other within the closes the bank allows.
+    expect(log.length).toBeLessThanOrEqual(callAt + ACCELERATION_CLOSES);
+    if (state.gameOver) {
+      expect(state.gameOver.reason).toBe('default');
+      expect(state.gameOver.message).toMatch(/^Default: the bank called your loans/);
+    } else {
+      expect(totalDebt(state)).toBe(0);
+      expect(state.debt.acceleration).toBeNull();
+    }
   });
 });

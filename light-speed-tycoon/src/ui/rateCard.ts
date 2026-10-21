@@ -1,9 +1,51 @@
 // Rate card: what everything costs, straight from balance.ts, so the player
-// can plan a build before quoting it, and (round 3) what borrowing costs.
+// can plan a build before quoting it, (round 3) what borrowing costs, and
+// (round 4) the rules of storms, pricing and a frozen credit line.
 //
 // Owner: ui-economy workstream.
 
 import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
+  ARR_SPIKE_CAP,
+  DIG_INS_PER_MILE_PER_YEAR,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_RESERVE,
+  FROZEN_SWEEP_SHARE,
+  FUNDING_CUSHION_MONTHS,
+  GRANDFATHER_MONTHS_DEFAULT,
+  GRANDFATHER_MONTHS_MAX,
+  GRANDFATHER_STEP_SHARE,
+  INCUMBENT_PROMO_CHURN,
+  INCUMBENT_PROMO_DISCOUNT,
+  INCUMBENT_PROMO_MIN_PASSINGS,
+  INCUMBENT_PROMO_MONTHS,
+  INCUMBENT_PROMO_QUIET_MONTHS,
+  INCUMBENT_PROMO_TAKE_RATE,
+  OUTAGE_CHURN_BASE,
+  OUTAGE_CHURN_MAX,
+  OUTAGE_CHURN_PER_DAY,
+  OUTAGE_DAYS_AERIAL_MAX,
+  OUTAGE_DAYS_AERIAL_MIN,
+  OUTAGE_DAYS_UNDERGROUND_MAX,
+  OUTAGE_DAYS_UNDERGROUND_MIN,
+  PRICE_STEP_CHURN_MAX,
+  PRICE_STEP_CHURN_PER_RISE,
+  PROMO_MAX_MONTHS,
+  PROMO_MAX_PERCENT_OFF,
+  PROMO_STEP_SHARE,
+  REPAIR_BASE_AERIAL,
+  REPAIR_BASE_UNDERGROUND,
+  REPAIR_PER_FT_AERIAL,
+  REPAIR_PER_FT_UNDERGROUND,
+  STORM_AERIAL_DAMAGE_CHANCE,
+  STORM_CHANCE_PER_DAY,
+  STORM_SEVERITY_MAX,
+  STORM_START_DAY,
+  STORM_UNDERGROUND_DAMAGE_CHANCE,
+  TIER_RETIRE_CHURN_BASE,
+  TIER_RETIRE_CHURN_MAX,
+  TIER_RETIRE_CHURN_PER_RISE,
   AERIAL_COST_PER_FT,
   CABINET_COST,
   CABINET_REACH_FT,
@@ -47,11 +89,25 @@ import {
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
   UNDERWRITING_MIN_MARGIN,
 } from '../sim/balance';
+import { formatDate } from '../sim/calendar';
 import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { el } from './dom';
 import { formatMultiple } from './bankPanel';
-import { formatBpsDelta, formatFeet, formatMoney, formatNumber, formatPercent, formatPerFt, formatRate, formatRatio, plural } from './format';
+import {
+  formatBpsDelta,
+  formatDayRange,
+  formatFeet,
+  formatMoney,
+  formatNumber,
+  formatOdds,
+  formatPercent,
+  formatPercentFine,
+  formatPerFt,
+  formatRate,
+  formatRatio,
+  plural,
+} from './format';
 
 export interface RateRow {
   label: string;
@@ -137,7 +193,132 @@ export function rateCardSections(): RateSection[] {
       ],
     },
     financingSection(),
+    frozenLineSection(),
+    stormSection(),
+    pricingSection(),
   ];
+}
+
+/** A price rise of this share is how the rate card quotes per-rise churn ("4% per 10% rise"). */
+const RISE_STEP = 0.1;
+
+/** Round 4: storms, dig-ins, outages and repairs, from balance.ts. */
+export function stormSection(): RateSection {
+  return {
+    title: 'Storms and dig-ins',
+    rows: [
+      { label: 'Storm season', value: `from ${formatDate(STORM_START_DAY)}`, note: 'The first year is calm, for building' },
+      {
+        label: 'Storm chance',
+        value: `${formatOdds(STORM_CHANCE_PER_DAY)} a day`,
+        note: `Each storm hits one area of the map, severity 1–${formatNumber(STORM_SEVERITY_MAX)}`,
+      },
+      { label: 'Aerial span damaged', value: `${formatPercentFine(STORM_AERIAL_DAMAGE_CHANCE)} per severity`, note: 'Each live aerial span in the storm area' },
+      {
+        label: 'Underground span damaged',
+        value: `${formatPercentFine(STORM_UNDERGROUND_DAMAGE_CHANCE)} per severity`,
+        note: 'Washouts are rare: buried cable rides out storms',
+      },
+      {
+        label: 'Dig-ins',
+        value: `${DIG_INS_PER_MILE_PER_YEAR.toLocaleString('en-US', { maximumFractionDigits: 2 })} a year per mile`,
+        note: 'An excavator cuts live underground cable (5,280 ft to the mile)',
+      },
+      { label: 'Aerial outage', value: formatDayRange(OUTAGE_DAYS_AERIAL_MIN, OUTAGE_DAYS_AERIAL_MAX), note: 'A damaged aerial span is out this long' },
+      {
+        label: 'Underground outage',
+        value: formatDayRange(OUTAGE_DAYS_UNDERGROUND_MIN, OUTAGE_DAYS_UNDERGROUND_MAX),
+        note: 'Digging down to the break takes longer',
+      },
+      { label: 'Aerial repair', value: `${formatMoney(REPAIR_BASE_AERIAL)} + ${formatPerFt(REPAIR_PER_FT_AERIAL)}`, note: 'Per damaged span, by its length' },
+      {
+        label: 'Underground repair',
+        value: `${formatMoney(REPAIR_BASE_UNDERGROUND)} + ${formatPerFt(REPAIR_PER_FT_UNDERGROUND)}`,
+        note: 'Per damaged span, by its length',
+      },
+      {
+        label: 'Outage churn',
+        value: `${formatPercentFine(OUTAGE_CHURN_BASE)} + ${formatPercentFine(OUTAGE_CHURN_PER_DAY)} a day out`,
+        note: `Extra cancellations at the close among subscribers who lost service (the base once per outage), at most ${formatPercent(OUTAGE_CHURN_MAX)}`,
+      },
+    ],
+  };
+}
+
+/** Round 4: price rises, price locks, retired tiers, intro promos and the incumbent's promos, from balance.ts. */
+export function pricingSection(): RateSection {
+  return {
+    title: 'Pricing',
+    rows: [
+      {
+        label: 'Price lock on a rise',
+        value: plural(GRANDFATHER_MONTHS_DEFAULT, 'month'),
+        note: `Today's subscribers keep their price this long (you can choose 0–${formatNumber(GRANDFATHER_MONTHS_MAX)}); new subscribers pay the new price; cuts reach everyone at once`,
+      },
+      {
+        label: 'Price-step churn',
+        value: `${formatPercentFine(PRICE_STEP_CHURN_PER_RISE * RISE_STEP)} per ${formatPercent(RISE_STEP)} rise`,
+        note: `Cancellations when a higher price reaches subscribers, at most ${formatPercent(PRICE_STEP_CHURN_MAX)}`,
+      },
+      { label: 'After a price lock', value: `${formatPercent(GRANDFATHER_STEP_SHARE)} of that`, note: 'Grandfathered subscribers take a rise better' },
+      { label: 'After an intro promo', value: `${formatPercent(PROMO_STEP_SHARE)} of that`, note: 'When a new subscriber’s promo price ends' },
+      {
+        label: 'Retired tier churn',
+        value: `${formatPercentFine(TIER_RETIRE_CHURN_BASE)} + ${formatPercentFine(TIER_RETIRE_CHURN_PER_RISE * RISE_STEP)} per ${formatPercent(RISE_STEP)} dearer`,
+        note: `Subscribers on a tier you stop offering move to the nearest-priced tier at the next close; at most ${formatPercent(TIER_RETIRE_CHURN_MAX)} cancel`,
+      },
+      {
+        label: 'Intro promo',
+        value: `up to ${formatNumber(PROMO_MAX_PERCENT_OFF)}% off`,
+        note: `For new signups, for up to ${plural(PROMO_MAX_MONTHS, 'month')}`,
+      },
+      {
+        label: 'Incumbent promo trigger',
+        value: `${formatPercent(INCUMBENT_PROMO_TAKE_RATE)} take rate`,
+        note: `In a cabinet area with at least ${plural(INCUMBENT_PROMO_MIN_PASSINGS, 'passing')}`,
+      },
+      {
+        label: 'Incumbent promo',
+        value: `${formatMoney(INCUMBENT_PROMO_DISCOUNT)} off for ${plural(INCUMBENT_PROMO_MONTHS, 'month')}`,
+        note: `Lowers your target take rate there; then quiet there for ${plural(INCUMBENT_PROMO_QUIET_MONTHS, 'month')}`,
+      },
+      {
+        label: 'Incumbent promo churn',
+        value: `+${formatPercentFine(INCUMBENT_PROMO_CHURN)} a month`,
+        note: 'For your subscribers in that area while the promo runs',
+      },
+    ],
+  };
+}
+
+/** Round 4: a frozen credit line's sweep and the loans being called, and the lending rules around them, from balance.ts. */
+export function frozenLineSection(): RateSection {
+  return {
+    title: 'Frozen line and loan rules',
+    rows: [
+      {
+        label: 'Frozen sweep',
+        value: `${formatPercent(FROZEN_SWEEP_SHARE)} of cash flow`,
+        note: `Each frozen close repays debt with this share of the month's positive operating cash flow, never taking cash below ${formatMoney(FROZEN_SWEEP_RESERVE)}`,
+      },
+      {
+        label: 'Loans called',
+        value: `after ${plural(FROZEN_ACCELERATION_CLOSES, 'frozen close')}`,
+        note: `In a row. Then everything owed falls due over ${plural(ACCELERATION_CLOSES, 'close')}, and a close that cannot pay is a default`,
+      },
+      { label: 'Call warning', value: `${plural(ACCELERATION_WARNING_CLOSES, 'close')} ahead`, note: 'A notice before the bank calls the loans' },
+      {
+        label: 'Lending ARR cap',
+        value: `${formatMultiple(ARR_SPIKE_CAP)} weakest month`,
+        note: 'Trailing revenue counts for at most this much of its weakest month, so a price spike cannot inflate what the bank lends',
+      },
+      {
+        label: 'Funding cushion',
+        value: plural(FUNDING_CUSHION_MONTHS, 'month'),
+        note: 'Of fixed costs (plus the next payment) that financing hints and cure advice leave in cash',
+      },
+    ],
+  };
 }
 
 /** Borrowing: rates and their parts, limits, covenants and fees, from balance.ts. */
@@ -169,19 +350,19 @@ export function financingSection(): RateSection {
     { label: 'Penalty rate', value: formatBpsDelta(PENALTY_STEP_UP_BPS), note: 'On every balance after repeated covenant breaches, until cured' },
     {
       label: 'Credit limit',
-      value: `${formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE)} ARR`,
-      note: 'Annual recurring revenue of your last closed months',
+      value: `${formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE)} lending ARR`,
+      note: 'Lending ARR: annual recurring revenue of your last closed months, smoothed',
     },
     {
       label: 'Term loan capacity',
-      value: `${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} ARR`,
+      value: `${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} lending ARR`,
       note: `Less the term loans you owe; at least ${formatMoney(TERM_LOAN_MIN)} a loan`,
     },
     { label: 'Terms', value: TERM_LOAN_YEARS.map((y) => `${y}`).join(' or ') + ' years', note: 'Level monthly payments of principal and interest' },
     {
       label: 'Leverage covenant',
       value: `max ${formatRatio(COVENANT_MAX_LEVERAGE)}`,
-      note: `Cash flow counted: yearly operating cash flow, or ${formatPercent(UNDERWRITING_MIN_MARGIN)} of ARR if that is more`,
+      note: `Cash flow counted: yearly operating cash flow (storm repairs at their past-year total), or ${formatPercent(UNDERWRITING_MIN_MARGIN)} of lending ARR if that is more`,
     },
     { label: 'Coverage covenant', value: `min ${formatRatio(COVENANT_MIN_COVERAGE)}`, note: 'That cash flow over the next 12 months of debt service' },
     {

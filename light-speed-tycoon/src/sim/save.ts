@@ -1,42 +1,61 @@
 // Save/load. Pure string <-> GameState; browser storage lives in the UI layer.
 //
-// This build writes schemaVersion 3 and reads 3, 2 and 1. Older saves (still
-// in players' browsers as autosaves) are validated against their own shape and
-// migrated one version at a time, each step validated: v1 -> migrateV1toV2 ->
-// v2 -> migrateV2toV3 -> v3. A v2 save gets no debt.
+// This build writes schemaVersion 4 and reads 4, 3, 2 and 1. Older saves
+// (still in players' browsers as autosaves) are validated against their own
+// shape and migrated one version at a time, each step validated: v1 ->
+// migrateV1toV2 -> v2 -> migrateV2toV3 -> v3 -> migrateV3toV4 -> v4. A v2
+// save gets no debt; a v3 save gets no storms, price locks or promos.
 //
-// Owner after the round-3 contract: sim-debt workstream (debt validation and
-// corruption cases; migration tests against the frozen v1 and v2 fixtures in
-// testing/).
+// Owner: the round-4 contract (architect). Workstreams do not change the
+// saved shape; migration tests run against the frozen v1, v2 and v3
+// fixtures in testing/.
 
-import { CABINET_REACH_FT, OLT_MAX_CARDS, OLT_PORTS_PER_CARD, START_YEAR } from './balance';
-import { groupThousands } from './finance';
+import {
+  ACCELERATION_WARNING_CLOSES,
+  CABINET_REACH_FT,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_SHARE,
+  OLT_MAX_CARDS,
+  OLT_PORTS_PER_CARD,
+  START_YEAR,
+} from './balance';
+import { dateOf, formatMonth } from './calendar';
+import { formatMoney, groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
 import { newDebt } from './debt';
 import { deriveSeed } from './rng';
 import { otherEnd, segmentsAtNode } from './streets';
-import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales } from './sales';
+import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales, retireDestination, unitsByTier } from './sales';
 import type {
+  Account,
   BuildStage,
   CableMethod,
   CableSpan,
   CovenantStage,
+  Debt,
   GameOverReason,
   GameState,
   LedgerCategory,
   LedgerEntry,
   MilestoneId,
+  MonthlyReport,
   MonthlyStats,
+  Network,
   NoticeKind,
+  OpsStats,
+  OutageCause,
   ParcelKind,
   PonTech,
+  PriceLockReason,
+  Sales,
   StreetClass,
   TierId,
   Zone,
 } from './types';
+import { CUT_OFF_DAYS_MAX, newWeather } from './weather';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const UINT32_MAX = 0xffffffff;
 /**
  * Largest map edge in cells a save may have: several times a generated town
@@ -68,6 +87,12 @@ const SANE_RATE_MAX_BPS = 100_000;
 const SANE_TERM_MONTHS_MAX = 1_200;
 /** Most compliant closes a save may count toward a cure (the rule itself, COVENANT_CURE_CLOSES, is tunable). */
 const SANE_CURE_CLOSES_MAX = 1_000;
+/** Most month closes a counter of closes (frozen closes, closes left of an acceleration) or a promo's months may hold. */
+const SANE_CLOSES_MAX = 10_000;
+/** Largest storm severity a save may carry (the rule, STORM_SEVERITY_MAX, is tunable). */
+const SANE_SEVERITY_MAX = 100;
+/** Most days of one month (an outage-days entry counts days in the open month). */
+const MONTH_DAYS_MAX = 31;
 
 export class SaveError extends Error {
   override name = 'SaveError';
@@ -80,8 +105,8 @@ export function serialize(state: GameState): string {
 
 /**
  * Parse and validate a save. Throws SaveError for malformed JSON, a missing or
- * unsupported schemaVersion, or a structurally invalid state. A schemaVersion 1
- * or 2 save is migrated to the current version (each step validated).
+ * unsupported schemaVersion, or a structurally invalid state. A schemaVersion
+ * 1, 2 or 3 save is migrated to the current version (each step validated).
  */
 export function deserialize(json: string): GameState {
   let raw: unknown;
@@ -98,25 +123,52 @@ export function deserialize(json: string): GameState {
     checkState(raw, 1);
     const v2 = migrateV1toV2(raw);
     checkState(v2 as unknown as Json, 2);
-    const state = migrateV2toV3(v2);
-    checkState(state as unknown as Json, 3);
+    const v3 = migrateV2toV3(v2);
+    checkState(v3 as unknown as Json, 3);
+    const state = toCurrent(v3);
     noteReachChange(state);
     return state;
   }
   if (raw.schemaVersion === 2) {
     upgradeEarlyV2(raw);
     checkState(raw, 2);
-    const state = migrateV2toV3(raw as unknown as V2State);
-    checkState(state as unknown as Json, 3);
-    return state;
+    const v3 = migrateV2toV3(raw as unknown as V2State);
+    checkState(v3 as unknown as Json, 3);
+    return toCurrent(v3);
+  }
+  if (raw.schemaVersion === 3) {
+    checkState(raw, 3);
+    return toCurrent(raw as unknown as V3State);
   }
   if (raw.schemaVersion !== SCHEMA_VERSION) {
     throw new SaveError(
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
-  checkState(raw, 3);
+  upgradeEarlyV4(raw);
+  checkState(raw, 4);
   return raw as unknown as GameState;
+}
+
+/**
+ * Bring a schemaVersion 4 save written before outage churn went by each
+ * subscriber's own days (Weather.cutOff) up to date: no subscriber has days
+ * waiting to be charged (an outage running now counts from today). The
+ * input object is changed in place; anything malformed is left for
+ * validation to reject.
+ */
+function upgradeEarlyV4(save: Json): void {
+  const weather = save.weather;
+  if (isRecord(weather) && !('cutOff' in weather)) weather.cutOff = [];
+}
+
+/** v3 -> v4, validated, and the notices about round-4 rules that take something away from this game. */
+function toCurrent(v3: V3State): GameState {
+  const state = migrateV3toV4(v3);
+  checkState(state as unknown as Json, 4);
+  noteRetiredTiers(state);
+  noteFrozenRules(state);
+  return state;
 }
 
 /**
@@ -171,17 +223,30 @@ export function fnv1a(text: string): string {
 // Migration
 // ---------------------------------------------------------------------------
 
-/** A schemaVersion 2 game: today's GameState without debt. */
-export type V2State = Omit<GameState, 'schemaVersion' | 'debt'> & { schemaVersion: 2 };
+/** A span as schemaVersion 2 and 3 saved it (no outage or conversion). */
+export type V3Span = Omit<CableSpan, 'outage' | 'conversion'>;
+/** An account as schemaVersion 2 and 3 saved it (no price locks). */
+export type V3Account = Omit<Account, 'locks'>;
+/** A schemaVersion 3 game: the round-3 shape (no weather, locks, promos, frozen counters). */
+export type V3State = Omit<GameState, 'schemaVersion' | 'rng' | 'network' | 'debt' | 'sales' | 'weather'> & {
+  schemaVersion: 3;
+  rng: { events: number; sales: number };
+  network: Omit<Network, 'spans'> & { spans: V3Span[] };
+  debt: Omit<Debt, 'frozenCloses' | 'acceleration'>;
+  sales: Omit<Sales, 'accounts' | 'promo' | 'incumbentPromos'> & { accounts: V3Account[] };
+};
+/** A schemaVersion 2 game: the round-3 shape without debt. */
+export type V2State = Omit<V3State, 'schemaVersion' | 'debt'> & { schemaVersion: 2 };
 
 /**
- * Turn a v2-valid save into a v3 GameState: everything kept as it is (the
- * same objects), plus debt = debt.newDebt() (nothing borrowed, covenant
- * compliant). Reports keep no `debt` stats (the UI shows them as "-").
- * Keys are written in newGame's order (debt right after finance) so migrated
- * and fresh saves hash alike.
+ * Turn a v2-valid save into a v3 game: everything kept as it is (the same
+ * objects), plus debt = debt.newDebt()'s round-3 fields (nothing borrowed,
+ * covenant compliant). Reports keep no `debt` stats (the UI shows them as
+ * "-"). Keys are written in newGame's order (debt right after finance) so
+ * migrated and fresh saves hash alike.
  */
-export function migrateV2toV3(v2: V2State): GameState {
+export function migrateV2toV3(v2: V2State): V3State {
+  const { credit, loans, nextLoanId, covenant } = newDebt();
   return {
     schemaVersion: 3,
     seed: v2.seed,
@@ -191,13 +256,157 @@ export function migrateV2toV3(v2: V2State): GameState {
     city: v2.city,
     network: v2.network,
     finance: v2.finance,
-    debt: newDebt(),
+    debt: { credit, loans, nextLoanId, covenant },
     sales: v2.sales,
     milestones: v2.milestones,
     notices: v2.notices,
     nextNoticeId: v2.nextNoticeId,
     gameOver: v2.gameOver,
   };
+}
+
+/**
+ * Consecutive closes at the end of `reports` whose review ended 'frozen'
+ * (report.debt.stage), stopping at the first that did not or has no debt stats.
+ */
+function trailingFrozenCloses(reports: readonly MonthlyReport[]): number {
+  let count = 0;
+  for (let i = reports.length - 1; i >= 0 && reports[i]?.debt?.stage === 'frozen'; i--) count++;
+  return count;
+}
+
+/**
+ * Turn a v3-valid save into a v4 GameState. The player keeps everything;
+ * what round 4 adds starts empty:
+ * - rng.weather = deriveSeed(seed, 'weather') (events and sales streams kept,
+ *   so make-ready draws, signups and churn continue exactly as before);
+ * - every span gets outage null and conversion null;
+ * - every account gets no price locks (everyone pays the list price, as in
+ *   round 3); no intro promo; no incumbent promos;
+ * - debt.frozenCloses = the trailing frozen closes of the reports when the
+ *   line is frozen with debt owed (at least 1, at most
+ *   FROZEN_ACCELERATION_CLOSES - ACCELERATION_WARNING_CLOSES - 1, so a game
+ *   frozen for years still gets its warning closes before the bank calls the
+ *   loans), else 0; no acceleration;
+ * - weather = weather.newWeather() (no storms yet);
+ * - reports keep no `ops` and no new DebtStats fields (the UI shows "-").
+ * Keys are written in newGame's order so migrated and fresh saves hash alike.
+ */
+export function migrateV3toV4(v3: V3State): GameState {
+  const owed = v3.debt.credit.balance + v3.debt.loans.reduce((sum, loan) => sum + loan.balance, 0);
+  const frozen = v3.debt.covenant.stage === 'frozen' && owed > 0;
+  const frozenCap = Math.max(1, FROZEN_ACCELERATION_CLOSES - ACCELERATION_WARNING_CLOSES - 1);
+  const frozenCloses = frozen ? Math.min(frozenCap, Math.max(1, trailingFrozenCloses(v3.finance.reports))) : 0;
+  const sales = v3.sales;
+  return {
+    schemaVersion: 4,
+    seed: v3.seed,
+    day: v3.day,
+    rng: { events: v3.rng.events, sales: v3.rng.sales, weather: deriveSeed(v3.seed, 'weather') },
+    nextId: v3.nextId,
+    city: v3.city,
+    network: {
+      spans: v3.network.spans.map((s) => ({
+        id: s.id,
+        segment: s.segment,
+        method: s.method,
+        stage: s.stage,
+        stageDaysLeft: s.stageDaysLeft,
+        constructDays: s.constructDays,
+        cost: s.cost,
+        refundable: s.refundable,
+        orderedDay: s.orderedDay,
+        liveDay: s.liveDay,
+        outage: null,
+        conversion: null,
+      })),
+      cabinets: v3.network.cabinets,
+      olt: v3.network.olt,
+      makeReady: v3.network.makeReady,
+      version: v3.network.version,
+    },
+    finance: v3.finance,
+    debt: {
+      credit: v3.debt.credit,
+      loans: v3.debt.loans,
+      nextLoanId: v3.debt.nextLoanId,
+      covenant: v3.debt.covenant,
+      frozenCloses,
+      acceleration: null,
+    },
+    sales: {
+      pricing: sales.pricing,
+      marketingPerMonth: sales.marketingPerMonth,
+      accounts: sales.accounts.map((a) => ({ parcel: a.parcel, cabinet: a.cabinet, tierUnits: a.tierUnits, since: a.since, locks: [] })),
+      routerParcels: sales.routerParcels,
+      connectsTotal: sales.connectsTotal,
+      fullCabinets: sales.fullCabinets,
+      installsPaused: sales.installsPaused,
+      month: sales.month,
+      promo: null,
+      incumbentPromos: [],
+    },
+    weather: newWeather(),
+    milestones: v3.milestones,
+    notices: v3.notices,
+    nextNoticeId: v3.nextNoticeId,
+    gameOver: v3.gameOver,
+  };
+}
+
+/**
+ * Round 3 let subscribers keep a tier the player stopped offering
+ * (grandfathered); round 4 moves them at the next close to the offered tier
+ * nearest in price (sales.closeSalesMonth step 4, some cancel). A save
+ * migrated with subscribers on an unoffered tier is told once per such tier:
+ * how many, where they go and at which close, and that offering the tier
+ * again keeps them on it.
+ */
+function noteRetiredTiers(state: GameState): void {
+  if (state.gameOver) return;
+  const tiers = state.sales.pricing.tiers;
+  const units = unitsByTier(state);
+  const today = dateOf(state.day);
+  const close = formatMonth(today.year, today.month);
+  for (const tier of tiers) {
+    const n = units[tier.id];
+    if (tier.offered || n === 0) continue;
+    const to = tiers.find((t) => t.id === retireDestination(tiers, tier.id));
+    if (!to) continue;
+    const who = n === 1 ? `Your 1 subscriber on ${tier.name}` : `Your ${groupThousands(n)} subscribers on ${tier.name}`;
+    postNotice(
+      state,
+      'rulesUpdated',
+      `Plans changed in this version: subscribers on a plan you no longer offer move at the next month close to the offered plan nearest in price, ` +
+        `and some cancel (more when the move costs them more). ${who} (${formatMoney(tier.price)}) ` +
+        `${n === 1 ? 'moves' : 'move'} to ${to.name} (${formatMoney(to.price)}) at the ${close} close; offer ${tier.name} again before then to keep ${n === 1 ? 'it' : 'them'} on it.`,
+    );
+  }
+}
+
+/**
+ * Round 4 changed what a frozen line means: the bank sweeps part of each
+ * month's operating cash flow and calls the loans after
+ * FROZEN_ACCELERATION_CLOSES frozen closes in a row. A save migrated while
+ * frozen with debt owed is told once, with its countdown (the other round-4
+ * rule that takes something away from a migrated game, the move off unoffered
+ * tiers, has its own notice: noteRetiredTiers).
+ */
+function noteFrozenRules(state: GameState): void {
+  const { debt } = state;
+  if (state.gameOver || debt.covenant.stage !== 'frozen' || debt.frozenCloses === 0) return;
+  let owed = debt.credit.balance;
+  for (const loan of debt.loans) owed += loan.balance;
+  const left = FROZEN_ACCELERATION_CLOSES - debt.frozenCloses;
+  const share = Math.round(FROZEN_SWEEP_SHARE * 100);
+  postNotice(
+    state,
+    'rulesUpdated',
+    `Loans changed in this version: while your credit line is frozen, the bank takes ${share}% of each month's operating cash flow ` +
+      `to repay what you owe (${formatMoney(owed)} now), and after ${FROZEN_ACCELERATION_CLOSES} frozen month closes in a row it calls the loans. ` +
+      `Your line counts as frozen for ${debt.frozenCloses} close${debt.frozenCloses === 1 ? '' : 's'}: ` +
+      `${left} more and everything falls due within a few months. Two compliant closes in a row lift the freeze.`,
+  );
 }
 
 /**
@@ -262,12 +471,18 @@ export function migrateV1toV2(v1: Record<string, unknown>): V2State {
       capex: { osp: Math.max(0, spent), connect: 0, co: 0 },
       negativeMonths: 0,
     },
-    sales: newSales(),
+    sales: v2Sales(),
     milestones: [],
     notices: [],
     nextNoticeId: 1,
     gameOver: null,
   };
+}
+
+/** newSales() as a round-2/3 save holds it (no promo or incumbent promos yet). */
+function v2Sales(): V2State['sales'] {
+  const { promo: _promo, incumbentPromos: _incumbent, ...sales } = newSales();
+  return sales;
 }
 
 /**
@@ -340,7 +555,7 @@ interface V1State {
 // ---------------------------------------------------------------------------
 
 type Json = Record<string, unknown>;
-type Version = 1 | 2 | 3;
+type Version = 1 | 2 | 3 | 4;
 
 /** Keys of an exhaustive record: adding a union member is a compile error until it is listed. */
 function members<T extends string>(record: Record<T, true>): readonly T[] {
@@ -377,9 +592,34 @@ const NOTICE_KINDS = members<NoticeKind>({
   creditFrozen: true,
   covenantCured: true,
   loanPaidOff: true,
+  debtSwept: true,
+  accelerationWarning: true,
+  loansCalled: true,
+  tierRetired: true,
+  priceStep: true,
+  incumbentPromo: true,
+  incumbentPromoEnded: true,
+  storm: true,
+  digIn: true,
+  serviceRestored: true,
   gameOver: true,
   milestone: true,
 });
+/** Notice kinds new in schemaVersion 4 (round 4). */
+const V4_NOTICE_KINDS: readonly NoticeKind[] = [
+  'debtSwept',
+  'accelerationWarning',
+  'loansCalled',
+  'tierRetired',
+  'priceStep',
+  'incumbentPromo',
+  'incumbentPromoEnded',
+  'storm',
+  'digIn',
+  'serviceRestored',
+];
+/** Notice kinds a schemaVersion 3 save can contain. */
+const V3_NOTICE_KIND_LIST: readonly NoticeKind[] = NOTICE_KINDS.filter((k) => !V4_NOTICE_KINDS.includes(k));
 /** Notice kinds new in schemaVersion 3 (financing). */
 const V3_NOTICE_KINDS: readonly NoticeKind[] = [
   'paymentDue',
@@ -391,7 +631,13 @@ const V3_NOTICE_KINDS: readonly NoticeKind[] = [
   'loanPaidOff',
 ];
 /** Notice kinds a schemaVersion 2 save can contain. */
-const V2_NOTICE_KINDS: readonly NoticeKind[] = NOTICE_KINDS.filter((k) => !V3_NOTICE_KINDS.includes(k));
+const V2_NOTICE_KINDS: readonly NoticeKind[] = V3_NOTICE_KIND_LIST.filter((k) => !V3_NOTICE_KINDS.includes(k));
+const NOTICE_KINDS_BY_VERSION: Record<Version, readonly NoticeKind[]> = {
+  1: V2_NOTICE_KINDS,
+  2: V2_NOTICE_KINDS,
+  3: V3_NOTICE_KIND_LIST,
+  4: NOTICE_KINDS,
+};
 const LEDGER_CATEGORIES = members<LedgerCategory>({
   construction: true,
   equipment: true,
@@ -402,20 +648,40 @@ const LEDGER_CATEGORIES = members<LedgerCategory>({
   overhead: true,
   payroll: true,
   marketing: true,
+  repair: true,
   interest: true,
   principal: true,
   loanProceeds: true,
   other: true,
 });
+/** Categories a schemaVersion 3 save can contain (no repairs). */
+const V3_LEDGER_CATEGORIES: readonly LedgerCategory[] = LEDGER_CATEGORIES.filter((c) => c !== 'repair');
 /** Categories a schemaVersion 2 save can contain (no financing flows but the never-posted 'interest'). */
-const V2_LEDGER_CATEGORIES: readonly LedgerCategory[] = LEDGER_CATEGORIES.filter((c) => c !== 'principal' && c !== 'loanProceeds');
+const V2_LEDGER_CATEGORIES: readonly LedgerCategory[] = V3_LEDGER_CATEGORIES.filter((c) => c !== 'principal' && c !== 'loanProceeds');
 /** Categories a schemaVersion 1 save can contain. */
 const V1_LEDGER_CATEGORIES: readonly LedgerCategory[] = V2_LEDGER_CATEGORIES.filter((c) => c !== 'install' && c !== 'overhead');
 const LEDGER_CATEGORIES_BY_VERSION: Record<Version, readonly LedgerCategory[]> = {
   1: V1_LEDGER_CATEGORIES,
   2: V2_LEDGER_CATEGORIES,
-  3: LEDGER_CATEGORIES,
+  3: V3_LEDGER_CATEGORIES,
+  4: LEDGER_CATEGORIES,
 };
+const OUTAGE_CAUSES = members<OutageCause>({ storm: true, digIn: true });
+const CONVERSION_STAGES: readonly BuildStage[] = ['permitting', 'constructing'];
+const LOCK_REASONS = members<PriceLockReason>({ grandfather: true, notice: true, promo: true });
+const OPS_FIELDS = members<keyof OpsStats>({
+  lastNoticeId: true,
+  tierMoves: true,
+  priceChurn: true,
+  outageChurn: true,
+  incumbentChurn: true,
+  outageUnitDays: true,
+  storms: true,
+  spansDamaged: true,
+  repairs: true,
+  incumbentPromos: true,
+  mrr: true,
+});
 const COVENANT_STAGES = members<CovenantStage>({ compliant: true, warning: true, penalty: true, frozen: true });
 const GAME_OVER_REASONS = members<GameOverReason>({ insolvent: true, default: true });
 const STATS_FIELDS = members<keyof MonthlyStats>({
@@ -525,6 +791,8 @@ function ascending(values: readonly number[], path: string): void {
 }
 
 interface CityShape {
+  width: number;
+  height: number;
   nodes: number;
   segments: number;
   parcels: readonly { kind: ParcelKind; units: number }[];
@@ -535,6 +803,8 @@ interface Context {
   day: number;
   nextId: number;
   city: CityShape;
+  /** weather.nextStormId (v4; 1 before): span outages refer to storms below it. */
+  nextStormId: number;
 }
 
 function checkState(save: Json, version: Version): void {
@@ -543,15 +813,57 @@ function checkState(save: Json, version: Version): void {
   const rng = obj(save.rng, 'rng');
   int(rng.events, 'rng.events', 0, UINT32_MAX);
   if (version >= 2) int(rng.sales, 'rng.sales', 0, UINT32_MAX);
+  if (version >= 4) int(rng.weather, 'rng.weather', 0, UINT32_MAX);
   const nextId = int(save.nextId, 'nextId', 1);
   const city = checkCity(obj(save.city, 'city'));
-  const ctx: Context = { version, day, nextId, city };
+  const ctx: Context = { version, day, nextId, city, nextStormId: 1 };
+  if (version >= 4) ctx.nextStormId = checkWeather(obj(save.weather, 'weather'), ctx);
   checkNetwork(obj(save.network, 'network'), ctx);
   checkFinance(obj(save.finance, 'finance'), ctx);
   if (version === 1) return;
   if (version >= 3) checkDebt(obj(save.debt, 'debt'), ctx);
   checkSales(obj(save.sales, 'sales'), ctx);
   checkProgress(save, ctx);
+}
+
+/** Weather (v4); returns nextStormId. */
+function checkWeather(weather: Json, ctx: Context): number {
+  const { city, day, nextId } = ctx;
+  const nextStormId = int(weather.nextStormId, 'weather.nextStormId', 1);
+  const ids = list(weather.storms, 'weather.storms').map((value, i) => {
+    const path = `weather.storms[${i}]`;
+    const storm = obj(value, path);
+    const id = int(storm.id, `${path}.id`, 1, nextStormId - 1);
+    int(storm.day, `${path}.day`, 0, day);
+    int(storm.x, `${path}.x`, 0, city.width);
+    int(storm.y, `${path}.y`, 0, city.height);
+    int(storm.radius, `${path}.radius`, 1, 2 * MAX_MAP_CELLS);
+    int(storm.severity, `${path}.severity`, 1, SANE_SEVERITY_MAX);
+    const spans = list(storm.spans, `${path}.spans`).map((span, k) => int(span, `${path}.spans[${k}]`, 1, nextId - 1));
+    ascending(spans, `${path}.spans`);
+    int(storm.repairCost, `${path}.repairCost`, 0);
+    return id;
+  });
+  ascending(ids, 'weather.storms (by id)');
+  const month = obj(weather.month, 'weather.month');
+  const segments = list(month.segmentOutageDays, 'weather.month.segmentOutageDays').map((value, i) => {
+    const path = `weather.month.segmentOutageDays[${i}]`;
+    const entry = obj(value, path);
+    int(entry.days, `${path}.days`, 1, MONTH_DAYS_MAX);
+    return ref(entry.segment, `${path}.segment`, city.segments, 'segment');
+  });
+  ascending(segments, 'weather.month.segmentOutageDays (by segment)');
+  for (const field of ['outageUnitDays', 'storms', 'spansDamaged', 'repairs'] as const) int(month[field], `weather.month.${field}`, 0);
+  const parcels = list(weather.cutOff, 'weather.cutOff').map((value, i) => {
+    const path = `weather.cutOff[${i}]`;
+    const entry = obj(value, path);
+    const days = int(entry.days, `${path}.days`, 0, CUT_OFF_DAYS_MAX);
+    int(entry.charged, `${path}.charged`, days === 0 ? 1 : 0, CUT_OFF_DAYS_MAX);
+    int(entry.units, `${path}.units`, 1, SANE_PARCEL_UNITS_MAX);
+    return ref(entry.parcel, `${path}.parcel`, city.parcels.length, 'parcel');
+  });
+  ascending(parcels, 'weather.cutOff (by parcel)');
+  return nextStormId;
 }
 
 function checkCity(city: Json): CityShape {
@@ -614,7 +926,7 @@ function checkCity(city: Json): CityShape {
   });
 
   ref(city.coNode, 'city.coNode', nodes.length, 'node');
-  return { nodes: nodes.length, segments: segments.length, parcels };
+  return { width, height, nodes: nodes.length, segments: segments.length, parcels };
 }
 
 /** Fields spans and cabinets share; returns the stage. */
@@ -644,9 +956,10 @@ function checkNetwork(network: Json, ctx: Context): void {
     const segment = ref(span.segment, `${path}.segment`, city.segments, 'segment');
     if (cabled.has(segment)) corrupt(`${path}.segment`, `${segment} already has a span`);
     cabled.add(segment);
-    oneOf(span.method, `${path}.method`, CABLE_METHODS);
+    const method = oneOf(span.method, `${path}.method`, CABLE_METHODS);
     int(span.constructDays, `${path}.constructDays`, 1);
     if (version >= 2) int(span.refundable, `${path}.refundable`, 0, span.cost as number);
+    if (version >= 4) checkSpanRound4(span, path, ctx, method);
   });
 
   const cabinetNodes = new Set<number>();
@@ -682,6 +995,31 @@ function checkNetwork(network: Json, ctx: Context): void {
   int(network.version, 'network.version', 0);
 }
 
+/** A span's outage and conversion (v4): only a live span can be out, only a live aerial span converting. */
+function checkSpanRound4(span: Json, path: string, ctx: Context, method: CableMethod): void {
+  const live = span.stage === 'live';
+  if (span.outage !== null) {
+    const outagePath = `${path}.outage`;
+    const outage = obj(span.outage, outagePath);
+    if (!live) corrupt(outagePath, `should be null while ${String(span.stage)}`);
+    oneOf(outage.cause, `${outagePath}.cause`, OUTAGE_CAUSES);
+    if (outage.storm !== null) int(outage.storm, `${outagePath}.storm`, 1, ctx.nextStormId - 1);
+    int(outage.startDay, `${outagePath}.startDay`, 0, ctx.day);
+    int(outage.daysLeft, `${outagePath}.daysLeft`, 1);
+    int(outage.repairCost, `${outagePath}.repairCost`, 0);
+  }
+  if (span.conversion !== null) {
+    const conversionPath = `${path}.conversion`;
+    const conversion = obj(span.conversion, conversionPath);
+    if (!live || method !== 'aerial') corrupt(conversionPath, 'should be null except on a live aerial span');
+    oneOf(conversion.stage, `${conversionPath}.stage`, CONVERSION_STAGES);
+    int(conversion.stageDaysLeft, `${conversionPath}.stageDaysLeft`, 0);
+    int(conversion.constructDays, `${conversionPath}.constructDays`, 1);
+    int(conversion.cost, `${conversionPath}.cost`, 0);
+    int(conversion.orderedDay, `${conversionPath}.orderedDay`, 0, ctx.day);
+  }
+}
+
 function checkFinance(finance: Json, ctx: Context): void {
   const categories = LEDGER_CATEGORIES_BY_VERSION[ctx.version];
   int(finance.cash, 'finance.cash');
@@ -712,7 +1050,11 @@ function checkFinance(finance: Json, ctx: Context): void {
       const stats = obj(report.stats, `${path}.stats`);
       for (const field of STATS_FIELDS) int(stats[field], `${path}.stats.${field}`, 0);
     }
-    if (ctx.version >= 3 && report.debt !== undefined) checkDebtStats(obj(report.debt, `${path}.debt`), `${path}.debt`);
+    if (ctx.version >= 3 && report.debt !== undefined) checkDebtStats(obj(report.debt, `${path}.debt`), `${path}.debt`, ctx.version);
+    if (ctx.version >= 4 && report.ops !== undefined) {
+      const ops = obj(report.ops, `${path}.ops`);
+      for (const field of OPS_FIELDS) int(ops[field], `${path}.ops.${field}`, 0);
+    }
   });
 
   if (ctx.version === 1) return;
@@ -723,8 +1065,8 @@ function checkFinance(finance: Json, ctx: Context): void {
   int(finance.negativeMonths, 'finance.negativeMonths', 0);
 }
 
-/** Report.debt (round-3 closes). */
-function checkDebtStats(stats: Json, path: string): void {
+/** Report.debt (round-3 closes; the round-4 fields are optional, checked when present). */
+function checkDebtStats(stats: Json, path: string, version: Version): void {
   int(stats.creditBalance, `${path}.creditBalance`, 0);
   int(stats.termBalance, `${path}.termBalance`, 0);
   int(stats.creditLimit, `${path}.creditLimit`, 0);
@@ -737,6 +1079,12 @@ function checkDebtStats(stats: Json, path: string): void {
   oneOf(stats.stage, `${path}.stage`, COVENANT_STAGES);
   if (stats.averageRateBps !== null) int(stats.averageRateBps, `${path}.averageRateBps`, 0);
   bool(stats.missedPayment, `${path}.missedPayment`);
+  if (version < 4) return;
+  if (stats.sweep !== undefined) int(stats.sweep, `${path}.sweep`, 0, SANE_DEBT_MAX);
+  if (stats.frozenCloses !== undefined) int(stats.frozenCloses, `${path}.frozenCloses`, 0, SANE_CLOSES_MAX);
+  if (stats.accelerationClosesLeft !== undefined && stats.accelerationClosesLeft !== null) {
+    int(stats.accelerationClosesLeft, `${path}.accelerationClosesLeft`, 1, SANE_CLOSES_MAX);
+  }
 }
 
 function checkRateParts(rate: Json, path: string): void {
@@ -772,6 +1120,14 @@ function checkDebt(debt: Json, ctx: Context): void {
   const covenant = obj(debt.covenant, 'debt.covenant');
   oneOf(covenant.stage, 'debt.covenant.stage', COVENANT_STAGES);
   int(covenant.compliantCloses, 'debt.covenant.compliantCloses', 0, SANE_CURE_CLOSES_MAX);
+
+  if (ctx.version < 4) return;
+  int(debt.frozenCloses, 'debt.frozenCloses', 0, SANE_CLOSES_MAX);
+  if (debt.acceleration !== null) {
+    const acceleration = obj(debt.acceleration, 'debt.acceleration');
+    int(acceleration.day, 'debt.acceleration.day', 0, ctx.day);
+    int(acceleration.closesLeft, 'debt.acceleration.closesLeft', 1, SANE_CLOSES_MAX);
+  }
 }
 
 function checkSales(sales: Json, ctx: Context): void {
@@ -818,6 +1174,20 @@ function checkSales(sales: Json, ctx: Context): void {
     // Homes and businesses are one household or business each.
     if (kind !== 'mdu' && units !== 1) corrupt(`${path}.tierUnits`, `should add up to 1 unit for a ${kind}, got ${units}`);
     int(account.since, `${path}.since`, 0, day);
+    if (ctx.version >= 4) {
+      // At most one lock per tier, in tier order. A lock past its close (or on
+      // a tier the account left) is harmless: the next close drops it.
+      const order = list(account.locks, `${path}.locks`).map((value, k) => {
+        const lockPath = `${path}.locks[${k}]`;
+        const lock = obj(value, lockPath);
+        const tier = oneOf(lock.tier, `${lockPath}.tier`, TIER_IDS);
+        int(lock.price, `${lockPath}.price`, 1, SANE_PRICE_MAX);
+        int(lock.untilDay, `${lockPath}.untilDay`, 0);
+        oneOf(lock.reason, `${lockPath}.reason`, LOCK_REASONS);
+        return TIER_IDS.indexOf(tier);
+      });
+      ascending(order, `${path}.locks (by tier)`);
+    }
   });
   ascending(parcelsWithService, 'sales.accounts (by parcel)');
 
@@ -837,6 +1207,25 @@ function checkSales(sales: Json, ctx: Context): void {
   for (const field of ['revenueDollarDays', 'marketingDollarDays', 'subscriberUnitDays', 'grossAdds', 'lostService'] as const) {
     int(month[field], `sales.month.${field}`, 0);
   }
+
+  if (ctx.version < 4) return;
+  if (sales.promo !== null) {
+    const promo = obj(sales.promo, 'sales.promo');
+    int(promo.percentOff, 'sales.promo.percentOff', 1, 100);
+    int(promo.months, 'sales.promo.months', 1, SANE_CLOSES_MAX);
+  }
+  const cabinets = list(sales.incumbentPromos, 'sales.incumbentPromos').map((value, i) => {
+    const path = `sales.incumbentPromos[${i}]`;
+    const promo = obj(value, path);
+    // A removed cabinet's record lingers until the next close drops it: the id need only have been issued.
+    const cabinet = int(promo.cabinet, `${path}.cabinet`, 1, nextId - 1);
+    const start = int(promo.startDay, `${path}.startDay`, 0, day);
+    const end = int(promo.endDay, `${path}.endDay`, start + 1);
+    int(promo.price, `${path}.price`, 1, SANE_PRICE_MAX);
+    int(promo.quietUntil, `${path}.quietUntil`, end);
+    return cabinet;
+  });
+  ascending(cabinets, 'sales.incumbentPromos (by cabinet)');
 }
 
 function checkProgress(save: Json, ctx: Context): void {
@@ -856,7 +1245,7 @@ function checkProgress(save: Json, ctx: Context): void {
     const notice = obj(value, path);
     const id = int(notice.id, `${path}.id`, 1, nextNoticeId - 1);
     int(notice.day, `${path}.day`, 0, ctx.day);
-    oneOf(notice.kind, `${path}.kind`, ctx.version >= 3 ? NOTICE_KINDS : V2_NOTICE_KINDS);
+    oneOf(notice.kind, `${path}.kind`, NOTICE_KINDS_BY_VERSION[ctx.version]);
     str(notice.message, `${path}.message`);
     if (notice.cabinet !== null) int(notice.cabinet, `${path}.cabinet`, 1, ctx.nextId - 1);
     if (notice.milestone !== null) oneOf(notice.milestone, `${path}.milestone`, MILESTONE_IDS);

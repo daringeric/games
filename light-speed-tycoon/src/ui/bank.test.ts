@@ -1,10 +1,14 @@
 // The Bank panel's pure view models, fed literal offers, quotes and covenant
 // figures (never the sim's quote functions), so the wording and the
 // arithmetic of the panel are pinned down on their own. Money and limits come
-// from balance.ts constants, never literal tuning values.
+// from balance.ts constants, never literal tuning values. Round 4: the
+// covenant remedy, the frozen line's sweep and countdown, the called loans,
+// the draw preview, the safe builder default and same-month re-pricing.
 
 import { describe, expect, it } from 'vitest';
 import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
   BASE_RATE_BPS,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
@@ -14,24 +18,34 @@ import {
   CPP_TARGET,
   CREDIT_LINE_EXTRA_BPS,
   DRAW_PRESETS,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_RESERVE,
+  FROZEN_SWEEP_SHARE,
   LOAN_ROUNDING,
   PENALTY_STEP_UP_BPS,
-  TERM_DEFAULT_ROUNDING,
   TERM_EXTRA_BPS,
   TERM_LOAN_MIN,
   UNDERWRITING_MIN_MARGIN,
 } from '../sim/balance';
-import { dayOf } from '../sim/calendar';
-import type { CovenantMetrics, CreditOffer, PrepayQuote, RateBreakdown, TermLoan, TermLoanQuote } from '../sim/types';
+import { dayOf, formatDate } from '../sim/calendar';
+import type { CovenantMetrics, CreditOffer, CureOption, DrawQuote, PrepayQuote, RateBreakdown, TermLoan, TermLoanQuote } from '../sim/types';
 import {
   STAGE_LABEL,
   STAGE_TONE,
+  closeDayAfter,
   covenantView,
+  remedyLine,
   cppLine,
   creditView,
+  cureAdvice,
   cureText,
   defaultTermAmount,
   drawPresets,
+  drawPreview,
+  frozenView,
+  isBankNotice,
+  repricedLines,
+  safeAmountLine,
   inFirstMonth,
   loanView,
   nextCloseDay,
@@ -104,6 +118,8 @@ function termQuote(over: Partial<TermLoanQuote> = {}): TermLoanQuote {
     after: metrics({ totalDebt: 100_000, annualDebtService: 18_360, leverage: 100_000 / 42_000, coverage: 42_000 / 18_360 }),
     breachesCovenant: false,
     cashAfter: 150_000,
+    repriced: [],
+    safeMaxAmount: 0,
     ...over,
   };
 }
@@ -196,10 +212,43 @@ describe('credit line', () => {
 });
 
 describe('term loan builder', () => {
-  it('defaults to the capacity rounded down, never below the smallest loan', () => {
+  it('starts at the largest covenant-safe amount, and at the smallest loan when none is safe', () => {
     expect(defaultTermAmount(0)).toBe(TERM_LOAN_MIN);
-    expect(defaultTermAmount(3 * TERM_DEFAULT_ROUNDING + 1)).toBe(Math.max(TERM_LOAN_MIN, 3 * TERM_DEFAULT_ROUNDING));
-    expect(defaultTermAmount(40 * TERM_DEFAULT_ROUNDING - 1)).toBe(Math.max(TERM_LOAN_MIN, 39 * TERM_DEFAULT_ROUNDING));
+    expect(defaultTermAmount(37 * LOAN_ROUNDING)).toBe(Math.max(TERM_LOAN_MIN, 37 * LOAN_ROUNDING));
+    expect(defaultTermAmount(400 * LOAN_ROUNDING)).toBe(400 * LOAN_ROUNDING);
+  });
+
+  it('says what the largest covenant-safe amount is, or that none is', () => {
+    const safe = 120 * LOAN_ROUNDING;
+    expect(safeAmountLine(safe, 360 * LOAN_ROUNDING, 7)).toBe(`Largest covenant-safe amount: ${formatMoney(safe)} over 7 years.`);
+    expect(safeAmountLine(safe, safe, 5)).toBe(`Largest covenant-safe amount: ${formatMoney(safe)} over 5 years, all the bank will lend.`);
+    expect(safeAmountLine(0, 360 * LOAN_ROUNDING, 7)).toBe(
+      `No 7-year loan keeps the covenants at today's figures: even the smallest, ${formatMoney(TERM_LOAN_MIN)}, would breach one at the next month close.`,
+    );
+    // Nothing to borrow: the reasons say why.
+    expect(safeAmountLine(0, 0, 7)).toBe('');
+    // In the builder's view, from the quote.
+    const view = termView(termQuote({ safeMaxAmount: safe }), 'compliant');
+    expect(view.safe).toBe(safeAmountLine(safe, 360_000, 7));
+  });
+
+  it('shows the same-month loans a new loan re-prices', () => {
+    const repriced = [{ loan: 1, rateBps: 650, rateBpsAfter: 725, payment: 1_200, paymentAfter: 1_265 }];
+    expect(repricedLines(repriced)).toEqual([
+      `Loan #1 (taken this month) re-prices from ${formatRate(650)} to ${formatRate(725)}: ${formatMoney(1_200)} → ${formatMoney(1_265)}/mo. Loans taken in the same month are priced together.`,
+    ]);
+    expect(termView(termQuote({ repriced }), 'compliant').repriced).toEqual(repricedLines(repriced));
+    expect(termView(termQuote(), 'compliant').repriced).toEqual([]);
+    // A loan that can't be quoted re-prices nothing.
+    expect(termView(termQuote({ repriced, payment: 0, maxAmount: 0 }), 'compliant').repriced).toEqual([]);
+  });
+
+  it('calls the capacity a multiple of lending ARR, never annual recurring revenue', () => {
+    const view = termView(termQuote(), 'compliant');
+    expect(view.capacity).toContain('lending ARR');
+    expect(view.capacity).not.toMatch(/annual recurring revenue/i);
+    expect(creditView(offer()).note).toContain('lending ARR');
+    expect(creditView(offer()).note).not.toMatch(/annual recurring revenue/i);
   });
 
   it('offers 25 / 50 / 75 / 100% of capacity, rounded down, disabled below the smallest loan', () => {
@@ -333,7 +382,9 @@ describe('covenant status', () => {
     expect(view.checks[1]).toMatchObject({ label: 'Coverage', value: formatRatio(42_000 / 40_000), ok: false, mark: 'under the minimum' });
     const counted = view.figures.find((f) => f.label === 'Cash flow the bank counts')!;
     expect(counted.value).toBe(`${formatMoney(42_000)}/yr`);
-    expect(counted.sub).toBe(`your yearly operating cash flow (${formatMoney(30_000)}), or ${formatPercent(UNDERWRITING_MIN_MARGIN)} of recurring revenue if that is more`);
+    expect(counted.sub).toBe(`your yearly operating cash flow (${formatMoney(30_000)}), or ${formatPercent(UNDERWRITING_MIN_MARGIN)} of lending ARR if that is more`);
+    expect(view.figures.find((f) => f.label === 'Lending ARR')).toMatchObject({ value: `${formatMoney(120_000)}/yr` });
+    expect(view.figures.some((f) => /annual recurring revenue/i.test(f.label))).toBe(false);
     expect(view.next).toContain(formatBpsDelta(PENALTY_STEP_UP_BPS));
     expect(view.cure).toContain(`1 of ${COVENANT_CURE_CLOSES} so far`);
 
@@ -350,7 +401,33 @@ describe('covenant status', () => {
     expect(stageNext('frozen')).toMatch(/default.*ends the game/);
     expect(cureText('compliant', 0)).toBe('');
     expect(cureText('frozen', 0)).toContain(plural(COVENANT_CURE_CLOSES, 'compliant month close'));
-    expect(cureText('frozen', 0)).toContain('no debt at all');
+    expect(cureText('frozen', 0)).toMatch(/no debt at all/i);
+    // The rule never advises a repayment on its own (that could leave too little cash): the verified cure does.
+    expect(cureText('frozen', 0)).not.toMatch(/repay/i);
+  });
+
+  it('leads with the verified cure: a repayment, or the operating cash flow that would cure it', () => {
+    const breached = metrics({ totalDebt: 300_000, annualDebtService: 40_000, leverage: 300_000 / 42_000, coverage: 42_000 / 40_000, leverageOk: false, coverageOk: false, compliant: false });
+    const repay: CureOption = {
+      kind: 'repayCredit',
+      loan: null,
+      amount: 42_000,
+      after: metrics({ totalDebt: 258_000, compliant: true }),
+      cashAfter: 88_000,
+      text: "Repay $42,000 of the credit line: at today's figures that brings leverage to 4.60× and coverage to 1.31×, leaving $88,000 in cash.",
+    };
+    expect(cureAdvice(repay)).toBe(repay.text);
+    expect(covenantView('warning', 0, breached, null, null, repay).remedy).toBe(repay.text);
+    const grow: CureOption = { kind: 'grow', loan: null, amount: 37_000, after: metrics(), cashAfter: 0, text: 'sim text' };
+    expect(cureAdvice(grow)).toBe(`No repayment cures it: about ${formatMoney(37_000)} a year more operating cash flow would, at today's figures.`);
+    expect(cureAdvice(null)).toBe('');
+    // Nothing to cure when today's figures pass, whatever was passed in.
+    expect(covenantView('penalty', 1, metrics(), null, null, repay).remedy).toBe('');
+    expect(covenantView('warning', 0, breached).remedy).toBe('');
+    // The line the Bank shows: once the loans are called, a cure does not undo the call.
+    expect(remedyLine(repay.text, false)).toBe(`To cure it now: ${repay.text}`);
+    expect(remedyLine(repay.text, true)).toBe(`To cure it now: ${repay.text} The call stands either way: everything you owe still falls due on schedule.`);
+    expect(remedyLine('', true)).toBe('');
   });
 
   it('dates the next payment at the next close and warns when cash is short of it', () => {
@@ -373,5 +450,91 @@ describe('amount fields', () => {
     expect(parseAmount('-5')).toBeNull();
     expect(parseAmount('12.5')).toBeNull();
     expect(parseAmount('abc')).toBeNull();
+  });
+});
+
+describe('the frozen line', () => {
+  const day = dayOf({ year: 2028, month: 3, day: 12 });
+
+  it('shows the last sweep, the next one and the countdown to the call', () => {
+    const view = frozenView({
+      lastSweep: { amount: 6_500, close: 'Feb 2028' },
+      nextSweep: 7_100,
+      closesUntilCall: ACCELERATION_WARNING_CLOSES + 1,
+      called: null,
+      day,
+      owed: 90_000,
+      frozen: true,
+    })!;
+    expect(view.title).toMatch(/sweep and the countdown/);
+    expect(view.tone).toBe('warn');
+    expect(view.text).toContain(formatPercent(FROZEN_SWEEP_SHARE));
+    expect(view.text).toContain(formatMoney(FROZEN_SWEEP_RESERVE));
+    expect(view.text).toContain(`after ${FROZEN_ACCELERATION_CLOSES} frozen closes in a row it calls the loans`);
+    expect(view.text).toContain(plural(ACCELERATION_CLOSES, 'close'));
+    const figure = (label: string) => view.figures.find((f) => f.label === label)!;
+    expect(figure('Last sweep')).toMatchObject({ value: formatMoney(6_500), sub: 'at the Feb 2028 close' });
+    expect(figure('Next sweep')).toMatchObject({ value: `≈ ${formatMoney(7_100)}`, sub: 'at the Apr 1, 2028 close, at this month\'s pace' });
+    expect(figure('Before the bank calls the loans')).toMatchObject({ value: plural(ACCELERATION_WARNING_CLOSES + 1, 'frozen close'), tone: 'warn' });
+    // Close to the call: danger, and the close it would come at.
+    const near = frozenView({ lastSweep: null, nextSweep: 0, closesUntilCall: 2, called: null, day, owed: 90_000, frozen: true })!;
+    expect(near.tone).toBe(2 <= ACCELERATION_WARNING_CLOSES ? 'danger' : 'warn');
+    expect(near.figures.find((f) => f.label === 'Last sweep')).toMatchObject({ value: 'None', tone: 'muted' });
+    expect(near.figures.find((f) => f.label === 'Next sweep')).toMatchObject({ value: 'None expected', tone: 'muted' });
+    expect(near.figures.at(-1)!.sub).toBe(`the call comes at the ${formatDate(closeDayAfter(day, 2))} close if still frozen`);
+  });
+
+  it('shows what falls due at each close once the loans are called, and nothing when neither frozen nor called', () => {
+    const called = frozenView({ lastSweep: null, nextSweep: 0, closesUntilCall: null, called: [31_000, 30_500, 30_000], day, owed: 90_000, frozen: false })!;
+    expect(called).toMatchObject({ title: 'Loans called', tone: 'danger' });
+    expect(called.text).toContain(formatMoney(90_000));
+    expect(called.text).toContain('over the next 3 closes');
+    expect(called.figures.map((f) => [f.label, f.value])).toEqual([
+      [`Due at the ${formatDate(closeDayAfter(day, 1))} close`, `≈ ${formatMoney(31_000)}`],
+      [`Due at the ${formatDate(closeDayAfter(day, 2))} close`, `≈ ${formatMoney(30_500)}`],
+      [`Due at the ${formatDate(closeDayAfter(day, 3))} close`, `≈ ${formatMoney(30_000)}`],
+    ]);
+    expect(frozenView({ lastSweep: null, nextSweep: 0, closesUntilCall: null, called: [5_000], day, owed: 5_000, frozen: true })!.text).toContain('at the next close');
+    expect(frozenView({ lastSweep: null, nextSweep: 0, closesUntilCall: null, called: null, day, owed: 90_000, frozen: false })).toBeNull();
+    expect(frozenView({ lastSweep: null, nextSweep: 0, closesUntilCall: null, called: null, day, owed: 0, frozen: true })).toBeNull();
+    expect(closeDayAfter(day, 1)).toBe(nextCloseDay(day));
+    expect(closeDayAfter(day, 2)).toBe(dayOf({ year: 2028, month: 5, day: 1 }));
+  });
+
+  it('keeps the sweep, the warning and the call among the notices to reread', () => {
+    for (const kind of ['debtSwept', 'accelerationWarning', 'loansCalled'] as const) expect(isBankNotice(kind)).toBe(true);
+  });
+});
+
+describe('the draw preview', () => {
+  function draw(over: Partial<DrawQuote> = {}): DrawQuote {
+    return {
+      ok: true,
+      reasons: [],
+      amount: 20_000,
+      before: metrics({ totalDebt: 40_000, annualDebtService: 3_000, leverage: 40_000 / 42_000, coverage: 14 }),
+      after: metrics({ totalDebt: 60_000, annualDebtService: 4_400, leverage: 60_000 / 42_000, coverage: 9.55 }),
+      breachesCovenant: false,
+      cashAfter: 50_000,
+      interestToClose: 85,
+      ...over,
+    };
+  }
+
+  it('previews leverage and coverage before and after a draw, and its interest to the close', () => {
+    const view = drawPreview(draw(), 'compliant')!;
+    expect(view.checks[0]).toMatchObject({ label: 'Leverage', value: `${formatRatio(40_000 / 42_000)} → ${formatRatio(60_000 / 42_000)}`, ok: true });
+    expect(view.checks[1]).toMatchObject({ label: 'Coverage', value: `${formatRatio(14)} → ${formatRatio(9.55)}`, ok: true });
+    expect(view.warning).toBeNull();
+    expect(view.interest).toContain(formatMoney(85));
+  });
+
+  it('warns when the draw would breach, by stage, and shows nothing for a draw the line refuses', () => {
+    const breach = draw({ breachesCovenant: true, after: metrics({ totalDebt: 300_000, leverage: 300_000 / 42_000, leverageOk: false, compliant: false }) });
+    expect(drawPreview(breach, 'compliant')!.warning).toBe(
+      "At today's cash flow this draw breaks the leverage covenant at the next month close: a warning first, then a penalty rate, then a frozen credit line.",
+    );
+    expect(drawPreview(breach, 'penalty')!.warning).toContain('a frozen credit line next');
+    expect(drawPreview(draw({ ok: false, reasons: ['Only $5,000 is available'] }), 'compliant')).toBeNull();
   });
 });

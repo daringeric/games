@@ -6,17 +6,19 @@ import { formatDate } from '../sim/calendar';
 import {
   CABINET_REACH_FT,
   CPP_TARGET,
-  LOAN_ROUNDING,
   OLT_MAX_CARDS,
   PERMITTING_CANCEL_REFUND,
+  POLE_RENT_PER_POLE_PER_MONTH,
   SPLIT_RATIO,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from '../sim/balance';
+import { activePromoFor } from '../sim/incumbent';
+import { stormRisk } from '../sim/weather';
 import { coveragePreview, segmentsWithinReach } from '../sim/coverage';
-import { creditAvailable } from '../sim/debt';
 import {
   cableRoute,
   getService,
+  outageImpact,
   ponPortsUsed,
   quoteCabinet,
   quoteCable,
@@ -34,6 +36,7 @@ import type {
   Cabinet,
   CableMethod,
   CableQuote,
+  CableSpan,
   Command,
   CommandResult,
   CppBand,
@@ -43,10 +46,13 @@ import type {
   QuoteLine,
   SegmentId,
   ServiceSnapshot,
+  SpanId,
 } from '../sim/types';
 import type { CoverageShade, OverlaySpec } from '../render/overlay';
 import { parcelGrid } from '../render/geometry';
 import { CableDrag } from './cableDrag';
+import { cashAfterRow, creditHint, fundingKey, fundsOf } from './funding';
+import type { Funds } from './funding';
 import {
   CLASS_LABEL,
   KIND_LABEL,
@@ -100,44 +106,12 @@ export interface CardModel {
 }
 
 // ---------------------------------------------------------------------------
-// Cash after an order, and the credit line when cash is short
+// Cash after an order, and how to finance it when cash is short (funding.ts,
+// owned by the Bank's workstream; re-exported here for existing callers)
 // ---------------------------------------------------------------------------
 
-/** What the player can spend: cash, and what the credit line would lend today. */
-export interface Funds {
-  cash: number;
-  /** debt.creditAvailable: 0 while frozen or before there is a limit. */
-  creditAvailable: number;
-}
-
-export function fundsOf(state: GameState): Funds {
-  return { cash: state.finance.cash, creditAvailable: creditAvailable(state) };
-}
-
-/** The "Cash after" row of a quote card: cash - cost, red below $0. */
-export function cashAfterRow(funds: Funds, cost: number): CardRow {
-  const after = funds.cash - cost;
-  return after < 0 ? { label: 'Cash after', value: formatMoney(after), tone: 'negative' } : { label: 'Cash after', value: formatMoney(after) };
-}
-
-/**
- * When cash can't cover `cost`: "Draw $X from your credit line to afford it"
- * if the line has the shortfall available (X = the shortfall rounded up to
- * LOAN_ROUNDING, capped at what is available), "Your credit line has only $Y
- * available" if it has some but not enough; otherwise (cash covers it, or no
- * credit) undefined.
- */
-export function creditHint(funds: Funds, cost: number): string | undefined {
-  const shortfall = cost - funds.cash;
-  if (shortfall <= 0) return undefined;
-  const available = Math.max(0, funds.creditAvailable);
-  if (available >= shortfall) {
-    const draw = Math.min(available, Math.ceil(shortfall / LOAN_ROUNDING) * LOAN_ROUNDING);
-    return `Draw ${formatMoney(draw)} from your credit line to afford it`;
-  }
-  if (available > 0) return `Your credit line has only ${formatMoney(available)} available`;
-  return undefined;
-}
+export { cashAfterRow, creditHint, fundsOf } from './funding';
+export type { Funds } from './funding';
 
 export interface ToolView {
   overlay: OverlaySpec;
@@ -148,8 +122,10 @@ export interface ToolOutcome {
   ok: boolean;
   /** What to toast; empty for nothing to say. */
   message: string;
-  /** A map panel the click asks for (the CO opens the OLT panel). */
-  open?: 'olt';
+  /** A map panel the click asks for (the CO opens the OLT panel, a live span the span panel). */
+  open?: 'olt' | 'span';
+  /** The span the span panel shows (open 'span'). */
+  span?: SpanId;
 }
 
 export type Dispatch = (cmd: Command) => CommandResult;
@@ -276,9 +252,7 @@ export class ToolController {
       this.hoverKey(state),
       this.drag ? `${this.drag.method}:${this.drag.corners.join('.')}` : '-',
       state.network.version,
-      state.finance.cash,
-      state.debt.credit.balance,
-      state.debt.covenant.stage,
+      fundingKey(state),
       state.day,
     ].join('|');
     // A new or loaded game can share every key field with the old one (a fresh
@@ -409,8 +383,11 @@ export class ToolController {
               : `Cable on ${name} removed, no refund once crews have started`,
         };
       }
-      case 'inspect':
-        return isNearCo(state, x, y) ? { ok: true, message: '', open: 'olt' } : null;
+      case 'inspect': {
+        if (isNearCo(state, x, y)) return { ok: true, message: '', open: 'olt' };
+        const span = inspectableSpan(state, x, y);
+        return span ? { ok: true, message: '', open: 'span', span: span.id } : null;
+      }
     }
   }
 
@@ -504,7 +481,7 @@ export class ToolController {
         : 'Esc to stop';
     return {
       overlay: { origin, snap, ...routeOverlay(state, path, quote, method) },
-      card: cableQuoteCard(method, quote, hint, fundsOf(state)),
+      card: cableQuoteCard(method, quote, hint, fundsOf(state), cableExposure(state, quote.newSegments, method)),
     };
   }
 
@@ -536,7 +513,7 @@ export class ToolController {
       : `Drag back to undo · ${this.touch ? 'two fingers cancel' : 'Esc to cancel'}`;
     return {
       overlay: { origin, snap, ...routeOverlay(state, route, quote, method) },
-      card: cableQuoteCard(method, quote, hint, fundsOf(state)),
+      card: cableQuoteCard(method, quote, hint, fundsOf(state), cableExposure(state, quote.newSegments, method)),
     };
   }
 }
@@ -582,12 +559,42 @@ export function cancelRefund(refundable: number): number {
   return Math.round(refundable * PERMITTING_CANCEL_REFUND);
 }
 
+/** What cable of a method costs to keep once live (cableExposure). */
+export interface CableExposure {
+  /** Expected storm (and, underground, dig-in) repair dollars a year, from weather.stormRisk. */
+  repairsPerYear: number;
+  /** Pole rent a month (aerial; 0 underground). */
+  poleRentPerMonth: number;
+}
+
+/**
+ * What cable of `method` on these segments would cost to keep: expected
+ * repairs a year (weather.stormRisk) and pole rent a month. The quote cards
+ * show it so the aerial / underground trade-off is visible.
+ */
+export function cableExposure(state: GameState, segments: readonly SegmentId[], method: CableMethod): CableExposure {
+  let repairsPerYear = 0;
+  let poles = 0;
+  for (const id of segments) {
+    const segment = state.city.segments[id];
+    if (!segment) continue;
+    repairsPerYear += stormRisk(state, segment, method).repairCostPerYear;
+    if (method === 'aerial') poles += polesOnSegment(segment);
+  }
+  return { repairsPerYear, poleRentPerMonth: poles * POLE_RENT_PER_POLE_PER_MONTH };
+}
+
+/** "about $340 a year in repairs" (under a dollar: "under $1 a year"). */
+export function stormRiskText(dollarsPerYear: number): string {
+  return dollarsPerYear < 1 ? 'under $1 a year in repairs' : `about ${formatMoney(dollarsPerYear)} a year in repairs`;
+}
+
 /**
  * Itemized quote card: charges, total and $/ft, cash after (with `funds`),
- * passings, cost per passing, timing, warnings, refund, and the credit line
- * when cash is short.
+ * passings, cost per passing, timing, storm risk and pole rent (with
+ * `exposure`), warnings, refund, and the credit line when cash is short.
  */
-export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: string, funds?: Funds): CardModel {
+export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: string, funds?: Funds, exposure?: CableExposure): CardModel {
   const rows: CardRow[] = [
     { label: 'Cost', value: formatMoney(quote.cost) },
     ...(funds && quote.newSegments.length > 0 ? [cashAfterRow(funds, quote.cost)] : []),
@@ -612,6 +619,13 @@ export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: str
     },
     { label: 'Build', value: plural(quote.constructDays, 'day') },
   ];
+  if (exposure && quote.newSegments.length > 0) {
+    rows.push({
+      label: 'Storm risk',
+      value: stormRiskText(exposure.repairsPerYear),
+      sub: method === 'aerial' ? `+ ${formatMoney(exposure.poleRentPerMonth)}/mo pole rent` : 'no pole rent',
+    });
+  }
   const warnings: string[] = [];
   if (quote.wrongSideParcels.length > 0) warnings.push(wrongSideWarning(quote.wrongSideParcels.length));
   if (quote.passingsAlong > quote.passingsInReach) {
@@ -891,13 +905,19 @@ function inspectView(state: GameState, x: number, y: number, touch: boolean): To
     ];
     if (coverage) rows.push({ label: 'Passings', value: formatNumber(coverage.passings) });
     rows.push({ label: 'Ordered', value: formatDate(cabinet.orderedDay) });
+    const warnings = state.sales.fullCabinets.includes(cabinet.id) ? ['Full: turning signups away'] : [];
+    const promo = activePromoFor(state, cabinet.id);
+    if (promo) {
+      rows.push({ label: 'Incumbent promo', value: `${formatMoney(promo.price)}/mo until ${formatDate(promo.endDay)}`, tone: 'negative' });
+      warnings.push(`The cable company is running a ${formatMoney(promo.price)} promo here: fewer signups and more cancellations until ${formatDate(promo.endDay)}`);
+    }
     return {
       overlay: { ring: { node, tone: 'cabinet' } },
       card: {
         title: 'Cabinet',
         tone: 'cabinet',
         rows,
-        warnings: state.sales.fullCabinets.includes(cabinet.id) ? ['Full: turning signups away'] : [],
+        warnings,
         blockers: [],
       },
     };
@@ -928,9 +948,17 @@ function inspectView(state: GameState, x: number, y: number, touch: boolean): To
       const undergroundMemo = rememberedPermitDays(state, seg, 'underground');
       if (aerialMemo !== null) rows.push({ label: 'Make-ready on file', value: plural(aerialMemo, 'day') });
       if (undergroundMemo !== null) rows.push({ label: 'Permit on file', value: plural(undergroundMemo, 'day') });
+      const warnings: string[] = [];
+      let hint: string | undefined;
+      if (span && span.stage === 'live') {
+        rows.push(...liveSpanRows(state, span));
+        const outage = outageText(state, span);
+        if (outage) warnings.push(outage);
+        hint = `${touch ? 'Tap' : 'Click'} for its storm history${span.method === 'aerial' ? ' and the underground rebuild' : ''}.`;
+      }
       return {
         overlay: { segment: { id: seg, tone: 'inspect' } },
-        card: { title: s.name, tone: span ? span.method : 'info', rows, blockers: [] },
+        card: { title: s.name, tone: span ? span.method : 'info', rows, warnings, blockers: [], hint },
       };
     }
   }
@@ -965,6 +993,56 @@ function inspectView(state: GameState, x: number, y: number, touch: boolean): To
     }
   }
   return { overlay: {}, card: null };
+}
+
+/** The live span the inspect tool would open at (x, y): not on the CO or a cabinet's corner, which their own cards take. */
+function inspectableSpan(state: GameState, x: number, y: number): CableSpan | undefined {
+  const { city } = state;
+  const node = nearestNode(city, x, y);
+  const n = city.nodes[node];
+  if (n && Math.hypot(n.x - x, n.y - y) <= NODE_PICK && (node === city.coNode || cabinetAt(state, node))) return undefined;
+  const seg = nearestSegment(city, x, y, STREET_PICK);
+  const span = seg === null ? undefined : spanOnSegment(state, seg);
+  return span && span.stage === 'live' ? span : undefined;
+}
+
+const CAUSE_LABEL = { storm: 'storm damage', digIn: 'cut by an excavator' } as const;
+
+/**
+ * "Out of service: storm damage, 3 days to repair, $1,500; 37 subscribers cut
+ * off", or null for a span in service.
+ */
+export function outageText(state: GameState, span: CableSpan): string | null {
+  const outage = span.outage;
+  if (!outage) return null;
+  const { subscribers } = outageImpact(state, span.id);
+  const cut = subscribers > 0 ? `; ${plural(subscribers, 'subscriber')} cut off` : '';
+  return `Out of service: ${CAUSE_LABEL[outage.cause]}, ${plural(outage.daysLeft, 'day')} to repair, ${formatMoney(outage.repairCost)}${cut}`;
+}
+
+/** "Underground rebuild: permit, 12 days left" / "Underground rebuild: digging, 3 days left", or null. */
+export function rebuildText(span: CableSpan): string | null {
+  const c = span.conversion;
+  if (!c) return null;
+  return `${c.stage === 'permitting' ? 'City permit' : 'Crews digging'}, ${plural(Math.max(0, c.stageDaysLeft), 'day')} left`;
+}
+
+/** Monthly pole rent a live span pays (aerial only). */
+export function spanPoleRent(state: GameState, span: CableSpan): number {
+  const segment = state.city.segments[span.segment];
+  return span.method === 'aerial' && span.stage === 'live' && segment ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH : 0;
+}
+
+/** Inspect rows for a live span: its service, any rebuild, pole rent and storm risk. */
+function liveSpanRows(state: GameState, span: CableSpan): CardRow[] {
+  const rows: CardRow[] = [];
+  const segment = state.city.segments[span.segment];
+  if (span.outage) rows.push({ label: 'Service', value: `Out, ${plural(span.outage.daysLeft, 'day')} to repair`, tone: 'negative' });
+  const rebuild = rebuildText(span);
+  if (rebuild) rows.push({ label: 'Underground rebuild', value: rebuild });
+  if (span.method === 'aerial') rows.push({ label: 'Pole rent', value: `${formatMoney(spanPoleRent(state, span))}/mo` });
+  if (segment) rows.push({ label: 'Storm risk', value: stormRiskText(stormRisk(state, segment, span.method).repairCostPerYear) });
+  return rows;
 }
 
 function cabinetStatus(cabinet: Cabinet, service: ServiceSnapshot): string {

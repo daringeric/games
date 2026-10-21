@@ -1,40 +1,60 @@
-// The Bank: the credit line (draw and repay), the term-loan builder (amount,
-// 5 or 7 years, a live quote with the rate's parts, the payment and the
-// covenants before and after), the loans list (prepay) and the covenant
-// status (stage, leverage and coverage against the limits, what happens next
-// and how to cure). Every figure comes from debt.ts (creditOffer,
-// quoteTermLoan, quotePrepay, covenantMetrics, estimateNextDebtService); the
-// panel only words and lays them out, and changes the game only through
-// drawCredit / repayCredit / takeTermLoan / prepayLoan. The quote functions
-// run only while the panel is open.
+// The Bank: covenant status first (stage, today's leverage and coverage
+// against the limits, a verified cure, and while frozen the sweep and the
+// countdown to the bank calling the loans), then the credit line (draw with a
+// covenant preview, repay), the term-loan builder (amount, 5 or 7 years, a
+// live quote with the rate's parts, the payment, same-month re-pricing and the
+// covenants before and after; it starts at the largest covenant-safe amount),
+// the loans list (prepay) and the bank's notices. Every figure comes from
+// debt.ts (creditOffer, quoteDraw, quoteTermLoan, maxSafeTermLoan,
+// quotePrepay, covenantMetrics, cureFor, estimateNextDebtService,
+// estimateSweep, closesUntilAcceleration, acceleratedSchedule); the panel only
+// words and lays them out, and changes the game only through drawCredit /
+// repayCredit / takeTermLoan / prepayLoan. The quote functions run only while
+// the panel is open.
+//
+// Wording: the bank lends on "lending ARR" (trailing revenue, smoothed:
+// debt.trailingArr); the HUD's MRR is a different figure and is never called
+// ARR here.
 //
 // The sheet is modal, but the clock keeps running behind it: main.ts calls
 // update() every frame and the figures refresh in place on each new day or
 // command, never rebuilding an input (focus and typed amounts survive).
 //
-// Owner: ui-bank workstream.
+// Owner: ui-bank workstream (round 4: sim-debt).
 
 import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
+  ARR_SPIKE_CAP,
+  ARR_TRAILING_MONTHS,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
   COVENANT_MIN_COVERAGE,
   CPP_TARGET,
   CREDIT_LIMIT_ARR_MULTIPLE,
   DRAW_PRESETS,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_RESERVE,
+  FROZEN_SWEEP_SHARE,
   LOAN_ROUNDING,
   PENALTY_STEP_UP_BPS,
   TERM_CAPACITY_ARR_MULTIPLE,
-  TERM_DEFAULT_ROUNDING,
   TERM_LOAN_MIN,
   TERM_LOAN_YEARS,
   UNDERWRITING_MIN_MARGIN,
 } from '../sim/balance';
 import { dateOf, dayOf, formatDate, formatMonth } from '../sim/calendar';
 import {
+  acceleratedSchedule,
+  closesUntilAcceleration,
   covenantMetrics,
   creditOffer,
+  cureFor,
   estimateNextDebtService,
+  estimateSweep,
   finalPayment,
+  maxSafeTermLoan,
+  quoteDraw,
   quotePrepay,
   quoteTermLoan,
   termCapacity,
@@ -45,7 +65,9 @@ import type {
   CovenantMetrics,
   CovenantStage,
   CreditOffer,
+  CureOption,
   DebtStats,
+  DrawQuote,
   GameState,
   LoanId,
   Notice,
@@ -119,14 +141,33 @@ export function stageNext(stage: CovenantStage): string {
   }
 }
 
-/** How to step back down, with the progress so far ('' while compliant). */
+/**
+ * How the stage steps back down, with the progress so far ('' while
+ * compliant): the rule only. What would make the next close compliant is
+ * cureAdvice, from debt.cureFor (verified pro forma, so it cannot
+ * backfire); this never advises a repayment on its own.
+ */
 export function cureText(stage: CovenantStage, compliantCloses: number): string {
   if (stage === 'compliant') return '';
   const progress = compliantCloses > 0 ? ` (${compliantCloses} of ${COVENANT_CURE_CLOSES} so far)` : '';
   return (
     `${plural(COVENANT_CURE_CLOSES, 'compliant month close')} in a row step back one stage${progress}. ` +
-    'Repay debt or grow your operating cash flow to get back within the limits; with no debt at all the bank lifts everything at the next month close.'
+    'With no debt at all, the bank lifts everything at the next month close.'
   );
+}
+
+/**
+ * The verified cure to show (debt.cureFor: a repayment or prepayment,
+ * repaying everything, or growth): its own sentence for a repayment, a
+ * prepayment or repaying everything, or "No repayment cures it: about $X a
+ * year more operating cash flow would." for growth; '' for none (no debt,
+ * the covenants pass today, or the loans are called and cash cannot repay
+ * them all).
+ */
+export function cureAdvice(option: CureOption | null | undefined): string {
+  if (!option) return '';
+  if (option.kind === 'grow') return `No repayment cures it: about ${formatMoney(option.amount)} a year more operating cash flow would, at today's figures.`;
+  return option.text;
 }
 
 /** How a new breach would escalate from this stage, for the builder's warning. */
@@ -146,7 +187,7 @@ function escalation(stage: CovenantStage): string {
 // Pure view models (unit-tested with literal offers and quotes)
 // ---------------------------------------------------------------------------
 
-/** "0.5×", "3×": a multiple of ARR. */
+/** "0.5×", "3×": a multiple of lending ARR. */
 export function formatMultiple(x: number): string {
   return `${Math.round(x * 100) / 100}×`;
 }
@@ -279,7 +320,9 @@ export interface CreditView {
 /** `pricing`: when the line's rate was set (its breakdown is that close's figures); omitted, the notes are undated. */
 export function creditView(offer: CreditOffer, pricing?: LinePricing): CreditView {
   const note =
-    offer.limit > 0 ? `Limit ${formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE)} your annual recurring revenue (${formatMoney(offer.arr)} a year), reset at each month close.` : '';
+    offer.limit > 0
+      ? `Limit ${formatMultiple(CREDIT_LIMIT_ARR_MULTIPLE)} your lending ARR (${formatMoney(offer.arr)} a year: trailing revenue, smoothed), reset at each month close.`
+      : '';
   return {
     figures: [
       { label: 'Limit', value: formatMoney(offer.limit) },
@@ -299,9 +342,37 @@ export function creditView(offer: CreditOffer, pricing?: LinePricing): CreditVie
   };
 }
 
-/** Capacity rounded down to TERM_DEFAULT_ROUNDING, at least TERM_LOAN_MIN. */
-export function defaultTermAmount(maxAmount: number): number {
-  return Math.max(TERM_LOAN_MIN, Math.floor(maxAmount / TERM_DEFAULT_ROUNDING) * TERM_DEFAULT_ROUNDING);
+/**
+ * Where the builder starts: the largest covenant-safe amount
+ * (TermLoanQuote.safeMaxAmount / debt.maxSafeTermLoan); TERM_LOAN_MIN when
+ * none is safe (the quote then shows the breach warning). The presets still
+ * reach the whole capacity.
+ */
+export function defaultTermAmount(safeMaxAmount: number): number {
+  return safeMaxAmount >= TERM_LOAN_MIN ? safeMaxAmount : TERM_LOAN_MIN;
+}
+
+/**
+ * The builder's line about the safe amount: "Largest covenant-safe amount:
+ * $X" (with the term), or why there is none; '' when nothing can be borrowed
+ * (the reasons say why).
+ */
+export function safeAmountLine(safeMaxAmount: number, maxAmount: number, years: TermYears): string {
+  if (maxAmount <= 0) return '';
+  if (safeMaxAmount >= TERM_LOAN_MIN) {
+    const all = safeMaxAmount >= maxAmount ? ', all the bank will lend' : '';
+    return `Largest covenant-safe amount: ${formatMoney(safeMaxAmount)} over ${years} years${all}.`;
+  }
+  return `No ${years}-year loan keeps the covenants at today's figures: even the smallest, ${formatMoney(TERM_LOAN_MIN)}, would breach one at the next month close.`;
+}
+
+/** "Loan #1 (taken this month) re-prices from 6.50% to 7.25%: $1,200 → $1,265/mo." for each same-month loan the quote re-prices. */
+export function repricedLines(repriced: TermLoanQuote['repriced']): string[] {
+  return repriced.map(
+    (r) =>
+      `Loan #${r.loan} (taken this month) re-prices from ${formatRate(r.rateBps)} to ${formatRate(r.rateBpsAfter)}: ` +
+      `${formatMoney(r.payment)} → ${formatMoney(r.paymentAfter)}/mo. Loans taken in the same month are priced together.`,
+  );
 }
 
 /** 25 / 50 / 75 / 100% of capacity, rounded down to LOAN_ROUNDING (100% is the capacity itself). */
@@ -351,6 +422,10 @@ export interface TermView {
   confirmLabel: string;
   /** "Up to $240,000 today: ..."; '' when nothing can be borrowed (the reasons say why). */
   capacity: string;
+  /** safeAmountLine: the largest covenant-safe amount, or why there is none ('' when nothing can be borrowed). */
+  safe: string;
+  /** Same-month loans this one would re-price (repricedLines); empty for none. */
+  repriced: string[];
   /** Fixed rate the loan would carry; with the penalty in force, what is charged today too. */
   rate: string;
   rateRows: RateRowView[];
@@ -371,7 +446,7 @@ export function termView(quote: TermLoanQuote, stage: CovenantStage): TermView {
   const valid = quote.payment > 0 && quote.maxAmount > 0;
   const capacity =
     quote.maxAmount > 0
-      ? `Up to ${formatMoney(quote.maxAmount)} today: ${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} your annual recurring revenue, less the term loans you owe.`
+      ? `Up to ${formatMoney(quote.maxAmount)} today: ${formatMultiple(TERM_CAPACITY_ARR_MULTIPLE)} your lending ARR (trailing revenue, smoothed), less the term loans you owe.`
       : '';
   const fixed = formatRate(quote.rate.rateBps);
   const penalty = quote.rate.penaltyBps > 0;
@@ -409,11 +484,35 @@ export function termView(quote: TermLoanQuote, stage: CovenantStage): TermView {
     reasons: quote.reasons,
     confirmLabel: valid ? `Borrow ${formatMoney(quote.amount)} over ${quote.termYears} years` : 'Borrow',
     capacity,
+    safe: safeAmountLine(quote.safeMaxAmount, quote.maxAmount, quote.termYears),
+    repriced: valid ? repricedLines(quote.repriced) : [],
     rate: quote.rate.penaltyBps > 0 ? `${fixed} fixed (${formatRate(quote.rate.effectiveRateBps)} while the penalty lasts)` : `${fixed} fixed`,
     rateRows: rateRows(quote.rate, { kind: 'term', years: quote.termYears }),
     figures,
     checks: [leverageCheck(quote.before, quote.after), coverageCheck(quote.before, quote.after)],
     warning,
+  };
+}
+
+/** The covenant preview under the draw form (debt.quoteDraw). */
+export interface DrawPreview {
+  /** Leverage and coverage today -> with the draw. */
+  checks: CovenantCheck[];
+  /** The breach warning, or null when the draw keeps the covenants. */
+  warning: string | null;
+  /** "Adds about $85 of interest to this month's close." */
+  interest: string;
+}
+
+/** The covenant preview for a draw the player typed, or null when it can't be drawn (the reasons say why). */
+export function drawPreview(quote: DrawQuote, stage: CovenantStage): DrawPreview | null {
+  if (!quote.ok) return null;
+  return {
+    checks: [leverageCheck(quote.before, quote.after), coverageCheck(quote.before, quote.after)],
+    warning: quote.breachesCovenant
+      ? `At today's cash flow this draw breaks ${brokenCovenants(quote.after)} at the next month close: ${escalation(stage)}.`
+      : null,
+    interest: `Held to the month end, it adds about ${formatMoney(quote.interestToClose)} of interest to this month's close.`,
   };
 }
 
@@ -484,6 +583,8 @@ export interface CovenantView {
   /** "How to cure", or "The tests" while compliant. */
   cureLabel: string;
   cure: string;
+  /** What would make the next close compliant at today's figures (cureAdvice), or '' when nothing needs curing. */
+  remedy: string;
 }
 
 /** Label of the covenant badge while the stage is compliant but today's figures break a covenant. */
@@ -526,12 +627,38 @@ export function lastTestFigure(last: LastTest | null): Figure | null {
  * reads 'At risk' (warn) with a hedged meaning; `nextClose` names that close
  * and `last` adds what the last close tested.
  */
+/** "smoothed: the mean of your last 3 closed months' revenue, at most 1.1× the weakest of them, × 12" */
+export function lendingArrNote(): string {
+  return `smoothed: the mean of your last ${plural(ARR_TRAILING_MONTHS, 'closed month')}' revenue, at most ${formatMultiple(ARR_SPIKE_CAP)} the weakest of them, × 12`;
+}
+
+/**
+ * The covenant section: stage, today's tests, the cash flow behind them, and
+ * what comes next. A compliant stage whose figures break a covenant today
+ * reads 'At risk' (warn) with a hedged meaning; `nextClose` names that close
+ * and `last` adds what the last close tested. `cure` is debt.cureFor's
+ * (a repayment that would pass both tests at today's figures, repaying
+ * everything, or the operating cash flow that would), shown as the remedy.
+ */
+/**
+ * The Bank's "To cure it now: ..." line for a verified cure (covenantView's
+ * remedy), '' with none. Once the bank has called the loans a cure lifts the
+ * freeze but not the call (nothing new can be borrowed until everything is
+ * repaid), so with `called` the line says the call stands (the panel passes
+ * false for repaying everything, which ends the call).
+ */
+export function remedyLine(remedy: string, called: boolean): string {
+  if (remedy === '') return '';
+  return `To cure it now: ${remedy}${called ? ' The call stands either way: everything you owe still falls due on schedule.' : ''}`;
+}
+
 export function covenantView(
   stage: CovenantStage,
   compliantCloses: number,
   metrics: CovenantMetrics,
   nextClose: number | null = null,
   last: LastTest | null = null,
+  cure: CureOption | null = null,
 ): CovenantView {
   const share = formatPercent(UNDERWRITING_MIN_MARGIN);
   const atRisk = stage === 'compliant' && !metrics.compliant;
@@ -543,11 +670,11 @@ export function covenantView(
     checks: [leverageCheck(null, metrics), coverageCheck(null, metrics)],
     figures: [
       { label: 'Debt', value: formatMoney(metrics.totalDebt) },
-      { label: 'Annual recurring revenue', value: `${formatMoney(metrics.arr)}/yr` },
+      { label: 'Lending ARR', value: `${formatMoney(metrics.arr)}/yr`, sub: lendingArrNote() },
       {
         label: 'Cash flow the bank counts',
         value: `${formatMoney(metrics.underwritingCashFlow)}/yr`,
-        sub: `your yearly operating cash flow (${formatMoney(metrics.annualOperatingCashFlow)}), or ${share} of recurring revenue if that is more`,
+        sub: `your yearly operating cash flow (${formatMoney(metrics.annualOperatingCashFlow)}), or ${share} of lending ARR if that is more`,
         tone: metrics.underwritingCashFlow > 0 ? undefined : 'danger',
       },
       { label: 'Debt service, next 12 months', value: `${formatMoney(metrics.annualDebtService)}/yr`, sub: 'at today’s rates' },
@@ -556,6 +683,93 @@ export function covenantView(
     next: stageNext(stage),
     cureLabel: stage === 'compliant' ? 'The tests' : 'How to cure',
     cure: stage === 'compliant' ? `The bank checks ${covenantLimits()} at every month close.` : cureText(stage, compliantCloses),
+    remedy: metrics.compliant ? '' : cureAdvice(cure),
+  };
+}
+
+/** What a frozen line (or called loans) means now, for the Bank: figures from the sim (debt.ts). */
+export interface FrozenInfo {
+  /** The latest close's sweep (report.debt.sweep) and the month it closed, or null when that close swept nothing. */
+  lastSweep: { amount: number; close: string } | null;
+  /** debt.estimateSweep: what the next close would sweep if the line stays frozen. */
+  nextSweep: number;
+  /** debt.closesUntilAcceleration: frozen closes left before the bank calls the loans, or null (not frozen, or already called). */
+  closesUntilCall: number | null;
+  /** debt.acceleratedSchedule once the loans are called: what falls due at each close left (index 0 = the next), else null. */
+  called: number[] | null;
+  /** Today (for the close dates). */
+  day: number;
+  /** Total debt today. */
+  owed: number;
+  /** The stage is 'frozen' (a call can outlast the freeze). */
+  frozen: boolean;
+}
+
+export interface FrozenView {
+  title: string;
+  tone: BankTone;
+  /** What the bank does while frozen, or what the call means. */
+  text: string;
+  figures: Figure[];
+}
+
+/** The 1st of the month `k` closes after `day` (k = 1: the next close). */
+export function closeDayAfter(day: number, k: number): number {
+  let next = day;
+  for (let i = 0; i < k; i++) next = nextCloseDay(next);
+  return next;
+}
+
+/**
+ * The frozen-line box: the sweep (last and next) and the countdown to the
+ * call, or, once the loans are called, what falls due at each close left.
+ * Null while the line is neither frozen with debt nor called.
+ */
+export function frozenView(info: FrozenInfo): FrozenView | null {
+  const sweepFigures: Figure[] = info.frozen
+    ? [
+        info.lastSweep
+          ? { label: 'Last sweep', value: formatMoney(info.lastSweep.amount), sub: `at the ${info.lastSweep.close} close` }
+          : { label: 'Last sweep', value: 'None', sub: 'no operating cash flow to share, or the line just froze', tone: 'muted' },
+        {
+          label: 'Next sweep',
+          value: info.nextSweep > 0 ? `≈ ${formatMoney(info.nextSweep)}` : 'None expected',
+          sub: `at the ${formatDate(nextCloseDay(info.day))} close, at this month's pace`,
+          tone: info.nextSweep > 0 ? undefined : 'muted',
+        },
+      ]
+    : [];
+  if (info.called !== null && info.owed > 0) {
+    const left = info.called.length;
+    return {
+      title: 'Loans called',
+      tone: 'danger',
+      text:
+        `The bank has called your loans: everything you owe (${formatMoney(info.owed)}) falls due ${left <= 1 ? 'at the next close' : `over the next ${left} closes`}, ` +
+        'and a close that cannot pay what falls due is a default that ends the game. Repaying early still works.',
+      figures: [
+        ...info.called.map((amount, i) => ({ label: `Due at the ${formatDate(closeDayAfter(info.day, i + 1))} close`, value: `≈ ${formatMoney(amount)}` })),
+        ...sweepFigures,
+      ],
+    };
+  }
+  if (!info.frozen || info.owed <= 0) return null;
+  const left = info.closesUntilCall ?? FROZEN_ACCELERATION_CLOSES;
+  return {
+    title: 'Frozen line: the sweep and the countdown',
+    tone: left <= ACCELERATION_WARNING_CLOSES ? 'danger' : 'warn',
+    text:
+      `While frozen, the bank takes ${formatPercent(FROZEN_SWEEP_SHARE)} of each month's positive operating cash flow (keeping ${formatMoney(FROZEN_SWEEP_RESERVE)} in cash) ` +
+      `to repay what you owe, and after ${FROZEN_ACCELERATION_CLOSES} frozen closes in a row it calls the loans: everything falls due within ${plural(ACCELERATION_CLOSES, 'close')}.`,
+    figures: [
+      ...sweepFigures,
+      {
+        label: 'Before the bank calls the loans',
+        value: left <= 0 ? 'Next close' : plural(left, 'frozen close'),
+        sub: left <= 0 ? '' : left === 1 ? 'the next close calls them unless the debt is gone' : `the call comes at the ${formatDate(closeDayAfter(info.day, left))} close if still frozen`,
+        tone: left <= ACCELERATION_WARNING_CLOSES ? 'danger' : 'warn',
+      },
+    ],
   };
 }
 
@@ -601,6 +815,9 @@ const BANK_NOTICE_KINDS: ReadonlySet<NoticeKind> = new Set<NoticeKind>([
   'creditFrozen',
   'covenantCured',
   'loanPaidOff',
+  'debtSwept',
+  'accelerationWarning',
+  'loansCalled',
 ]);
 
 /** How many of them the Bank lists. */
@@ -841,6 +1058,11 @@ class BankView {
   private readonly drawPresetButtons: HTMLButtonElement[] = [];
   private readonly drawReasons: HTMLElement;
   private readonly drawReasonsKey = { value: '' };
+  private readonly drawPreview: HTMLElement;
+  private readonly drawChecks: HTMLElement;
+  private readonly drawChecksKey = { value: '' };
+  private readonly drawWarning: HTMLElement;
+  private readonly drawInterest: HTMLElement;
   private readonly repayForm: HTMLElement;
   private readonly repayInput: HTMLInputElement;
   private readonly repayButton: HTMLButtonElement;
@@ -851,6 +1073,9 @@ class BankView {
   // Term loan builder.
   private readonly termFieldset: HTMLFieldSetElement;
   private readonly termCapacity: HTMLElement;
+  private readonly termSafe: HTMLElement;
+  private readonly termRepriced: HTMLElement;
+  private readonly termRepricedKey = { value: '' };
   private readonly termInput: HTMLInputElement;
   private readonly termPresetButtons: HTMLButtonElement[] = [];
   private readonly yearButtons = new Map<TermYears, HTMLButtonElement>();
@@ -871,6 +1096,8 @@ class BankView {
   /** The player typed an amount (or picked a preset): capacity changes leave it alone. */
   private termDirty = false;
   private termMax = -1;
+  /** Capacity, safe maximum and term the builder's default amount was last set for. */
+  private termDefaultKey = '';
   // Loans.
   private readonly loanList: HTMLElement;
   private readonly loansEmpty: HTMLElement;
@@ -884,6 +1111,12 @@ class BankView {
   private readonly covNext: HTMLElement;
   private readonly covCureLabel: HTMLElement;
   private readonly covCure: HTMLElement;
+  private readonly covRemedy: HTMLElement;
+  // The frozen line: the sweep and the countdown, or the called loans.
+  private readonly frozenBox: HTMLElement;
+  private readonly frozenTitle: HTMLElement;
+  private readonly frozenText: HTMLElement;
+  private readonly frozenFigures: FigureList;
   private readonly repayReason: HTMLElement;
   // Notices from the bank, to reread.
   private readonly noticesSection: HTMLElement;
@@ -936,6 +1169,15 @@ class BankView {
       drawPresets.append(b);
     }
     this.drawReasons = reasons();
+    this.drawChecks = el('dl', { class: 'bank-checks' });
+    this.drawWarning = el('p', { class: 'bank-warning', attrs: { 'data-testid': 'bank-draw-warning', hidden: '' } });
+    this.drawInterest = el('p', { class: 'bank-note' });
+    this.drawPreview = el('div', { class: 'bank-draw-preview', attrs: { 'data-testid': 'bank-draw-preview', role: 'group', 'aria-label': 'Covenants after this draw', hidden: '' } }, [
+      el('h4', { class: 'bank-subhead', text: 'Covenants after this draw' }),
+      this.drawChecks,
+      this.drawWarning,
+      this.drawInterest,
+    ]);
     this.repayInput = amountInput('Amount to repay', 'bank-repay-amount');
     this.repayButton = button('Repay', 'sheet-secondary bank-go', () => this.repay(), { 'data-testid': 'bank-repay' });
     const repayPresets = el('div', { class: 'bank-presets', attrs: { role: 'group', 'aria-label': 'Repay presets' } });
@@ -961,6 +1203,7 @@ class BankView {
       el('div', { class: 'bank-form' }, [
         el('div', { class: 'bank-form-row' }, [el('span', { class: 'bank-form-label', text: 'Draw' }), moneyField(this.drawInput), this.drawButton]),
         drawPresets,
+        this.drawPreview,
         this.drawReasons,
       ]),
       this.repayForm,
@@ -969,6 +1212,8 @@ class BankView {
 
     // b) Term loan builder.
     this.termCapacity = el('p', { class: 'bank-note', attrs: { 'data-testid': 'bank-term-capacity' } });
+    this.termSafe = el('p', { class: 'bank-note bank-safe', attrs: { 'data-testid': 'bank-term-safe', hidden: '' } });
+    this.termRepriced = el('ul', { class: 'bank-repriced', attrs: { 'data-testid': 'bank-term-repriced', hidden: '' } });
     this.termInput = amountInput('Term loan amount', 'bank-term-amount');
     const termPresets = el('div', { class: 'bank-presets', attrs: { role: 'group', 'aria-label': 'Share of what you can borrow' } });
     for (let i = 0; i < 4; i++) {
@@ -1018,11 +1263,13 @@ class BankView {
     this.termQuote = el('div', { class: 'bank-quote', attrs: { role: 'group', 'aria-label': 'Term loan quote' } }, [
       el('div', { class: 'bank-rate' }, [el('p', { class: 'bank-rate-total' }, [el('span', { text: 'Rate' }), this.termRate]), this.termRateRows]),
       this.termFigures.root,
+      this.termRepriced,
       el('h4', { class: 'bank-subhead', text: 'Covenants after this loan' }),
       this.termChecks,
     ]);
     const term = section('term', 'New term loan', [
       this.termCapacity,
+      this.termSafe,
       this.termFieldset,
       this.termQuote,
       this.termWarning,
@@ -1044,9 +1291,21 @@ class BankView {
     this.covNext = el('span', { class: 'bank-next', attrs: { 'data-testid': 'bank-covenant-next' } });
     this.covCure = el('span', { class: 'bank-cure', attrs: { 'data-testid': 'bank-covenant-cure' } });
     this.covCureLabel = el('strong');
-    const covenant = section('covenant', 'Covenants', [
+    this.covRemedy = el('p', { class: 'bank-remedy', attrs: { 'data-testid': 'bank-covenant-remedy', hidden: '' } });
+    this.frozenTitle = el('h4', { class: 'bank-subhead bank-frozen-title' });
+    this.frozenText = el('p', { class: 'bank-note' });
+    this.frozenFigures = new FigureList('bank-frozen-figs', 'bank-frozen');
+    this.frozenBox = el('div', { class: 'bank-frozen', attrs: { 'data-testid': 'bank-frozen', role: 'group', 'aria-label': 'Frozen line', hidden: '' } }, [
+      this.frozenTitle,
+      this.frozenText,
+      this.frozenFigures.root,
+    ]);
+    // Covenant status leads the Bank: where you stand, what would cure it, and the countdown while frozen.
+    const covenant = section('covenant', 'Covenant status', [
       el('div', { class: 'bank-stage-line' }, [this.covStage, this.covMeaning]),
       this.covChecks,
+      this.covRemedy,
+      this.frozenBox,
       this.covFigures.root,
       el('p', { class: 'bank-explain' }, [el('strong', { text: 'What happens next: ' }), this.covNext]),
       el('p', { class: 'bank-explain' }, [this.covCureLabel, this.covCure]),
@@ -1057,10 +1316,13 @@ class BankView {
     this.noticesSection = section('notices', 'Notices from the bank', [this.noticeList]);
     this.noticesSection.hidden = true;
 
-    sheet.body.append(this.live, summary, credit, term, loans, covenant, this.noticesSection);
+    sheet.body.append(this.live, summary, covenant, credit, term, loans, this.noticesSection);
 
     // Typing updates the quotes at once; an Enter acts like the form's button.
-    this.drawInput.addEventListener('input', () => this.hideError(this.creditError));
+    this.drawInput.addEventListener('input', () => {
+      this.hideError(this.creditError);
+      this.refreshDrawPreview(this.session.state);
+    });
     this.repayInput.addEventListener('input', () => this.hideError(this.creditError));
     this.termInput.addEventListener('input', () => {
       this.termDirty = true;
@@ -1102,7 +1364,35 @@ class BankView {
       b.tabIndex = y === years ? 0 : -1;
     }
     this.hideError(this.termError);
+    this.syncTermDefault(this.session.state, termCapacity(this.session.state), true);
     this.announceTerm(this.refreshTerm(this.session.state));
+  }
+
+  /**
+   * Set the builder to the largest covenant-safe amount of the chosen term
+   * (debt.maxSafeTermLoan; TERM_LOAN_MIN when none) whenever that, the
+   * capacity or the term changes, unless the player typed or picked an
+   * amount. `picked`: the player just chose the term (the input may have focus).
+   */
+  private syncTermDefault(state: GameState, max: number, picked = false): void {
+    const safe = max > 0 ? maxSafeTermLoan(state, this.termYears) : 0;
+    const key = `${max}:${safe}:${this.termYears}`;
+    if (key === this.termDefaultKey) return;
+    this.termDefaultKey = key;
+    if (this.termDirty || (!picked && document.activeElement === this.termInput)) return;
+    this.termInput.value = String(defaultTermAmount(safe));
+  }
+
+  /** The covenant preview under the draw form, for what is typed (hidden for nothing typed or an amount the line can't give). */
+  private refreshDrawPreview(state: GameState): void {
+    const text = this.drawInput.value.trim();
+    const preview = text === '' ? null : drawPreview(quoteDraw(state, parseNumberField(text)), state.debt.covenant.stage);
+    this.drawPreview.hidden = preview === null;
+    if (!preview) return;
+    setChecks(this.drawChecks, preview.checks, this.drawChecksKey);
+    setText(this.drawWarning, preview.warning ?? '');
+    this.drawWarning.hidden = preview.warning === null;
+    setText(this.drawInterest, preview.interest);
   }
 
   private announceTerm(view: TermView): void {
@@ -1122,12 +1412,15 @@ class BankView {
     const lastReport = state.finance.reports.at(-1);
     const lastClose = lastReport ? formatMonth(lastReport.year, lastReport.month) : null;
     const nextClose = nextCloseDay(state.day);
+    // Once the loans are called (or will be before a cure could lift the freeze), only repaying everything (debt.cureFor).
+    const cure = metrics.compliant ? null : cureFor(state);
     const cov = covenantView(
       stage,
       state.debt.covenant.compliantCloses,
       metrics,
       nextClose,
       lastReport?.debt && lastClose ? { close: lastClose, debt: lastReport.debt } : null,
+      cure,
     );
 
     // Summary: the badge reads like the covenant section's (an at-risk stage included).
@@ -1160,6 +1453,7 @@ class BankView {
     setDisabled(this.drawInput, !credit.canDraw);
     setDisabled(this.drawButton, !credit.canDraw);
     setList(this.drawReasons, credit.reasons, this.drawReasonsKey);
+    this.refreshDrawPreview(state);
     this.repayForm.hidden = offer.balance <= 0;
     this.repayPresets = credit.repayPresets;
     this.repayPresets.forEach((p, i) => {
@@ -1172,11 +1466,12 @@ class BankView {
     setText(this.repayReason, credit.repayReason);
     this.repayReason.hidden = credit.repayReason === '';
 
-    // Term loan builder: a new capacity resets the default amount unless the player chose one.
+    // Term loan builder: it starts at the largest covenant-safe amount, reset when that (or the capacity)
+    // changes unless the player chose an amount; the presets still reach the whole capacity.
     const max = termCapacity(state);
+    this.syncTermDefault(state, max);
     if (max !== this.termMax) {
       this.termMax = max;
-      if (!this.termDirty && document.activeElement !== this.termInput) this.termInput.value = String(defaultTermAmount(max));
       this.termPresets = termPresets(max);
       this.termPresets.forEach((p, i) => {
         const b = this.termPresetButtons[i];
@@ -1201,6 +1496,25 @@ class BankView {
     setText(this.covNext, cov.next);
     setText(this.covCureLabel, `${cov.cureLabel}: `);
     setText(this.covCure, cov.cure);
+    setText(this.covRemedy, remedyLine(cov.remedy, state.debt.acceleration !== null && cure?.kind !== 'repayAll'));
+    this.covRemedy.hidden = cov.remedy === '';
+    const frozen = frozenView({
+      lastSweep: lastReport?.debt?.sweep && lastClose ? { amount: lastReport.debt.sweep, close: lastClose } : null,
+      nextSweep: estimateSweep(state),
+      closesUntilCall: closesUntilAcceleration(state),
+      called: state.debt.acceleration !== null ? acceleratedSchedule(state) : null,
+      day: state.day,
+      owed: totalDebt(state),
+      frozen: stage === 'frozen',
+    });
+    this.frozenBox.hidden = frozen === null;
+    if (frozen) {
+      setText(this.frozenTitle, frozen.title);
+      setText(this.frozenText, frozen.text);
+      this.frozenFigures.set(frozen.figures);
+      // Not tone-*: those color every number inside (style.css); the box keeps its figures' own tones.
+      for (const t of ['warn', 'danger'] as const) this.frozenBox.classList.toggle(`bank-frozen-${t}`, frozen.tone === t);
+    }
 
     // Notices from the bank.
     const notices = bankNotices(state.notices);
@@ -1227,6 +1541,9 @@ class BankView {
     setAttr(this.termInput, 'aria-invalid', String(!quote.ok && quote.maxAmount > 0 && quote.payment === 0));
     setText(this.termCapacity, view.capacity);
     this.termCapacity.hidden = view.capacity === '';
+    setText(this.termSafe, view.safe);
+    this.termSafe.hidden = view.safe === '';
+    setList(this.termRepriced, view.repriced, this.termRepricedKey);
     // Nothing to borrow: the reasons say why, and there is no loan to quote.
     this.termQuote.hidden = quote.maxAmount <= 0;
     setText(this.termRate, view.rate);
@@ -1377,6 +1694,7 @@ class BankView {
     }
     this.hideError(this.creditError);
     this.drawInput.value = '';
+    this.drawPreview.hidden = true;
     this.toasts.show(`Drew ${formatMoney(amount)} from the credit line`, 'ok');
     this.refresh(true);
   }
@@ -1416,6 +1734,7 @@ class BankView {
     this.toasts.show(`Borrowed ${formatMoney(amount)} over ${years} years${terms}`, 'ok');
     this.termDirty = false;
     this.termMax = -1;
+    this.termDefaultKey = '';
     this.refresh(true);
   }
 

@@ -11,22 +11,38 @@
 //   principal (unless a missed payment capitalized interest);
 // - a command's cost is exactly the cash it moved; a rejected one moves none;
 // - ports: accounts within each cabinet's splitters, splitters within the OLT;
+// - round 4: price locks one per tier, only on tiers with units, in tier
+//   order; outages only on live spans, and never longer than their method's
+//   longest outage; the frozen-line count and the call consistent with the
+//   covenant stage and the debt; each close's ops figures consistent with
+//   its stats and ledger (price + outage + incumbent cancellations within
+//   the month's churn, repairs = -totals.repair);
 // - saves round-trip (and a game reloaded mid-session replays identically);
 // - any single-field corruption of a mid-session save is rejected with a
 //   SaveError or loads a game that then runs every command and a month close
 //   without crashing, with consistent books from then on.
 
 import { describe, expect, it } from 'vitest';
-import { LOAN_ROUNDING, START_CASH, TERM_LOAN_MIN, TERM_LOAN_YEARS, TIER_DEFAULTS } from '../balance';
+import {
+  ACCELERATION_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
+  LOAN_ROUNDING,
+  OUTAGE_DAYS_AERIAL_MAX,
+  OUTAGE_DAYS_UNDERGROUND_MAX,
+  START_CASH,
+  TERM_LOAN_MIN,
+  TERM_LOAN_YEARS,
+  TIER_DEFAULTS,
+} from '../balance';
 import { isFirstOfMonth } from '../calendar';
-import { totalDebt } from '../debt';
+import { creditAvailable, totalDebt } from '../debt';
 import { applyCommand, newGame, runDays, tick } from '../game';
 import { getService, ponPortsUsed } from '../network';
-import { cabinetPortCapacity, cabinetPortsUsed } from '../sales';
+import { cabinetPortCapacity, cabinetPortsUsed, TIER_IDS } from '../sales';
 import { deserialize, hashState, SaveError, serialize } from '../save';
 import { makeGridCity } from '../testing/fixtures';
 import type { GridCityOptions } from '../testing/fixtures';
-import type { Command, CommandResult, GameState, TermYears } from '../types';
+import type { Command, CommandResult, GameState, MonthlyReport, PriceLockReason, TermYears } from '../types';
 import { mixedBot } from './bots';
 import { runBot } from './harness';
 
@@ -39,6 +55,8 @@ const COMMAND_TYPES: readonly Command['type'][] = [
   'removeCabinet',
   'addOltCard',
   'setPricing',
+  'setPromo',
+  'convertSpan',
   'setMarketing',
   'drawCredit',
   'repayCredit',
@@ -120,6 +138,54 @@ function brokenInvariant(state: GameState, books: Books): string | null {
     if ((used.get(cabinet.id) ?? 0) > cabinetPortCapacity(cabinet)) return `cabinet ${cabinet.id} carries more ports than its splitters`;
   }
   if (ponPortsUsed(state) > state.network.olt.ponPorts) return 'more splitters than OLT PON ports';
+  return brokenRound4Invariant(state);
+}
+
+/** Round-4 state invariants: price locks, outages, the frozen line. The first broken one, or null. */
+function brokenRound4Invariant(state: GameState): string | null {
+  for (const account of state.sales.accounts) {
+    let last = -1;
+    for (const lock of account.locks) {
+      const order = TIER_IDS.indexOf(lock.tier);
+      if (order <= last) return `parcel ${account.parcel}: price locks not one per tier in tier order`;
+      last = order;
+      if (account.tierUnits[lock.tier] <= 0) return `parcel ${account.parcel}: a price lock on ${lock.tier}, which it has no units on`;
+    }
+  }
+  for (const span of state.network.spans) {
+    const outage = span.outage;
+    if (outage === null) continue;
+    if (span.stage !== 'live') return `span ${span.id}: an outage on a span that is not live`;
+    const longest = span.method === 'aerial' ? OUTAGE_DAYS_AERIAL_MAX : OUTAGE_DAYS_UNDERGROUND_MAX;
+    if (outage.daysLeft < 1 || state.day - outage.startDay + outage.daysLeft > longest) {
+      return `span ${span.id}: an outage from day ${outage.startDay} with ${outage.daysLeft} days left outlasts ${longest} days`;
+    }
+  }
+  const { covenant, frozenCloses, acceleration } = state.debt;
+  if (frozenCloses < 0 || (frozenCloses > 0 && covenant.stage !== 'frozen')) return `${frozenCloses} frozen closes at stage ${covenant.stage}`;
+  if (acceleration !== null && (acceleration.closesLeft < 1 || acceleration.closesLeft > ACCELERATION_CLOSES)) {
+    return `loans called with ${acceleration.closesLeft} closes left`;
+  }
+  return null;
+}
+
+/** Invariants of one closed month's report (round 4: ops, the frozen line at the close). The first broken one, or null. */
+function brokenCloseInvariant(report: MonthlyReport): string | null {
+  const label = `${report.year}-${report.month}`;
+  const { ops, stats, debt } = report;
+  if (!ops || !stats || !debt) return `${label}: a round-4 close without ops, stats or debt figures`;
+  if (ops.priceChurn < 0 || ops.outageChurn < 0 || ops.incumbentChurn < 0) return `${label}: negative churn figures`;
+  if (ops.priceChurn + ops.outageChurn + ops.incumbentChurn > stats.churned) {
+    return `${label}: price ${ops.priceChurn} + outage ${ops.outageChurn} + incumbent ${ops.incumbentChurn} cancellations exceed the ${stats.churned} churned`;
+  }
+  if (ops.repairs !== 0 - (report.totals.repair ?? 0)) return `${label}: repairs ${ops.repairs} vs ledger ${report.totals.repair ?? 0}`;
+  if (ops.outageUnitDays < 0 || ops.storms < 0 || ops.spansDamaged < 0) return `${label}: negative outage figures`;
+  const owed = debt.creditBalance + debt.termBalance;
+  const frozenCloses = debt.frozenCloses ?? 0;
+  if (frozenCloses > 0 && (debt.stage !== 'frozen' || owed === 0)) return `${label}: ${frozenCloses} frozen closes at stage ${debt.stage} owing ${owed}`;
+  const left = debt.accelerationClosesLeft ?? null;
+  if (left !== null && (owed === 0 || left < 1 || left > ACCELERATION_CLOSES)) return `${label}: loans called with ${left} closes left owing ${owed}`;
+  if (frozenCloses >= FROZEN_ACCELERATION_CLOSES && owed > 0 && left === null) return `${label}: ${frozenCloses} frozen closes and the loans not called`;
   return null;
 }
 
@@ -139,15 +205,22 @@ describe('long mixed sessions on generated towns', () => {
       const books = openBooks(state);
       const problems: string[] = [];
       let roundTrips = 0;
+      let closesChecked = 0;
+      const lockReasons = new Set<PriceLockReason>();
       const run = runBot(seed, mixedBot(), SESSION_MONTHS, {
         state,
         afterCommand: (s, cmd, result, cashBefore) => {
           const problem = commandMismatch(s, cmd, result, cashBefore) ?? brokenInvariant(s, books);
           if (problem && problems.length < 10) problems.push(`day ${s.day} after ${cmd?.type}: ${problem}`);
+          for (const account of s.sales.accounts) for (const lock of account.locks) lockReasons.add(lock.reason);
         },
         afterTick: (s) => {
           const problem = brokenInvariant(s, books);
           if (problem && problems.length < 10) problems.push(`day ${s.day}: ${problem}`);
+          for (; closesChecked < s.finance.reports.length; closesChecked++) {
+            const closeProblem = brokenCloseInvariant(s.finance.reports[closesChecked] as MonthlyReport);
+            if (closeProblem && problems.length < 10) problems.push(`day ${s.day}: ${closeProblem}`);
+          }
           if (isFirstOfMonth(s.day) && s.finance.reports.length % ROUND_TRIP_EVERY_MONTHS === 0) {
             const text = serialize(s);
             const loaded = deserialize(text);
@@ -166,6 +239,12 @@ describe('long mixed sessions on generated towns', () => {
       // The session really exercised the economy: subscribers billed, plant removed and re-ordered.
       expect(run.state.sales.connectsTotal).toBeGreaterThan(0);
       expect(run.state.network.makeReady.length).toBeGreaterThan(0);
+      // Round 4: grandfathered and passed-on price rises, intro promos, retired tiers, storms.
+      expect([...lockReasons].sort()).toEqual(['grandfather', 'notice', 'promo']);
+      expect(run.notices.priceStep ?? 0).toBeGreaterThan(0);
+      expect(run.notices.tierRetired ?? 0).toBeGreaterThan(0);
+      expect(run.notices.storm ?? 0).toBeGreaterThan(0);
+      expect(closesChecked).toBe(SESSION_MONTHS);
     },
     LONG_TEST_MS,
   );
@@ -228,6 +307,8 @@ function midSessionSave(): string {
   const s = run.state;
   applyCommand(s, { type: 'layCable', segments: city.segments.map((seg) => seg.id), method: 'underground' });
   applyCommand(s, { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: TERM_LOAN_YEARS.at(-1) as TermYears });
+  // A credit-line balance too, whatever the bot's own draws and repayments left.
+  if (s.debt.credit.balance === 0) applyCommand(s, { type: 'drawCredit', amount: Math.min(LOAN_ROUNDING, creditAvailable(s)) });
   runDays(s, 10);
   return serialize(s);
 }

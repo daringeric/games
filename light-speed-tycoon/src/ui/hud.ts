@@ -1,22 +1,33 @@
 // Top bar: speed controls, date, cash (with an overdraft warning), the
 // pricing, milestones and bank buttons, the menu, and a row of chips:
-// passings, cost per passing, subscribers, monthly recurring revenue, OLT PON
-// ports, the build queue, and (round 3) total debt and the covenant stage
-// while they matter. The debt and covenant chips open the Bank panel.
+// passings, cost per passing, subscribers, MRR (the monthly run-rate: what
+// subscribers pay per month today; never called ARR, which is the Bank's
+// smoothed lending figure), OLT PON ports, the build queue, and (round 3)
+// total debt and the covenant stage while they matter (round 4: with the
+// frozen line's countdown to the call, and the closes left once called). The
+// debt and covenant chips open the Bank panel.
 //
-// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream.
+// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream (round 4: sim-debt).
 
-import { CPP_AMBER_MULTIPLIER, CPP_TARGET, INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
+import {
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
+  CPP_AMBER_MULTIPLIER,
+  CPP_TARGET,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_SHARE,
+  INSOLVENCY_GRACE_MONTHS,
+} from '../sim/balance';
 import { formatDate } from '../sim/calendar';
-import { covenantMetrics, totalDebt } from '../sim/debt';
+import { acceleratedSchedule, closesUntilAcceleration, covenantMetrics, cureOptions, totalDebt } from '../sim/debt';
 import { runwayMonths } from '../sim/finance';
 import { costPerPassing, cppBand } from '../sim/metrics';
 import { getService, ponPortsUsed } from '../sim/network';
 import { monthlyRecurringRevenue, subscriberUnits } from '../sim/sales';
 import type { CppBand, GameOverReason, GameState } from '../sim/types';
-import { STAGE_TONE, brokenCovenants, covenantLimits, cureText, stageMeaning, stageNext } from './bankPanel';
+import { STAGE_TONE, brokenCovenants, covenantLimits, cureAdvice, cureText, stageMeaning, stageNext } from './bankPanel';
 import { el, icon, setText } from './dom';
-import { formatMoney, formatNumber, plural } from './format';
+import { formatMoney, formatNumber, formatPercent, plural } from './format';
 import { ICONS } from './icons';
 import { SPEEDS } from './session';
 import type { GameSession, Speed } from './session';
@@ -99,25 +110,64 @@ export function debtStatus(state: GameState): DebtStatus | null {
 }
 
 export interface CovenantStatus {
-  /** "Covenant warning" / "Penalty rate" / "Credit frozen", or "Covenant at risk" while compliant with today's figures in breach */
+  /**
+   * "Covenant warning" / "Penalty rate" / "Credit frozen: 4 closes to call",
+   * "Loans called: 2 closes left", or "Covenant at risk" while compliant with
+   * today's figures in breach.
+   */
   text: string;
   tone: 'warn' | 'danger';
-  /** What it means, what comes next and how to cure it. */
+  /** What it means, what comes next and how to cure it (a verified cure, debt.cureOptions). */
   tip: string;
 }
 
 const COVENANT_CHIP_TEXT = { warning: 'Covenant warning', penalty: 'Penalty rate', frozen: 'Credit frozen' } as const;
 
+/** "Credit frozen: 4 closes to call" (frozen with debt, not yet called), or "Credit frozen" otherwise. */
+export function frozenChipText(closesUntilCall: number | null): string {
+  if (closesUntilCall === null) return COVENANT_CHIP_TEXT.frozen;
+  if (closesUntilCall <= 0) return `${COVENANT_CHIP_TEXT.frozen}: call at the next close`;
+  return `${COVENANT_CHIP_TEXT.frozen}: ${plural(closesUntilCall, 'close')} to call`;
+}
+
+/** "Loans called: 2 closes left" */
+export function calledChipText(closesLeft: number): string {
+  return `Loans called: ${plural(Math.max(1, closesLeft), 'close')} left`;
+}
+
+/** " To cure it now: ..." with the first verified cure, or ''. */
+function remedyTip(state: GameState): string {
+  const advice = cureAdvice(cureOptions(state)[0]);
+  return advice === '' ? '' : ` To cure it now: ${advice}`;
+}
+
 /**
  * The HUD's covenant chip, or null while the loans are in good standing
  * (compliant) and today's figures keep the covenants. Compliant with today's
  * figures in breach, it warns ahead of the close ("Covenant at risk"),
- * hedged: the close tests that month's figures, which can still pass.
+ * hedged: the close tests that month's figures, which can still pass. Frozen
+ * with debt it counts the frozen closes left before the bank calls the loans
+ * (debt.closesUntilAcceleration); once called, whatever the stage, the closes
+ * left to repay everything, both danger.
  */
 export function covenantStatus(state: GameState): CovenantStatus | null {
   const { stage, compliantCloses } = state.debt.covenant;
+  const owed = totalDebt(state);
+  const call = state.debt.acceleration;
+  if (call !== null && owed > 0) {
+    const schedule = acceleratedSchedule(state);
+    const next = schedule[0] ?? 0;
+    return {
+      text: calledChipText(call.closesLeft),
+      tone: 'danger',
+      tip:
+        `Loans called: after ${FROZEN_ACCELERATION_CLOSES} frozen closes in a row the bank wants everything you owe (${formatMoney(owed)}) ` +
+        `within ${plural(Math.max(1, call.closesLeft), 'close')}: about ${formatMoney(next)} at the next close. ` +
+        'A close that cannot pay what falls due is a default that ends the game. Open the Bank for each payment.',
+    };
+  }
   if (stage === 'compliant') {
-    if (totalDebt(state) <= 0) return null;
+    if (owed <= 0) return null;
     const metrics = covenantMetrics(state);
     if (metrics.compliant) return null;
     return {
@@ -125,16 +175,24 @@ export function covenantStatus(state: GameState): CovenantStatus | null {
       tone: 'warn',
       tip:
         `Covenant at risk: at today's figures your debt breaks ${brokenCovenants(metrics)} (the bank requires ${covenantLimits()} at each month close). ` +
-        "The next close tests that month's figures: a breach then brings a warning first. Open the Bank for the figures.",
+        `The next close tests that month's figures: a breach then brings a warning first.${remedyTip(state)} Open the Bank for the figures.`,
     };
   }
   const tone = STAGE_TONE[stage] === 'danger' ? 'danger' : 'warn';
+  const left = stage === 'frozen' ? closesUntilAcceleration(state) : null;
+  const text = stage === 'frozen' ? frozenChipText(left) : COVENANT_CHIP_TEXT[stage];
+  const countdown =
+    left === null
+      ? ''
+      : ` While frozen, the bank takes ${formatPercent(FROZEN_SWEEP_SHARE)} of each month's positive operating cash flow to repay what you owe, ` +
+        `and ${left <= 0 ? 'the next close' : `after ${plural(left, 'more frozen close')}`} it calls the loans: everything falls due within ${plural(ACCELERATION_CLOSES, 'close')}.` +
+        (left <= ACCELERATION_WARNING_CLOSES ? ' The call is close.' : '');
   return {
-    text: COVENANT_CHIP_TEXT[stage],
+    text,
     tone,
     tip:
       `${COVENANT_CHIP_TEXT[stage]}: the bank requires ${covenantLimits()} at each month close. ` +
-      `${stageMeaning(stage)} ${stageNext(stage)} To cure: ${cureText(stage, compliantCloses)}`,
+      `${stageMeaning(stage)} ${stageNext(stage)}${countdown} To step back down: ${cureText(stage, compliantCloses)}${remedyTip(state)}`,
   };
 }
 
@@ -162,10 +220,12 @@ export function overdraftStatus(state: GameState): OverdraftStatus | null {
   const { cash, negativeMonths } = state.finance;
   if (state.gameOver) return { text: GAME_OVER_TEXT[state.gameOver.reason] ?? GAME_OVER_TEXT.insolvent, tone: 'danger', tip: state.gameOver.message };
   if (cash >= 0 && negativeMonths <= 0) return null;
-  if (state.debt.covenant.stage === 'frozen' && totalDebt(state) > 0) {
+  const owed = totalDebt(state) > 0;
+  if (owed && (state.debt.covenant.stage === 'frozen' || state.debt.acceleration !== null)) {
+    const why = state.debt.acceleration !== null ? 'The bank has called your loans' : 'Your credit line is frozen with debt owed';
     const rule =
-      'Your credit line is frozen with debt owed, so no close in the red is tolerated: a month close that cannot pay its loan payments ' +
-      'is a default, and the game ends. No draws or new loans while frozen: keep cash above the payment due at the close.';
+      `${why}, so no close in the red is tolerated: a month close that cannot pay what falls due ` +
+      'is a default, and the game ends. No draws or new loans now: keep cash above the payment due at the close.';
     return cash < 0
       ? { text: 'Overdrawn: no closes left', tone: 'danger', tip: `Cash is below $0. ${rule}` }
       : { text: 'Recovering: no closes left', tone: 'warn', tip: `Cash is back above $0: keep it there through the next month close. ${rule}` };
@@ -186,12 +246,20 @@ export function overdraftStatus(state: GameState): OverdraftStatus | null {
   };
 }
 
-/** Tooltip for the cash figure: months of runway at last month's operating burn, when burning. */
+/** Tooltip for the cash figure: months of runway at the monthly burn (finance.runwayMonths), when burning. */
 export function runwayHint(state: GameState): string {
   const months = runwayMonths(state);
   if (months === null) return 'Cash on hand';
-  return `Cash on hand: about ${plural(months, 'month')} of runway at last month's operating loss`;
+  if (state.debt.acceleration !== null && totalDebt(state) > 0) {
+    return `Cash on hand: about ${plural(months, 'month')} of runway at last month's operating loss (storm repairs spread over the year) and the called loans' next payment`;
+  }
+  return `Cash on hand: about ${plural(months, 'month')} of runway at last month's burn (storm repairs spread over the year)`;
 }
+
+/** The MRR chip's tooltip: what the figure is, and that the Bank lends on a different one. */
+export const MRR_TIP =
+  'MRR (monthly run-rate): what your subscribers pay per month at today’s prices, price locks included. ' +
+  'The Bank lends on a different figure, lending ARR: your trailing months’ revenue, smoothed.';
 
 export interface HudActions {
   pricing(): void;
@@ -319,10 +387,7 @@ export class Hud {
         this.subs,
         label(' subs'),
       ]),
-      el('span', { class: 'chip chip-mrr', attrs: { title: 'Monthly recurring revenue: what your subscribers pay per month at today’s prices' } }, [
-        icon(ICONS.coins),
-        this.mrr,
-      ]),
+      el('span', { class: 'chip chip-mrr', attrs: { title: MRR_TIP, 'data-testid': 'hud-mrr-chip' } }, [icon(ICONS.coins), label('MRR '), this.mrr]),
       this.ponChip,
       this.buildingChip,
       this.debtChip,

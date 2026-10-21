@@ -2,7 +2,7 @@
 // the seams between game, network, finance and save every simulated day.
 
 import { describe, expect, it } from 'vitest';
-import { MARKETING_MAX_PER_MONTH, START_CASH, TIER_PRICE_MAX, TIER_PRICE_MIN } from './balance';
+import { MARKETING_MAX_PER_MONTH, START_CASH, STORM_LOG_DAYS, TIER_PRICE_MAX, TIER_PRICE_MIN } from './balance';
 import { isFirstOfMonth } from './calendar';
 import { monthlyPoleRent } from './finance';
 import { applyCommand, newGame, tick } from './game';
@@ -11,7 +11,7 @@ import { Rng } from './rng';
 import { cabinetPortCapacity, cabinetPortsUsed, TIER_IDS } from './sales';
 import { deserialize, hashState, serialize } from './save';
 import { otherEnd, segmentsAtNode, shortestPath } from './streets';
-import type { CableMethod, Command, GameState, NodeId, StreetSegment } from './types';
+import type { CableMethod, Command, GameState, NodeId, ServiceSnapshot, StreetSegment } from './types';
 
 const TWO_YEARS = 730;
 /** Two built-out years with a fresh service computation every day take a few seconds. */
@@ -73,6 +73,37 @@ function expectPortsWithinCapacity(state: GameState): void {
   expect(ponPortsUsed(state)).toBeLessThanOrEqual(state.network.olt.ponPorts);
 }
 
+/**
+ * Weather seams (round 4): outages only on live spans, rebuilds only on live
+ * aerial ones; interrupted streets are lit streets (and the memo agrees with a
+ * fresh computation); the storm log is ordered and recent; the open month's
+ * outage days are sorted, one per segment, and its repairs are its 'repair'
+ * entries.
+ */
+function expectWeatherConsistent(state: GameState, memo: ServiceSnapshot, fresh: ServiceSnapshot): void {
+  for (const span of state.network.spans) {
+    if (span.outage) {
+      expect(span.stage).toBe('live');
+      expect(span.outage.daysLeft).toBeGreaterThanOrEqual(1);
+    }
+    if (span.conversion) expect([span.stage, span.method]).toEqual(['live', 'aerial']);
+  }
+  expect([...memo.interruptedSegments].sort((a, b) => a - b)).toEqual([...fresh.interruptedSegments].sort((a, b) => a - b));
+  for (const segment of memo.interruptedSegments) expect(memo.litSegments.has(segment)).toBe(true);
+  const { storms, nextStormId, month } = state.weather;
+  for (let i = 0; i < storms.length; i++) {
+    const storm = storms[i]!;
+    expect(storm.id).toBeLessThan(nextStormId);
+    if (i > 0) expect(storm.id).toBeGreaterThan(storms[i - 1]!.id);
+    expect(state.day - storm.day).toBeLessThan(STORM_LOG_DAYS);
+  }
+  const segments = month.segmentOutageDays.map((e) => e.segment);
+  expect(segments).toEqual([...new Set(segments)].sort((a, b) => a - b));
+  expect(month.segmentOutageDays.every((e) => e.days >= 1 && e.days <= 31)).toBe(true);
+  const repairs = 0 - state.finance.monthToDate.filter((e) => e.category === 'repair').reduce((sum, e) => sum + e.amount, 0);
+  expect(month.repairs).toBe(repairs);
+}
+
 /** Corners the player's plant already reaches (plus the CO). */
 function reachedNodes(state: GameState): NodeId[] {
   const nodes = new Set<NodeId>([state.city.coNode]);
@@ -125,6 +156,12 @@ function botCommand(state: GameState, rng: Rng): Command {
   // Only thin out a plant with cabinets to spare.
   if (roll < 0.92 && state.network.cabinets.length > 2) return { type: 'removeCabinet', cabinet: rng.pick(state.network.cabinets).id };
   if (roll < 0.93) return { type: 'addOltCard' };
+  if (roll < 0.95) {
+    // Rebuild a span underground: usually a live aerial one, sometimes one that cannot be (rejected).
+    const aerial = state.network.spans.filter((s) => s.method === 'aerial' && s.stage === 'live' && s.conversion === null);
+    const pool = aerial.length > 0 && rng.chance(0.8) ? aerial : state.network.spans;
+    if (pool.length > 0) return { type: 'convertSpan', span: rng.pick(pool).id };
+  }
   const junk: unknown[] = [
     { type: 'layCable', segments: [city.segments.length], method: 'aerial' },
     { type: 'layCable', segments: [], method: 'underground' },
@@ -195,6 +232,7 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
       }
       expectPortsWithinCapacity(state);
       expect(state.finance.capex.osp + state.finance.capex.co).toBe(plantCapex(state));
+      expectWeatherConsistent(state, memo, fresh);
       if (state.gameOver) {
         // Only a month close ends the game, and it stops that day cold.
         expect(isFirstOfMonth(state.day)).toBe(true);
@@ -216,8 +254,10 @@ function play(state: GameState, bot: Rng, untilDay: number, tally: Tally): void 
       if (report.stats!.subscribers > 0) tally.monthsWithSubscribers++;
       const prevCash = state.finance.reports.at(-2)?.cashEnd ?? tally.startCash;
       if (prevCash === null) throw new Error('play() must start at day 0 for its first report');
-      // After the close only the new day's installs have posted.
-      expect(state.finance.monthToDate.every((e) => e.category === 'install' && e.day === state.day)).toBe(true);
+      // After the close only the new day's installs (and its storm repairs) have posted.
+      expect(state.finance.monthToDate.every((e) => (e.category === 'install' || e.category === 'repair') && e.day === state.day)).toBe(true);
+      // The month's repairs are its 'repair' entries.
+      expect(report.ops?.repairs).toBe(0 - (report.totals.repair ?? 0));
       const sinceClose = state.finance.monthToDate.reduce((sum, e) => sum + e.amount, 0);
       expect(report.cashEnd).toBe(state.finance.cash - sinceClose);
       expect(report.cashEnd - prevCash).toBe(report.net);
@@ -276,6 +316,9 @@ describe('two-year sessions on generated towns', () => {
       expect(state.finance.reports.some((r) => (r.totals.install ?? 0) < 0)).toBe(true);
       expect(state.sales.connectsTotal).toBeGreaterThan(0);
       expect(state.milestones.map((m) => m.id)).toContain('firstLight');
+      // Storm season (the second year) came with the weather on: storms, and the bot's rebuilds.
+      expect(state.finance.reports.reduce((sum, r) => sum + (r.ops?.storms ?? 0), 0)).toBeGreaterThan(0);
+      expect(tally.ok.convertSpan ?? 0).toBeGreaterThan(0);
 
       // The final save loads, and keeps playing like the original.
       const loaded = deserialize(serialize(state));

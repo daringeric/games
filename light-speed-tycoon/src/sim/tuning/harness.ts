@@ -8,14 +8,24 @@
 // invariants.test.ts (long mixed sessions). Pure and deterministic: bots draw
 // from their own Rng, never from the game's streams.
 
-import { CABINET_COST, CABINET_REACH_FT, SPLITTER_COST } from '../balance';
+import {
+  CABINET_COST,
+  CABINET_REACH_FT,
+  POLE_RENT_PER_POLE_PER_MONTH,
+  SMB_MULTIPLIER_DEFAULT,
+  SPLITTER_COST,
+  TIER_DEFAULTS,
+  TIER_PRICE_MAX,
+  TIER_PRICE_MIN,
+} from '../balance';
 import { dayOf, MONTH_LENGTHS } from '../calendar';
 import { creditLimit, penaltyBps, termCapacity } from '../debt';
 import { applyCommand, newGame, tick } from '../game';
 import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
 import { orderFees, quoteCable, spanCharges } from '../network';
-import { otherEnd, parcelsServedBy, segmentsAtNode, segmentsWithin } from '../streets';
+import { otherEnd, parcelsServedBy, polesOnSegment, segmentsAtNode, segmentsWithin } from '../streets';
+import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
 import type {
   CableMethod,
   City,
@@ -25,8 +35,10 @@ import type {
   GameOver,
   GameState,
   MonthlyReport,
+  NoticeKind,
   SegmentId,
   StreetSegment,
+  TierId,
   Zone,
 } from '../types';
 
@@ -73,6 +85,8 @@ export interface RunResult {
   capacityBeforeFirstSubscriber: number;
   /** borrowingCapacity right after each close of the run (capacityAfterClose[0] after month 1). */
   capacityAfterClose: number[];
+  /** Round 4: notices posted during the run, by kind (every one, though the game's log keeps only the newest). */
+  notices: Partial<Record<NoticeKind, number>>;
 }
 
 export interface RunOptions {
@@ -105,10 +119,18 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
   const capacityAtStart = borrowingCapacity(state);
   let capacityBeforeFirstSubscriber = 0;
   const capacityAfterClose: number[] = [];
+  const notices: Partial<Record<NoticeKind, number>> = {};
+  let lastNotice = state.nextNoticeId - 1;
+  const countNotices = () => {
+    if (state.nextNoticeId - 1 <= lastNotice) return;
+    for (const notice of state.notices) if (notice.id > lastNotice) notices[notice.kind] = (notices[notice.kind] ?? 0) + 1;
+    lastNotice = state.nextNoticeId - 1;
+  };
   const noSubscriberYet = () => state.sales.accounts.length === 0 && state.sales.connectsTotal === 0;
   const send: Send = (cmd) => {
     const cashBefore = state.finance.cash;
     const result = applyCommand(state, cmd);
+    countNotices();
     if (result.ok) {
       commands[cmd.type] = (commands[cmd.type] ?? 0) + 1;
       firstMonth[cmd.type] ??= state.finance.reports.length - startReports + 1;
@@ -123,6 +145,7 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     if (state.day % BOT_INTERVAL_DAYS === 0) bot.act(state, send);
     const closes = state.finance.reports.length;
     tick(state);
+    countNotices();
     if (state.finance.reports.length > closes) capacityAfterClose.push(borrowingCapacity(state));
     opts.afterTick?.(state);
   }
@@ -147,6 +170,7 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     capacityAtStart,
     capacityBeforeFirstSubscriber,
     capacityAfterClose,
+    notices,
   };
 }
 
@@ -298,6 +322,282 @@ export function median(values: readonly number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   return sorted.length % 2 === 1 ? (sorted[mid] as number) : ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2;
+}
+
+// ---------------------------------------------------------------------------
+// Round 4 measures: plant by method, outages, prices, the frozen line
+// ---------------------------------------------------------------------------
+
+/** Feet of cable by method at the end of the run (every span, any stage; a rebuilt span counts as underground). */
+export function plantFeet(result: RunResult): Record<CableMethod, number> {
+  const feet: Record<CableMethod, number> = { aerial: 0, underground: 0 };
+  for (const span of result.state.network.spans) feet[span.method] += result.state.city.segments[span.segment]?.lengthFt ?? 0;
+  return feet;
+}
+
+/** Underground share of the run's plant by feet (plantFeet); null with no plant. */
+export function undergroundShare(result: RunResult): number | null {
+  const feet = plantFeet(result);
+  const total = feet.aerial + feet.underground;
+  return total > 0 ? feet.underground / total : null;
+}
+
+/** Round-4 operating figures (MonthlyReport.ops) summed over the run, with the month's voluntary churn. */
+export interface OpsTotals {
+  churned: number;
+  priceChurn: number;
+  outageChurn: number;
+  incumbentChurn: number;
+  tierMoves: number;
+  outageUnitDays: number;
+  storms: number;
+  spansDamaged: number;
+  repairs: number;
+  /** Months x incumbent promos running in them (ops.incumbentPromos summed). */
+  incumbentPromoMonths: number;
+  revenue: number;
+}
+
+export function opsTotals(result: RunResult): OpsTotals {
+  const totals: OpsTotals = {
+    churned: 0,
+    priceChurn: 0,
+    outageChurn: 0,
+    incumbentChurn: 0,
+    tierMoves: 0,
+    outageUnitDays: 0,
+    storms: 0,
+    spansDamaged: 0,
+    repairs: 0,
+    incumbentPromoMonths: 0,
+    revenue: 0,
+  };
+  for (const report of result.reports) {
+    totals.churned += report.stats?.churned ?? 0;
+    totals.revenue += report.totals.revenue ?? 0;
+    const ops = report.ops;
+    if (!ops) continue;
+    totals.priceChurn += ops.priceChurn;
+    totals.outageChurn += ops.outageChurn;
+    totals.incumbentChurn += ops.incumbentChurn;
+    totals.tierMoves += ops.tierMoves;
+    totals.outageUnitDays += ops.outageUnitDays;
+    totals.storms += ops.storms;
+    totals.spansDamaged += ops.spansDamaged;
+    totals.repairs += ops.repairs;
+    totals.incumbentPromoMonths += ops.incumbentPromos;
+  }
+  return totals;
+}
+
+/** Sum of the monthly operating cash flow (financing and capex excluded) over months 1..toMonth. */
+export function cumulativeOperatingCashFlow(result: RunResult, toMonth = result.kpis.length): number {
+  let flow = 0;
+  for (const kpi of result.kpis.slice(0, toMonth)) flow += kpi.operatingCashFlow;
+  return flow;
+}
+
+/** What owning the run's plant costs a year at its last close: pole rent on its aerial spans and the expected storm and dig-in repairs (weather.stormRisk by method). */
+export function plantRunningCostPerYear(result: RunResult): { poleRent: number; repairs: number } {
+  const { state } = result;
+  let poles = 0;
+  let repairs = 0;
+  for (const span of state.network.spans) {
+    const segment = state.city.segments[span.segment];
+    if (!segment) continue;
+    if (span.method === 'aerial') poles += polesOnSegment(segment);
+    repairs += stormRisk(state, segment, span.method).repairCostPerYear;
+  }
+  return { poleRent: poles * POLE_RENT_PER_POLE_PER_MONTH * 12, repairs };
+}
+
+/** What storms are expected to cost the run's plant a year at its last close (weather.stormRisk per span, by its method). */
+export interface StormExposure {
+  /** Repair dollars. */
+  repairs: number;
+  /** Subscriber-days without service: each span's expected days out x the subscribers on its street. */
+  subscriberDaysOut: number;
+  /** Cancellations: each span's expected outages x its street's subscribers x the outage churn of an average outage. */
+  outageChurn: number;
+}
+
+/**
+ * The run's storm exposure (StormExposure) at its last close. Realized storm
+ * losses (MonthlyReport.ops) depend on where the storms happened to fall, and
+ * two runs of one seed see different storms once their plant differs (each
+ * storm draws per span in its area from the weather stream), so comparing
+ * strategies on a few seeds compares their luck as much as their plant; this
+ * compares the plant.
+ */
+export function stormExposure(result: RunResult): StormExposure {
+  const { state } = result;
+  const subscribers = new Map<SegmentId, number>();
+  for (const account of state.sales.accounts) {
+    const parcel = state.city.parcels[account.parcel];
+    if (!parcel) continue;
+    let units = 0;
+    for (const id of Object.keys(account.tierUnits) as TierId[]) units += account.tierUnits[id];
+    subscribers.set(parcel.segment, (subscribers.get(parcel.segment) ?? 0) + units);
+  }
+  const exposure: StormExposure = { repairs: 0, subscriberDaysOut: 0, outageChurn: 0 };
+  for (const span of state.network.spans) {
+    const segment = state.city.segments[span.segment];
+    if (!segment) continue;
+    const risk = stormRisk(state, segment, span.method);
+    const subs = subscribers.get(span.segment) ?? 0;
+    exposure.repairs += risk.repairCostPerYear;
+    exposure.subscriberDaysOut += risk.outageDaysPerYear * subs;
+    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method));
+  }
+  return exposure;
+}
+
+/**
+ * Cost per passing over `years` of owning the plant: lifetime outside-plant
+ * capex plus `years` x its yearly running cost (plantRunningCostPerYear),
+ * over the passings at the last close; null with nothing passed. The
+ * aerial-versus-underground trade-off in one figure: aerial is cheaper up
+ * front and dearer to own, underground the reverse.
+ */
+export function ownershipCostPerPassing(result: RunResult, years = VALUE_YEARS): number | null {
+  const last = result.reports.at(-1);
+  if (!last || last.passings <= 0) return null;
+  const running = plantRunningCostPerYear(result);
+  return (result.state.finance.capex.osp + years * (running.poleRent + running.repairs)) / last.passings;
+}
+
+/** Years of trailing operating cash flow runValue counts: the horizon SMART weighs a street's running costs over (SMART_DEFAULTS.horizonYears). */
+export const VALUE_YEARS = 12;
+
+/**
+ * What the run has built, valued at its last close: cash - debt + `years` x
+ * the operating cash flow of the last 12 closes (fewer at the start). A
+ * long-run view: plant that costs more up front but less to run (pole rent,
+ * repairs, outage churn) shows here, while cumulative cash flow only sees
+ * the first five years. A run that ended in game over is worth its cash less
+ * its debt only.
+ */
+export function runValue(result: RunResult, years = VALUE_YEARS): number {
+  const last = result.reports.at(-1);
+  if (!last) return result.state.finance.cash;
+  const debt = reportDebt(last);
+  if (result.gameOver) return last.cashEnd - debt;
+  const trailing = result.kpis.slice(-12);
+  let flow = 0;
+  for (const kpi of trailing) flow += kpi.operatingCashFlow;
+  const annual = trailing.length > 0 ? (flow * 12) / trailing.length : 0;
+  return last.cashEnd - debt + years * annual;
+}
+
+/**
+ * The run deleveraged through the frozen line's call: some close had the
+ * loans called (DebtStats.accelerationClosesLeft set) and a later close owed
+ * nothing. 1-based month of that close, else null.
+ */
+export function repaidAfterCall(result: RunResult): number | null {
+  let called = false;
+  for (let i = 0; i < result.reports.length; i++) {
+    const report = result.reports[i] as MonthlyReport;
+    if (report.debt?.accelerationClosesLeft != null) called = true;
+    else if (called && reportDebt(report) === 0) return i + 1;
+  }
+  return null;
+}
+
+/** 1-based month of the first close that ended frozen, or null. */
+export function firstFrozenMonth(result: RunResult): number | null {
+  const i = result.reports.findIndex((r) => r.debt?.stage === 'frozen');
+  return i < 0 ? null : i + 1;
+}
+
+/** Share of the town passed at the run's last close (passedShare of its last month); 0 for a run with no closes. */
+export function finalPassedShare(result: RunResult): number {
+  return passedShare(result, result.reports.length) ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Round 4: the constant-price sweep
+// ---------------------------------------------------------------------------
+
+/** Price multipliers the sweep tries, x every tier's TIER_DEFAULTS price. */
+export const PRICE_SWEEP_MULTIPLIERS: readonly number[] = [0.7, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6];
+
+/** Household prices `multiplier` x TIER_DEFAULTS (rounded, within TIER_PRICE_MIN..TIER_PRICE_MAX), every tier offered. */
+export function scaledPrices(multiplier: number): Array<{ id: TierId; price: number; offered: boolean }> {
+  return TIER_DEFAULTS.map((t) => ({
+    id: t.id,
+    price: Math.min(TIER_PRICE_MAX, Math.max(TIER_PRICE_MIN, Math.round(t.price * multiplier))),
+    offered: true,
+  }));
+}
+
+/**
+ * `makeInner` (a bot that keeps whatever prices it finds, e.g. SMART), with
+ * every tier set to `multiplier` x its TIER_DEFAULTS price before its first
+ * look and kept there (SMB multiplier at its default).
+ */
+export function constantPriceBot(makeInner: BotFactory, multiplier: number): BotFactory {
+  return (seed) => {
+    const inner = makeInner(seed);
+    let set = multiplier === 1;
+    return {
+      name: `${inner.name}@${multiplier}`,
+      act(state, send) {
+        if (!set) set = send({ type: 'setPricing', tiers: scaledPrices(multiplier), smbMultiplier: SMB_MULTIPLIER_DEFAULT }).ok;
+        inner.act(state, send);
+      },
+    };
+  };
+}
+
+export interface SweepPoint {
+  multiplier: number;
+  /** Mean over the seeds of cumulative operating cash flow to the last month (cumulativeOperatingCashFlow). */
+  operatingCashFlow: number;
+  /** Mean runValue over the seeds. */
+  value: number;
+  /** Means over the seeds: share passed, subscribers and take rate at the last close, ARPU and churn over the run. */
+  passedShare: number;
+  subscribers: number;
+  takeRate: number;
+  arpu: number;
+  churn: number;
+  /** Seeds that ended in game over. */
+  gameOvers: number;
+}
+
+/**
+ * The constant-price sweep: `makeInner` at each multiplier (constantPriceBot)
+ * on every seed for `months`, averaged per multiplier.
+ */
+export function priceSweep(
+  seeds: readonly number[],
+  makeInner: BotFactory,
+  months: number,
+  multipliers: readonly number[] = PRICE_SWEEP_MULTIPLIERS,
+): SweepPoint[] {
+  return multipliers.map((multiplier) => {
+    const point: SweepPoint = { multiplier, operatingCashFlow: 0, value: 0, passedShare: 0, subscribers: 0, takeRate: 0, arpu: 0, churn: 0, gameOvers: 0 };
+    for (const seed of seeds) {
+      const run = runBot(seed, constantPriceBot(makeInner, multiplier), months);
+      point.operatingCashFlow += cumulativeOperatingCashFlow(run) / seeds.length;
+      point.value += runValue(run) / seeds.length;
+      point.passedShare += finalPassedShare(run) / seeds.length;
+      point.subscribers += (run.reports.at(-1)?.stats?.subscribers ?? 0) / seeds.length;
+      point.takeRate += (run.kpis.at(-1)?.takeRate ?? 0) / seeds.length;
+      point.arpu += (averageArpu(run) ?? 0) / seeds.length;
+      point.churn += (averageChurn(run) ?? 0) / seeds.length;
+      if (run.gameOver) point.gameOvers++;
+    }
+    return point;
+  });
+}
+
+/** The sweep point with the highest cumulative operating cash flow (the first on a tie). */
+export function bestSweepPoint(points: readonly SweepPoint[]): SweepPoint | null {
+  let best: SweepPoint | null = null;
+  for (const point of points) if (!best || point.operatingCashFlow > best.operatingCashFlow) best = point;
+  return best;
 }
 
 // ---------------------------------------------------------------------------

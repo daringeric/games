@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MARKETING_MAX_PER_MONTH, TERM_LOAN_MIN, TIER_DEFAULTS } from './balance';
+import { MARKETING_MAX_PER_MONTH, STORM_START_DAY, TERM_LOAN_MIN, TIER_DEFAULTS } from './balance';
 import { isFirstOfMonth } from './calendar';
 import { creditAvailable, termCapacity } from './debt';
 import { applyCommand, newGame, runDays } from './game';
@@ -9,6 +9,7 @@ import { deserialize, hashState, serialize } from './save';
 import { shortestPath } from './streets';
 import { makeGridCity } from './testing/fixtures';
 import type { Command, CommandResult, GameState } from './types';
+import { outageSpanIds } from './weather';
 
 // Commands interleaved with day counts. Default grid: horizontal segments 0..8,
 // vertical 9..16, CO at node 0. Every aerial order draws make-ready (with its
@@ -256,5 +257,62 @@ describe('determinism with debt', () => {
     expect([...first.results, ...second.results]).toEqual(a.results);
     expect(hashState(second.state)).toBe(hashState(a.state));
     expect(hashState(salesSession(6, DEBT_SCRIPT).state)).not.toBe(hashState(a.state));
+  });
+});
+
+// Storm season on the sales town: mostly aerial plant, an underground
+// rebuild ordered once storms have begun, and two years of weather.
+const STORM_SCRIPT: ReadonlyArray<Step> = [
+  ...SALES_SCRIPT,
+  STORM_START_DAY - 330,
+  (s) => ({ type: 'convertSpan', span: s.network.spans.find((sp) => sp.method === 'aerial' && sp.stage === 'live')?.id ?? 0 }),
+  { type: 'layCable', segments: [12, 13, 14, 15], method: 'aerial' },
+  300,
+];
+
+function stormSession(seed: number, steps: ReadonlyArray<Step> = STORM_SCRIPT): Session {
+  const state = newGame(seed, { city: SALES_CITY });
+  state.finance.cash = 5_000_000;
+  return play(state, steps);
+}
+
+describe('determinism with weather', () => {
+  it('replays storms, outages, repairs and an underground rebuild identically from the same seed', () => {
+    const a = stormSession(5);
+    const b = stormSession(5);
+    expect(a.results.every((r) => r.ok), JSON.stringify(a.results)).toBe(true);
+    expect(a.state.day).toBeGreaterThan(STORM_START_DAY + 200);
+    const storms = a.state.finance.reports.reduce((sum, r) => sum + (r.ops?.storms ?? 0), 0);
+    expect(storms).toBeGreaterThan(0);
+    expect(a.state.finance.reports.some((r) => (r.ops?.spansDamaged ?? 0) > 0)).toBe(true);
+    // The rebuild finished: one span changed method.
+    expect(a.state.network.spans.some((s) => s.method === 'underground' && s.orderedDay < STORM_START_DAY && s.cost > 0)).toBe(true);
+    expect(a.results).toEqual(b.results);
+    expect(a.state.weather).toEqual(b.state.weather);
+    expect(hashState(a.state)).toBe(hashState(b.state));
+    expect(hashState(stormSession(6).state)).not.toBe(hashState(a.state));
+  });
+
+  it('replays identically through a save and load taken while spans are out of service', () => {
+    const straight = stormSession(5);
+    // The same session, saved and reloaded on the first day of the last stretch with a span out.
+    const last = STORM_SCRIPT.length - 1;
+    const first = play(newGame(5, { city: SALES_CITY }), []);
+    first.state.finance.cash = 5_000_000;
+    const head = play(first.state, STORM_SCRIPT.slice(0, last));
+    let state = head.state;
+    const days = STORM_SCRIPT[last] as number;
+    let ran = 0;
+    while (ran < days && outageSpanIds(state).length === 0) {
+      runDays(state, 1);
+      ran++;
+    }
+    expect(outageSpanIds(state).length).toBeGreaterThan(0);
+    const json = serialize(state);
+    state = deserialize(json);
+    expect(serialize(state)).toBe(json);
+    runDays(state, days - ran);
+    expect(head.results).toEqual(straight.results);
+    expect(hashState(state)).toBe(hashState(straight.state));
   });
 });

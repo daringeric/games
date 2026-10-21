@@ -5,12 +5,25 @@
 //   - a rejected command changes nothing at all;
 //   - total debt moves only by proceeds (+), principal entries (-) and, at a
 //     close whose payment was missed, capitalized interest (+);
-//   - a save mid-session replays identically; nothing throws.
+//   - a save mid-session replays identically; nothing throws;
+//   - round 4: debt.frozenCloses counts the closes ending frozen with debt
+//     owed, the bank calls the loans exactly at FROZEN_ACCELERATION_CLOSES of
+//     them, a call counts down while anything is owed and ends with nothing
+//     owed, nothing new is lent while it runs, and only a close that began
+//     frozen sweeps.
 
 import { describe, expect, it } from 'vitest';
-import { MARKETING_MAX_PER_MONTH, START_CASH, TERM_LOAN_MIN, TERM_LOAN_YEARS, TIER_DEFAULTS } from './balance';
+import {
+  ACCELERATION_CLOSES,
+  FROZEN_ACCELERATION_CLOSES,
+  MARKETING_MAX_PER_MONTH,
+  START_CASH,
+  TERM_LOAN_MIN,
+  TERM_LOAN_YEARS,
+  TIER_DEFAULTS,
+} from './balance';
 import { isFirstOfMonth } from './calendar';
-import { creditAvailable, termCapacity, totalDebt } from './debt';
+import { closesUntilAcceleration, creditAvailable, termCapacity, totalDebt } from './debt';
 import { applyCommand, newGame, tick } from './game';
 import { Rng } from './rng';
 import { deserialize, hashState, serialize } from './save';
@@ -132,6 +145,13 @@ interface Tally {
   missedCloses: number;
   capitalized: number;
   frozenCloses: number;
+  /** Round 4: dollars swept from frozen months, and closes at which the bank called the loans. */
+  swept: number;
+  calls: number;
+}
+
+function newTally(): Tally {
+  return { accepted: {}, rejected: 0, missedCloses: 0, capitalized: 0, frozenCloses: 0, swept: 0, calls: 0 };
 }
 
 /**
@@ -161,7 +181,7 @@ function session(seed: number, days: number, opts: { style?: Style; reloadAt?: n
   const style = opts.style ?? MIDDLING;
   const openingCash = state.finance.cash;
   const rng = new Rng(seed * 7919 + 1);
-  const tally: Tally = { accepted: {}, rejected: 0, missedCloses: 0, capitalized: 0, frozenCloses: 0 };
+  const tally = newTally();
   opening(state);
 
   for (let day = 0; day < days && !state.gameOver; day++) {
@@ -173,8 +193,11 @@ function session(seed: number, days: number, opts: { style?: Style; reloadAt?: n
       const cash = state.finance.cash;
       const debt = totalDebt(state);
       const flows = debtFlows(state);
+      const called = state.debt.acceleration !== null;
       const result = applyCommand(state, cmd);
       if (result.ok) {
+        // Nothing new is lent once the bank has called the loans.
+        expect(called && (cmd.type === 'drawCredit' || cmd.type === 'takeTermLoan'), JSON.stringify(cmd)).toBe(false);
         tally.accepted[cmd.type] = (tally.accepted[cmd.type] ?? 0) + 1;
         expect(result.cost, JSON.stringify(cmd)).toBe(cash - state.finance.cash);
         expect(totalDebt(state) - debt, JSON.stringify(cmd)).toBe(debtFlows(state) - flows);
@@ -188,6 +211,9 @@ function session(seed: number, days: number, opts: { style?: Style; reloadAt?: n
     const debt = totalDebt(state);
     const flows = debtFlows(state);
     const closing = isFirstOfMonth(state.day + 1);
+    const stageBefore = state.debt.covenant.stage;
+    const frozenBefore = state.debt.frozenCloses;
+    const callBefore = state.debt.acceleration === null ? null : { ...state.debt.acceleration };
     tick(state);
     const capitalized = totalDebt(state) - debt - (debtFlows(state) - flows);
     if (closing) {
@@ -202,6 +228,39 @@ function session(seed: number, days: number, opts: { style?: Style; reloadAt?: n
       }
       if (report.debt!.stage === 'frozen') tally.frozenCloses++;
       expect(report.debt!.creditBalance + report.debt!.termBalance).toBe(totalDebt(state));
+      // Round 4: the report records the count and the call as they stand after the close.
+      expect(report.debt!.frozenCloses).toBe(state.debt.frozenCloses);
+      expect(report.debt!.accelerationClosesLeft ?? null).toBe(state.debt.acceleration?.closesLeft ?? null);
+      // Only a close that began frozen sweeps, and the sweep is principal repaid.
+      expect(report.debt!.sweep).toBeGreaterThanOrEqual(0);
+      if (report.debt!.sweep! > 0) expect(stageBefore).toBe('frozen');
+      expect(-(report.totals.principal ?? 0)).toBeGreaterThanOrEqual(report.debt!.sweep!);
+      tally.swept += report.debt!.sweep!;
+      if (!state.gameOver) {
+        const owed = totalDebt(state);
+        expect(state.debt.frozenCloses).toBe(report.debt!.stage === 'frozen' && owed > 0 ? frozenBefore + 1 : 0);
+        const call = state.debt.acceleration;
+        if (call === null) {
+          // A call ends only with nothing owed.
+          if (callBefore !== null) expect(owed).toBe(0);
+          if (state.debt.covenant.stage === 'frozen' && owed > 0) {
+            expect(state.debt.frozenCloses).toBeLessThan(FROZEN_ACCELERATION_CLOSES);
+            expect(closesUntilAcceleration(state)).toBe(FROZEN_ACCELERATION_CLOSES - state.debt.frozenCloses);
+          }
+        } else {
+          expect(owed).toBeGreaterThan(0);
+          if (callBefore === null) {
+            // Called exactly at FROZEN_ACCELERATION_CLOSES frozen closes in a row.
+            expect(state.debt.frozenCloses).toBe(FROZEN_ACCELERATION_CLOSES);
+            expect(call).toEqual({ day: state.day, closesLeft: ACCELERATION_CLOSES });
+            tally.calls++;
+          } else {
+            expect(call.closesLeft).toBe(Math.max(1, callBefore.closesLeft - 1));
+          }
+          for (const loan of state.debt.loans) expect(loan.monthsLeft).toBeLessThanOrEqual(call.closesLeft);
+          expect(closesUntilAcceleration(state)).toBeNull();
+        }
+      }
     } else {
       expect(capitalized).toBe(0);
     }
@@ -221,7 +280,7 @@ describe('random sessions with debt', () => {
   it(
     'keeps the books, the costs and the debt exact through every command and close',
     () => {
-      const totals: Tally = { accepted: {}, rejected: 0, missedCloses: 0, capitalized: 0, frozenCloses: 0 };
+      const totals = newTally();
       const endings: string[] = [];
       for (const seed of SEEDS) {
         // Prudent, middling and reckless players: some still playing at the end, some in default.
@@ -231,6 +290,8 @@ describe('random sessions with debt', () => {
         totals.missedCloses += tally.missedCloses;
         totals.capitalized += tally.capitalized;
         totals.frozenCloses += tally.frozenCloses;
+        totals.swept += tally.swept;
+        totals.calls += tally.calls;
         endings.push(state.gameOver?.reason ?? "playing");
         // Whatever happened, the game saves and loads as itself.
         expect(deserialize(serialize(state))).toEqual(state);
@@ -244,6 +305,8 @@ describe('random sessions with debt', () => {
       expect(totals.frozenCloses).toBeGreaterThan(0);
       expect(totals.missedCloses).toBeGreaterThan(0);
       expect(totals.capitalized).toBeGreaterThan(0);
+      // Frozen months with cash flow to share were swept (round 4).
+      expect(totals.swept).toBeGreaterThan(0);
       expect(endings).toContain('default');
       // ...while the prudent players were still in business at the end.
       expect(endings).toContain('playing');
@@ -259,6 +322,7 @@ describe('random sessions with debt', () => {
         [2, MIDDLING, 77],
         [4, RECKLESS, 45],
       ];
+      let termLoans = 0;
       for (const [seed, style, reloadAt] of runs) {
         const straight = session(seed, 2 * 365, { style });
         // The reload lands while the game is still on.
@@ -267,8 +331,11 @@ describe('random sessions with debt', () => {
         const reloaded = session(seed, 2 * 365, { style, reloadAt });
         expect(hashState(again.state)).toBe(hashState(straight.state));
         expect(hashState(reloaded.state)).toBe(hashState(straight.state));
-        expect(straight.tally.accepted.takeTermLoan ?? 0).toBeGreaterThan(0);
+        // Every run borrowed, and the runs between them took term loans (smoothed lending ARR comes slowly to a fast ramp).
+        expect((straight.tally.accepted.takeTermLoan ?? 0) + (straight.tally.accepted.drawCredit ?? 0)).toBeGreaterThan(0);
+        termLoans += straight.tally.accepted.takeTermLoan ?? 0;
       }
+      expect(termLoans).toBeGreaterThan(0);
     },
     LONG_TEST_MS,
   );

@@ -2,6 +2,8 @@
 // ?debug=1: production builds only expose window.__lst with that flag (see
 // src/ui/debugHook.ts). Replacing the game in play keeps the flag in the URL,
 // so a reload after a new game, a load or an import still has the hook.
+// Debug pages start with the month-end briefing off (round 4): a spec that
+// wants it opens with openWithBriefings() or calls setBriefing().
 //
 // Owner: ui-economy workstream. Other specs import these; if a spec needs a
 // helper that is not here, define it in that spec.
@@ -36,6 +38,27 @@ export function withDebug(url: string): string {
 export async function open(page: Page, url: string): Promise<void> {
   await page.goto(withDebug(url));
   await page.waitForFunction(() => window.__lst !== undefined);
+}
+
+/** A briefing setting for a debug page: '1' (the stored preference, every month by default), a frequency, or 'off'. */
+export type BriefingParam = '1' | 'monthly' | 'quarterly' | 'attention' | 'off';
+
+/** `url` with briefing=<setting> added (see src/ui/briefing.ts startingBriefingSetting). */
+export function withBriefing(url: string, setting: BriefingParam = '1'): string {
+  const [path = '/', query = ''] = url.split('?');
+  const params = new URLSearchParams(query);
+  params.set('briefing', setting);
+  return `${path}?${params.toString()}`;
+}
+
+/** Open `url` like open(), with month-end briefings on ('1': the stored preference). */
+export async function openWithBriefings(page: Page, url: string, setting: BriefingParam = '1'): Promise<void> {
+  await open(page, withBriefing(url, setting));
+}
+
+/** Switch this page's month-end briefings without storing a preference (window.__lst.setBriefing). */
+export async function setBriefing(page: Page, setting: Exclude<BriefingParam, '1'>): Promise<void> {
+  await page.evaluate((s) => window.__lst!.setBriefing(s), setting);
 }
 
 export async function nodeOnScreen(page: Page, node: number): Promise<{ x: number; y: number }> {

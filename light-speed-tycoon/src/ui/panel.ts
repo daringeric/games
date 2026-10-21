@@ -1,10 +1,12 @@
 // Report panel: the last closed month (net, revenue, subscribers, the
 // scorecard KPIs and, from round 3, financing: interest, principal, money
-// borrowed, debt, leverage and coverage) and this month's spending so far. On
-// phones and short screens it starts collapsed to three headline figures;
-// "Details" opens the rest.
+// borrowed, debt, leverage and coverage; from round 4, repairs, outages,
+// price steps, tier moves, incumbent promos and the frozen-line sweep) and
+// this month's spending so far. On phones and short screens it starts
+// collapsed to three headline figures; "Details" opens the rest.
 //
-// Owner: ui-economy workstream; financing rows: ui-bank workstream.
+// Owner: ui-economy workstream; financing rows: ui-bank workstream; round-4
+// rows: ui-briefing workstream.
 
 import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatMonth } from '../sim/calendar';
@@ -24,9 +26,15 @@ export type ReportRowKey =
   | 'costPerConnection'
   | 'operatingCashFlow'
   | 'poleRent'
+  | 'repairs'
   | 'passings'
+  | 'outages'
+  | 'priceChurn'
+  | 'tierMoves'
+  | 'incumbentPromos'
   | 'interest'
   | 'principal'
+  | 'sweep'
   | 'proceeds'
   | 'debt'
   | 'leverage'
@@ -43,6 +51,11 @@ export interface ReportRow {
   detail: string | null;
   /** Longer explanation for a tooltip. */
   hint: string;
+  /**
+   * Round-4 rows only: nothing happened this month (or the report predates
+   * round 4 and reads '–'), so the panel leaves the row out to stay short.
+   */
+  quiet?: boolean;
 }
 
 const DASH = '–';
@@ -147,6 +160,7 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       detail: null,
       hint: 'Rent for the utility poles your aerial cable hangs on',
     },
+    repairsRow(report),
     {
       key: 'passings',
       label: 'Passings',
@@ -155,7 +169,71 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       detail: null,
       hint: 'Homes and businesses your lit network passes',
     },
+    ...operationsRows(report),
     ...financingRows(report),
+  ];
+}
+
+/** Storm and dig-in repairs (totals.repair); '–' on a report from before round 4 (no ops). */
+export function repairsRow(report: MonthlyReport): ReportRow {
+  const ops = report.ops ?? null;
+  const spent = 0 - (report.totals.repair ?? 0);
+  return {
+    key: 'repairs',
+    label: 'Repairs',
+    value: ops ? formatMoney(spent) : DASH,
+    tone: null,
+    detail: ops && ops.spansDamaged > 0 ? `${plural(ops.spansDamaged, 'span')} damaged` : null,
+    hint: 'Fixing spans storms and excavators damaged. Aerial cable is hit far more often than underground',
+    quiet: !ops || (spent === 0 && ops.spansDamaged === 0),
+  };
+}
+
+/**
+ * Round 4's operating figures (report.ops): outages, price-step and
+ * tier-move cancellations, and the incumbent's promos. A report from before
+ * round 4 (no ops) reads '–' throughout.
+ */
+export function operationsRows(report: MonthlyReport): ReportRow[] {
+  const ops = report.ops ?? null;
+  const count = (n: number | undefined) => (ops ? formatNumber(n ?? 0) : DASH);
+  return [
+    {
+      key: 'outages',
+      label: 'Outages',
+      value: ops ? `${formatNumber(ops.outageUnitDays)} sub-days` : DASH,
+      tone: null,
+      detail: ops ? `${plural(ops.storms, 'storm')}, ${formatNumber(ops.outageChurn)} cancelled` : null,
+      hint: 'Subscriber-days without service because a damaged span cut their street off, the storms that hit, and the cancellations the outages caused',
+      quiet: !ops || (ops.outageUnitDays === 0 && ops.storms === 0 && ops.outageChurn === 0),
+    },
+    {
+      key: 'priceChurn',
+      label: 'Price-step cancels',
+      value: count(ops?.priceChurn),
+      tone: null,
+      detail: null,
+      hint: 'Subscribers who cancelled at this close because their price stepped up (a price lock or intro promo ending, or a move off a retired tier)',
+      quiet: !ops || ops.priceChurn === 0,
+    },
+    {
+      key: 'tierMoves',
+      label: 'Tier moves',
+      value: count(ops?.tierMoves),
+      tone: null,
+      detail: null,
+      hint: 'Subscribers moved off tiers you no longer offer, to the offered tier nearest in price',
+      quiet: !ops || ops.tierMoves === 0,
+    },
+    {
+      key: 'incumbentPromos',
+      label: 'Incumbent promos',
+      value: count(ops?.incumbentPromos),
+      tone: null,
+      detail: ops && ops.incumbentPromos > 0 ? `${formatNumber(ops.incumbentChurn)} cancelled` : null,
+      hint: 'Areas where the cable company ran a promo this month, and your subscribers it took',
+      quiet: !ops || (ops.incumbentPromos === 0 && ops.incumbentChurn === 0),
+    },
   ];
 }
 
@@ -187,6 +265,15 @@ export function financingRows(report: MonthlyReport): ReportRow[] {
       tone: null,
       detail: null,
       hint: 'Credit-line repayments, scheduled term-loan principal and prepayments',
+    },
+    {
+      key: 'sweep',
+      label: 'Swept by the bank',
+      value: debt?.sweep === undefined ? DASH : formatMoney(debt.sweep),
+      tone: null,
+      detail: debt?.frozenCloses ? `${plural(debt.frozenCloses, 'frozen close')} in a row` : null,
+      hint: 'While the credit line is frozen the bank takes part of each month’s operating cash flow to repay debt (included in principal repaid)',
+      quiet: !debt?.sweep,
     },
     {
       key: 'proceeds',
@@ -226,12 +313,15 @@ export function financingRows(report: MonthlyReport): ReportRow[] {
 /**
  * "Mar 2027 closed: net +$1,200, 412 subs, 1,034 passings" (no subscriber
  * count for a report without stats; ", payment missed" when the close could
- * not pay its debt service).
+ * not pay its debt service; round 4: ", 2 storms" and ", $8,000 swept" when
+ * storms hit or the bank swept cash from a frozen line).
  */
 export function monthClosedMessage(report: MonthlyReport): string {
   const parts = [`net ${formatSignedMoney(report.net)}`];
   if (report.stats) parts.push(plural(report.stats.subscribers, 'sub'));
   parts.push(plural(report.passings, 'passing'));
+  if (report.ops && report.ops.storms > 0) parts.push(plural(report.ops.storms, 'storm'));
+  if (report.debt?.sweep) parts.push(`${formatMoney(report.debt.sweep)} swept`);
   if (report.debt?.missedPayment) parts.push('payment missed');
   return `${formatMonth(report.year, report.month)} closed: ${parts.join(', ')}`;
 }
@@ -251,6 +341,8 @@ const HEADLINE: readonly ReportRowKey[] = ['net', 'subscribers', 'takeRate'];
 const COMPACT_QUERY = '(max-width: 880px), (max-height: 500px)';
 
 interface RowView {
+  /** The row's own element (round-4 rows hide while quiet). */
+  row: HTMLElement;
   value: HTMLElement;
   /** Where the row's secondary line goes (the subscriber movements), if anywhere. */
   detail: HTMLElement | null;
@@ -259,7 +351,7 @@ interface RowView {
 }
 
 /** Rows whose secondary line sits right after the value rather than on a row of its own. */
-const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage'];
+const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage', 'repairs', 'outages', 'incumbentPromos', 'sweep'];
 
 export class ReportPanel {
   readonly root: HTMLElement;
@@ -293,10 +385,9 @@ export class ReportPanel {
       const kind = headline ? 'stat' : 'row';
       const value = el('span', { class: 'num' });
       const inline = INLINE_DETAIL.includes(row.key) ? el('small', { class: 'row-sub', attrs: { hidden: '' } }) : null;
-      this.rows.set(row.key, { value, detail: null, inline });
-      (headline ? this.headline : this.details).append(
-        el('div', { class: `${kind} ${kind}-${row.key}`, attrs: { title: row.hint } }, [el('dt', { text: row.label }), el('dd', {}, [value, inline])]),
-      );
+      const line = el('div', { class: `${kind} ${kind}-${row.key}`, attrs: { title: row.hint } }, [el('dt', { text: row.label }), el('dd', {}, [value, inline])]);
+      this.rows.set(row.key, { row: line, value, detail: null, inline });
+      (headline ? this.headline : this.details).append(line);
     }
     // The subscriber headline's movements get a row of their own in the details.
     const moves = el('span', { class: 'num' });
@@ -354,6 +445,7 @@ export class ReportPanel {
       for (const row of reportRows(last)) {
         const view = this.rows.get(row.key);
         if (!view) continue;
+        view.row.hidden = row.quiet === true;
         setText(view.value, row.value);
         view.value.classList.toggle('negative', row.tone === 'negative');
         view.value.classList.toggle('breach', row.tone === 'breach');

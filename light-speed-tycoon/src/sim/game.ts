@@ -10,6 +10,7 @@ import {
   addOltCard,
   addSplitter,
   advanceNetwork,
+  convertSpan,
   getService,
   layCable,
   placeCabinet,
@@ -17,8 +18,9 @@ import {
   removeSpan,
 } from './network';
 import { deriveSeed, withRng } from './rng';
-import { accrueDay, newSales, setMarketing, setPricing, stepSales } from './sales';
-import type { CableMethod, City, Command, CommandResult, GameState, TermYears, TierSetting } from './types';
+import { accrueDay, newSales, setMarketing, setPricing, setPromo, stepSales } from './sales';
+import type { CableMethod, City, Command, CommandResult, GameState, IntroPromo, TermYears, TierSetting } from './types';
+import { newWeather, stepWeather } from './weather';
 
 export interface NewGameOptions {
   /** Use this city instead of generating one (tests, scenarios). */
@@ -29,20 +31,21 @@ export interface NewGameOptions {
 /**
  * Fresh game: day 0, START_CASH, empty network with an OLT of OLT_START_CARDS
  * line cards (OLT_START_PON_PORTS GPON ports), rng.events = deriveSeed(seed,
- * 'events'), rng.sales = deriveSeed(seed, 'sales'), city = opts.city ??
+ * 'events'), rng.sales = deriveSeed(seed, 'sales'), rng.weather =
+ * deriveSeed(seed, 'weather'), city = opts.city ??
  * generateCity(deriveSeed(seed, 'citygen'), opts.cityOptions), default pricing
- * and marketing, no subscribers, milestones, notices or capex, and no debt
- * (debt.newDebt()).
+ * and marketing, no subscribers, milestones, notices or capex, no debt
+ * (debt.newDebt()) and no storms yet (weather.newWeather()).
  */
 export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
   // Keep the seed as the uint32 that deriveSeed actually mixes, so it saves and
   // validates as one; every derived stream is unchanged by this.
   const base = seed >>> 0;
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     seed: base,
     day: 0,
-    rng: { events: deriveSeed(base, 'events'), sales: deriveSeed(base, 'sales') },
+    rng: { events: deriveSeed(base, 'events'), sales: deriveSeed(base, 'sales'), weather: deriveSeed(base, 'weather') },
     nextId: 1,
     city: opts.city ?? generateCity(deriveSeed(base, 'citygen'), opts.cityOptions),
     network: {
@@ -55,6 +58,7 @@ export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
     finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
     debt: newDebt(),
     sales: newSales(),
+    weather: newWeather(),
     milestones: [],
     notices: [],
     nextNoticeId: 1,
@@ -75,6 +79,12 @@ function reject(reason: string): CommandResult {
  * prepayLoan { loan: number, amount: number } are field-type checked here
  * and handed to debt.ts, which checks values (whole dollars, limits, terms,
  * cash, the covenant stage).
+ *
+ * Round 4: setPricing's optional grandfatherMonths must be a number when
+ * present (sales.setPricing checks its range); setPromo { promo: null |
+ * { percentOff: number, months: number } } goes to sales.setPromo;
+ * convertSpan { span: number } goes to network.convertSpan with the events
+ * stream (its permit draw).
  */
 export function applyCommand(state: GameState, cmd: Command): CommandResult {
   // Commands also come from replays, scripts and the console, so check field
@@ -110,13 +120,27 @@ export function applyCommand(state: GameState, cmd: Command): CommandResult {
     case 'addOltCard':
       return addOltCard(state);
     case 'setPricing': {
-      const { tiers, smbMultiplier } = fields;
+      const { tiers, smbMultiplier, grandfatherMonths } = fields;
       if (!Array.isArray(tiers) || !tiers.every(isTierSettingShape)) {
         return reject('setPricing needs a list of tiers, each { id, price, offered }');
       }
       if (typeof smbMultiplier !== 'number') return reject('setPricing needs an SMB multiplier');
+      if (grandfatherMonths !== undefined && typeof grandfatherMonths !== 'number') {
+        return reject('setPricing grandfatherMonths must be a number of months');
+      }
       // Unknown ids, prices out of range and the like are rejected by sales.setPricing.
-      return setPricing(state, tiers, smbMultiplier);
+      return grandfatherMonths === undefined ? setPricing(state, tiers, smbMultiplier) : setPricing(state, tiers, smbMultiplier, grandfatherMonths);
+    }
+    case 'setPromo': {
+      const { promo } = fields;
+      if (promo !== null && !isPromoShape(promo)) return reject('setPromo needs promo: null or { percentOff, months }');
+      // Out-of-range values are rejected by sales.setPromo.
+      return setPromo(state, promo);
+    }
+    case 'convertSpan': {
+      const { span } = fields;
+      if (typeof span !== 'number') return reject('convertSpan needs a cable span id');
+      return withRng(state, 'events', (rng) => convertSpan(state, span, rng));
     }
     case 'setMarketing':
       if (typeof fields.perMonth !== 'number') return reject('setMarketing needs a monthly budget');
@@ -147,6 +171,12 @@ function isTierSettingShape(value: unknown): value is TierSetting {
   return typeof t.id === 'string' && typeof t.price === 'number' && typeof t.offered === 'boolean';
 }
 
+function isPromoShape(value: unknown): value is IntroPromo {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const p = value as Record<string, unknown>;
+  return typeof p.percentOff === 'number' && typeof p.months === 'number';
+}
+
 function describeType(type: unknown): string {
   return typeof type === 'string' ? JSON.stringify(type) : type === undefined ? 'missing type' : typeof type;
 }
@@ -166,6 +196,10 @@ function describeType(type: unknown): string {
  *   if closing: closeMonth (sales stream for churn), which may end the game;
  *     if it did, stop here: no network progress, no sales
  *   advanceNetwork
+ *   weather.stepWeather for the new day (weather stream; round 4): repairs,
+ *     storms, dig-ins and the month's outage accruals. It sees today's
+ *     network progress (a span that went live today can be hit), and the
+ *     sales step sees its outages the same day (no signups on a cut-off street)
  *   stepSales for the new day (sales stream)
  * A span that goes live on the 1st, or a lot that appears that day, belongs to
  * the new month. Day 0 never gets a sales step (no signups or churn), only its
@@ -182,6 +216,7 @@ export function tick(state: GameState): void {
   if (closing) withRng(state, 'sales', (rng) => closeMonth(state, passings, rng));
   if (state.gameOver) return;
   advanceNetwork(state);
+  withRng(state, 'weather', (rng) => stepWeather(state, rng));
   withRng(state, 'sales', (rng) => stepSales(state, rng));
 }
 

@@ -26,13 +26,17 @@ src/
     coverage.ts   cabinet reach and the placement preview
     sales.ts      subscribers: signups, installs, ports, billing accruals, churn, pricing
     finance.ts    ledger, monthly close, insolvency
-    debt.ts       credit line, term loans, underwriting, pricing, covenants, default
+    debt.ts       credit line, term loans, underwriting, pricing, covenants, default,
+                  the frozen-line sweep and loan acceleration
+    weather.ts    storms, dig-ins, span outages and repairs
+    incumbent.ts  the incumbent cable company's local promos
+    advisor.ts    the month-end briefing and the advisor's ranked suggestions
     metrics.ts    cost-per-passing bands and report KPIs
     milestones.ts scorecard milestones
     notices.ts    player-facing notices raised by the sim
     game.ts       newGame / applyCommand / tick
-    save.ts       serialize / deserialize, v1 -> v2 -> v3 migration
-    testing/      fixtures for unit tests (incl. frozen schemaVersion 1 and 2 saves)
+    save.ts       serialize / deserialize, v1 -> v2 -> v3 -> v4 migration
+    testing/      fixtures for unit tests (incl. frozen schemaVersion 1, 2 and 3 saves)
     tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes
   ui/           HTML/CSS HUD, tools, input, storage
