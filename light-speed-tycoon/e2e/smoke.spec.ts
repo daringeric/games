@@ -135,6 +135,7 @@ const speedOf = (page: Page) => page.locator('.speed[aria-pressed="true"]').getA
 
 // Phones, tablets and narrow windows: every control must be on screen and on top.
 const LAYOUTS = [
+  { name: 'phone portrait', width: 390, height: 844, touch: true },
   { name: 'iPad portrait', width: 768, height: 1024, touch: true },
   { name: 'iPad Air portrait', width: 820, height: 1180, touch: true },
   { name: 'small landscape phone', width: 740, height: 360, touch: true },
@@ -152,21 +153,39 @@ for (const layout of LAYOUTS) {
       await open(page, '/?seed=12345');
       // Let the web fonts settle the HUD's width.
       await page.evaluate(() => document.fonts.ready);
-      const problems = await page.evaluate(() => {
-        const out: string[] = [];
-        for (const el of document.querySelectorAll<HTMLElement>('.speed, .menu-button, .hud-action, .tool, .hint-close, .panel-toggle')) {
-          const r = el.getBoundingClientRect();
-          const label = el.getAttribute('aria-label') ?? el.textContent ?? el.className;
-          if (r.left < 0 || r.top < 0 || r.right > window.innerWidth || r.bottom > window.innerHeight) {
-            out.push(`${label} is off screen at [${Math.round(r.left)}, ${Math.round(r.top)}, ${Math.round(r.right)}, ${Math.round(r.bottom)}]`);
-            continue;
+      const problems = (selector: string) =>
+        page.evaluate((selector) => {
+          const out: string[] = [];
+          for (const el of document.querySelectorAll<HTMLElement>(selector)) {
+            if (el.hidden) {
+              out.push(`${el.className} is hidden`);
+              continue;
+            }
+            const r = el.getBoundingClientRect();
+            const label = el.getAttribute('aria-label') ?? el.textContent ?? el.className;
+            if (r.left < 0 || r.top < 0 || r.right > window.innerWidth || r.bottom > window.innerHeight) {
+              out.push(`${label} is off screen at [${Math.round(r.left)}, ${Math.round(r.top)}, ${Math.round(r.right)}, ${Math.round(r.bottom)}]`);
+              continue;
+            }
+            const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            if (!hit || !el.contains(hit)) out.push(`${label} is covered by ${hit ? `${hit.tagName}.${hit.className}` : 'nothing'}`);
           }
-          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-          if (!hit || !el.contains(hit)) out.push(`${label} is covered by ${hit ? `${hit.tagName}.${hit.className}` : 'nothing'}`);
-        }
-        return out;
+          return out;
+        }, selector);
+      const controls = '.speed, .menu-button, .hud-action, .tool, .hint-close, .panel-toggle';
+      expect(await problems(controls)).toEqual([]);
+      // The busiest HUD: debt, a covenant stage and an overdraft all showing (test-only state).
+      await page.evaluate(() => {
+        const s = window.__lst!.getState();
+        s.debt.credit.balance = 412_000;
+        s.debt.covenant.stage = 'frozen';
+        s.finance.cash = -1_234_567;
+        window.__lst!.tick(1);
       });
-      expect(problems).toEqual([]);
+      await expect(page.getByTestId('hud-debt')).toBeVisible();
+      await expect(page.getByTestId('hud-covenant')).toBeVisible();
+      await expect(page.getByTestId('hud-insolvency')).toBeVisible();
+      expect(await problems(`${controls}, .chip-debt, .chip-covenant, .hud-alert`)).toEqual([]);
       // The menu opens fully on screen too.
       await page.getByRole('button', { name: 'Menu' }).click();
       const menu = await page.getByRole('menu').boundingBox();

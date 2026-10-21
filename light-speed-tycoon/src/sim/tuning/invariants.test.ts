@@ -1,10 +1,14 @@
 // Invariants over long mixed bot sessions (bots.ts mixedBot: the careful
-// operator plus random removals, cancellations, splitters, OLT cards, price
-// and budget changes and junk), using every command type:
+// operator, borrowing, plus random removals, cancellations, splitters, OLT
+// cards, price and budget changes, credit-line draws and repayments, term
+// loans, prepayments and junk), using every command type:
 //
 // - capex: capex.osp + capex.co === -(every construction, equipment and refund
 //   amount ever posted) and capex.connect === -(every install amount);
-// - the books: opening cash + every amount ever posted === cash;
+// - the books: opening cash + every amount ever posted === cash (financing
+//   entries - proceeds, principal, interest, late fees - included);
+// - debt: total debt moves only by what is posted as loan proceeds and
+//   principal (unless a missed payment capitalized interest);
 // - a command's cost is exactly the cash it moved; a rejected one moves none;
 // - ports: accounts within each cabinet's splitters, splitters within the OLT;
 // - saves round-trip (and a game reloaded mid-session replays identically);
@@ -13,15 +17,16 @@
 //   without crashing, with consistent books from then on.
 
 import { describe, expect, it } from 'vitest';
-import { START_CASH, TIER_DEFAULTS } from '../balance';
+import { LOAN_ROUNDING, START_CASH, TERM_LOAN_MIN, TERM_LOAN_YEARS, TIER_DEFAULTS } from '../balance';
 import { isFirstOfMonth } from '../calendar';
+import { totalDebt } from '../debt';
 import { applyCommand, newGame, runDays, tick } from '../game';
 import { getService, ponPortsUsed } from '../network';
 import { cabinetPortCapacity, cabinetPortsUsed } from '../sales';
 import { deserialize, hashState, SaveError, serialize } from '../save';
 import { makeGridCity } from '../testing/fixtures';
 import type { GridCityOptions } from '../testing/fixtures';
-import type { Command, CommandResult, GameState } from '../types';
+import type { Command, CommandResult, GameState, TermYears } from '../types';
 import { mixedBot } from './bots';
 import { runBot } from './harness';
 
@@ -35,6 +40,10 @@ const COMMAND_TYPES: readonly Command['type'][] = [
   'addOltCard',
   'setPricing',
   'setMarketing',
+  'drawCredit',
+  'repayCredit',
+  'takeTermLoan',
+  'prepayLoan',
 ];
 const PLANT_CATEGORIES = ['construction', 'equipment', 'refund'] as const;
 const SESSION_SEEDS = [3, 2027];
@@ -72,6 +81,16 @@ interface Books {
   /** capex.osp + capex.co + plant postings, and capex.connect + install postings, at the start (0 for a new game). */
   plantBase: number;
   connectBase: number;
+  /** Total debt less every loan proceeds and principal amount posted, at the start. */
+  debtBase: number;
+  /** Closes that had missed a payment at the start. */
+  missedBase: number;
+}
+
+const DEBT_CATEGORIES = ['loanProceeds', 'principal'] as const;
+
+function missedPayments(state: GameState): number {
+  return state.finance.reports.filter((r) => r.debt?.missedPayment).length;
 }
 
 function openBooks(state: GameState): Books {
@@ -79,6 +98,8 @@ function openBooks(state: GameState): Books {
     opening: state.finance.cash - postedTotal(state),
     plantBase: state.finance.capex.osp + state.finance.capex.co + postedIn(state, PLANT_CATEGORIES),
     connectBase: state.finance.capex.connect + postedIn(state, ['install']),
+    debtBase: totalDebt(state) - postedIn(state, DEBT_CATEGORIES),
+    missedBase: missedPayments(state),
   };
 }
 
@@ -90,6 +111,10 @@ function brokenInvariant(state: GameState, books: Books): string | null {
   if (plant !== books.plantBase) return `plant capex ${finance.capex.osp} + ${finance.capex.co} does not match its ledger (${plant} != ${books.plantBase})`;
   const connect = finance.capex.connect + postedIn(state, ['install']);
   if (connect !== books.connectBase) return `connect capex ${finance.capex.connect} does not match the install ledger`;
+  // A missed payment adds its unpaid interest to the balances without a ledger entry.
+  if (missedPayments(state) === books.missedBase && totalDebt(state) !== books.debtBase + postedIn(state, DEBT_CATEGORIES)) {
+    return `debt ${totalDebt(state)} does not match proceeds and principal posted (${books.debtBase} + ${postedIn(state, DEBT_CATEGORIES)})`;
+  }
   const used = cabinetPortsUsed(state);
   for (const cabinet of state.network.cabinets) {
     if ((used.get(cabinet.id) ?? 0) > cabinetPortCapacity(cabinet)) return `cabinet ${cabinet.id} carries more ports than its splitters`;
@@ -192,8 +217,8 @@ const MIXED_LOTS: GridCityOptions['parcelKinds'] = (p) =>
 /**
  * A small-town mixed session long enough to hold every kind of record: spans
  * at every stage, cabinets with extra splitters, extra OLT cards, make-ready
- * memos, subscribers with building routers, closed months with stats,
- * notices and milestones.
+ * memos, subscribers with building routers, closed months with stats and debt
+ * stats, notices and milestones, a credit-line balance and an open term loan.
  */
 function midSessionSave(): string {
   const city = makeGridCity({ cols: 3, rows: 3, parcelKinds: MIXED_LOTS });
@@ -202,6 +227,7 @@ function midSessionSave(): string {
   // Pick up mid-month with plant still in permitting.
   const s = run.state;
   applyCommand(s, { type: 'layCable', segments: city.segments.map((seg) => seg.id), method: 'underground' });
+  applyCommand(s, { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: TERM_LOAN_YEARS.at(-1) as TermYears });
   runDays(s, 10);
   return serialize(s);
 }
@@ -236,6 +262,10 @@ function playEveryCommand(state: GameState): void {
     { type: 'setMarketing', perMonth: 2_000 },
     { type: 'removeSpan', span },
     { type: 'removeCabinet', cabinet },
+    { type: 'drawCredit', amount: LOAN_ROUNDING },
+    { type: 'repayCredit', amount: LOAN_ROUNDING / 2 },
+    { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: TERM_LOAN_YEARS[0] as TermYears },
+    { type: 'prepayLoan', loan: state.debt.loans[0]?.id ?? 1, amount: LOAN_ROUNDING },
   ];
   for (const cmd of commands) applyCommand(state, cmd);
   runDays(state, 35);
@@ -258,6 +288,9 @@ describe('single-field corruption of a mid-session save', () => {
       expect(base.finance.reports.length).toBeGreaterThan(3);
       expect(base.finance.monthToDate.length).toBeGreaterThan(0);
       expect(base.notices.length).toBeGreaterThan(0);
+      expect(base.debt.loans.length).toBeGreaterThan(0);
+      expect(base.debt.credit.balance).toBeGreaterThan(0);
+      expect(base.finance.reports.at(-1)?.debt).toBeDefined();
 
       const paths = savePaths(JSON.parse(text));
       expect(paths.length).toBeGreaterThan(200);

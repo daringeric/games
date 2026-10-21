@@ -1,16 +1,19 @@
 // Save/load. Pure string <-> GameState; browser storage lives in the UI layer.
 //
-// This build writes schemaVersion 2 and reads 2 and 1. A version-1 save (round
-// 1, still in players' browsers as autosaves) is validated against the v1
-// shape, migrated with migrateV1toV2, then validated as v2.
+// This build writes schemaVersion 3 and reads 3, 2 and 1. Older saves (still
+// in players' browsers as autosaves) are validated against their own shape and
+// migrated one version at a time, each step validated: v1 -> migrateV1toV2 ->
+// v2 -> migrateV2toV3 -> v3. A v2 save gets no debt.
 //
-// Owner after the round-2 contract: sim-economy workstream (migration tests
-// against the frozen v1 fixtures in testing/, new corruption cases, review).
+// Owner after the round-3 contract: sim-debt workstream (debt validation and
+// corruption cases; migration tests against the frozen v1 and v2 fixtures in
+// testing/).
 
 import { CABINET_REACH_FT, OLT_MAX_CARDS, OLT_PORTS_PER_CARD, START_YEAR } from './balance';
 import { groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
+import { newDebt } from './debt';
 import { deriveSeed } from './rng';
 import { otherEnd, segmentsAtNode } from './streets';
 import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales } from './sales';
@@ -18,6 +21,8 @@ import type {
   BuildStage,
   CableMethod,
   CableSpan,
+  CovenantStage,
+  GameOverReason,
   GameState,
   LedgerCategory,
   LedgerEntry,
@@ -31,7 +36,7 @@ import type {
   Zone,
 } from './types';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const UINT32_MAX = 0xffffffff;
 /**
  * Largest map edge in cells a save may have: several times a generated town
@@ -53,6 +58,16 @@ const SANE_PRICE_MAX = 100_000;
 const SANE_PARCEL_UNITS_MAX = 10_000;
 const SANE_MULTIPLIER_MAX = 100;
 const SANE_BUDGET_MAX = 1_000_000_000;
+/**
+ * Largest balance, principal or payment a save may carry ($1 trillion), and
+ * the largest rate (1,000% a year) and term (100 years): interest on them
+ * stays a finite whole number, and amortization loops stay short.
+ */
+const SANE_DEBT_MAX = 1_000_000_000_000;
+const SANE_RATE_MAX_BPS = 100_000;
+const SANE_TERM_MONTHS_MAX = 1_200;
+/** Most compliant closes a save may count toward a cure (the rule itself, COVENANT_CURE_CLOSES, is tunable). */
+const SANE_CURE_CLOSES_MAX = 1_000;
 
 export class SaveError extends Error {
   override name = 'SaveError';
@@ -66,7 +81,7 @@ export function serialize(state: GameState): string {
 /**
  * Parse and validate a save. Throws SaveError for malformed JSON, a missing or
  * unsupported schemaVersion, or a structurally invalid state. A schemaVersion 1
- * save is migrated to the current version.
+ * or 2 save is migrated to the current version (each step validated).
  */
 export function deserialize(json: string): GameState {
   let raw: unknown;
@@ -81,18 +96,26 @@ export function deserialize(json: string): GameState {
   }
   if (raw.schemaVersion === 1) {
     checkState(raw, 1);
-    const migrated = migrateV1toV2(raw);
-    checkState(migrated as unknown as Json, 2);
-    noteReachChange(migrated);
-    return migrated;
+    const v2 = migrateV1toV2(raw);
+    checkState(v2 as unknown as Json, 2);
+    const state = migrateV2toV3(v2);
+    checkState(state as unknown as Json, 3);
+    noteReachChange(state);
+    return state;
+  }
+  if (raw.schemaVersion === 2) {
+    upgradeEarlyV2(raw);
+    checkState(raw, 2);
+    const state = migrateV2toV3(raw as unknown as V2State);
+    checkState(state as unknown as Json, 3);
+    return state;
   }
   if (raw.schemaVersion !== SCHEMA_VERSION) {
     throw new SaveError(
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
-  upgradeEarlyV2(raw);
-  checkState(raw, 2);
+  checkState(raw, 3);
   return raw as unknown as GameState;
 }
 
@@ -148,8 +171,37 @@ export function fnv1a(text: string): string {
 // Migration
 // ---------------------------------------------------------------------------
 
+/** A schemaVersion 2 game: today's GameState without debt. */
+export type V2State = Omit<GameState, 'schemaVersion' | 'debt'> & { schemaVersion: 2 };
+
 /**
- * Turn a parsed, v1-valid save into a v2 GameState (the input object is not
+ * Turn a v2-valid save into a v3 GameState: everything kept as it is (the
+ * same objects), plus debt = debt.newDebt() (nothing borrowed, covenant
+ * compliant). Reports keep no `debt` stats (the UI shows them as "-").
+ * Keys are written in newGame's order (debt right after finance) so migrated
+ * and fresh saves hash alike.
+ */
+export function migrateV2toV3(v2: V2State): GameState {
+  return {
+    schemaVersion: 3,
+    seed: v2.seed,
+    day: v2.day,
+    rng: v2.rng,
+    nextId: v2.nextId,
+    city: v2.city,
+    network: v2.network,
+    finance: v2.finance,
+    debt: newDebt(),
+    sales: v2.sales,
+    milestones: v2.milestones,
+    notices: v2.notices,
+    nextNoticeId: v2.nextNoticeId,
+    gameOver: v2.gameOver,
+  };
+}
+
+/**
+ * Turn a parsed, v1-valid save into a v2 game (the input object is not
  * reused). Players keep their town, plant, cash, ledger and reports:
  * - rng.sales = deriveSeed(seed, 'sales'); rng.events kept, so make-ready
  *   draws continue exactly as before.
@@ -165,7 +217,7 @@ export function fnv1a(text: string): string {
  *   for homes that are already passed), no milestones, notices or game over.
  * Keys are written in newGame's order so migrated and fresh saves hash alike.
  */
-export function migrateV1toV2(v1: Record<string, unknown>): GameState {
+export function migrateV1toV2(v1: Record<string, unknown>): V2State {
   const old = v1 as unknown as V1State;
   const capexCategories: readonly LedgerCategory[] = ['construction', 'equipment', 'refund'];
   let spent = 0;
@@ -288,7 +340,7 @@ interface V1State {
 // ---------------------------------------------------------------------------
 
 type Json = Record<string, unknown>;
-type Version = 1 | 2;
+type Version = 1 | 2 | 3;
 
 /** Keys of an exhaustive record: adding a union member is a compile error until it is listed. */
 function members<T extends string>(record: Record<T, true>): readonly T[] {
@@ -318,9 +370,28 @@ const NOTICE_KINDS = members<NoticeKind>({
   installsPaused: true,
   installsResumed: true,
   rulesUpdated: true,
+  paymentDue: true,
+  paymentMissed: true,
+  covenantWarning: true,
+  covenantPenalty: true,
+  creditFrozen: true,
+  covenantCured: true,
+  loanPaidOff: true,
   gameOver: true,
   milestone: true,
 });
+/** Notice kinds new in schemaVersion 3 (financing). */
+const V3_NOTICE_KINDS: readonly NoticeKind[] = [
+  'paymentDue',
+  'paymentMissed',
+  'covenantWarning',
+  'covenantPenalty',
+  'creditFrozen',
+  'covenantCured',
+  'loanPaidOff',
+];
+/** Notice kinds a schemaVersion 2 save can contain. */
+const V2_NOTICE_KINDS: readonly NoticeKind[] = NOTICE_KINDS.filter((k) => !V3_NOTICE_KINDS.includes(k));
 const LEDGER_CATEGORIES = members<LedgerCategory>({
   construction: true,
   equipment: true,
@@ -332,10 +403,21 @@ const LEDGER_CATEGORIES = members<LedgerCategory>({
   payroll: true,
   marketing: true,
   interest: true,
+  principal: true,
+  loanProceeds: true,
   other: true,
 });
+/** Categories a schemaVersion 2 save can contain (no financing flows but the never-posted 'interest'). */
+const V2_LEDGER_CATEGORIES: readonly LedgerCategory[] = LEDGER_CATEGORIES.filter((c) => c !== 'principal' && c !== 'loanProceeds');
 /** Categories a schemaVersion 1 save can contain. */
-const V1_LEDGER_CATEGORIES: readonly LedgerCategory[] = LEDGER_CATEGORIES.filter((c) => c !== 'install' && c !== 'overhead');
+const V1_LEDGER_CATEGORIES: readonly LedgerCategory[] = V2_LEDGER_CATEGORIES.filter((c) => c !== 'install' && c !== 'overhead');
+const LEDGER_CATEGORIES_BY_VERSION: Record<Version, readonly LedgerCategory[]> = {
+  1: V1_LEDGER_CATEGORIES,
+  2: V2_LEDGER_CATEGORIES,
+  3: LEDGER_CATEGORIES,
+};
+const COVENANT_STAGES = members<CovenantStage>({ compliant: true, warning: true, penalty: true, frozen: true });
+const GAME_OVER_REASONS = members<GameOverReason>({ insolvent: true, default: true });
 const STATS_FIELDS = members<keyof MonthlyStats>({
   subscribers: true,
   accounts: true,
@@ -460,13 +542,14 @@ function checkState(save: Json, version: Version): void {
   const day = int(save.day, 'day', 0);
   const rng = obj(save.rng, 'rng');
   int(rng.events, 'rng.events', 0, UINT32_MAX);
-  if (version === 2) int(rng.sales, 'rng.sales', 0, UINT32_MAX);
+  if (version >= 2) int(rng.sales, 'rng.sales', 0, UINT32_MAX);
   const nextId = int(save.nextId, 'nextId', 1);
   const city = checkCity(obj(save.city, 'city'));
   const ctx: Context = { version, day, nextId, city };
   checkNetwork(obj(save.network, 'network'), ctx);
   checkFinance(obj(save.finance, 'finance'), ctx);
   if (version === 1) return;
+  if (version >= 3) checkDebt(obj(save.debt, 'debt'), ctx);
   checkSales(obj(save.sales, 'sales'), ctx);
   checkProgress(save, ctx);
 }
@@ -563,7 +646,7 @@ function checkNetwork(network: Json, ctx: Context): void {
     cabled.add(segment);
     oneOf(span.method, `${path}.method`, CABLE_METHODS);
     int(span.constructDays, `${path}.constructDays`, 1);
-    if (version === 2) int(span.refundable, `${path}.refundable`, 0, span.cost as number);
+    if (version >= 2) int(span.refundable, `${path}.refundable`, 0, span.cost as number);
   });
 
   const cabinetNodes = new Set<number>();
@@ -579,10 +662,10 @@ function checkNetwork(network: Json, ctx: Context): void {
 
   const olt = obj(network.olt, 'network.olt');
   int(olt.ponPorts, 'network.olt.ponPorts', 0);
-  if (version === 2) int(olt.cards, 'network.olt.cards', 0);
+  if (version >= 2) int(olt.cards, 'network.olt.cards', 0);
   oneOf(olt.tech, 'network.olt.tech', PON_TECHS);
 
-  if (version === 2) {
+  if (version >= 2) {
     const keys: number[] = [];
     list(network.makeReady, 'network.makeReady').forEach((value, i) => {
       const path = `network.makeReady[${i}]`;
@@ -600,7 +683,7 @@ function checkNetwork(network: Json, ctx: Context): void {
 }
 
 function checkFinance(finance: Json, ctx: Context): void {
-  const categories = ctx.version === 2 ? LEDGER_CATEGORIES : V1_LEDGER_CATEGORIES;
+  const categories = LEDGER_CATEGORIES_BY_VERSION[ctx.version];
   int(finance.cash, 'finance.cash');
 
   list(finance.monthToDate, 'finance.monthToDate').forEach((value, i) => {
@@ -625,10 +708,11 @@ function checkFinance(finance: Json, ctx: Context): void {
     int(report.net, `${path}.net`);
     int(report.cashEnd, `${path}.cashEnd`);
     int(report.passings, `${path}.passings`, 0);
-    if (ctx.version === 2 && report.stats !== undefined) {
+    if (ctx.version >= 2 && report.stats !== undefined) {
       const stats = obj(report.stats, `${path}.stats`);
       for (const field of STATS_FIELDS) int(stats[field], `${path}.stats.${field}`, 0);
     }
+    if (ctx.version >= 3 && report.debt !== undefined) checkDebtStats(obj(report.debt, `${path}.debt`), `${path}.debt`);
   });
 
   if (ctx.version === 1) return;
@@ -637,6 +721,57 @@ function checkFinance(finance: Json, ctx: Context): void {
   int(capex.connect, 'finance.capex.connect', 0);
   int(capex.co, 'finance.capex.co', 0);
   int(finance.negativeMonths, 'finance.negativeMonths', 0);
+}
+
+/** Report.debt (round-3 closes). */
+function checkDebtStats(stats: Json, path: string): void {
+  int(stats.creditBalance, `${path}.creditBalance`, 0);
+  int(stats.termBalance, `${path}.termBalance`, 0);
+  int(stats.creditLimit, `${path}.creditLimit`, 0);
+  int(stats.arr, `${path}.arr`, 0);
+  int(stats.annualOperatingCashFlow, `${path}.annualOperatingCashFlow`);
+  int(stats.annualDebtService, `${path}.annualDebtService`, 0);
+  // Required but nullable: a missing field is corrupt, null is "not measurable".
+  if (stats.leverageX100 !== null) int(stats.leverageX100, `${path}.leverageX100`, 0);
+  if (stats.coverageX100 !== null) int(stats.coverageX100, `${path}.coverageX100`);
+  oneOf(stats.stage, `${path}.stage`, COVENANT_STAGES);
+  if (stats.averageRateBps !== null) int(stats.averageRateBps, `${path}.averageRateBps`, 0);
+  bool(stats.missedPayment, `${path}.missedPayment`);
+}
+
+function checkRateParts(rate: Json, path: string): void {
+  for (const field of ['baseBps', 'leverageBps', 'cppBps', 'productBps'] as const) {
+    int(rate[field], `${path}.${field}`, 0, SANE_RATE_MAX_BPS);
+  }
+}
+
+function checkDebt(debt: Json, ctx: Context): void {
+  const credit = obj(debt.credit, 'debt.credit');
+  int(credit.balance, 'debt.credit.balance', 0, SANE_DEBT_MAX);
+  checkRateParts(obj(credit.rate, 'debt.credit.rate'), 'debt.credit.rate');
+  // A month of end-of-day balances.
+  int(credit.balanceDollarDays, 'debt.credit.balanceDollarDays', 0, SANE_DEBT_MAX * 31);
+
+  const nextLoanId = int(debt.nextLoanId, 'debt.nextLoanId', 1);
+  const ids = list(debt.loans, 'debt.loans').map((value, i) => {
+    const path = `debt.loans[${i}]`;
+    const loan = obj(value, path);
+    const id = int(loan.id, `${path}.id`, 1, nextLoanId - 1);
+    int(loan.principal, `${path}.principal`, 1, SANE_DEBT_MAX);
+    // Missed payments capitalize interest, so the balance may exceed the principal.
+    int(loan.balance, `${path}.balance`, 1, SANE_DEBT_MAX);
+    int(loan.rateBps, `${path}.rateBps`, 0, SANE_RATE_MAX_BPS);
+    const termMonths = int(loan.termMonths, `${path}.termMonths`, 1, SANE_TERM_MONTHS_MAX);
+    int(loan.payment, `${path}.payment`, 1, SANE_DEBT_MAX);
+    int(loan.monthsLeft, `${path}.monthsLeft`, 1, termMonths);
+    int(loan.originatedDay, `${path}.originatedDay`, 0, ctx.day);
+    return id;
+  });
+  ascending(ids, 'debt.loans (by id)');
+
+  const covenant = obj(debt.covenant, 'debt.covenant');
+  oneOf(covenant.stage, 'debt.covenant.stage', COVENANT_STAGES);
+  int(covenant.compliantCloses, 'debt.covenant.compliantCloses', 0, SANE_CURE_CLOSES_MAX);
 }
 
 function checkSales(sales: Json, ctx: Context): void {
@@ -721,7 +856,7 @@ function checkProgress(save: Json, ctx: Context): void {
     const notice = obj(value, path);
     const id = int(notice.id, `${path}.id`, 1, nextNoticeId - 1);
     int(notice.day, `${path}.day`, 0, ctx.day);
-    oneOf(notice.kind, `${path}.kind`, NOTICE_KINDS);
+    oneOf(notice.kind, `${path}.kind`, ctx.version >= 3 ? NOTICE_KINDS : V2_NOTICE_KINDS);
     str(notice.message, `${path}.message`);
     if (notice.cabinet !== null) int(notice.cabinet, `${path}.cabinet`, 1, ctx.nextId - 1);
     if (notice.milestone !== null) oneOf(notice.milestone, `${path}.milestone`, MILESTONE_IDS);
@@ -732,7 +867,7 @@ function checkProgress(save: Json, ctx: Context): void {
   if (save.gameOver !== null) {
     const over = obj(save.gameOver, 'gameOver');
     int(over.day, 'gameOver.day', 0, ctx.day);
-    oneOf(over.reason, 'gameOver.reason', ['insolvent'] as const);
+    oneOf(over.reason, 'gameOver.reason', ctx.version >= 3 ? GAME_OVER_REASONS : (['insolvent'] as const));
     str(over.message, 'gameOver.message');
   }
 }

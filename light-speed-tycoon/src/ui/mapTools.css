@@ -120,6 +120,13 @@
   font-weight: 700;
 }
 
+/* Cash after an order that would leave it below $0. */
+.float-card .tone-negative {
+  color: var(--danger);
+  font-family: var(--font-display);
+  font-weight: 600;
+}
+
 /* Small print after a value (the cost-per-passing target), never band-colored. */
 .float-card .row-sub {
   margin-left: 2px;
@@ -146,6 +153,17 @@
   color: var(--text-2);
   font-size: 12.5px;
   font-weight: 700;
+}
+
+/* Cash is short: what the credit line could do (shown in the compact card too). */
+.card-credit {
+  margin: 6px 0 0;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: var(--chip);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 800;
 }
 
 /* Cost overlay legend: never takes clicks, so it can't cover a control. ---------- */
@@ -359,6 +377,24 @@
 
 .olt-add-detail {
   font: 700 12.5px / 1 var(--font-ui);
+}
+
+.olt-cash-after {
+  display: flex;
+  justify-content: space-between;
+  margin: 8px 2px 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.olt-cash-after .num {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.olt-cash-after .num.negative {
+  color: var(--danger);
 }
 
 /* Short screens and phones -------------------------------------------------------- */

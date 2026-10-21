@@ -1,13 +1,14 @@
 // Cash, ledger and monthly close.
 
-import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH } from './balance';
+import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH, SUPPORT_COST_PER_SUB_PER_MONTH } from './balance';
 import { dateOf, formatMonth, MONTH_LENGTHS } from './calendar';
+import { closeDebtMonth, reviewDebt, totalDebt } from './debt';
 import { operatingCashFlow } from './metrics';
 import { checkMilestones } from './milestones';
 import { ponPortsUsed } from './network';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
-import { closeSalesMonth, subscriberUnits } from './sales';
+import { closeSalesMonth, monthlyRecurringRevenue, subscriberUnits } from './sales';
 import { polesOnSegment } from './streets';
 import type { GameState, LedgerCategory, LedgerEntry, MonthlyReport, MonthlyStats } from './types';
 
@@ -24,7 +25,9 @@ const CATEGORY_ORDER: Record<LedgerCategory, number> = {
   payroll: 7,
   marketing: 8,
   interest: 9,
-  other: 10,
+  principal: 10,
+  loanProceeds: 11,
+  other: 12,
 };
 
 /** Whole number with thousands separators: 12400 -> "12,400". */
@@ -82,6 +85,34 @@ export function monthlyPoleRent(state: GameState): number {
 }
 
 /**
+ * Cash the next month close will have at its debt step (closeMonth steps 1-3
+ * done): today's cash, plus the billing it will post (revenue accrued so far,
+ * plus today's subscribers at today's prices for the days of the month not
+ * yet accrued), less pole rent for today's live aerial spans, the overhead,
+ * marketing and support (accrued so far plus today's rates for the days
+ * left), and installs for the days left at the month's pace so far. Exact on
+ * the month's last day, when nothing is left to accrue; before that an
+ * estimate (signups, churn and commands change it). The payment reminder
+ * (debt.endDebtDay) and the Bank's next payment compare it with
+ * debt.estimateNextDebtService. Pure read, O(accounts + ledger entries).
+ */
+export function estimateCashAtClose(state: GameState): number {
+  const { finance, sales } = state;
+  const date = dateOf(state.day);
+  const daysInMonth = MONTH_LENGTHS[date.month - 1] as number;
+  // Days still to accrue: tick() accrues each day as it moves onto it (day 0 on the first tick).
+  const left = daysInMonth - date.day + (state.day === 0 ? 1 : 0);
+  const month = sales.month;
+  const revenue = Math.round((month.revenueDollarDays + monthlyRecurringRevenue(state) * left) / daysInMonth);
+  const marketing = Math.round((month.marketingDollarDays + sales.marketingPerMonth * left) / daysInMonth);
+  const support = Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (month.subscriberUnitDays + subscriberUnits(state) * left)) / daysInMonth);
+  let installs = 0;
+  for (const entry of finance.monthToDate) if (entry.category === 'install') installs += entry.amount;
+  const installsLeft = Math.round((installs * left) / date.day);
+  return finance.cash + revenue - marketing - support - OVERHEAD_PER_MONTH - monthlyPoleRent(state) + installsLeft;
+}
+
+/**
  * Close the month that just ended. Called by tick() when the new day is the 1st
  * of a month (never for day 0), before that day's network progress and sales
  * step, so the network is as it stood on the ended month's last day. `rng` is
@@ -91,14 +122,20 @@ export function monthlyPoleRent(state: GameState): number {
  *   1. pole rent for live aerial spans;
  *   2. 'overhead' -OVERHEAD_PER_MONTH ("Overhead for Mar 2027");
  *   3. sales.closeSalesMonth: revenue, marketing, support, churn, accrual reset;
- *   4. totals, net and the MonthlyReport (labelled with the ended month), with
+ *   4. debt.closeDebtMonth: the month's debt service (credit-line interest,
+ *      term-loan payments) out of the cash left after 1-3, or a missed
+ *      payment (interest capitalized, a late fee);
+ *   5. totals, net and the MonthlyReport (labelled with the ended month), with
  *      `stats` from the month-end state: subscribers/accounts after churn, the
  *      SalesClose counts, sales.connectsTotal, finance.capex, PON ports in use
  *      / olt.ponPorts, sales.fullCabinets.length; append it to finance.reports
  *      and clear monthToDate;
- *   5. milestones.checkMilestones(state, report);
- *   6. checkInsolvency(state).
- * Returns the report. Every report it writes has `stats`.
+ *   6. milestones.checkMilestones(state, report);
+ *   7. debt.reviewDebt: default (game over) / missed payment / covenant
+ *      review and its notices, the credit line's re-pricing, report.debt;
+ *   8. checkInsolvency(state) (nothing once a default has ended the game).
+ * Returns the report. Every report it writes has `stats` and `debt` (zeros
+ * with no debt).
  */
 export function closeMonth(state: GameState, passings: number, rng: Rng): MonthlyReport {
   const lastDay = state.day - 1;
@@ -120,6 +157,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
   }
 
   const sales = closeSalesMonth(state, rng, MONTH_LENGTHS[ended.month - 1] as number, lastDay);
+  const debtClose = closeDebtMonth(state, lastDay);
 
   const sums = new Map<LedgerCategory, number>();
   let net = 0;
@@ -161,6 +199,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
   state.finance.monthToDate = [];
 
   checkMilestones(state, report);
+  reviewDebt(state, report, debtClose);
   checkInsolvency(state);
   return report;
 }
@@ -180,8 +219,11 @@ function latestCloseLabel(state: GameState): string {
  * 'insolvent', message } and post a 'gameOver' notice; otherwise post an
  * 'insolvencyWarning' notice saying how many more negative closes end the game
  * ("Cash is below zero at the Mar 2027 close. 2 more closes in the red and the
- * bank shuts you down."). If cash >= 0: negativeMonths = 0 (no notice).
- * Does nothing once gameOver is set.
+ * bank shuts you down."). With the credit line frozen and debt outstanding the
+ * warning says instead that the next close in the red is a default: such a
+ * close cannot pay its loan payments, and a payment missed while frozen ends
+ * the game (debt.reviewDebt) before any grace runs out. If cash >= 0:
+ * negativeMonths = 0 (no notice). Does nothing once gameOver is set.
  */
 export function checkInsolvency(state: GameState): void {
   if (state.gameOver) return;
@@ -202,24 +244,25 @@ export function checkInsolvency(state: GameState): void {
     postNotice(state, 'gameOver', message);
     return;
   }
-  postNotice(
-    state,
-    'insolvencyWarning',
-    `Cash is below zero at the ${label} close (${formatMoney(finance.cash)}). ` +
-      `${left} more close${left === 1 ? '' : 's'} in the red and the bank shuts you down.`,
-  );
+  const next =
+    state.debt.covenant.stage === 'frozen' && totalDebt(state) > 0
+      ? 'Your credit line is frozen, so the next close in the red is a default: it cannot pay its loan payments, the bank calls your loans and the game ends.'
+      : `${left} more close${left === 1 ? '' : 's'} in the red and the bank shuts you down.`;
+  postNotice(state, 'insolvencyWarning', `Cash is below zero at the ${label} close (${formatMoney(finance.cash)}). ${next}`);
 }
 
 /**
- * Months of runway at the current burn, for the HUD warning: null when there is
- * no closed month yet or the last closed month's operating cash flow
- * (metrics.operatingCashFlow) was >= 0; otherwise
- * floor(max(0, cash) / -operatingCashFlow(last)). Pure read.
+ * Months of runway at the current burn, for the HUD warning. The burn is the
+ * last closed month's operating cash flow (metrics.operatingCashFlow) plus its
+ * debt service (totals.interest and totals.principal, both <= 0; money
+ * borrowed is not income, so loanProceeds is left out). Null when there is no
+ * closed month yet or that flow was >= 0; otherwise
+ * floor(max(0, cash) / -flow). Pure read.
  */
 export function runwayMonths(state: GameState): number | null {
   const last = state.finance.reports.at(-1);
   if (!last) return null;
-  const flow = operatingCashFlow(last);
+  const flow = operatingCashFlow(last) + (last.totals.interest ?? 0) + (last.totals.principal ?? 0);
   if (flow >= 0) return null;
   return Math.floor(Math.max(0, state.finance.cash) / -flow);
 }

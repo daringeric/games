@@ -1,8 +1,24 @@
 // Test-only helpers: small, hand-checkable cities that don't depend on the generator.
 
-import { CABINET_START_SPLITTERS, TILE_FT } from '../balance';
+import { ARR_TRAILING_MONTHS, BASE_RATE_BPS, CABINET_START_SPLITTERS, START_YEAR, TILE_FT } from '../balance';
+import { dayOf } from '../calendar';
+import { annualOperatingCashFlow, creditLimit, levelPayment, trailingArr } from '../debt';
 import { newGame } from '../game';
-import type { CabinetId, City, GameState, NodeId, Parcel, ParcelKind, SegmentId, StreetNode, StreetSegment } from '../types';
+import type {
+  CabinetId,
+  City,
+  DebtStats,
+  GameState,
+  LedgerCategory,
+  MonthlyReport,
+  NodeId,
+  Parcel,
+  ParcelKind,
+  SegmentId,
+  StreetNode,
+  StreetSegment,
+  TermLoan,
+} from '../types';
 
 export interface GridCityOptions {
   /** Blocks across. Default 3. */
@@ -204,6 +220,84 @@ export function addLivePlant(state: GameState, opts: LivePlantOptions = {}): Cab
   }
   state.network.version++;
   return cabinet;
+}
+
+// ---------------------------------------------------------------------------
+// Financing (round 3)
+// ---------------------------------------------------------------------------
+
+/** A closed month for unit tests: `revenue` billed and `costs` spent (as overhead), nothing else, no stats. */
+export function closedMonth(year: number, month: number, revenue: number, costs = 0): MonthlyReport {
+  const totals: Partial<Record<LedgerCategory, number>> = {};
+  if (revenue !== 0) totals.revenue = revenue;
+  if (costs !== 0) totals.overhead = -costs;
+  return { year, month, totals, net: revenue - costs, cashEnd: 0, passings: 0 };
+}
+
+/** Year and month (1..12) of the `index`-th month of the game (0 = Jan of START_YEAR). */
+function gameMonth(index: number): { year: number; month: number } {
+  return { year: START_YEAR + Math.floor(index / 12), month: (index % 12) + 1 };
+}
+
+/**
+ * Replace state's closed months with `months` (default ARR_TRAILING_MONTHS)
+ * months that each billed `revenue` and spent `costs`, labelled from Jan of
+ * START_YEAR on, and move the day to the 10th of the month after them (as if
+ * those months had closed in play). Then trailingArr = revenue x 12 and
+ * annualOperatingCashFlow = (revenue - costs) x 12. Cash is left as it is
+ * (these books do not add up; use real play where a test checks them).
+ */
+export function giveHistory(state: GameState, revenue: number, costs = 0, months = ARR_TRAILING_MONTHS): GameState {
+  state.finance.reports = [];
+  for (let i = 0; i < months; i++) {
+    const { year, month } = gameMonth(i);
+    state.finance.reports.push(closedMonth(year, month, revenue, costs));
+  }
+  const next = gameMonth(months);
+  state.day = dayOf({ year: next.year, month: next.month, day: 10 });
+  return state;
+}
+
+/** makeTestState on `city` with giveHistory(revenue, costs, months). */
+export function makeTradingState(revenue: number, costs = 0, opts: { months?: number; city?: City } = {}): GameState {
+  return giveHistory(makeTestState(opts.city), revenue, costs, opts.months);
+}
+
+/** A term loan for unit tests: defaults to a fresh 5-year loan at BASE_RATE_BPS taken on day 0, level payment from debt.levelPayment. */
+export function makeLoan(overrides: Partial<TermLoan> = {}): TermLoan {
+  const principal = overrides.principal ?? overrides.balance ?? 60_000;
+  const rateBps = overrides.rateBps ?? BASE_RATE_BPS;
+  const termMonths = overrides.termMonths ?? 60;
+  const balance = overrides.balance ?? principal;
+  const monthsLeft = overrides.monthsLeft ?? termMonths;
+  return {
+    id: 1,
+    principal,
+    balance,
+    rateBps,
+    termMonths,
+    payment: levelPayment(balance, rateBps, monthsLeft),
+    monthsLeft,
+    originatedDay: 0,
+    ...overrides,
+  };
+}
+
+/** The report.debt a close writes when nothing is owed, from the state right after that close. */
+export function noDebtStats(state: GameState): DebtStats {
+  return {
+    creditBalance: 0,
+    termBalance: 0,
+    creditLimit: creditLimit(state),
+    arr: trailingArr(state),
+    annualOperatingCashFlow: annualOperatingCashFlow(state),
+    annualDebtService: 0,
+    leverageX100: 0,
+    coverageX100: null,
+    stage: 'compliant',
+    averageRateBps: null,
+    missedPayment: false,
+  };
 }
 
 function ordinalSuffix(n: number): string {

@@ -25,4 +25,6 @@ export const ICONS = {
   tag: svg('<path d="M3.5 12.5V4h8.5l8.5 8.5-8.5 8.5z"/><circle cx="8" cy="8.5" r="1.5" fill="currentColor"/>'),
   trophy: svg('<path d="M8 4h8v5a4 4 0 01-8 0z"/><path d="M8 6H5a3 3 0 003 4M16 6h3a3 3 0 01-3 4"/><path d="M12 13v4M8.5 20h7"/>'),
   warning: svg('<path d="M12 4l9 16H3z"/><path d="M12 10v4.5"/><circle cx="12" cy="17.3" r="0.9" fill="currentColor"/>'),
+  // Round 3: the Bank panel and the HUD debt chip.
+  bank: svg('<path d="M3.5 9.5L12 4.5l8.5 5"/><path d="M6 10.5v7M10 10.5v7M14 10.5v7M18 10.5v7"/><path d="M3.5 20h17"/>'),
 };

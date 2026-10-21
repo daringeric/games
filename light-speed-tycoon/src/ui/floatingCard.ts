@@ -1,10 +1,11 @@
 // The card that follows the cursor with a quote or details for whatever is
 // under it (rendered from the tools' CardModel): an itemized charge table,
-// label/value rows (cost-per-passing values colored by band), amber warnings,
-// small print, red blockers and a hint line.
+// label/value rows (cost-per-passing values colored by band, money below $0
+// in red), amber warnings, small print, red blockers, the credit-line note
+// when cash is short, and a hint line.
 
 import { el } from './dom';
-import type { CardModel } from './tools';
+import type { CardModel, CardRow } from './tools';
 
 /** Screen band the card may use: below the HUD and above a bottom toolbar (CSS px). */
 export interface CardSafeArea {
@@ -152,7 +153,7 @@ export class FloatingCard {
               el('dt', { text: r.label }),
               el(
                 'dd',
-                { class: r.tone ? `tone-value tone-${r.tone === 'muted' ? 'muted' : `cpp-${r.tone}`}` : undefined },
+                { class: r.tone ? `tone-value ${valueToneClass(r.tone)}` : undefined },
                 r.sub ? [r.value, el('small', { class: 'row-sub', text: r.sub })] : [r.value],
               ),
             ]),
@@ -164,7 +165,14 @@ export class FloatingCard {
     if (warnings.length > 0) parts.push(el('ul', { class: 'card-warnings' }, warnings.map((w) => el('li', { text: w }))));
     if (card.note) parts.push(el('p', { class: 'card-note', text: card.note }));
     if (card.blockers.length > 0) parts.push(el('ul', { class: 'blockers' }, card.blockers.map((b) => el('li', { text: b }))));
+    if (card.credit) parts.push(el('p', { class: 'card-credit', text: card.credit }));
     if (card.hint) parts.push(el('p', { class: 'hint-line', text: card.hint }));
     this.root.replaceChildren(...parts);
   }
+}
+
+/** The class that colors a row's value. */
+function valueToneClass(tone: NonNullable<CardRow['tone']>): string {
+  if (tone === 'muted' || tone === 'negative') return `tone-${tone}`;
+  return `tone-cpp-${tone}`;
 }

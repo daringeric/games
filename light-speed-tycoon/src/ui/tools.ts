@@ -3,8 +3,17 @@
 // Free of DOM and Pixi so it unit-tests against hand-built states.
 
 import { formatDate } from '../sim/calendar';
-import { CABINET_REACH_FT, CPP_TARGET, OLT_MAX_CARDS, PERMITTING_CANCEL_REFUND, SPLIT_RATIO, UNDERGROUND_ROCK_SURCHARGE_PER_FT } from '../sim/balance';
+import {
+  CABINET_REACH_FT,
+  CPP_TARGET,
+  LOAN_ROUNDING,
+  OLT_MAX_CARDS,
+  PERMITTING_CANCEL_REFUND,
+  SPLIT_RATIO,
+  UNDERGROUND_ROCK_SURCHARGE_PER_FT,
+} from '../sim/balance';
 import { coveragePreview, segmentsWithinReach } from '../sim/coverage';
+import { creditAvailable } from '../sim/debt';
 import {
   cableRoute,
   getService,
@@ -56,8 +65,8 @@ export type ToolId = 'inspect' | 'aerial' | 'underground' | 'cabinet' | 'remove'
 export interface CardRow {
   label: string;
   value: string;
-  /** Colors the value: a cost-per-passing band, or muted for "nothing to show". */
-  tone?: CppBand | 'muted';
+  /** Colors the value: a cost-per-passing band, muted for "nothing to show", negative for money below $0. */
+  tone?: CppBand | 'muted' | 'negative';
   /** Small print after the value, e.g. the cost-per-passing target. */
   sub?: string;
 }
@@ -85,7 +94,49 @@ export interface CardModel {
   note?: string;
   /** Red reasons the action can't go ahead. */
   blockers: string[];
+  /** When cash is short: how the credit line could cover it (shown with the blockers, compact layout too). */
+  credit?: string;
   hint?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Cash after an order, and the credit line when cash is short
+// ---------------------------------------------------------------------------
+
+/** What the player can spend: cash, and what the credit line would lend today. */
+export interface Funds {
+  cash: number;
+  /** debt.creditAvailable: 0 while frozen or before there is a limit. */
+  creditAvailable: number;
+}
+
+export function fundsOf(state: GameState): Funds {
+  return { cash: state.finance.cash, creditAvailable: creditAvailable(state) };
+}
+
+/** The "Cash after" row of a quote card: cash - cost, red below $0. */
+export function cashAfterRow(funds: Funds, cost: number): CardRow {
+  const after = funds.cash - cost;
+  return after < 0 ? { label: 'Cash after', value: formatMoney(after), tone: 'negative' } : { label: 'Cash after', value: formatMoney(after) };
+}
+
+/**
+ * When cash can't cover `cost`: "Draw $X from your credit line to afford it"
+ * if the line has the shortfall available (X = the shortfall rounded up to
+ * LOAN_ROUNDING, capped at what is available), "Your credit line has only $Y
+ * available" if it has some but not enough; otherwise (cash covers it, or no
+ * credit) undefined.
+ */
+export function creditHint(funds: Funds, cost: number): string | undefined {
+  const shortfall = cost - funds.cash;
+  if (shortfall <= 0) return undefined;
+  const available = Math.max(0, funds.creditAvailable);
+  if (available >= shortfall) {
+    const draw = Math.min(available, Math.ceil(shortfall / LOAN_ROUNDING) * LOAN_ROUNDING);
+    return `Draw ${formatMoney(draw)} from your credit line to afford it`;
+  }
+  if (available > 0) return `Your credit line has only ${formatMoney(available)} available`;
+  return undefined;
 }
 
 export interface ToolView {
@@ -226,6 +277,8 @@ export class ToolController {
       this.drag ? `${this.drag.method}:${this.drag.corners.join('.')}` : '-',
       state.network.version,
       state.finance.cash,
+      state.debt.credit.balance,
+      state.debt.covenant.stage,
       state.day,
     ].join('|');
     // A new or loaded game can share every key field with the old one (a fresh
@@ -451,7 +504,7 @@ export class ToolController {
         : 'Esc to stop';
     return {
       overlay: { origin, snap, ...routeOverlay(state, path, quote, method) },
-      card: cableQuoteCard(method, quote, hint),
+      card: cableQuoteCard(method, quote, hint, fundsOf(state)),
     };
   }
 
@@ -483,7 +536,7 @@ export class ToolController {
       : `Drag back to undo · ${this.touch ? 'two fingers cancel' : 'Esc to cancel'}`;
     return {
       overlay: { origin, snap, ...routeOverlay(state, route, quote, method) },
-      card: cableQuoteCard(method, quote, hint),
+      card: cableQuoteCard(method, quote, hint, fundsOf(state)),
     };
   }
 }
@@ -529,10 +582,15 @@ export function cancelRefund(refundable: number): number {
   return Math.round(refundable * PERMITTING_CANCEL_REFUND);
 }
 
-/** Itemized quote card: charges, total and $/ft, passings, cost per passing, timing, warnings, refund. */
-export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: string): CardModel {
+/**
+ * Itemized quote card: charges, total and $/ft, cash after (with `funds`),
+ * passings, cost per passing, timing, warnings, refund, and the credit line
+ * when cash is short.
+ */
+export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: string, funds?: Funds): CardModel {
   const rows: CardRow[] = [
     { label: 'Cost', value: formatMoney(quote.cost) },
+    ...(funds && quote.newSegments.length > 0 ? [cashAfterRow(funds, quote.cost)] : []),
     { label: 'Per foot', value: quote.lengthFt > 0 ? formatPerFt(quote.costPerFt) : '–', tone: quote.lengthFt > 0 ? undefined : 'muted' },
     { label: 'Length', value: `${formatFeet(quote.lengthFt)} · ${plural(quote.newSegments.length, 'span')}` },
     {
@@ -569,6 +627,7 @@ export function cableQuoteCard(method: CableMethod, quote: CableQuote, hint: str
     warnings,
     note: quote.newSegments.length > 0 ? `Cancel while permitting: ${formatMoney(cancelRefund(quote.refundable))} back` : undefined,
     blockers: quote.reasons,
+    credit: funds ? creditHint(funds, quote.cost) : undefined,
     hint,
   };
 }
@@ -589,6 +648,7 @@ function cabinetView(state: GameState, node: NodeId, touch: boolean): ToolView {
 /** Hovering an empty corner: what a cabinet there would cover, and what it costs. */
 function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView {
   const quote = quoteCabinet(state, node);
+  const funds = fundsOf(state);
   const preview = coveragePreview(state, node);
   const reach = preview.segments.map((s) => ({
     id: s.segment,
@@ -620,9 +680,11 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
             },
         { label: 'Ports', value: `${formatNumber(preview.ports)} (1:${SPLIT_RATIO}, 1 PON port)` },
         { label: 'Cost', value: formatMoney(quote.cost) },
+        cashAfterRow(funds, quote.cost),
         { label: 'Ready in', value: plural(quote.permitDays + quote.constructDays, 'day') },
       ],
       blockers: quote.reasons,
+      credit: creditHint(funds, quote.cost),
       hint: quote.ok
         ? `${touch ? 'Tap again' : 'Click'} to place. It lights streets within ${formatFeet(preview.reachFt)} along cable joined to the CO: solid streets light today, shaded ones once cabled.`
         : undefined,
@@ -633,6 +695,7 @@ function coverageView(state: GameState, node: NodeId, touch: boolean): ToolView 
 /** Hovering an existing cabinet with the cabinet tool: add a splitter. */
 function splitterView(state: GameState, cabinet: Cabinet, touch: boolean): ToolView {
   const quote = quoteSplitter(state, cabinet.id);
+  const funds = fundsOf(state);
   const used = cabinetPortsUsed(state).get(cabinet.id) ?? 0;
   const warnings = state.sales.fullCabinets.includes(cabinet.id) ? ['Full: turning signups away'] : [];
   return {
@@ -643,6 +706,7 @@ function splitterView(state: GameState, cabinet: Cabinet, touch: boolean): ToolV
       rows: [
         { label: 'At', value: cornerLabel(state, cabinet.node) },
         { label: 'Cost', value: formatMoney(quote.cost) },
+        cashAfterRow(funds, quote.cost),
         { label: 'Splitters', value: `${cabinet.splitters} → ${quote.splittersAfter}` },
         {
           label: 'Ports',
@@ -652,6 +716,7 @@ function splitterView(state: GameState, cabinet: Cabinet, touch: boolean): ToolV
       ],
       warnings,
       blockers: quote.reasons,
+      credit: creditHint(funds, quote.cost),
       hint: quote.ok ? `${touch ? 'Tap again' : 'Click'} to add a 1:${SPLIT_RATIO} splitter (uses 1 PON port).` : undefined,
     },
   };

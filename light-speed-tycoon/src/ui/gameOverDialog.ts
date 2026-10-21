@@ -1,10 +1,10 @@
-// Game over: the company ran out of cash. The save is finished (the sim
-// rejects every command and the day is frozen); offer a way on: load the last
-// manual save, start a new town, or export this one.
+// Game over: the company ran out of cash, or defaulted on its loans. The save
+// is finished (the sim rejects every command and the day is frozen); offer a
+// way on: load the last manual save, start a new town, or export this one.
 //
 // Owner: ui-economy workstream.
 
-import type { GameOver } from '../sim/types';
+import type { GameOver, GameOverReason } from '../sim/types';
 import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { el, icon } from './dom';
@@ -15,6 +15,11 @@ export interface GameOverActions {
   loadLastSave?: () => void;
   startNewTown(): void;
   exportGame(): void;
+}
+
+/** The dialog's subtitle: how the town's company ended. */
+export function gameOverSubtitle(reason: GameOverReason, townName: string): string {
+  return reason === 'default' ? `${townName} has defaulted on its loans.` : `${townName} has gone bankrupt.`;
 }
 
 export class GameOverDialog {
@@ -33,7 +38,7 @@ export class GameOverDialog {
     this.close();
     const sheet = openSheet({
       title: 'Game over',
-      subtitle: `${townName} has gone bankrupt.`,
+      subtitle: gameOverSubtitle(over.reason, townName),
       className: 'game-over',
       // Esc and the close button leave the frozen town on screen; the menu still offers load, new and export.
       backdropCloses: false,

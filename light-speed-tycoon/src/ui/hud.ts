@@ -1,17 +1,20 @@
 // Top bar: speed controls, date, cash (with an overdraft warning), the
-// pricing and milestones buttons, the menu, and a row of chips: passings,
-// cost per passing, subscribers, monthly recurring revenue, OLT PON ports and
-// the build queue.
+// pricing, milestones and bank buttons, the menu, and a row of chips:
+// passings, cost per passing, subscribers, monthly recurring revenue, OLT PON
+// ports, the build queue, and (round 3) total debt and the covenant stage
+// while they matter. The debt and covenant chips open the Bank panel.
 //
-// Owner: ui-economy workstream.
+// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream.
 
 import { CPP_AMBER_MULTIPLIER, CPP_TARGET, INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
+import { covenantMetrics, totalDebt } from '../sim/debt';
 import { runwayMonths } from '../sim/finance';
 import { costPerPassing, cppBand } from '../sim/metrics';
 import { getService, ponPortsUsed } from '../sim/network';
 import { monthlyRecurringRevenue, subscriberUnits } from '../sim/sales';
-import type { CppBand, GameState } from '../sim/types';
+import type { CppBand, GameOverReason, GameState } from '../sim/types';
+import { STAGE_TONE, brokenCovenants, covenantLimits, cureText, stageMeaning, stageNext } from './bankPanel';
 import { el, icon, setText } from './dom';
 import { formatMoney, formatNumber, plural } from './format';
 import { ICONS } from './icons';
@@ -72,6 +75,74 @@ export function cppStatus(state: GameState): CppStatus | null {
   };
 }
 
+export interface DebtStatus {
+  /** "Debt $412,000" */
+  text: string;
+  total: number;
+  /** "Credit line $12,000 · Term loans $400,000 (2)" and where to see more. */
+  tip: string;
+}
+
+/** The HUD's debt chip: everything owed, or null while nothing is (the chip hides). */
+export function debtStatus(state: GameState): DebtStatus | null {
+  const total = totalDebt(state);
+  if (total <= 0) return null;
+  const line = state.debt.credit.balance;
+  const loans = state.debt.loans;
+  const term = total - line;
+  const parts = [`Credit line ${formatMoney(line)}`, `term loans ${formatMoney(term)}${loans.length > 0 ? ` (${plural(loans.length, 'loan')})` : ''}`];
+  return {
+    text: `Debt ${formatMoney(total)}`,
+    total,
+    tip: `Debt: ${parts.join(', ')}. Open the Bank for rates, payments and covenants.`,
+  };
+}
+
+export interface CovenantStatus {
+  /** "Covenant warning" / "Penalty rate" / "Credit frozen", or "Covenant at risk" while compliant with today's figures in breach */
+  text: string;
+  tone: 'warn' | 'danger';
+  /** What it means, what comes next and how to cure it. */
+  tip: string;
+}
+
+const COVENANT_CHIP_TEXT = { warning: 'Covenant warning', penalty: 'Penalty rate', frozen: 'Credit frozen' } as const;
+
+/**
+ * The HUD's covenant chip, or null while the loans are in good standing
+ * (compliant) and today's figures keep the covenants. Compliant with today's
+ * figures in breach, it warns ahead of the close ("Covenant at risk"),
+ * hedged: the close tests that month's figures, which can still pass.
+ */
+export function covenantStatus(state: GameState): CovenantStatus | null {
+  const { stage, compliantCloses } = state.debt.covenant;
+  if (stage === 'compliant') {
+    if (totalDebt(state) <= 0) return null;
+    const metrics = covenantMetrics(state);
+    if (metrics.compliant) return null;
+    return {
+      text: 'Covenant at risk',
+      tone: 'warn',
+      tip:
+        `Covenant at risk: at today's figures your debt breaks ${brokenCovenants(metrics)} (the bank requires ${covenantLimits()} at each month close). ` +
+        "The next close tests that month's figures: a breach then brings a warning first. Open the Bank for the figures.",
+    };
+  }
+  const tone = STAGE_TONE[stage] === 'danger' ? 'danger' : 'warn';
+  return {
+    text: COVENANT_CHIP_TEXT[stage],
+    tone,
+    tip:
+      `${COVENANT_CHIP_TEXT[stage]}: the bank requires ${covenantLimits()} at each month close. ` +
+      `${stageMeaning(stage)} ${stageNext(stage)} To cure: ${cureText(stage, compliantCloses)}`,
+  };
+}
+
+const GAME_OVER_TEXT: Readonly<Record<GameOverReason, string>> = {
+  insolvent: 'Game over: out of cash',
+  default: 'Game over: loan default',
+};
+
 export interface OverdraftStatus {
   /** "Overdrawn: 2 closes left" */
   text: string;
@@ -82,12 +153,23 @@ export interface OverdraftStatus {
 /**
  * The HUD's insolvency warning, or null while cash is at or above $0 and the
  * last month close was too. "Closes left" counts the negative month closes the
- * bank still tolerates (INSOLVENCY_GRACE_MONTHS in a row end the game).
+ * bank still tolerates (INSOLVENCY_GRACE_MONTHS in a row end the game). With
+ * the credit line frozen and debt owed it tolerates none: a close in the red
+ * cannot pay its loan payments, and a payment missed while frozen is a
+ * default that ends the game.
  */
 export function overdraftStatus(state: GameState): OverdraftStatus | null {
   const { cash, negativeMonths } = state.finance;
-  if (state.gameOver) return { text: 'Game over: out of cash', tone: 'danger', tip: state.gameOver.message };
+  if (state.gameOver) return { text: GAME_OVER_TEXT[state.gameOver.reason] ?? GAME_OVER_TEXT.insolvent, tone: 'danger', tip: state.gameOver.message };
   if (cash >= 0 && negativeMonths <= 0) return null;
+  if (state.debt.covenant.stage === 'frozen' && totalDebt(state) > 0) {
+    const rule =
+      'Your credit line is frozen with debt owed, so no close in the red is tolerated: a month close that cannot pay its loan payments ' +
+      'is a default, and the game ends. No draws or new loans while frozen: keep cash above the payment due at the close.';
+    return cash < 0
+      ? { text: 'Overdrawn: no closes left', tone: 'danger', tip: `Cash is below $0. ${rule}` }
+      : { text: 'Recovering: no closes left', tone: 'warn', tip: `Cash is back above $0: keep it there through the next month close. ${rule}` };
+  }
   const left = Math.max(0, INSOLVENCY_GRACE_MONTHS - negativeMonths);
   const closes = plural(left, 'close');
   const rule =
@@ -114,6 +196,8 @@ export function runwayHint(state: GameState): string {
 export interface HudActions {
   pricing(): void;
   milestones(): void;
+  /** Open the Bank panel (the bank button, the debt and covenant chips). */
+  bank(): void;
 }
 
 export class Hud {
@@ -121,6 +205,7 @@ export class Hud {
   readonly menuButton: HTMLButtonElement;
   readonly pricingButton: HTMLButtonElement;
   readonly milestonesButton: HTMLButtonElement;
+  readonly bankButton: HTMLButtonElement;
   private readonly speedButtons = new Map<Speed, HTMLButtonElement>();
   private readonly town: HTMLElement;
   private readonly date: HTMLElement;
@@ -136,6 +221,10 @@ export class Hud {
   private readonly buildingChip: HTMLElement;
   private readonly cpp: HTMLElement;
   private readonly cppChip: HTMLElement;
+  private readonly debt: HTMLElement;
+  private readonly debtChip: HTMLButtonElement;
+  private readonly covenant: HTMLElement;
+  private readonly covenantChip: HTMLButtonElement;
   /** Session revision and state the subscriber figures were last computed for. */
   private seen: { revision: number; state: GameState | null } = { revision: -1, state: null };
 
@@ -175,6 +264,7 @@ export class Hud {
       });
     this.pricingButton = action('Pricing', 'Pricing and marketing', ICONS.tag, actions.pricing);
     this.milestonesButton = action('Milestones', 'Milestones', ICONS.trophy, actions.milestones);
+    this.bankButton = action('Bank', 'Bank: credit line and loans', ICONS.bank, actions.bank);
     this.menuButton = el('button', {
       class: 'btn icon-btn menu-button',
       attrs: { type: 'button', 'aria-label': 'Menu', 'aria-haspopup': 'true', 'aria-expanded': 'false' },
@@ -196,6 +286,27 @@ export class Hud {
     this.ponChip = el('span', { class: 'chip chip-pon' }, [icon(ICONS.chip), this.pon]);
     // Counts every order not yet live: permitting as well as crews on site (the tooltip splits them).
     this.buildingChip = el('span', { class: 'chip chip-building' }, [icon(ICONS.crew), this.building, label(' in progress')]);
+    // Debt and the covenant stage: buttons into the Bank, shown only while they matter.
+    this.debt = el('span', { class: 'num' });
+    this.debtChip = el(
+      'button',
+      {
+        class: 'chip chip-button chip-debt',
+        attrs: { type: 'button', 'data-testid': 'hud-debt', 'aria-haspopup': 'dialog', hidden: '' },
+        on: { click: actions.bank },
+      },
+      [icon(ICONS.bank), this.debt],
+    );
+    this.covenant = el('span');
+    this.covenantChip = el(
+      'button',
+      {
+        class: 'chip chip-button chip-covenant chip-warn',
+        attrs: { type: 'button', 'data-testid': 'hud-covenant', 'aria-haspopup': 'dialog', hidden: '' },
+        on: { click: actions.bank },
+      },
+      [icon(ICONS.warning), this.covenant],
+    );
     const stats = el('div', { class: 'hud-stats' }, [
       el('span', { class: 'chip chip-passings', attrs: { title: 'Homes and businesses your lit network passes' } }, [
         icon(ICONS.home),
@@ -214,6 +325,8 @@ export class Hud {
       ]),
       this.ponChip,
       this.buildingChip,
+      this.debtChip,
+      this.covenantChip,
     ]);
 
     this.root = el('header', { class: 'hud pill-card', attrs: { 'aria-label': 'Game status' } }, [
@@ -221,7 +334,7 @@ export class Hud {
       el('div', { class: 'hud-when' }, [this.town, this.date]),
       this.cash,
       this.alert,
-      el('div', { class: 'hud-actions' }, [this.pricingButton, this.milestonesButton]),
+      el('div', { class: 'hud-actions' }, [this.pricingButton, this.milestonesButton, this.bankButton]),
       this.menuButton,
       stats,
     ]);
@@ -271,6 +384,24 @@ export class Hud {
         for (const band of ['green', 'amber', 'red'] as const) this.cppChip.classList.toggle(`band-${band}`, cpp.band === band);
         if (this.cppChip.title !== cpp.tip) this.cppChip.title = cpp.tip;
       }
+      const debt = debtStatus(state);
+      this.debtChip.hidden = debt === null;
+      if (debt) {
+        setText(this.debt, debt.text);
+        if (this.debtChip.title !== debt.tip) this.debtChip.title = debt.tip;
+        setLabel(this.debtChip, `${debt.text}: loans and payments`);
+      }
+      const covenant = covenantStatus(state);
+      this.covenantChip.hidden = covenant === null;
+      // Narrower screens drop the chip labels to make room for these two (see style.css).
+      this.root.classList.toggle('has-debt', debt !== null || covenant !== null);
+      if (covenant) {
+        setText(this.covenant, covenant.text);
+        this.covenantChip.classList.toggle('chip-warn', covenant.tone === 'warn');
+        this.covenantChip.classList.toggle('chip-danger', covenant.tone === 'danger');
+        if (this.covenantChip.title !== covenant.tip) this.covenantChip.title = covenant.tip;
+        setLabel(this.covenantChip, `${covenant.text}: what it means`);
+      }
     }
 
     let permitting = 0;
@@ -283,4 +414,8 @@ export class Hud {
     const tip = `${formatNumber(permitting)} permitting, ${formatNumber(constructing)} with crews on site`;
     if (this.buildingChip.title !== tip) this.buildingChip.title = tip;
   }
+}
+
+function setLabel(node: HTMLElement, label: string): void {
+  if (node.getAttribute('aria-label') !== label) node.setAttribute('aria-label', label);
 }

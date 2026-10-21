@@ -9,12 +9,26 @@
 // from their own Rng, never from the game's streams.
 
 import { CABINET_COST, CABINET_REACH_FT, SPLITTER_COST } from '../balance';
+import { dayOf, MONTH_LENGTHS } from '../calendar';
+import { creditLimit, penaltyBps, termCapacity } from '../debt';
 import { applyCommand, newGame, tick } from '../game';
 import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
 import { orderFees, quoteCable, spanCharges } from '../network';
 import { otherEnd, parcelsServedBy, segmentsAtNode, segmentsWithin } from '../streets';
-import type { CableMethod, City, Command, CommandResult, GameOver, GameState, MonthlyReport, SegmentId, StreetSegment, Zone } from '../types';
+import type {
+  CableMethod,
+  City,
+  Command,
+  CommandResult,
+  CovenantStage,
+  GameOver,
+  GameState,
+  MonthlyReport,
+  SegmentId,
+  StreetSegment,
+  Zone,
+} from '../types';
 
 /** The seeds every balance target is checked on. */
 export const TUNING_SEEDS: readonly number[] = [1, 2027, 424242, 99, 12345];
@@ -53,6 +67,12 @@ export interface RunResult {
   rejected: number;
   /** Milliseconds the run took by opts.clock (0 without one: the sim never reads a clock itself). */
   ms: number;
+  /** borrowingCapacity on the day the run started (before the bot's first look). */
+  capacityAtStart: number;
+  /** Most borrowingCapacity seen on any day before the first subscriber signed up (whole run if nobody ever did). */
+  capacityBeforeFirstSubscriber: number;
+  /** borrowingCapacity right after each close of the run (capacityAfterClose[0] after month 1). */
+  capacityAfterClose: number[];
 }
 
 export interface RunOptions {
@@ -82,6 +102,10 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
   const firstMonth: Record<string, number> = {};
   let rejected = 0;
   const startReports = state.finance.reports.length;
+  const capacityAtStart = borrowingCapacity(state);
+  let capacityBeforeFirstSubscriber = 0;
+  const capacityAfterClose: number[] = [];
+  const noSubscriberYet = () => state.sales.accounts.length === 0 && state.sales.connectsTotal === 0;
   const send: Send = (cmd) => {
     const cashBefore = state.finance.cash;
     const result = applyCommand(state, cmd);
@@ -95,8 +119,11 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     return result;
   };
   while (state.finance.reports.length - startReports < months && !state.gameOver) {
+    if (noSubscriberYet()) capacityBeforeFirstSubscriber = Math.max(capacityBeforeFirstSubscriber, borrowingCapacity(state));
     if (state.day % BOT_INTERVAL_DAYS === 0) bot.act(state, send);
+    const closes = state.finance.reports.length;
     tick(state);
+    if (state.finance.reports.length > closes) capacityAfterClose.push(borrowingCapacity(state));
     opts.afterTick?.(state);
   }
   const reports = state.finance.reports.slice(startReports);
@@ -117,7 +144,119 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     firstMonth,
     rejected,
     ms: opts.clock ? opts.clock() - started : 0,
+    capacityAtStart,
+    capacityBeforeFirstSubscriber,
+    capacityAfterClose,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Financing measures (round 3)
+// ---------------------------------------------------------------------------
+
+/** What the bank would lend now: the credit-line limit plus term-loan capacity (debt.creditLimit + debt.termCapacity). */
+export function borrowingCapacity(state: GameState): number {
+  return creditLimit(state) + termCapacity(state);
+}
+
+/** Total debt at a report's month end (credit line + term loans); 0 for a report without debt stats. */
+export function reportDebt(report: MonthlyReport): number {
+  return report.debt ? report.debt.creditBalance + report.debt.termBalance : 0;
+}
+
+/** Most total debt at any month end of the run. */
+export function peakDebt(result: RunResult): number {
+  return result.reports.reduce((peak, r) => Math.max(peak, reportDebt(r)), 0);
+}
+
+/**
+ * Debt-weighted average borrowing rate of the run, bps: sum(total debt x
+ * averageRateBps) / sum(total debt) over the month ends with debt (penalty
+ * included, as DebtStats records it); null if the run never borrowed.
+ * `withoutPenalty`: only month ends whose stage carries no penalty surcharge
+ * ('compliant' or 'warning'), i.e. the risk pricing alone.
+ */
+export function averageBorrowingRate(result: RunResult, withoutPenalty = false): number | null {
+  let weighted = 0;
+  let total = 0;
+  for (const report of result.reports) {
+    const debt = reportDebt(report);
+    const rate = report.debt?.averageRateBps;
+    if (debt <= 0 || rate === null || rate === undefined) continue;
+    if (withoutPenalty && penaltyBps(report.debt?.stage ?? 'compliant') > 0) continue;
+    weighted += debt * rate;
+    total += debt;
+  }
+  return total > 0 ? weighted / total : null;
+}
+
+const STAGE_RANK: Record<CovenantStage, number> = { compliant: 0, warning: 1, penalty: 2, frozen: 3 };
+
+/** The worst covenant stage any close of the run ended in ('compliant' for a run without debt stats). */
+export function worstStage(result: RunResult): CovenantStage {
+  let worst: CovenantStage = 'compliant';
+  for (const report of result.reports) {
+    const stage = report.debt?.stage;
+    if (stage && STAGE_RANK[stage] > STAGE_RANK[worst]) worst = stage;
+  }
+  return worst;
+}
+
+/** Stage changes of the run as "m7 warning, m8 penalty, ..." entries: [month, stage after that close]. */
+export function stageHistory(result: RunResult): Array<[number, CovenantStage]> {
+  const changes: Array<[number, CovenantStage]> = [];
+  let last: CovenantStage = 'compliant';
+  result.reports.forEach((report, i) => {
+    const stage = report.debt?.stage ?? 'compliant';
+    if (stage !== last) changes.push([i + 1, stage]);
+    last = stage;
+  });
+  return changes;
+}
+
+/** Share of the month ends with debt at which lifetime cost per passing was red (metrics.cppBand); null without debt. */
+export function redWhileOwingShare(result: RunResult): number | null {
+  let owing = 0;
+  let red = 0;
+  result.reports.forEach((report, i) => {
+    if (reportDebt(report) <= 0) return;
+    owing++;
+    if (result.kpis[i]?.cppBand === 'red') red++;
+  });
+  return owing > 0 ? red / owing : null;
+}
+
+/** 1-based months whose close missed its debt service. */
+export function missedPaymentMonths(result: RunResult): number[] {
+  const months: number[] = [];
+  result.reports.forEach((report, i) => {
+    if (report.debt?.missedPayment) months.push(i + 1);
+  });
+  return months;
+}
+
+/** Units on parcels that exist on `day` (appearsDay <= day). */
+export function unitsPresent(city: City, day: number): number {
+  let units = 0;
+  for (const parcel of city.parcels) if (parcel.appearsDay <= day) units += parcel.units;
+  return units;
+}
+
+/** Last day of the month a report closed. */
+export function reportLastDay(report: MonthlyReport): number {
+  return dayOf({ year: report.year, month: report.month, day: MONTH_LENGTHS[report.month - 1] as number });
+}
+
+/**
+ * Share of the town's units passed at the end of 1-based `month`: the report's
+ * passings over the units on parcels present on that month's last day (the
+ * passings were counted then too); null past the end of the run.
+ */
+export function passedShare(result: RunResult, month: number): number | null {
+  const report = result.reports[month - 1];
+  if (!report) return null;
+  const units = unitsPresent(result.state.city, reportLastDay(report));
+  return units > 0 ? report.passings / units : null;
 }
 
 /** 1-based month of the first close with operating cash flow > 0, or null. */

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { CABINET_REACH_FT, CPP_TARGET, SPLIT_RATIO } from '../sim/balance';
+import { CABINET_REACH_FT, CPP_TARGET, LOAN_ROUNDING, SPLIT_RATIO } from '../sim/balance';
 import { coveragePreview } from '../sim/coverage';
+import { creditAvailable, creditLimit } from '../sim/debt';
 import { applyCommand, newGame, runDays } from '../sim/game';
 import {
   getService,
@@ -16,7 +17,7 @@ import {
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { Command, CommandResult, GameState } from '../sim/types';
 import { formatMoney, formatNumber, formatPerFt } from './format';
-import { ToolController, accountAt, cancelRefund, cornerLabel, wrongSideWarning } from './tools';
+import { ToolController, accountAt, cancelRefund, cashAfterRow, cornerLabel, creditHint, fundsOf, wrongSideWarning } from './tools';
 import type { CardModel } from './tools';
 
 // Grid town: nodes (i, j) at (4i, 2j), id j * 4 + i; the CO is node 0 at (0, 0).
@@ -639,6 +640,92 @@ describe('inspect tool', () => {
     const blockers = tools.view(state).card?.blockers;
     expect(blockers).toEqual(quoteCabinet(state, 5).reasons);
     expect(blockers?.join(' ')).toMatch(/Not enough cash/);
+  });
+});
+
+describe('cash after an order, and the credit line when cash is short', () => {
+  /** Closed months with `revenue` each, so the town has ARR and a credit limit. */
+  function withRevenue(state: GameState, revenue: number, months = 3): GameState {
+    for (let m = 1; m <= months; m++) {
+      state.finance.reports.push({ year: 2027, month: m, totals: { revenue }, net: revenue, cashEnd: state.finance.cash, passings: 0 });
+    }
+    return state;
+  }
+
+  it('shows cash after (red below $0) and how the credit line could cover a shortfall', () => {
+    expect(cashAfterRow({ cash: 1_000, creditAvailable: 0 }, 400)).toEqual({ label: 'Cash after', value: formatMoney(600) });
+    expect(cashAfterRow({ cash: 1_000, creditAvailable: 0 }, 1_500)).toEqual({ label: 'Cash after', value: formatMoney(-500), tone: 'negative' });
+
+    // Cash covers it: nothing to say.
+    expect(creditHint({ cash: 1_000, creditAvailable: 50_000 }, 1_000)).toBeUndefined();
+    // No credit: nothing to offer.
+    expect(creditHint({ cash: 1_000, creditAvailable: 0 }, 5_000)).toBeUndefined();
+    // The shortfall rounds up to LOAN_ROUNDING...
+    const shortfall = LOAN_ROUNDING + 1;
+    expect(creditHint({ cash: 1_000, creditAvailable: 10 * LOAN_ROUNDING }, 1_000 + shortfall)).toBe(
+      `Draw ${formatMoney(2 * LOAN_ROUNDING)} from your credit line to afford it`,
+    );
+    // ...capped at what is available.
+    expect(creditHint({ cash: 0, creditAvailable: shortfall }, shortfall)).toBe(`Draw ${formatMoney(shortfall)} from your credit line to afford it`);
+    // Some credit, not enough.
+    expect(creditHint({ cash: 0, creditAvailable: shortfall - 1 }, shortfall)).toBe(`Your credit line has only ${formatMoney(shortfall - 1)} available`);
+    // Overdrawn already: the whole cost plus the hole is the shortfall.
+    expect(creditHint({ cash: -LOAN_ROUNDING, creditAvailable: 10 * LOAN_ROUNDING }, LOAN_ROUNDING)).toBe(
+      `Draw ${formatMoney(2 * LOAN_ROUNDING)} from your credit line to afford it`,
+    );
+  });
+
+  it('puts cash after and the credit hint on the cabinet, splitter and cable quote cards', () => {
+    const state = withRevenue(game(), 100 * LOAN_ROUNDING);
+    expect(creditAvailable(state)).toBeGreaterThan(0);
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(4.1, 2.1);
+    const cabinet = quoteCabinet(state, 5);
+    let card = tools.view(state).card!;
+    expect(card.rows.find((r) => r.label === 'Cash after')).toEqual({ label: 'Cash after', value: formatMoney(state.finance.cash - cabinet.cost) });
+    expect(card.credit).toBeUndefined();
+
+    state.finance.cash = 100;
+    card = tools.view(state).card!;
+    expect(card.rows.find((r) => r.label === 'Cash after')).toMatchObject({ value: formatMoney(100 - cabinet.cost), tone: 'negative' });
+    expect(card.credit).toBe(creditHint(fundsOf(state), cabinet.cost));
+    expect(card.credit).toMatch(/^Draw \$[\d,]+ from your credit line to afford it$/);
+
+    state.finance.cash = 1_000_000;
+    expect(applyCommand(state, { type: 'placeCabinet', node: 0 }).ok).toBe(true);
+    state.finance.cash = 10;
+    tools.hoverAt(0.1, 0.1);
+    const splitter = quoteSplitter(state, state.network.cabinets[0]!.id);
+    card = tools.view(state).card!;
+    expect(card.title).toBe('Add a splitter');
+    expect(row(card, 'Cash after')).toBe(formatMoney(10 - splitter.cost));
+    expect(card.credit).toBe(creditHint(fundsOf(state), splitter.cost));
+
+    tools.setTool('underground');
+    tools.click(state, dispatcher(state), 0, 0);
+    tools.hoverAt(8, 0);
+    const cable = quoteCable(state, [0, 1], 'underground');
+    card = tools.view(state).card!;
+    expect(row(card, 'Cash after')).toBe(formatMoney(10 - cable.cost));
+    expect(card.credit).toBe(creditHint(fundsOf(state), cable.cost));
+  });
+
+  it('recomputes the card when only the credit line or the covenant stage changes', () => {
+    const state = withRevenue(game(), 100 * LOAN_ROUNDING);
+    state.finance.cash = 100;
+    const tools = new ToolController();
+    tools.setTool('cabinet');
+    tools.hoverAt(4.1, 2.1);
+    expect(tools.view(state).card?.credit).toMatch(/^Draw/);
+    // The line fully drawn (cash unchanged): nothing left to offer.
+    state.debt.credit.balance = creditLimit(state);
+    expect(tools.view(state).card?.credit).toBeUndefined();
+    state.debt.credit.balance = 0;
+    expect(tools.view(state).card?.credit).toMatch(/^Draw/);
+    // Frozen: no draws.
+    state.debt.covenant.stage = 'frozen';
+    expect(tools.view(state).card?.credit).toBeUndefined();
   });
 });
 

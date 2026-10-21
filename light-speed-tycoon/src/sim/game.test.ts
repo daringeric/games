@@ -16,14 +16,16 @@ import {
   POLE_RENT_PER_POLE_PER_MONTH,
   SPLITTER_COST,
   START_CASH,
+  TERM_LOAN_MIN,
 } from './balance';
 import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
+import { newDebt, rateOf } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng, withRng } from './rng';
 import { defaultPricing, newSales, stepSales } from './sales';
-import { addLivePlant, makeGridCity } from './testing/fixtures';
+import { addLivePlant, makeGridCity, noDebtStats } from './testing/fixtures';
 import type { City, Command, GameState, MonthlyReport } from './types';
 
 // Default grid: 3x2 blocks of 4x2 cells, CO at node 0. Horizontal segments
@@ -46,7 +48,7 @@ describe('newGame', () => {
     const city = makeGridCity();
     const state = newGame(42, { city });
     expect(state).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       seed: 42,
       day: 0,
       rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales') },
@@ -60,6 +62,7 @@ describe('newGame', () => {
         version: 0,
       },
       finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
+      debt: newDebt(),
       sales: newSales(),
       milestones: [],
       notices: [],
@@ -244,6 +247,30 @@ const REJECTIONS: RejectCase[] = [
   },
   { name: 'setMarketing without a budget', cmd: { type: 'setMarketing' }, reason: /setMarketing needs a monthly budget/ },
   { name: 'setMarketing with a string budget', cmd: { type: 'setMarketing', perMonth: '5000' }, reason: /setMarketing needs a monthly budget/ },
+  // Financing (round 3): field types
+  { name: 'drawCredit without an amount', cmd: { type: 'drawCredit' }, reason: /^drawCredit needs an amount in dollars$/ },
+  { name: 'drawCredit with a string amount', cmd: { type: 'drawCredit', amount: '5000' }, reason: /^drawCredit needs an amount in dollars$/ },
+  { name: 'repayCredit without an amount', cmd: { type: 'repayCredit' }, reason: /^repayCredit needs an amount in dollars$/ },
+  { name: 'repayCredit with a null amount', cmd: { type: 'repayCredit', amount: null }, reason: /^repayCredit needs an amount in dollars$/ },
+  { name: 'takeTermLoan without an amount', cmd: { type: 'takeTermLoan', termYears: 5 }, reason: /^takeTermLoan needs an amount in dollars$/ },
+  { name: 'takeTermLoan with an array amount', cmd: { type: 'takeTermLoan', amount: [1], termYears: 5 }, reason: /^takeTermLoan needs an amount in dollars$/ },
+  { name: 'takeTermLoan without a term', cmd: { type: 'takeTermLoan', amount: TERM_LOAN_MIN }, reason: /^takeTermLoan needs a term in years$/ },
+  { name: 'takeTermLoan with a string term', cmd: { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: '5' }, reason: /^takeTermLoan needs a term in years$/ },
+  { name: 'prepayLoan without a loan', cmd: { type: 'prepayLoan', amount: 100 }, reason: /^prepayLoan needs a loan id$/ },
+  { name: 'prepayLoan with a string loan', cmd: { type: 'prepayLoan', loan: '1', amount: 100 }, reason: /^prepayLoan needs a loan id$/ },
+  { name: 'prepayLoan without an amount', cmd: { type: 'prepayLoan', loan: 1 }, reason: /^prepayLoan needs an amount in dollars$/ },
+  { name: 'prepayLoan with an object amount', cmd: { type: 'prepayLoan', loan: 1, amount: {} }, reason: /^prepayLoan needs an amount in dollars$/ },
+  // Financing: well-formed numbers the bank refuses (debt.ts checks values)
+  { name: 'a NaN draw', cmd: { type: 'drawCredit', amount: Number.NaN }, reason: /whole number of dollars/ },
+  { name: 'a fractional draw', cmd: { type: 'drawCredit', amount: 10.5 }, reason: /whole number of dollars/ },
+  { name: 'a draw with no credit line yet', cmd: { type: 'drawCredit', amount: 1_000 }, reason: /^No credit line yet/ },
+  { name: 'a negative repayment', cmd: { type: 'repayCredit', amount: -1 }, reason: /whole number of dollars/ },
+  { name: 'a repayment with nothing drawn', cmd: { type: 'repayCredit', amount: 1 }, reason: /^Nothing is drawn on the credit line/ },
+  { name: 'a six-year loan', cmd: { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 6 }, reason: /^Term must be/ },
+  { name: 'an infinite loan', cmd: { type: 'takeTermLoan', amount: Number.POSITIVE_INFINITY, termYears: 5 }, reason: /whole number of dollars/ },
+  { name: 'a loan with no revenue to lend against', cmd: { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 7 }, reason: /^No term loans yet/ },
+  { name: 'a prepayment on an unknown loan', cmd: { type: 'prepayLoan', loan: 3, amount: 100 }, reason: /^There is no open term loan #3/ },
+  { name: 'a NaN loan id', cmd: { type: 'prepayLoan', loan: Number.NaN, amount: 100 }, reason: /^There is no open term loan #NaN/ },
   // Well-formed commands the rules refuse
   {
     name: 'a price out of range',
@@ -407,6 +434,7 @@ describe('tick and runDays', () => {
           ponPorts: OLT_START_PON_PORTS,
           fullCabinets: 0,
         },
+        debt: noDebtStats(state),
       },
     ]);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -640,6 +668,10 @@ describe('game over', () => {
     { type: 'addOltCard' },
     { type: 'setPricing', tiers: tierSettings(), smbMultiplier: 1.5 },
     { type: 'setMarketing', perMonth: 0 },
+    { type: 'drawCredit', amount: 1_000 },
+    { type: 'repayCredit', amount: 1_000 },
+    { type: 'takeTermLoan', amount: TERM_LOAN_MIN, termYears: 5 },
+    { type: 'prepayLoan', loan: 1, amount: 1_000 },
     { type: 'teleport' },
     {},
   ];
@@ -653,5 +685,41 @@ describe('game over', () => {
     const result = applyCommand(state, cmd as Command);
     expect(result).toEqual({ ok: false, reason: `Game over: ${state.gameOver!.message}` });
     expect(state).toEqual(before);
+  });
+});
+
+describe('the daily tick with debt (round 3)', () => {
+  it('accrues each day\'s end-of-day credit balance before the day advances, so a close counts the month\'s last day', () => {
+    const state = game();
+    // Revenue to lend against: three closed months of it.
+    state.finance.reports = [1, 2, 3].map((month) => ({ year: 2027, month, totals: { revenue: 30_000 }, net: 30_000, cashEnd: 0, passings: 0 }));
+    state.day = dayOf({ year: 2027, month: 4, day: 30 });
+    expect(applyCommand(state, { type: 'drawCredit', amount: 20_000 })).toEqual({ ok: true, cost: -20_000 });
+    expect(state.debt.credit.balanceDollarDays).toBe(0);
+    tick(state); // May 1: April closes with one day of the balance
+    const rate = rateOf(newDebt().credit.rate);
+    expect(state.finance.reports.at(-1)!.totals.interest).toBe(-Math.round((20_000 * rate) / (10_000 * 365)));
+    expect(state.debt.credit.balanceDollarDays).toBe(0);
+    tick(state); // the end of May 1 accrues on the next tick
+    expect(state.debt.credit.balanceDollarDays).toBe(20_000);
+  });
+
+  it('never throws for junk debt commands, in any field', () => {
+    const state = game();
+    const junk: unknown[] = [Number.NaN, -1, 0, 0.5, 1e308, Number.NEGATIVE_INFINITY, 2 ** 53 + 2];
+    for (const a of junk) {
+      for (const b of junk) {
+        for (const cmd of [
+          { type: 'drawCredit', amount: a },
+          { type: 'repayCredit', amount: a },
+          { type: 'takeTermLoan', amount: a, termYears: b },
+          { type: 'prepayLoan', loan: a, amount: b },
+        ]) {
+          const before = structuredClone(state);
+          expect(() => applyCommand(state, cmd as Command)).not.toThrow();
+          expect(state).toEqual(before);
+        }
+      }
+    }
   });
 });

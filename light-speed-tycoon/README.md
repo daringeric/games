@@ -26,12 +26,13 @@ src/
     coverage.ts   cabinet reach and the placement preview
     sales.ts      subscribers: signups, installs, ports, billing accruals, churn, pricing
     finance.ts    ledger, monthly close, insolvency
+    debt.ts       credit line, term loans, underwriting, pricing, covenants, default
     metrics.ts    cost-per-passing bands and report KPIs
     milestones.ts scorecard milestones
     notices.ts    player-facing notices raised by the sim
     game.ts       newGame / applyCommand / tick
-    save.ts       serialize / deserialize, v1 -> v2 migration
-    testing/      fixtures for unit tests (incl. frozen schemaVersion 1 saves)
+    save.ts       serialize / deserialize, v1 -> v2 -> v3 migration
+    testing/      fixtures for unit tests (incl. frozen schemaVersion 1 and 2 saves)
     tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes
   ui/           HTML/CSS HUD, tools, input, storage
@@ -44,8 +45,8 @@ e2e/            Playwright tests
 - **The sim is pure.** Nothing under `src/sim` touches the DOM, Pixi, timers, `Math.random()` or `Date`. Randomness comes from `Rng` streams whose state lives in `GameState`, so a seed plus a command log replays a game exactly.
 - **All player actions are `Command`s** sent through `applyCommand`. The UI never mutates `GameState` directly.
 - **`GameState` is plain JSON data.** No classes, `Map`s or `Set`s in saved state. Derived data (`ServiceSnapshot`) is recomputed and memoized on `network.version`.
-- **Units:** feet, whole dollars, days. Day 0 is Jan 1, 2027.
-- **IDs:** nodes, segments and parcels have `id === index`. Spans and cabinets draw from `state.nextId`.
+- **Units:** feet, whole dollars, days. Day 0 is Jan 1, 2027. Interest rates are whole basis points (725 = 7.25% a year).
+- **IDs:** nodes, segments and parcels have `id === index`. Spans and cabinets draw from `state.nextId`; term loans from `state.debt.nextLoanId`.
 - **Render reads, never writes.** Renderers take state and draw it. Input handlers turn pointer events into `Command`s.
 - **Deterministic math.** The sim uses arithmetic and `Math.sqrt` only (no `Math.pow`/`log`/`exp`/trig, no `**`), so a seed and a command log replay identically on every engine. `src/sim/purity.test.ts` scans the sim sources for this and the purity rule above.
 - **Balance is symbolic.** Tests reference `balance.ts` constants (or quote results), never literal dollar amounts, so tuning never breaks them.

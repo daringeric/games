@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "A fun-first city-builder/tycoon about building and running a fiber ISP.",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": "22.x"

@@ -4,6 +4,7 @@ import { OLT_START_CARDS, OLT_START_PON_PORTS, START_CASH } from './balance';
 import { isFirstOfMonth } from './calendar';
 import { generateCity } from './citygen';
 import type { CityGenOptions } from './citygen';
+import { drawCredit, endDebtDay, newDebt, prepayLoan, repayCredit, takeTermLoan } from './debt';
 import { closeMonth } from './finance';
 import {
   addOltCard,
@@ -17,7 +18,7 @@ import {
 } from './network';
 import { deriveSeed, withRng } from './rng';
 import { accrueDay, newSales, setMarketing, setPricing, stepSales } from './sales';
-import type { CableMethod, City, Command, CommandResult, GameState, TierSetting } from './types';
+import type { CableMethod, City, Command, CommandResult, GameState, TermYears, TierSetting } from './types';
 
 export interface NewGameOptions {
   /** Use this city instead of generating one (tests, scenarios). */
@@ -30,14 +31,15 @@ export interface NewGameOptions {
  * line cards (OLT_START_PON_PORTS GPON ports), rng.events = deriveSeed(seed,
  * 'events'), rng.sales = deriveSeed(seed, 'sales'), city = opts.city ??
  * generateCity(deriveSeed(seed, 'citygen'), opts.cityOptions), default pricing
- * and marketing, no subscribers, milestones, notices or capex.
+ * and marketing, no subscribers, milestones, notices or capex, and no debt
+ * (debt.newDebt()).
  */
 export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
   // Keep the seed as the uint32 that deriveSeed actually mixes, so it saves and
   // validates as one; every derived stream is unchanged by this.
   const base = seed >>> 0;
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     seed: base,
     day: 0,
     rng: { events: deriveSeed(base, 'events'), sales: deriveSeed(base, 'sales') },
@@ -51,6 +53,7 @@ export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
       version: 0,
     },
     finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
+    debt: newDebt(),
     sales: newSales(),
     milestones: [],
     notices: [],
@@ -66,6 +69,12 @@ function reject(reason: string): CommandResult {
 /**
  * Validate and apply one player command. Never throws for bad input; returns
  * { ok: false, reason }. Once state.gameOver is set every command is rejected.
+ *
+ * Financing (round 3): drawCredit { amount: number }, repayCredit
+ * { amount: number }, takeTermLoan { amount: number, termYears: number } and
+ * prepayLoan { loan: number, amount: number } are field-type checked here
+ * and handed to debt.ts, which checks values (whole dollars, limits, terms,
+ * cash, the covenant stage).
  */
 export function applyCommand(state: GameState, cmd: Command): CommandResult {
   // Commands also come from replays, scripts and the console, so check field
@@ -112,6 +121,21 @@ export function applyCommand(state: GameState, cmd: Command): CommandResult {
     case 'setMarketing':
       if (typeof fields.perMonth !== 'number') return reject('setMarketing needs a monthly budget');
       return setMarketing(state, fields.perMonth);
+    case 'drawCredit':
+      if (typeof fields.amount !== 'number') return reject('drawCredit needs an amount in dollars');
+      return drawCredit(state, fields.amount);
+    case 'repayCredit':
+      if (typeof fields.amount !== 'number') return reject('repayCredit needs an amount in dollars');
+      return repayCredit(state, fields.amount);
+    case 'takeTermLoan':
+      if (typeof fields.amount !== 'number') return reject('takeTermLoan needs an amount in dollars');
+      // An unknown term (6 years, 1.5) is rejected by takeTermLoan naming the terms on offer.
+      if (typeof fields.termYears !== 'number') return reject('takeTermLoan needs a term in years');
+      return takeTermLoan(state, fields.amount, fields.termYears as TermYears);
+    case 'prepayLoan':
+      if (typeof fields.loan !== 'number') return reject('prepayLoan needs a loan id');
+      if (typeof fields.amount !== 'number') return reject('prepayLoan needs an amount in dollars');
+      return prepayLoan(state, fields.loan, fields.amount);
     default:
       return reject(`Unknown command: ${describeType(fields.type)}`);
   }
@@ -130,6 +154,9 @@ function describeType(type: unknown): string {
 /**
  * Advance one day. Does nothing once the game is over (the day stops
  * advancing). Otherwise, in order:
+ *   debt.endDebtDay: the credit line accrues the day's end-of-day balance
+ *     (so every day of a month counts, its last day included, before the
+ *     close) and the 'paymentDue' reminder is posted when due
  *   on day 0 only: accrue day 0's billing (sales.accrueDay) at the settings
  *     in effect as the day ends, so commands sent on day 0 count and the first
  *     month bills all of its days (day 0 gets no sales step otherwise)
@@ -146,6 +173,7 @@ function describeType(type: unknown): string {
  */
 export function tick(state: GameState): void {
   if (state.gameOver) return;
+  endDebtDay(state);
   if (state.day === 0) accrueDay(state);
   const closing = isFirstOfMonth(state.day + 1);
   // Parcels appear by day, so take passings before the day moves on.
