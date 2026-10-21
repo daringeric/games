@@ -47,8 +47,13 @@
 // - The take-rate model compares your tiers with the incumbent's local price
 //   (incumbent.incumbentPriceFor the street's serving cabinet: its promo
 //   price while one runs there) and values the intro promo for signups.
-// - No one signs up on a street interrupted by an outage
-//   (ServiceSnapshot.interruptedSegments); its subscribers keep their accounts.
+// - While an outage cuts a street off from its serving cabinet
+//   (ServiceSnapshot.cutOffCabinets), new subscribers there connect only to a
+//   cabinet that still reaches it with a free port (else no one signs up),
+//   and no one joins a building whose account is cut off
+//   (network.outageService). Subscribers cut off keep their accounts and are
+//   charged outage churn for their own days without service at each close,
+//   an outage's base churn once (weather.outageChargeOf).
 
 import {
   CHURN_MONTHLY_BASE,
@@ -103,7 +108,7 @@ import {
 import { dateOf, dayOf, formatMonth } from './calendar';
 import { formatMoney, groupThousands, postEntry, postEntryOn } from './finance';
 import { activePromos, incumbentChurnFor, incumbentPriceFor } from './incumbent';
-import { getService } from './network';
+import { getService, outageService } from './network';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
 import { cornerName } from './streets';
@@ -128,7 +133,7 @@ import type {
   TierId,
   TierSetting,
 } from './types';
-import { outageChurnProbability, outageDaysOn } from './weather';
+import { outageChargeOf } from './weather';
 
 /** The tier lineup, in display (and Pricing.tiers) order. */
 export const TIER_IDS: readonly TierId[] = TIER_DEFAULTS.map((t) => t.id);
@@ -860,8 +865,15 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  * - Before signups, locks on tiers an account has no units on are dropped
  *   (only a loaded save can have them: every other path drops them when the
  *   units leave).
- * - Step 2 skips segments in service.interruptedSegments (an outage cuts
- *   them off: no signups, no draws; their accounts stay).
+ * - Step 2: on a segment whose serving cabinet an outage cuts off from it
+ *   (service.cutOffCabinets), new accounts go to the first cabinet of its
+ *   segmentCabinets that still reaches it and has a free port (it does not
+ *   count as full there, and the street's waiting demand is not put on it);
+ *   with none, the segment is skipped (no signups, no draws; its accounts
+ *   stay). A unit drawn for a building whose account is cut off
+ *   (network.outageService) does not connect, and ports lent to accounts it
+ *   re-homes for the outage are not free. The take rate stays that of the
+ *   serving cabinet's area.
  * - The target take rate and tier mix on a segment are those against the
  *   incumbent's price at its serving cabinet (incumbent.incumbentPriceFor:
  *   its promo price while one runs there) with the intro promo valued
@@ -883,7 +895,9 @@ export function stepSales(state: GameState, rng: Rng): void {
   const index = cityIndex(city);
   const pricing = sales.pricing;
   const promo = sales.promo;
-  const interrupted = service.interruptedSegments;
+  const cutOff = service.cutOffCabinets;
+  // While a span is out: who has no service, and the ports lent to the others it cut off (network.outageService).
+  const outage = cutOff.size > 0 ? outageService(state, service) : null;
   // Take rates and tier mixes per incumbent price: INCUMBENT_PRICE everywhere
   // but the cabinet areas where it runs a promo today.
   const localPrice = new Map<CabinetId, number>();
@@ -916,7 +930,7 @@ export function stepSales(state: GameState, rng: Rng): void {
   const freePorts = (cabinetId: CabinetId): number => {
     portsUsed ??= cabinetPortsUsed(state);
     const cabinet = cabinetsById.get(cabinetId);
-    return (cabinet ? cabinetPortCapacity(cabinet) : 0) - (portsUsed.get(cabinetId) ?? 0);
+    return (cabinet ? cabinetPortCapacity(cabinet) : 0) - (portsUsed.get(cabinetId) ?? 0) - (outage?.lent.get(cabinetId) ?? 0);
   };
   const routers = new Set(sales.routerParcels);
   const fullToday = new Set<CabinetId>();
@@ -934,11 +948,21 @@ export function stepSales(state: GameState, rng: Rng): void {
 
   for (const seg of index.servingSegments) {
     if (!service.litSegments.has(seg)) continue;
-    // An outage cuts the street off: nobody signs up until repairs finish.
-    if (interrupted.size > 0 && interrupted.has(seg)) continue;
-    const server = service.servingCabinet.get(seg);
-    if (server === undefined) continue;
-    const { take, mixes } = demandAt(localPrice.get(server) ?? INCUMBENT_PRICE);
+    const nearest = service.servingCabinet.get(seg);
+    if (nearest === undefined) continue;
+    // An outage cuts the street off from its cabinet: new signups go to the
+    // nearest cabinet that still reaches it and has a free port, else they
+    // wait for the repair.
+    let server = nearest;
+    let rerouted = false;
+    const lost = cutOff.size > 0 ? cutOff.get(seg) : undefined;
+    if (lost?.has(nearest)) {
+      const working = (service.segmentCabinets.get(seg) ?? []).find((c) => !lost.has(c) && freePorts(c) > 0);
+      if (working === undefined) continue;
+      server = working;
+      rerouted = true;
+    }
+    const { take, mixes } = demandAt(localPrice.get(nearest) ?? INCUMBENT_PRICE);
     const from = index.segStart[seg] as number;
     const to = index.segStart[seg + 1] as number;
 
@@ -994,9 +1018,12 @@ export function stepSales(state: GameState, rng: Rng): void {
       // Ports: a new account needs its ports on the serving cabinet; more units
       // in a building that already has an account ride on its router's port.
       if (existing < 0 && freePorts(server) < portsForKind(parcel.kind)) {
-        fullToday.add(server);
+        // A cabinet standing in for one an outage cut off is not "full" for its own streets.
+        if (!rerouted) fullToday.add(server);
         continue;
       }
+      // A building an outage leaves without service connects no one more until repairs finish.
+      if (existing >= 0 && outage !== null && outage.cutOff.has(chosen)) continue;
 
       // Cash: installs pause while cash cannot cover the next one.
       const cost = installCost(parcel.kind, routers.has(chosen));
@@ -1041,9 +1068,9 @@ export function stepSales(state: GameState, rng: Rng): void {
       sales.month.grossAdds += 1;
     }
 
-    // Demand still waiting here that needs new ports on the server.
+    // Demand still waiting here that needs new ports on the server (its own, not a stand-in's).
     const waiting = Math.min(gap - connectedHere, newPorts - portsTakenHere);
-    if (waiting > 0) {
+    if (waiting > 0 && !rerouted) {
       portDemandPerDay.set(server, (portDemandPerDay.get(server) ?? 0) + waiting * ramp);
       minNewPorts.set(server, Math.min(minNewPorts.get(server) ?? Infinity, fewestPorts));
     }
@@ -1216,8 +1243,12 @@ function stepWhy(reasons: ReadonlySet<PriceLockReason>): string {
  *      regular   - churnProbability at what it pays (its lock price, when lower)
  *      price     - when its lock ends at this close (untilDay <= state.day):
  *                  stepChurnProbability(lock price, list price, stepShare(reason))
- *      outage    - weather.outageChurnProbability(days its street was
- *                  interrupted in the month, weather.outageDaysOn)
+ *      outage    - the churn of the account's days cut off since the last
+ *                  close (weather.outageChargeOf: outageChurnProbability of
+ *                  its days, less what earlier closes charged the same
+ *                  outage, so its base churn is charged once), times the
+ *                  share of its units that were cut off (units it added
+ *                  later were not)
  *      incumbent - incumbent.incumbentChurnFor(its cabinet): a promo ran there
  *    capped at CHURN_TOTAL_MAX; a cancellation counts in churned and in the
  *    part its draw falls in (churnCause). Accounts left with 0 units are
@@ -1316,7 +1347,9 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
   for (const account of sales.accounts) {
     const parcel = parcels[account.parcel];
     const kind = parcel?.kind ?? 'home';
-    const outage = parcel ? outageChurnProbability(outageDaysOn(state, parcel.segment)) : 0;
+    const charge = outageChargeOf(state, account.parcel);
+    // Spread over the account's units by the share of them that were cut off: units it added later were not.
+    const outage = charge ? charge.probability * Math.min(1, charge.units / Math.max(1, accountUnits(account))) : 0;
     const incumbent = incumbentChurnFor(state, account.cabinet);
     for (const id of TIER_IDS) {
       const units = account.tierUnits[id];

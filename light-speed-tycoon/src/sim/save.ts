@@ -19,13 +19,14 @@ import {
   OLT_PORTS_PER_CARD,
   START_YEAR,
 } from './balance';
+import { dateOf, formatMonth } from './calendar';
 import { formatMoney, groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
 import { newDebt } from './debt';
 import { deriveSeed } from './rng';
 import { otherEnd, segmentsAtNode } from './streets';
-import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales } from './sales';
+import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales, retireDestination, unitsByTier } from './sales';
 import type {
   Account,
   BuildStage,
@@ -52,7 +53,7 @@ import type {
   TierId,
   Zone,
 } from './types';
-import { newWeather } from './weather';
+import { CUT_OFF_DAYS_MAX, newWeather } from './weather';
 
 const SCHEMA_VERSION = 4;
 const UINT32_MAX = 0xffffffff;
@@ -144,14 +145,28 @@ export function deserialize(json: string): GameState {
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
+  upgradeEarlyV4(raw);
   checkState(raw, 4);
   return raw as unknown as GameState;
 }
 
-/** v3 -> v4, validated, and the notice about the new frozen-line rules when they reach this game. */
+/**
+ * Bring a schemaVersion 4 save written before outage churn went by each
+ * subscriber's own days (Weather.cutOff) up to date: no subscriber has days
+ * waiting to be charged (an outage running now counts from today). The
+ * input object is changed in place; anything malformed is left for
+ * validation to reject.
+ */
+function upgradeEarlyV4(save: Json): void {
+  const weather = save.weather;
+  if (isRecord(weather) && !('cutOff' in weather)) weather.cutOff = [];
+}
+
+/** v3 -> v4, validated, and the notices about round-4 rules that take something away from this game. */
 function toCurrent(v3: V3State): GameState {
   const state = migrateV3toV4(v3);
   checkState(state as unknown as Json, 4);
+  noteRetiredTiers(state);
   noteFrozenRules(state);
   return state;
 }
@@ -340,11 +355,42 @@ export function migrateV3toV4(v3: V3State): GameState {
 }
 
 /**
+ * Round 3 let subscribers keep a tier the player stopped offering
+ * (grandfathered); round 4 moves them at the next close to the offered tier
+ * nearest in price (sales.closeSalesMonth step 4, some cancel). A save
+ * migrated with subscribers on an unoffered tier is told once per such tier:
+ * how many, where they go and at which close, and that offering the tier
+ * again keeps them on it.
+ */
+function noteRetiredTiers(state: GameState): void {
+  if (state.gameOver) return;
+  const tiers = state.sales.pricing.tiers;
+  const units = unitsByTier(state);
+  const today = dateOf(state.day);
+  const close = formatMonth(today.year, today.month);
+  for (const tier of tiers) {
+    const n = units[tier.id];
+    if (tier.offered || n === 0) continue;
+    const to = tiers.find((t) => t.id === retireDestination(tiers, tier.id));
+    if (!to) continue;
+    const who = n === 1 ? `Your 1 subscriber on ${tier.name}` : `Your ${groupThousands(n)} subscribers on ${tier.name}`;
+    postNotice(
+      state,
+      'rulesUpdated',
+      `Plans changed in this version: subscribers on a plan you no longer offer move at the next month close to the offered plan nearest in price, ` +
+        `and some cancel (more when the move costs them more). ${who} (${formatMoney(tier.price)}) ` +
+        `${n === 1 ? 'moves' : 'move'} to ${to.name} (${formatMoney(to.price)}) at the ${close} close; offer ${tier.name} again before then to keep ${n === 1 ? 'it' : 'them'} on it.`,
+    );
+  }
+}
+
+/**
  * Round 4 changed what a frozen line means: the bank sweeps part of each
  * month's operating cash flow and calls the loans after
  * FROZEN_ACCELERATION_CLOSES frozen closes in a row. A save migrated while
- * frozen with debt owed is told once, with its countdown (nothing else in
- * round 4 takes anything away from a migrated game).
+ * frozen with debt owed is told once, with its countdown (the other round-4
+ * rule that takes something away from a migrated game, the move off unoffered
+ * tiers, has its own notice: noteRetiredTiers).
  */
 function noteFrozenRules(state: GameState): void {
   const { debt } = state;
@@ -808,6 +854,15 @@ function checkWeather(weather: Json, ctx: Context): number {
   });
   ascending(segments, 'weather.month.segmentOutageDays (by segment)');
   for (const field of ['outageUnitDays', 'storms', 'spansDamaged', 'repairs'] as const) int(month[field], `weather.month.${field}`, 0);
+  const parcels = list(weather.cutOff, 'weather.cutOff').map((value, i) => {
+    const path = `weather.cutOff[${i}]`;
+    const entry = obj(value, path);
+    const days = int(entry.days, `${path}.days`, 0, CUT_OFF_DAYS_MAX);
+    int(entry.charged, `${path}.charged`, days === 0 ? 1 : 0, CUT_OFF_DAYS_MAX);
+    int(entry.units, `${path}.units`, 1, SANE_PARCEL_UNITS_MAX);
+    return ref(entry.parcel, `${path}.parcel`, city.parcels.length, 'parcel');
+  });
+  ascending(parcels, 'weather.cutOff (by parcel)');
   return nextStormId;
 }
 

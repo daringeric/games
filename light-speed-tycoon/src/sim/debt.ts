@@ -79,6 +79,7 @@ import { costPerPassing, cppBand, operatingCashFlow, trailingRepairs } from './m
 import { getService } from './network';
 import { postNotice } from './notices';
 import type {
+  Command,
   CommandResult,
   CovenantMetrics,
   CovenantStage,
@@ -1968,6 +1969,81 @@ export function cureOptions(state: GameState): CureOption[] {
   return grow === null ? [] : [grow];
 }
 
+/**
+ * Whether a cure started now can lift a freeze before the bank calls the
+ * loans: the COVENANT_CURE_CLOSES compliant closes in a row it takes (fewer
+ * when today's figures pass and some are already counted) fit in the closes
+ * left (closesUntilAcceleration). True when nothing is counting down; false
+ * once the loans are called (a cure does not end a call: only repaying
+ * everything does).
+ */
+export function cureBeatsCall(state: GameState): boolean {
+  if (state.debt.acceleration !== null) return false;
+  const left = closesUntilAcceleration(state);
+  if (left === null) return true;
+  const done = covenantMetrics(state).compliant ? state.debt.covenant.compliantCloses : 0;
+  return Math.max(1, COVENANT_CURE_CLOSES - done) <= Math.max(1, left);
+}
+
+/**
+ * Repaying everything owed now as a cure option (kind 'repayAll', amount the
+ * debt): the credit line and every term loan, each loan with the interest
+ * accrued on it, when cash after it still holds the next close's debt
+ * service (the line's interest accrued so far) plus FUNDING_CUSHION_MONTHS
+ * of fixed costs; null when nothing is owed or cash cannot. With nothing
+ * owed the next close clears the covenant stage and ends a call
+ * (reviewDebt). Pure.
+ */
+export function repayAllCure(state: GameState): CureOption | null {
+  const owed = totalDebt(state);
+  if (owed === 0) return null;
+  let interest = 0;
+  for (const loan of state.debt.loans) interest += accruedOn(state, loan, loan.balance);
+  const pro = withDebt(state, { ...state.debt, credit: { ...state.debt.credit, balance: 0 }, loans: [], acceleration: null });
+  const cashAfter = state.finance.cash - owed - interest;
+  if (cashAfter < estimateNextDebtService(pro) + fixedCostCushion(state)) return null;
+  const accrued = interest > 0 ? ` and ${formatMoney(interest)} of accrued interest` : '';
+  const ends =
+    state.debt.acceleration !== null
+      ? 'ends the call and clears your standing'
+      : state.debt.covenant.stage === 'frozen'
+        ? 'lifts the freeze, before the bank can call the loans'
+        : 'clears your standing';
+  return {
+    kind: 'repayAll',
+    loan: null,
+    amount: owed,
+    after: covenantMetrics(pro),
+    cashAfter,
+    text: `Repay everything you owe (${formatMoney(owed)}${accrued}): with no debt the next close ${ends}, leaving ${formatMoney(cashAfter)} in cash.`,
+  };
+}
+
+/**
+ * The cure to show (the advisor's covenantCure, the Bank's "To cure it
+ * now"): null when nothing is owed or today's figures pass. When the bank has
+ * called the loans, or a cure could not lift the freeze before it does
+ * (cureBeatsCall), only repaying everything (repayAllCure; null when cash
+ * cannot: nothing short of it helps). Otherwise the first cureOptions entry,
+ * with repaying everything ahead of the 'grow' figure when no single
+ * repayment cures but cash covers all of it.
+ */
+export function cureFor(state: GameState): CureOption | null {
+  if (totalDebt(state) === 0 || covenantMetrics(state).compliant) return null;
+  if (!cureBeatsCall(state)) return repayAllCure(state);
+  const first = cureOptions(state)[0] ?? null;
+  if (first === null || first.kind === 'grow') return repayAllCure(state) ?? first;
+  return first;
+}
+
+/** The commands that repay everything owed now: the credit line, then each term loan in full (repayAllCure). */
+export function repayAllCommands(state: GameState): Command[] {
+  const commands: Command[] = [];
+  if (state.debt.credit.balance > 0) commands.push({ type: 'repayCredit', amount: state.debt.credit.balance });
+  for (const loan of state.debt.loans) commands.push({ type: 'prepayLoan', loan: loan.id, amount: loan.balance });
+  return commands;
+}
+
 /** `state` with `debt` in place of its own (a shallow copy for pro forma reads; never written). */
 function withDebt(state: GameState, debt: Debt): GameState {
   return { ...state, debt };
@@ -2007,6 +2083,18 @@ function metricsText(m: CovenantMetrics): string {
 }
 
 /**
+ * " (until then the bank counts $23,666, 35% of lending ARR)" when the
+ * trailing operating cash flow is below the underwriting floor (what the
+ * covenant figures count instead), else "": so a 'grow' text's figures,
+ * all on the operating-cash-flow basis, do not read against the floor.
+ */
+function floorNote(base: MetricsBase): string {
+  const floor = base.arr * UNDERWRITING_MIN_MARGIN;
+  if (base.ocf >= floor) return '';
+  return ` (until then the bank counts ${formatMoney(floor)}, ${Math.round(UNDERWRITING_MIN_MARGIN * 100)}% of lending ARR)`;
+}
+
+/**
  * The 'grow' cure: the smallest multiple of LOAN_ROUNDING of extra annual
  * operating cash flow with which both tests pass at today's debt and debt
  * service (underwriting cash flow >= debt / COVENANT_MAX_LEVERAGE and >=
@@ -2029,8 +2117,9 @@ function growCure(state: GameState): CureOption | null {
       after,
       cashAfter,
       text:
-        `No single repayment cures it: about ${formatMoney(amount)} a year more operating cash flow ` +
-        `(${formatMoney(after.annualOperatingCashFlow)} a year in all) would, at today's figures bringing ${metricsText(after)}.`,
+        `No single repayment cures it: about ${formatMoney(amount)} a year more operating cash flow would, ` +
+        `raising it from ${formatMoney(base.ocf)} to ${formatMoney(after.annualOperatingCashFlow)} a year${floorNote(base)}, ` +
+        `at today's figures bringing ${metricsText(after)}.`,
     };
   }
   return null;

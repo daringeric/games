@@ -289,14 +289,20 @@ describe('#2 #6 #11 the payment reminder projects cash at the close', () => {
     }
   });
 
-  it('counts the installs still to come at the month\'s pace so far', () => {
+  it('counts the installs still to come at the pace of the month so far and the last closed month', () => {
     const state = makeTradingState(20_000, 0);
     state.day = monthStartOf(state.day) + 9; // the 10th
+    const last = state.finance.reports.at(-1)!;
+    const lastDays = MONTH_LENGTHS[last.month - 1] as number;
+    expect(last.totals.install ?? 0).toBe(0);
     const before = estimateCashAtClose(state);
     postEntry(state, 'install', -10_000, 'Installs');
     const left = nextCloseDay(state.day) - 1 - state.day;
-    // Cash fell by the install; the days left are expected to spend at the same daily pace.
-    expect(estimateCashAtClose(state)).toBe(before - 10_000 - Math.round((10_000 * left) / dateOf(state.day).day));
+    // Cash fell by the install; the days left are expected to spend at the daily pace of both months' installs.
+    expect(estimateCashAtClose(state)).toBe(before - 10_000 - Math.round((10_000 * left) / (dateOf(state.day).day + lastDays)));
+    // The last closed month's installs count toward the pace too.
+    last.totals.install = -31_000;
+    expect(estimateCashAtClose(state)).toBe(before - 10_000 - Math.round((41_000 * left) / (dateOf(state.day).day + lastDays)));
   });
 });
 

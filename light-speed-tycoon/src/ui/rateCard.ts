@@ -239,7 +239,7 @@ export function stormSection(): RateSection {
       {
         label: 'Outage churn',
         value: `${formatPercentFine(OUTAGE_CHURN_BASE)} + ${formatPercentFine(OUTAGE_CHURN_PER_DAY)} a day out`,
-        note: `Extra cancellations at the close among subscribers who lost service, at most ${formatPercent(OUTAGE_CHURN_MAX)}`,
+        note: `Extra cancellations at the close among subscribers who lost service (the base once per outage), at most ${formatPercent(OUTAGE_CHURN_MAX)}`,
       },
     ],
   };

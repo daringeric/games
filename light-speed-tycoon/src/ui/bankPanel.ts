@@ -6,7 +6,7 @@
 // covenants before and after; it starts at the largest covenant-safe amount),
 // the loans list (prepay) and the bank's notices. Every figure comes from
 // debt.ts (creditOffer, quoteDraw, quoteTermLoan, maxSafeTermLoan,
-// quotePrepay, covenantMetrics, cureOptions, estimateNextDebtService,
+// quotePrepay, covenantMetrics, cureFor, estimateNextDebtService,
 // estimateSweep, closesUntilAcceleration, acceleratedSchedule); the panel only
 // words and lays them out, and changes the game only through drawCredit /
 // repayCredit / takeTermLoan / prepayLoan. The quote functions run only while
@@ -49,7 +49,7 @@ import {
   closesUntilAcceleration,
   covenantMetrics,
   creditOffer,
-  cureOptions,
+  cureFor,
   estimateNextDebtService,
   estimateSweep,
   finalPayment,
@@ -144,7 +144,7 @@ export function stageNext(stage: CovenantStage): string {
 /**
  * How the stage steps back down, with the progress so far ('' while
  * compliant): the rule only. What would make the next close compliant is
- * cureAdvice, from debt.cureOptions (verified pro forma, so it cannot
+ * cureAdvice, from debt.cureFor (verified pro forma, so it cannot
  * backfire); this never advises a repayment on its own.
  */
 export function cureText(stage: CovenantStage, compliantCloses: number): string {
@@ -157,10 +157,12 @@ export function cureText(stage: CovenantStage, compliantCloses: number): string 
 }
 
 /**
- * The verified cure to show (the first debt.cureOptions entry): its own
- * sentence for a repayment or prepayment, or "No repayment cures it: about
- * $X a year more operating cash flow would." for growth; '' for none (no
- * debt, or the covenants pass today).
+ * The verified cure to show (debt.cureFor: a repayment or prepayment,
+ * repaying everything, or growth): its own sentence for a repayment, a
+ * prepayment or repaying everything, or "No repayment cures it: about $X a
+ * year more operating cash flow would." for growth; '' for none (no debt,
+ * the covenants pass today, or the loans are called and cash cannot repay
+ * them all).
  */
 export function cureAdvice(option: CureOption | null | undefined): string {
   if (!option) return '';
@@ -634,15 +636,16 @@ export function lendingArrNote(): string {
  * The covenant section: stage, today's tests, the cash flow behind them, and
  * what comes next. A compliant stage whose figures break a covenant today
  * reads 'At risk' (warn) with a hedged meaning; `nextClose` names that close
- * and `last` adds what the last close tested. `cure` is the first
- * debt.cureOptions entry (a repayment that would pass both tests at today's
- * figures, or the operating cash flow that would), shown as the remedy.
+ * and `last` adds what the last close tested. `cure` is debt.cureFor's
+ * (a repayment that would pass both tests at today's figures, repaying
+ * everything, or the operating cash flow that would), shown as the remedy.
  */
 /**
  * The Bank's "To cure it now: ..." line for a verified cure (covenantView's
  * remedy), '' with none. Once the bank has called the loans a cure lifts the
  * freeze but not the call (nothing new can be borrowed until everything is
- * repaid), so the line says the call stands.
+ * repaid), so with `called` the line says the call stands (the panel passes
+ * false for repaying everything, which ends the call).
  */
 export function remedyLine(remedy: string, called: boolean): string {
   if (remedy === '') return '';
@@ -1409,13 +1412,15 @@ class BankView {
     const lastReport = state.finance.reports.at(-1);
     const lastClose = lastReport ? formatMonth(lastReport.year, lastReport.month) : null;
     const nextClose = nextCloseDay(state.day);
+    // Once the loans are called (or will be before a cure could lift the freeze), only repaying everything (debt.cureFor).
+    const cure = metrics.compliant ? null : cureFor(state);
     const cov = covenantView(
       stage,
       state.debt.covenant.compliantCloses,
       metrics,
       nextClose,
       lastReport?.debt && lastClose ? { close: lastClose, debt: lastReport.debt } : null,
-      metrics.compliant ? null : (cureOptions(state)[0] ?? null),
+      cure,
     );
 
     // Summary: the badge reads like the covenant section's (an at-risk stage included).
@@ -1491,7 +1496,7 @@ class BankView {
     setText(this.covNext, cov.next);
     setText(this.covCureLabel, `${cov.cureLabel}: `);
     setText(this.covCure, cov.cure);
-    setText(this.covRemedy, remedyLine(cov.remedy, state.debt.acceleration !== null));
+    setText(this.covRemedy, remedyLine(cov.remedy, state.debt.acceleration !== null && cure?.kind !== 'repayAll'));
     this.covRemedy.hidden = cov.remedy === '';
     const frozen = frozenView({
       lastSweep: lastReport?.debt?.sweep && lastClose ? { amount: lastReport.debt.sweep, close: lastClose } : null,

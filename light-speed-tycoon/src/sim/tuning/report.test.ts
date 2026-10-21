@@ -1,30 +1,42 @@
-// Balance report: the per-seed numbers behind targets.test.ts, printed only
-// when asked for (otherwise this file is a trivial pass):
+// Balance report: the per-seed numbers behind targets.test.ts and
+// targets4.test.ts, printed only when asked for (otherwise this file is a
+// trivial pass):
 //
 //   TUNE_REPORT=1 npx vitest run src/sim/tuning/report.test.ts
 //
-// Optional: TUNE_SEEDS=1,2,3 (default TUNING_SEEDS), TUNE_MONTHS=60.
+// Optional: TUNE_SEEDS=1,2,3 (default TUNING_SEEDS), TUNE_MONTHS=60,
+// TUNE_SWEEP=0 to skip the constant-price sweep (the slowest part).
 
 import { describe, expect, it } from 'vitest';
 import { CPP_TARGET, START_CASH } from '../balance';
 import { newGame } from '../game';
-import { carelessBot, idleBot, leveredBot, ruralBot, smartBot } from './bots';
+import { allAerialBot, allUndergroundBot, carelessBot, frozenHoarderBot, idleBot, leveredBot, priceHikerBot, ruralBot, smartBot } from './bots';
 import {
   averageArpu,
   averageBorrowingRate,
   averageChurn,
+  bestSweepPoint,
   cppProbes,
+  cumulativeOperatingCashFlow,
+  finalPassedShare,
   firstPositiveMonth,
   median,
   missedPaymentMonths,
+  opsTotals,
+  ownershipCostPerPassing,
   passedShare,
   peakDebt,
+  priceSweep,
   redWhileOwingShare,
+  repaidAfterCall,
   runBot,
+  runValue,
   stageHistory,
+  stormExposure,
   townBuildOut,
   townFacts,
   TUNING_SEEDS,
+  undergroundShare,
   worstStage,
 } from './harness';
 import type { RunResult } from './harness';
@@ -34,6 +46,7 @@ const SEEDS: readonly number[] = process.env.TUNE_SEEDS
   ? process.env.TUNE_SEEDS.split(',').map((s) => Number(s.trim()))
   : TUNING_SEEDS;
 const MONTHS = Number(process.env.TUNE_MONTHS ?? 60);
+const SWEEP = process.env.TUNE_SWEEP !== '0';
 /** Months shown in the per-seed table. */
 const SHOWN_MONTHS = [1, 3, 6, 9, 12, 15, 18, 24, 30, 36, 48, 60];
 /** Months shown in the per-seed financing table. */
@@ -96,6 +109,33 @@ function debtTable(run: RunResult): string {
   );
 }
 
+/** One row per bot of the round-4 comparison: growth, plant, storms, money. */
+function methodRow(name: string, run: RunResult): Record<string, string> {
+  const ops = opsTotals(run);
+  const exposure = stormExposure(run);
+  return {
+    bot: name,
+    end: gameOverText(run),
+    share: pct(finalPassedShare(run)),
+    underground: pct(undergroundShare(run)),
+    subs: num(run.reports.at(-1)?.stats?.subscribers),
+    'op cash flow': dollars(cumulativeOperatingCashFlow(run)),
+    value: dollars(runValue(run)),
+    '12y cost/passing': dollars(ownershipCostPerPassing(run)),
+    'exp. repairs/yr': dollars(exposure.repairs),
+    'exp. days out/yr': exposure.subscriberDaysOut.toFixed(0),
+    repairs: dollars(ops.repairs),
+    'sub-days out': num(ops.outageUnitDays),
+    'outage churn': num(ops.outageChurn),
+    'price churn': num(ops.priceChurn),
+    'incumbent churn': num(ops.incumbentChurn),
+    promos: num(run.notices.incumbentPromo ?? 0),
+    rebuilds: num(run.commands.convertSpan ?? 0),
+    called: num(run.notices.loansCalled ?? 0),
+    'repaid m': num(repaidAfterCall(run)),
+  };
+}
+
 describe('balance report', () => {
   it.runIf(!ENABLED)('prints nothing unless TUNE_REPORT=1', () => {
     expect(ENABLED).toBe(false);
@@ -117,6 +157,12 @@ describe('balance report', () => {
         const rural = runBot(seed, ruralBot(), MONTHS);
         const careless = runBot(seed, carelessBot, Math.min(36, MONTHS));
         const idle = runBot(seed, idleBot, Math.min(24, MONTHS));
+        const aerial = runBot(seed, allAerialBot(), MONTHS);
+        const underground = runBot(seed, allUndergroundBot(), MONTHS);
+        const hoarder = runBot(seed, frozenHoarderBot(), MONTHS);
+        const spender = runBot(seed, frozenHoarderBot({ spendHoard: true }), MONTHS);
+        const hiker = runBot(seed, priceHikerBot(), MONTHS);
+        const hikerNotice = runBot(seed, priceHikerBot(0), MONTHS);
         const k36 = smart.kpis[35];
         const last = smart.reports.length;
         out.push(
@@ -140,6 +186,17 @@ describe('balance report', () => {
             `(${bps(averageBorrowingRate(rural, true))} without penalty months), red cost per passing at ${pct(redWhileOwingShare(rural), 0)} of month ends with debt`,
           `CARELESS: game over ${careless.gameOverMonth === null ? 'never' : `month ${careless.gameOverMonth} (${careless.gameOver?.reason})`}; ` +
             `IDLE: ${idle.gameOver ? `game over month ${idle.gameOverMonth}` : `alive at month ${idle.reports.length}, ${dollars(idle.state.finance.cash)}`}`,
+          'Round 4: build method, storms, the frozen line and prices',
+          table([
+            methodRow('SMART', smart),
+            methodRow('ALL_AERIAL', aerial),
+            methodRow('ALL_UNDERGROUND', underground),
+            methodRow('FROZEN_HOARDER', hoarder),
+            methodRow('hoarder (spends)', spender),
+            methodRow('PRICE_HIKER', hiker),
+            methodRow('PRICE_HIKER (0 months)', hikerNotice),
+            methodRow('no loans', noDebt),
+          ]),
         );
         summary.push({
           seed: String(seed),
@@ -167,6 +224,13 @@ describe('balance report', () => {
           'rural rate': bps(averageBorrowingRate(rural)),
           careless: careless.gameOverMonth === null ? 'alive' : `bust m${careless.gameOverMonth}`,
           idle: idle.gameOver ? `bust m${idle.gameOverMonth}` : 'alive',
+          ugnd: pct(undergroundShare(smart)),
+          'aerial repairs x': `${(stormExposure(aerial).repairs / Math.max(1, stormExposure(smart).repairs)).toFixed(2)} (${(opsTotals(aerial).repairs / Math.max(1, opsTotals(smart).repairs)).toFixed(2)})`,
+          'aerial out x': `${(stormExposure(aerial).subscriberDaysOut / Math.max(1e-9, stormExposure(smart).subscriberDaysOut)).toFixed(2)} (${(opsTotals(aerial).outageUnitDays / Math.max(1, opsTotals(smart).outageUnitDays)).toFixed(2)})`,
+          'all-ugnd share': pct(finalPassedShare(underground)),
+          promos: num(smart.notices.incumbentPromo ?? 0),
+          hoarder: hoarder.gameOver ? `${hoarder.gameOver.reason} m${hoarder.gameOverMonth}` : `repaid m${repaidAfterCall(hoarder) ?? '-'}`,
+          'hiker subs': `${num(hiker.reports.at(-1)?.stats?.subscribers)}/${num(smart.reports.at(-1)?.stats?.subscribers)}`,
           ms: smart.ms.toFixed(0),
         });
       }
@@ -175,13 +239,35 @@ describe('balance report', () => {
           `cash-flow positive month 12-18 median, take 30-45%, ARPU $60-80, churn 0.8-2%, cpp <= ${dollars(CPP_TARGET)} at months 36 and 60; ` +
           `share passed at month 60 >= 50% (median 50-70%), 15+ points over no loans; peak debt >= ${dollars(0.4 * START_CASH)}; ` +
           `rate 6-11%, rural >= SMART + 1%; worst stage warning; no missed payments; capacity after month 3 <= ${dollars(0.1 * START_CASH)}; ` +
-          `LEVERED defaults on 4+ of 5)`,
+          `LEVERED defaults on 4+ of 5; round 4: SMART underground 20-60%, all-aerial storm exposure (realized in brackets): repairs >= 1.25x, sub-days out >= 1.1x SMART's, ` +
+          `all-underground passes less, 1-10 incumbent promos, hoarders repay through the call or default, hikers end with <= half SMART's subscribers)`,
         table(summary),
       );
+      if (SWEEP) {
+        const points = priceSweep(SEEDS, smartBot(), MONTHS);
+        const best = bestSweepPoint(points);
+        out.push(
+          `\n=== constant-price sweep: SMART at multiples of every TIER_DEFAULTS price, mean over ${SEEDS.length} seeds; ` +
+            `best by operating cash flow to month ${MONTHS}: x${best?.multiplier} (target: within 15% of x1)`,
+          table(
+            points.map((p) => ({
+              'x price': p.multiplier.toFixed(1),
+              'op cash flow': dollars(p.operatingCashFlow),
+              value: dollars(p.value),
+              share: pct(p.passedShare),
+              subs: p.subscribers.toFixed(0),
+              take: pct(p.takeRate),
+              arpu: dollars(p.arpu),
+              churn: pct(p.churn, 2),
+              'game overs': String(p.gameOvers),
+            })),
+          ),
+        );
+      }
       // Straight to stdout: the default reporter hides console.log of passing tests.
       process.stdout.write(`${out.join('\n')}\n`);
       expect(summary.length).toBe(SEEDS.length);
     },
-    600_000,
+    3_600_000,
   );
 });

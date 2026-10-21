@@ -26,8 +26,11 @@
 //   suggests no financing once an earlier one borrowed (borrowing is
 //   verified one suggestion at a time) or once covenantCure has said not to
 //   borrow (a covenant breached or near its limit), and sizes its financing
-//   to cover the earlier spend too. So doing every suggestion of one advise() call stays
-//   covenant-safe and keeps the cushion.
+//   to cover the earlier spend too. The one borrowing that can come before
+//   that warning is paymentShort's (the payment the next close must make,
+//   covenant-safe), and the warning then says to borrow nothing beyond it.
+//   So doing every suggestion of one advise() call stays covenant-safe and
+//   keeps the cushion.
 // - Each fires at most once per call, with priority in its severity's band
 //   (urgent 300-399, important 200-299, tip 100-199): ADVICE_PRIORITY.
 // - `why` quotes the figures (dollars via finance.formatMoney, rates and
@@ -73,7 +76,8 @@ import {
   acceleratedSchedule,
   closesUntilAcceleration,
   covenantMetrics,
-  cureOptions,
+  cureBeatsCall,
+  cureFor,
   estimateNextDebtService,
   estimateSweep,
   formatMultiple,
@@ -83,12 +87,13 @@ import {
   pricingCpp,
   quoteDraw,
   quoteTermLoan,
+  repayAllCommands,
   totalDebt,
 } from './debt';
 import { estimateCashAtClose, formatMoney, groupThousands, monthlyBurn, runwayMonths } from './finance';
 import { activePromos } from './incumbent';
 import { costPerPassing, cppBand, operatingCashFlow, passingsWeightedRate, reportKpis } from './metrics';
-import { getService, outageImpact, ponPortsUsed, quoteConvert, quoteOltCard, quoteSplitter } from './network';
+import { getService, outageImpact, outageService, ponPortsUsed, quoteConvert, quoteOltCard, quoteSplitter } from './network';
 import {
   accountUnits,
   cabinetPortCapacity,
@@ -101,7 +106,7 @@ import {
   unitsByTier,
 } from './sales';
 import { cornerName } from './streets';
-import { outageChurnProbability, outageDaysOn, outageSpanIds, repairCost } from './weather';
+import { cutOffOf, outageChurnFor, outageSpanIds, repairCost } from './weather';
 import type {
   Advice,
   AdviceAction,
@@ -155,7 +160,8 @@ export const ADVICE_ORDER: readonly AdviceId[] = [
 /**
  * Notice kinds that mean the player should look (the briefing's
  * needsAttention, the "only when something needs attention" setting);
- * storms and dig-ins only while plant is still out at the close
+ * storms and dig-ins only while plant is still out at the close, a full
+ * cabinet, a full OLT or paused installs only while still so at the close
  * (noticeNeedsAttention).
  */
 export const ATTENTION_NOTICE_KINDS: ReadonlySet<NoticeKind> = new Set<NoticeKind>([
@@ -277,13 +283,20 @@ export interface AdvicePlan {
 
 /**
  * What the plans made so far in one advicePlans call have claimed: cash they
- * spend, whether one borrows or repays, and whether one (covenantCure) told
- * the player not to borrow, so no later plan suggests borrowing either.
+ * spend, whether one borrows or repays (borrowed), whether one takes on new
+ * debt (newDebt: a draw or a term loan), whether one (covenantCure) told the
+ * player not to borrow, so no later plan suggests borrowing either,
+ * whether paymentShort fired (loansCalled then leaves a last called close to
+ * it), and whether cash is short (cashShort).
  */
 interface Claims {
   spend: number;
   borrowed: boolean;
+  newDebt: boolean;
   holdBorrowing: boolean;
+  paymentShort: boolean;
+  /** An earlier plan is about cash running short (paymentShort, cashRunway): no suggestion to spend more on growth. */
+  cashShort: boolean;
 }
 
 /** Order advice: priority descending, then ADVICE_ORDER. */
@@ -310,8 +323,11 @@ export function advicePlans(state: GameState): AdvicePlan[] {
     found.push(plan);
     r.claims.spend += plan.spend;
     if (plan.commands.some((c) => FINANCING_COMMANDS.has(c.type))) r.claims.borrowed = true;
+    if (plan.commands.some((c) => c.type === 'drawCredit' || c.type === 'takeTermLoan')) r.claims.newDebt = true;
     // A covenant breached or near its limit: every covenantCure text says not to borrow more.
     if (id === 'covenantCure') r.claims.holdBorrowing = true;
+    if (id === 'paymentShort') r.claims.paymentShort = true;
+    if (id === 'paymentShort' || id === 'cashRunway') r.claims.cashShort = true;
   }
   const rank = (id: AdviceId) => ADVICE_ORDER.indexOf(id);
   return found.sort((a, b) => b.advice.priority - a.advice.priority || rank(a.advice.id) - rank(b.advice.id));
@@ -399,7 +415,7 @@ function readingsOf(state: GameState): Readings {
     waiting,
     subscribed,
     splitterCandidates: once(() => splitterCandidates(state, portsUsed(), waiting())),
-    claims: { spend: 0, borrowed: false, holdBorrowing: false },
+    claims: { spend: 0, borrowed: false, newDebt: false, holdBorrowing: false, paymentShort: false, cashShort: false },
   };
   return r;
 }
@@ -551,6 +567,11 @@ function purchaseFunding(state: GameState, r: Readings, cost: number): { text: s
   return { text: `: ${funding.phrase} pays for it and keeps a cushion, within the covenants.`, commands: funding.commands, cash: false };
 }
 
+/** What a purchase waits on beyond its cost: "the next loan payment" while one is due or anything is owed, else "a cushion" (the fixed costs fundingHint keeps). */
+function keepWhat(r: Readings): string {
+  return r.nextService() > 0 || r.debt() > 0 ? 'the next loan payment' : 'a cushion for the month’s costs';
+}
+
 /** Cash alone covers `cost` on top of what earlier rules claimed, keeping the cushion (fundingHint finds no shortfall). */
 function cashCovers(state: GameState, r: Readings, cost: number): boolean {
   return fundingHint(state, cost + r.claims.spend).kind === 'cash';
@@ -609,12 +630,16 @@ function paymentShortRule(state: GameState, r: Readings): AdvicePlan | null {
  * loansCalled (urgent): the bank has called the loans (Debt.acceleration):
  * what falls due at the next close (debt.acceleratedSchedule) against the
  * cash projected there, the rest over the closes left, and that a close that
- * cannot pay is a default. Open Bank.
+ * cannot pay is a default. Not when everything falls due at the next close
+ * and paymentShort (earlier in the same call) already says it cannot be
+ * paid. Open Bank.
  */
 function loansCalledRule(state: GameState, r: Readings): AdvicePlan | null {
   const acceleration = state.debt.acceleration;
   const debt = r.debt();
   if (acceleration === null || debt === 0) return null;
+  // Everything falls due at the next close and paymentShort already says that close cannot pay it: one card, not two.
+  if (r.claims.paymentShort && acceleration.closesLeft <= 1) return null;
   const schedule = acceleratedSchedule(state);
   const due = schedule[0] ?? r.nextService();
   let rest = 0;
@@ -650,10 +675,16 @@ const NEXT_BREACH: Record<GameState['debt']['covenant']['stage'], string> = {
 /**
  * covenantCure: a covenant breached at today's figures (urgent while the
  * stage is penalty or frozen, or when the close is URGENT_CLOSE_DAYS away
- * or fewer; important otherwise) with the first debt.cureOptions entry (a
- * verified repayment or prepayment, or the 'grow' figure when no single
- * repayment cures it); or, compliant but within COVENANT_RISK_MARGIN of a
- * limit, important: hold off on borrowing. Never "borrow more". Open Bank.
+ * or fewer; important otherwise) with the cure debt.cureFor shows (a verified
+ * repayment or prepayment; repaying everything when no single repayment
+ * cures and cash covers it all; else the 'grow' figure). Once the bank has
+ * called the loans, or a cure could not lift the freeze before it calls them
+ * (debt.cureBeatsCall), only repaying everything helps: that (urgent) when
+ * cash covers it, else nothing (frozenSweep and loansCalled say what
+ * happens). Or, compliant but within COVENANT_RISK_MARGIN of a limit,
+ * important: hold off on borrowing (beyond what an earlier suggestion, the
+ * payment the next close must make, borrows: Claims.newDebt). Never "borrow
+ * more". Open Bank.
  */
 function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
   if (r.debt() === 0) return null;
@@ -661,17 +692,27 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
   const stage = state.debt.covenant.stage;
   const close = closeLabel(r.closeDay());
   if (!m.compliant) {
-    const urgent = stage === 'penalty' || stage === 'frozen' || r.closeDay() - state.day <= URGENT_CLOSE_DAYS;
+    const inTime = cureBeatsCall(state);
+    const urgent = !inTime || stage === 'penalty' || stage === 'frozen' || r.closeDay() - state.day <= URGENT_CLOSE_DAYS;
     const priority = urgent ? ADVICE_PRIORITY.covenantCureUrgent : ADVICE_PRIORITY.covenantCureAtRisk;
-    const lead = `At today's figures ${covenantFigures(m)} breach the covenants, and the ${close} close tests them again: ${NEXT_BREACH[stage]}.`;
-    const option = cureOptions(state)[0];
+    const option = cureFor(state);
+    if (!inTime && (!option || option.kind !== 'repayAll')) return null;
+    const lead = !inTime
+      ? state.debt.acceleration !== null
+        ? 'The bank has called your loans: a covenant cure does not end the call, only repaying everything does.'
+        : `At today's figures ${covenantFigures(m)} breach the covenants, and lifting the freeze takes ${COVENANT_CURE_CLOSES} compliant closes in a row, ` +
+          `more than remain before the bank calls the loans: only repaying everything stops it.`
+      : `At today's figures ${covenantFigures(m)} breach the covenants, and the ${close} close tests them again: ${NEXT_BREACH[stage]}.`;
     if (!option) {
       const why = `${lead} No single repayment cures it: grow operating cash flow (more subscribers, lower costs) and do not borrow more.`;
       return plan(makeAdvice('covenantCure', priority, 'Grow cash flow to meet the covenants', why, BANK));
     }
     let title: string;
     let commands: Command[] = [];
-    if (option.kind === 'repayCredit') {
+    if (option.kind === 'repayAll') {
+      title = `Repay all ${money(option.amount)} you owe`;
+      commands = repayAllCommands(state);
+    } else if (option.kind === 'repayCredit') {
       title = `Repay ${money(option.amount)} of the credit line`;
       commands = [{ type: 'repayCredit', amount: option.amount }];
     } else if (option.kind === 'prepayLoan' && option.loan !== null) {
@@ -679,7 +720,8 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
       title = loan && option.amount >= loan.balance ? `Pay off term loan #${option.loan}` : `Prepay ${money(option.amount)} of term loan #${option.loan}`;
       commands = [{ type: 'prepayLoan', loan: option.loan, amount: option.amount }];
     } else {
-      title = `Grow operating cash flow by ${money(option.amount)} a year`;
+      // On the same basis as its text: today's operating cash flow raised to this.
+      title = `Grow operating cash flow to about ${money(Math.round(option.after.annualOperatingCashFlow / LOAN_ROUNDING) * LOAN_ROUNDING)} a year`;
     }
     const spend = commands.length > 0 ? state.finance.cash - option.cashAfter : 0;
     return plan(makeAdvice('covenantCure', priority, title, `${lead} ${option.text}`, BANK), commands, spend);
@@ -687,9 +729,12 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
   const leverageNear = m.totalDebt > 0 && m.leverage !== null && m.leverage > COVENANT_MAX_LEVERAGE * (1 - COVENANT_RISK_MARGIN);
   const coverageNear = m.coverage !== null && m.coverage < COVENANT_MIN_COVERAGE * (1 + COVENANT_RISK_MARGIN);
   if (!leverageNear && !coverageNear) return null;
+  const hold = r.claims.newDebt
+    ? 'Beyond the borrowing suggested above (it covers the payment and stays within the covenants), hold off on new borrowing and keep cash flow growing'
+    : 'Hold off on new borrowing and keep cash flow growing';
   const why =
     `At today's figures ${covenantFigures(m)} pass, but only just: a weak month or more borrowing would breach them at the ${close} close. ` +
-    'Hold off on new borrowing and keep cash flow growing; repaying debt widens the margin.';
+    `${hold}; repaying debt widens the margin.`;
   return plan(makeAdvice('covenantCure', ADVICE_PRIORITY.covenantCureAtRisk, 'Keep clear of the covenant limits', why, BANK));
 }
 
@@ -762,13 +807,17 @@ function cashRunwayRule(state: GameState, r: Readings): AdvicePlan | null {
     : runway === 0
       ? `At your current burn of ${money(burn)} a month, your cash (${money(cash)}) will not last the month.`
       : `At your current burn of ${money(burn)} a month, your ${money(cash)} of cash lasts about ${count(runway ?? 0, 'month', 'months')}.`;
+  // "Borrowing suggested above" only when an earlier plan takes on new debt: a
+  // repayment above (covenantCure's) is not borrowing, and its warning stands.
   const next = funding
     ? `${capitalize(funding.phrase)} adds about ${months === 1 ? 'a month' : `${months} months`} of ${paused ? 'costs' : 'runway'} and stays within the covenants.`
-    : borrowed
+    : r.claims.newDebt
       ? `Beyond the borrowing suggested above, ${cutSpending(state)} until revenue catches up.`
       : hold
         ? `Until the covenants are clear of their limits (see above), don't borrow: ${cutSpending(state)} until revenue catches up.`
-        : `No covenant-safe borrowing covers it: ${cutSpending(state)} until revenue catches up.`;
+        : borrowed
+          ? `After the repayment suggested above, ${cutSpending(state)} until revenue catches up.`
+          : `No covenant-safe borrowing covers it: ${cutSpending(state)} until revenue catches up.`;
   const title = paused
     ? 'Raise cash to restart installs'
     : funding
@@ -827,7 +876,7 @@ function addSplitterRule(state: GameState, r: Readings): AdvicePlan | null {
   const lead = best.full
     ? `The cabinet at ${place} has no free splitter port, so ${waiting} ${best.waiting === 1 ? 'is' : 'are'} being turned away.`
     : `The cabinet at ${place} has ${groupThousands(best.used)} of its ${groupThousands(best.capacity)} ports in use, with ${waiting}.`;
-  const next = `A splitter (${money(cost)}) adds ${SPLIT_RATIO} ports${paid ? paid.text : ', but cash is tight: add it once cash covers it and the next loan payment.'}`;
+  const next = `A splitter (${money(cost)}) adds ${SPLIT_RATIO} ports${paid ? paid.text : `, but cash is tight: add it once cash covers it and ${keepWhat(r)}.`}`;
   const priority = !best.full
     ? ADVICE_PRIORITY.addSplitterNearlyFull
     : paid?.cash
@@ -862,7 +911,7 @@ function addOltCardRule(state: GameState, r: Readings): AdvicePlan | null {
       ? ', so no cabinet or splitter can be added'
       : '';
   const lead = `${groupThousands(used)} of the ${groupThousands(olt.ponPorts)} PON ports at the CO are in use${need}.`;
-  const next = `A line card (${money(cost)}) adds ${OLT_PORTS_PER_CARD} more${paid ? paid.text : ', once cash covers it and the next loan payment.'}`;
+  const next = `A line card (${money(cost)}) adds ${OLT_PORTS_PER_CARD} more${paid ? paid.text : `, once cash covers it and ${keepWhat(r)}.`}`;
   const priority = needer ? ADVICE_PRIORITY.addOltCardNeeded : ADVICE_PRIORITY.addOltCardNearlyFull;
   const commands: Command[] = paid ? [...paid.commands, { type: 'addOltCard' }] : [];
   return plan(makeAdvice('addOltCard', priority, paid ? 'Add an OLT line card' : 'Add an OLT line card when cash allows', `${lead} ${next}`, OLT), commands, paid ? cost : 0);
@@ -870,52 +919,72 @@ function addOltCardRule(state: GameState, r: Readings): AdvicePlan | null {
 
 /**
  * outages (important): spans out of service now with subscribers cut off
- * (ServiceSnapshot.interruptedSegments): the span cutting off the most
- * (network.outageImpact, measured for at most OUTAGE_CANDIDATES_MAX spans),
- * its street, the days left, its repair cost and the churn its subscribers
- * risk at the close (weather.outageChurnProbability over the days out this
- * month plus the days left). Show me: that street.
+ * (network.outageService: the outage cuts their own cabinet off from their
+ * street and no other cabinet there has a port free): the span cutting off
+ * the most (network.outageImpact, measured for at most
+ * OUTAGE_CANDIDATES_MAX spans), its street, the days left, its repair
+ * cost and the churn its subscribers still risk (weather.outageChurnFor: their
+ * days cut off so far, weather.cutOffOf, plus the days still to come, a span
+ * repaired in `daysLeft` days being out daysLeft - 1 more days, less what
+ * earlier closes charged) at the closes those days fall before (one, or the
+ * next two when the outage runs past a close). Show me: that street.
  */
 function outagesRule(state: GameState, r: Readings): AdvicePlan | null {
   const out = state.network.spans.filter((s) => s.outage !== null && s.stage === 'live');
   if (out.length === 0) return null;
   const service = r.service();
-  const interrupted = service.interruptedSegments;
-  if (interrupted.size === 0) return null;
-  const subscribed = r.subscribed();
+  if (service.cutOffCabinets.size === 0) return null;
   const parcels = state.city.parcels;
+  const dark = outageService(state, service).cutOff;
   let total = 0;
   const onSegment = new Map<SegmentId, number>();
-  for (const [id, units] of subscribed) {
-    const parcel = parcels[id];
-    if (!parcel || !interrupted.has(parcel.segment)) continue;
+  const cutOff: { segment: SegmentId; parcel: ParcelId }[] = [];
+  for (const account of state.sales.accounts) {
+    const parcel = parcels[account.parcel];
+    if (!parcel || !dark.has(account.parcel)) continue;
+    const units = accountUnits(account);
     total += units;
     onSegment.set(parcel.segment, (onSegment.get(parcel.segment) ?? 0) + units);
+    cutOff.push({ segment: parcel.segment, parcel: parcel.id });
   }
   if (total === 0) return null;
   const daysLeft = (s: CableSpan) => s.outage?.daysLeft ?? 0;
   const ranked = [...out].sort((a, b) => (onSegment.get(b.segment) ?? 0) - (onSegment.get(a.segment) ?? 0) || daysLeft(b) - daysLeft(a) || a.id - b.id);
   let worst = ranked[0] as CableSpan;
   let units = 0;
+  let segments: readonly SegmentId[] = [];
   for (const span of ranked.slice(0, OUTAGE_CANDIDATES_MAX)) {
-    const cut = outageImpact(state, span.id).subscribers;
-    if (cut > units) {
-      units = cut;
+    const impact = outageImpact(state, span.id);
+    if (impact.subscribers > units) {
+      units = impact.subscribers;
       worst = span;
+      segments = impact.segments;
     }
   }
   if (units === 0) units = total;
   const outage = worst.outage;
   if (!outage) return null;
   const street = state.city.segments[worst.segment]?.name ?? 'a street';
-  const p = outageChurnProbability(outageDaysOn(state, worst.segment) + outage.daysLeft);
+  // Its subscribers' outage so far (the longest among them), and the days still to come.
+  const theirs = segments.length > 0 ? new Set(segments) : null;
+  let soFar = { days: 0, charged: 0 };
+  for (const c of cutOff) {
+    if (theirs !== null && !theirs.has(c.segment)) continue;
+    const entry = cutOffOf(state, c.parcel);
+    if (entry && entry.days + entry.charged > soFar.days + soFar.charged) soFar = entry;
+  }
+  const more = Math.max(0, outage.daysLeft - 1);
+  const p = outageChurnFor(soFar.charged, soFar.days + more);
+  const first = r.closeDay();
+  const last = nextCloseDay(state.day + more);
+  const closes = last === first ? `the ${closeLabel(first)} close` : `the ${closeLabel(first)} and ${closeLabel(last)} closes`;
   const cause = outage.cause === 'storm' ? 'A storm' : 'A dig-in';
   const all = total > units ? ` (${groupThousands(total)} in all)` : '';
   const lead =
     `${cause} cut ${count(units, 'subscriber', 'subscribers')} off on ${street}${all}; ` +
     `the repair (${money(outage.repairCost)}) finishes in ${count(outage.daysLeft, 'day', 'days')}.`;
   const expected = Math.round(units * p);
-  const next = `Days without service add churn: about ${pct(p)} of them${expected > 0 ? ` (${groupThousands(expected)})` : ''} may cancel at the close.`;
+  const next = `Days without service add churn: about ${pct(p)} of them${expected > 0 ? ` (${groupThousands(expected)})` : ''} may cancel at ${closes}.`;
   return plan(makeAdvice('outages', ADVICE_PRIORITY.outages, `Service is out on ${street}`, `${lead} ${next}`, { kind: 'focusSegment', segment: worst.segment }));
 }
 
@@ -923,7 +992,7 @@ function outagesRule(state: GameState, r: Readings): AdvicePlan | null {
  * Subscribed units an outage on `span` would cut off (beyond what is cut
  * off today): the coverage rule on a pro forma copy with that span out
  * (state is never written; the copy has its own network object, so the
- * service cache keys it apart).
+ * service cache keys it apart), counted per account (network.outageService).
  */
 function unitsFedBy(state: GameState, span: CableSpan, r: Readings): number {
   if (span.outage !== null) return outageImpact(state, span.id).subscribers;
@@ -931,13 +1000,10 @@ function unitsFedBy(state: GameState, span: CableSpan, r: Readings): number {
     s.id === span.id ? { ...s, outage: { cause: 'storm' as const, storm: null, startDay: state.day, daysLeft: 1, repairCost: 0 } } : s,
   );
   const pro: GameState = { ...state, network: { ...state.network, spans } };
-  const before = r.service().interruptedSegments;
-  const cut = getService(pro).interruptedSegments;
+  const before = outageService(state, r.service()).cutOff;
+  const after = outageService(pro, getService(pro)).cutOff;
   let units = 0;
-  for (const [id, n] of r.subscribed()) {
-    const parcel = state.city.parcels[id];
-    if (parcel && cut.has(parcel.segment) && !before.has(parcel.segment)) units += n;
-  }
+  for (const account of state.sales.accounts) if (after.has(account.parcel) && !before.has(account.parcel)) units += accountUnits(account);
   return units;
 }
 
@@ -993,7 +1059,7 @@ function stormUndergroundRule(state: GameState, r: Readings): AdvicePlan | null 
     const next = convert
       ? `Rebuilding it underground costs ${money(quote.cost)} and saves ${savings}: it pays for itself in about ${count(Math.ceil(quote.cost / saved), 'year', 'years')}.`
       : pays
-        ? `Rebuilding it underground (${money(quote.cost)}) would save ${savings}: do it once cash covers it and the next loan payment, and build new streets around here underground.`
+        ? `Rebuilding it underground (${money(quote.cost)}) would save ${savings}: do it once cash covers it and ${keepWhat(r)}, and build new streets around here underground.`
         : quote.cost > 0
           ? `Rebuilding it (${money(quote.cost)}) would save only ${savings}, so build new streets around here underground instead.`
           : 'Build new streets around here underground.';
@@ -1069,10 +1135,15 @@ function incumbentPromoRule(state: GameState, r: Readings): AdvicePlan | null {
  * per kind and cabinet) while marketing is under MARKETING_PER_PASSING_GOOD
  * a passing and raising it to that would sign people up at least
  * TAKE_RATE_MIN_PACE times as fast: what raising it does to the signup pace
- * (sales.marketingBoost).
+ * (sales.marketingBoost). Not while installs are paused (new customers
+ * already wait for cash) or an earlier suggestion of the same call is about
+ * cash running short (Claims.cashShort: paymentShort or cashRunway), so it
+ * never sits next to a card telling the player to cut spending or raise
+ * cash.
  * Open Pricing (marketing lives there).
  */
 function takeRateRule(state: GameState, r: Readings): AdvicePlan | null {
+  if (state.sales.installsPaused || r.claims.cashShort) return null;
   const service = r.service();
   const passings = service.passings;
   if (passings <= 0) return null;
@@ -1170,11 +1241,12 @@ function pricingRule(state: GameState): AdvicePlan | null {
 /**
  * redCpp: the lifetime cost per passing the lender prices on
  * (debt.pricingCpp) is amber or red: the CPP_SPREAD_BPS spread it adds to
- * the credit line and new loans (and what that costs a year on today's
- * debt), and where green builds take it. Important while anything is owed,
- * else a tip. Open Bank.
+ * the credit line and new loans (and what that costs a year on the line's
+ * balance, the only debt it re-prices: a term loan's rate is fixed when it
+ * is taken), and where green builds take it. Important while the line is
+ * drawn, else a tip. Open Bank.
  */
-function redCppRule(state: GameState, r: Readings): AdvicePlan | null {
+function redCppRule(state: GameState): AdvicePlan | null {
   const cpp = pricingCpp(state);
   if (cpp === null) return null;
   const band = cppBand(cpp);
@@ -1182,15 +1254,16 @@ function redCppRule(state: GameState, r: Readings): AdvicePlan | null {
   const spread = CPP_SPREAD_BPS[band];
   const lower = band === 'red' ? 'amber' : 'green';
   const threshold = band === 'red' ? CPP_TARGET * CPP_AMBER_MULTIPLIER : CPP_TARGET;
-  const debt = r.debt();
-  const cost = debt > 0 ? `: about ${money((debt * spread) / 10_000)} a year on today's ${money(debt)} of debt` : '';
+  const line = state.debt.credit.balance;
+  const cost = line > 0 ? `: about ${money((line * spread) / 10_000)} a year on the ${money(line)} drawn on the line` : '';
+  const fixed = state.debt.loans.length > 0 ? ' (your term loans keep the rates they were taken at)' : '';
   const lead =
     `Your lifetime cost per passing is ${money(cpp)} (${band}; target ${money(CPP_TARGET)}), ` +
-    `so the bank adds ${formatRateBps(spread)} to the credit line and every new loan${cost}.`;
+    `so the bank adds ${formatRateBps(spread)} to the credit line and every new loan${fixed}${cost}.`;
   const next =
     `Builds that pass homes for under ${money(CPP_TARGET)} each (green on the cabinet tool) bring it down; ` +
     `at ${money(threshold)} or less the spread drops to ${formatRateBps(CPP_SPREAD_BPS[lower])}.`;
-  const priority = debt > 0 ? ADVICE_PRIORITY.redCppWithDebt : ADVICE_PRIORITY.redCpp;
+  const priority = line > 0 ? ADVICE_PRIORITY.redCppWithDebt : ADVICE_PRIORITY.redCpp;
   return plan(makeAdvice('redCpp', priority, 'Bring your cost per passing down', `${lead} ${next}`, BANK));
 }
 
@@ -1408,14 +1481,31 @@ function periodNotices(state: GameState, report: MonthlyReport, before: MonthlyR
  */
 /**
  * Whether a period notice needs the player (Briefing.needsAttention): its
- * kind is in ATTENTION_NOTICE_KINDS, and a 'storm' or 'digIn' only while a
- * span is still out of service (a storm repaired before the close is news,
- * not something to act on).
+ * kind is in ATTENTION_NOTICE_KINDS, and one about something the player can
+ * have fixed before the close only while it still stands at the close: a
+ * 'storm' or 'digIn' while a span is still out of service (a storm repaired
+ * before the close is news, not something to act on), 'cabinetFull' while
+ * its cabinet (Notice.cabinet; any, without one) is still in
+ * Sales.fullCabinets, 'oltFull' while no PON port is free, 'installsPaused'
+ * while installs are still paused.
  */
-export function noticeNeedsAttention(state: GameState, notice: Pick<Notice, 'kind'>): boolean {
+export function noticeNeedsAttention(state: GameState, notice: Pick<Notice, 'kind'> & Partial<Pick<Notice, 'cabinet'>>): boolean {
   if (!ATTENTION_NOTICE_KINDS.has(notice.kind)) return false;
-  if (notice.kind === 'storm' || notice.kind === 'digIn') return outageSpanIds(state).length > 0;
-  return true;
+  switch (notice.kind) {
+    case 'storm':
+    case 'digIn':
+      return outageSpanIds(state).length > 0;
+    case 'cabinetFull': {
+      const full = state.sales.fullCabinets;
+      return notice.cabinet === undefined || notice.cabinet === null ? full.length > 0 : full.includes(notice.cabinet);
+    }
+    case 'oltFull':
+      return ponPortsUsed(state) >= state.network.olt.ponPorts;
+    case 'installsPaused':
+      return state.sales.installsPaused;
+    default:
+      return true;
+  }
 }
 
 export function buildBriefing(state: GameState, span = 1): Briefing | null {
@@ -1458,6 +1548,7 @@ export function buildBriefing(state: GameState, span = 1): Briefing | null {
     .map(([category, amount]) => ({ category, amount }));
 
   const nextPayment = estimateNextDebtService(state);
+  const sweep = estimateSweep(state);
   const notices = periodNotices(state, report, previous);
   const advice = advise(state);
 
@@ -1485,7 +1576,8 @@ export function buildBriefing(state: GameState, span = 1): Briefing | null {
     forward: {
       nextCloseDay: nextCloseDay(state.day),
       nextPayment,
-      projectedCash: estimateCashAtClose(state) - nextPayment,
+      projectedCash: estimateCashAtClose(state) - nextPayment - sweep,
+      sweep,
       runwayMonths: runwayMonths(state),
       closesUntilCalled: closesUntilAcceleration(state),
       accelerationClosesLeft: state.debt.acceleration?.closesLeft ?? null,

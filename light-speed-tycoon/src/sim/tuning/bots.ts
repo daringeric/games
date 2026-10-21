@@ -20,17 +20,25 @@
 //   covenant-safe draw (debt.fundingHint) buys a splitter or OLT card that
 //   cash alone cannot. smartBot({ borrow: false }) is the round-2 SMART.
 //   Round 4:
-//   - it picks each street's method by its lifetime cost over
+//   - it picks each new street's method by its lifetime cost over
 //     opts.horizonYears (lifetimeCost: construction, make-ready and fees, pole
-//     rent, weather.stormRisk repairs, the outage churn of the subscribers the
-//     span would carry, and the make-ready wait before its own street lights),
-//     so trunks that carry a whole cabinet area go underground and leaf streets
-//     stay aerial where poles make that cheaper;
-//   - it rebuilds underground an aerial span storms have hit
-//     opts.convertHits times when network.quoteConvert pays back (pole rent,
-//     repairs and outage churn avoided) within opts.convertPaybackYears;
-//   - it answers an incumbent promo with extra marketing on the contested
-//     passings (opts.promoMarketingPerPassing), or an intro promo (opts.introPromo);
+//     rent, weather.stormRisk repairs and the outage churn of the street's own
+//     subscribers; a street whose way to the cabinet is all underground also
+//     counts the margin it loses waiting for make-ready). In practice it buries
+//     the short blocks, where a pole's rent and a repair crew's call-out weigh
+//     most per foot, and strings the long blocks on poles. When a project's
+//     lifetime plan would break its cost-per-passing test (what the bank prices
+//     on), it keeps only the burials that save the most for their extra cost,
+//     and at last strings the area aerial;
+//   - it keeps a year of expected storm repairs above its cash floor (and two
+//     in its building reserve), so a storm month never leaves a payment unpaid;
+//   - it rebuilds underground an aerial span storms have hit opts.convertHits
+//     times when network.quoteConvert pays back (pole rent, repairs and outage
+//     churn avoided) within opts.convertPaybackYears (with today's values a
+//     rebuild's fees and bore rarely do);
+//   - while the incumbent runs a promo in any of its areas it offers new
+//     signups SMART_INTRO_PROMO (opts.introPromo), or extra marketing on the
+//     contested passings (opts.promoMarketingPerPassing);
 //   - it never ignores a frozen line: past a warning it takes debt.cureOptions'
 //     first repayment, else deleverages, and builds nothing until compliant.
 // - LEVERED: borrows to the limit (every term loan termCapacity allows plus the
@@ -51,8 +59,9 @@
 // - PRICE_HIKER (round 4): SMART, but every PRICE_HIKE_EVERY_MONTHS it raises
 //   every offered tier by PRICE_HIKE_SHARE (grandfathered for the default
 //   months, or passed on at the next bill with priceHikerBot(0)).
-// - RURAL: SMART's borrowing rules on red rural cabinet areas only, so
-//   its lifetime cost per passing is red while it borrows: the bank's CPP spread.
+// - RURAL: SMART's borrowing rules on red rural cabinet areas only (round 3's
+//   cash rules, no storm reserve), so its lifetime cost per passing is red
+//   while it borrows: the bank's CPP spread.
 // - CARELESS: overbuilds underground toward random far corners whenever cash
 //   covers it (no reserve), cabinets at every 4th corner reached, marketing at
 //   the maximum, never adds splitters, never borrows.
@@ -173,6 +182,14 @@ import type { BotFactory, Send } from './harness';
 export const SMART_MARKETING_PER_PASSING = 2;
 
 /**
+ * SMART's answer to an incumbent promo: while the cable company runs one in
+ * any of its areas, new signups get this intro offer (a modest match of the
+ * cable company's discount for a few months). Extra marketing on the
+ * contested passings (promoMarketingPerPassing) did no better over 20 seeds.
+ */
+export const SMART_INTRO_PROMO: IntroPromo = { percentOff: 20, months: 3 };
+
+/**
  * How a bot picks each new street's cable method:
  *   lifetime    - the cheaper over the bot's horizon (lifetimeCost; SMART);
  *   aerial      - aerial wherever the street has poles, else underground (ALL_AERIAL);
@@ -229,6 +246,12 @@ export interface SmartOptions {
    * plant, over passings plus its new units): green money for green plant.
    */
   loanLifetimeCpp: number;
+  /**
+   * A project built with its own cash keeps the projected lifetime cost per
+   * passing at most this (round 4: underground plant raises it, and the bank
+   * prices every loan on it), unless the bot builds red areas.
+   */
+  ownLifetimeCpp: number;
   /** Borrow for a project even while its own reserve is short (only the covenant buffers limit it): the rural-heavy bot. */
   borrowWhenShort: boolean;
   /** Smallest term loan it takes (it borrows in chunks); at least TERM_LOAN_MIN. */
@@ -237,8 +260,10 @@ export interface SmartOptions {
   loanStep: number;
   /** Cash floor below which it draws on the line: months of fixed costs (overhead + marketing) ... */
   floorMonths: number;
-  /** ... plus this many days of expected installs, plus the next close's debt service. */
+  /** ... plus this many days of expected installs, plus the next close's debt service ... */
   floorInstallDays: number;
+  /** ... plus this many years of expected repairs on its plant (expectedRepairsPerYear): a storm month never leaves the debt service unpaid. */
+  floorStormYears: number;
   /** Share of the drawable line (within the line buffer) its reserve counts instead of idle cash. */
   lineLean: number;
   /** Build red cabinet areas too, and borrow for any band. */
@@ -251,6 +276,10 @@ export interface SmartOptions {
   methods: MethodPolicy;
   /** Years of running costs (pole rent, repairs, outage churn) the lifetime method choice weighs against the up-front difference. */
   horizonYears: number;
+  /** Weight of the make-ready wait in the lifetime method choice (1: the margin lost while waiting, in full). */
+  waitWeight: number;
+  /** Years of expected repairs on its plant (expectedRepairsPerYear) kept in the reserve: a bad storm is not a missed payment. */
+  stormReserveYears: number;
   /** Rebuild storm-hit aerial spans underground when it pays back (round 4). */
   convert: boolean;
   /** Storm hits (in the weather log) that make an aerial span worth a look. */
@@ -279,7 +308,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   marketingPerPassing: SMART_MARKETING_PER_PASSING,
   splitterAt: 0.8,
   reserveMonths: 3,
-  burnMonths: 9,
+  burnMonths: 7,
   installDays: 365,
   maxProjectsPerLook: 6,
   minNewUnits: 25,
@@ -292,22 +321,26 @@ export const SMART_DEFAULTS: SmartOptions = {
   lineLeverageShare: 0.9,
   lineCoverageMultiple: 1.1,
   termYears: 7,
-  loanLifetimeCpp: 0.9 * CPP_TARGET,
+  loanLifetimeCpp: 0.97 * CPP_TARGET,
+  ownLifetimeCpp: 0.98 * CPP_TARGET,
   borrowWhenShort: false,
   minLoan: 25_000,
   loanStep: 5_000,
   floorMonths: 1,
   floorInstallDays: 60,
+  floorStormYears: 1,
   lineLean: 1,
   allowRed: false,
   redOnly: false,
   methods: 'lifetime',
-  horizonYears: 10,
+  horizonYears: 12,
+  waitWeight: 1,
+  stormReserveYears: 2,
   convert: true,
   convertHits: 2,
   convertPaybackYears: 10,
-  promoMarketingPerPassing: 2,
-  introPromo: null,
+  promoMarketingPerPassing: 0,
+  introPromo: SMART_INTRO_PROMO,
   cure: true,
   name: 'smart',
 };
@@ -394,42 +427,48 @@ function outageCostPerYear(state: GameState, segment: StreetSegment, method: Cab
  * plus the horizon's pole rent and expected outage cost (weather.stormRisk
  * repairs, and the outage churn of its own street's `own` subscribers: the
  * street grid gives the rest of the plant a second path, so an outage cuts
- * off little more than the street itself), plus the margin the `carried`
- * subscribers (its street and those that light through it) lose while it
- * waits for permits and make-ready.
+ * off little more than the street itself), plus opts.waitWeight x the margin
+ * `waiting` subscribers lose while it waits for permits and make-ready
+ * (expectedLeadDays: the street lights that much later).
  */
 export function lifetimeCost(
   state: GameState,
   segment: StreetSegment,
   method: CableMethod,
-  carried: number,
   own: number,
+  waiting: number,
   opts: SmartOptions,
   econ: SubscriberEconomics,
 ): number {
   const upfront = spanCharges(segment, method).total + orderFees(method) * Math.min(1, segment.lengthFt / opts.orderMaxFt);
   const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 : 0;
   const yearly = rent + outageCostPerYear(state, segment, method, own, econ);
-  const wait = (expectedLeadDays(segment, method) / 30) * (WAIT_ON_CARRIED ? carried : own) * econ.margin;
+  const wait = waiting > 0 ? opts.waitWeight * (expectedLeadDays(segment, method) / 30) * waiting * econ.margin : 0;
   return upfront + opts.horizonYears * yearly + wait;
 }
 
-export let WAIT_ON_CARRIED = false;
-export function setWaitOnCarried(v: boolean): void { WAIT_ON_CARRIED = v; }
-/** The method a bot cables `segment` with: `carried` subscribers light through it, `own` of them on the street itself. */
+/**
+ * The method a bot cables `segment` with (MethodPolicy): for 'lifetime' the
+ * cheaper lifetimeCost, with `own` subscribers on the street and `waiting`
+ * of them lighting as soon as this segment does.
+ */
 export function chooseMethod(
   state: GameState,
   segment: StreetSegment,
-  carried: number,
   own: number,
+  waiting: number,
   opts: SmartOptions,
   econ: SubscriberEconomics,
+  minGain = 0,
 ): CableMethod {
   if (!segment.hasPoles || opts.methods === 'underground') return 'underground';
   if (opts.methods === 'aerial') return 'aerial';
-  const aerial = lifetimeCost(state, segment, 'aerial', carried, own, opts, econ);
-  const underground = lifetimeCost(state, segment, 'underground', carried, own, opts, econ);
-  return underground < aerial ? 'underground' : 'aerial';
+  const aerial = lifetimeCost(state, segment, 'aerial', own, waiting, opts, econ);
+  const underground = lifetimeCost(state, segment, 'underground', own, waiting, opts, econ);
+  if (minGain <= 0) return underground < aerial ? 'underground' : 'aerial';
+  // Only when what it saves over the horizon is at least minGain x what it costs more up front.
+  const extra = spanCharges(segment, 'underground').total - spanCharges(segment, 'aerial').total;
+  return aerial - underground >= minGain * Math.max(1, extra) ? 'underground' : 'aerial';
 }
 
 /** Up-front charges (before fees) of the method a policy would pick on cost alone: underground everywhere, else the cheaper buildable way. */
@@ -535,8 +574,19 @@ export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAUL
   return (
     opts.reserveMonths * fixed +
     burnMonths * uncovered +
-    expectedInstalls(state, opts.installDays, opts.marketingPerPassing)
+    expectedInstalls(state, opts.installDays, opts.marketingPerPassing) +
+    opts.stormReserveYears * expectedRepairsPerYear(state)
   );
+}
+
+/** Expected storm and dig-in repairs a year on the plant as it stands (weather.stormRisk per span, by its method). */
+export function expectedRepairsPerYear(state: GameState): number {
+  let repairs = 0;
+  for (const span of state.network.spans) {
+    const segment = state.city.segments[span.segment];
+    if (segment) repairs += riskOf(state, segment, span.method).repairCostPerYear;
+  }
+  return repairs;
 }
 
 /** Target take rate by building kind at today's prices (sales.targetTakeRate), for streetConnectCost. */
@@ -694,13 +744,13 @@ interface PlanContext {
  * The orders (and cabinet, and OLT card if no PON port is free) that light as
  * much of the cabinet area at `node` as `budget` allows, counting what
  * connecting its expected signups will cost (streetConnectCost) as part of the
- * project: the feeder from the committed plant (cableRoute, aerial where
- * possible unless the bot builds underground everywhere), then streets with
+ * project: the feeder from the committed plant (the cheaper over the bot's
+ * horizon of the poled route and the plain shortest one), then streets with
  * homes in reach that nobody serves yet, nearest first, each with its street
  * path back to the cabinet. Each new segment's method is chosen once for the
- * whole area (chooseMethod): the feeder carries every subscriber the area is
- * expected to have, a street on the way to others carries theirs too. Null
- * when it would newly pass fewer than opts.minNewUnits.
+ * whole area (chooseMethod; burials need a lifetime saving of at least
+ * `minGain` x their extra up-front cost). Null when it would newly pass fewer
+ * than opts.minNewUnits.
  */
 function planProject(
   state: GameState,
@@ -709,6 +759,7 @@ function planProject(
   budget: number,
   ctx: PlanContext,
   opts: SmartOptions,
+  minGain = 0,
 ): Project | null {
   const { city, network } = state;
   const preview = coveragePreview(state, node);
@@ -717,11 +768,33 @@ function planProject(
   if (oltCard && network.olt.cards >= OLT_MAX_CARDS) return null;
   const fixed = (here ? 0 : quoteCabinet(state, node).cost) + (oltCard ? OLT_CARD_COST : 0);
 
-  const feeder: SegmentId[] = [];
+  let feeder: SegmentId[] = [];
   if (source !== node) {
-    const route = cableRoute(state, source, node, opts.methods === 'underground' ? 'underground' : 'aerial');
-    if (!route) return null;
-    for (const id of route) if (!ctx.cabled.has(id)) feeder.push(id);
+    // The aerial route keeps to poled streets (a detour of up to
+    // AERIAL_DETOUR_MAX_RATIO); a lifetime planner also prices the plain
+    // shortest route, which may cross streets without poles, and takes the
+    // cheaper over its horizon.
+    const routes =
+      opts.methods === 'underground'
+        ? [cableRoute(state, source, node, 'underground')]
+        : opts.methods === 'aerial'
+          ? [cableRoute(state, source, node, 'aerial')]
+          : [cableRoute(state, source, node, 'aerial'), cableRoute(state, source, node, 'underground')];
+    let best = Infinity;
+    for (const route of routes) {
+      if (!route) continue;
+      const fresh = route.filter((id) => !ctx.cabled.has(id));
+      let cost = 0;
+      for (const id of fresh) {
+        const seg = city.segments[id] as StreetSegment;
+        cost += lifetimeCost(state, seg, chooseMethod(state, seg, 0, 0, opts, ctx.econ, minGain), 0, 0, opts, ctx.econ);
+      }
+      if (cost < best) {
+        best = cost;
+        feeder = fresh;
+      }
+    }
+    if (best === Infinity) return null;
   }
 
   const tree = streetTree(city, node, CABINET_REACH_FT);
@@ -747,22 +820,25 @@ function planProject(
       return { segment: entry.segment, path, subs: streetSubscribers(state, entry.segment, ctx.rates) };
     });
 
-  // Method per new segment, for the whole area: subscribers carried and on the street itself.
-  const carried = new Map<SegmentId, number>();
+  // Method per new segment, for the whole area, on running costs first (each
+  // street's own subscribers). Then make-ready timing: a street whose way to
+  // the cabinet (its path and the feeder) is all underground lights as soon as
+  // its own cable is in, so its wait counts too (nearest streets first, so a
+  // path's streets are settled before the streets beyond them).
   const own = new Map<SegmentId, number>();
-  let areaSubs = 0;
-  for (const t of targets) {
-    areaSubs += t.subs;
-    own.set(t.segment, t.subs);
-    for (const id of t.path) carried.set(id, (carried.get(id) ?? 0) + t.subs);
-  }
-  for (const id of feeder) carried.set(id, (carried.get(id) ?? 0) + areaSubs);
+  for (const t of targets) own.set(t.segment, t.subs);
   const methods = new Map<SegmentId, CableMethod>();
-  for (const [id, subs] of carried) {
-    methods.set(id, chooseMethod(state, city.segments[id] as StreetSegment, subs, own.get(id) ?? 0, opts, ctx.econ));
+  const choose = (id: SegmentId, waiting: number) =>
+    chooseMethod(state, city.segments[id] as StreetSegment, own.get(id) ?? 0, waiting, opts, ctx.econ, minGain);
+  for (const id of feeder) methods.set(id, choose(id, 0));
+  for (const t of targets) for (const id of t.path) if (!methods.has(id)) methods.set(id, choose(id, 0));
+  if (opts.methods === 'lifetime' && opts.waitWeight > 0 && feeder.every((id) => methods.get(id) === 'underground')) {
+    for (const t of targets) {
+      if (!t.path.includes(t.segment) || methods.get(t.segment) === 'underground') continue;
+      if (t.path.every((id) => id === t.segment || methods.get(id) === 'underground')) methods.set(t.segment, choose(t.segment, t.subs));
+    }
   }
-  const methodOf = (id: SegmentId): CableMethod =>
-    methods.get(id) ?? chooseMethod(state, city.segments[id] as StreetSegment, 0, 0, opts, ctx.econ);
+  const methodOf = (id: SegmentId): CableMethod => methods.get(id) ?? choose(id, 0);
 
   const costOf = (ids: Iterable<SegmentId>) => {
     let cost = 0;
@@ -810,6 +886,14 @@ function planProject(
 }
 
 const BAND_RANK = { green: 0, amber: 1, red: 2 } as const;
+
+/**
+ * When a project's lifetime plan fails the bot's cost-per-passing test,
+ * chooseProject re-plans it keeping only the burials whose lifetime saving
+ * is at least each of these multiples of their extra up-front cost, then all
+ * aerial where poled.
+ */
+const LIFETIME_FALLBACK_GAINS: readonly number[] = [0.25, 0.5];
 
 const streetReachCache = new WeakMap<City, SegmentId[][]>();
 
@@ -901,12 +985,27 @@ function chooseProject(
     candidates.push({ node, band, score });
   }
   candidates.sort((x, y) => x.band - y.band || y.score - x.score || x.node - y.node);
-  for (const candidate of candidates.slice(0, opts.candidatesTried)) {
-    const project = planProject(state, candidate.node, source[candidate.node] as number, budget, ctx, opts);
-    if (!project) continue;
+  const acceptable = (project: Project | null): project is Project => {
+    if (!project) return false;
     const band = BAND_RANK[cppBand(projectCpp(project))];
-    if ((strict && band > maxBand) || (opts.redOnly && band < BAND_RANK.red) || !accept(project)) continue;
-    return project;
+    return !(strict && band > maxBand) && !(opts.redOnly && band < BAND_RANK.red) && accept(project);
+  };
+  for (const candidate of candidates.slice(0, opts.candidatesTried)) {
+    const from = source[candidate.node] as number;
+    const project = planProject(state, candidate.node, from, budget, ctx, opts);
+    if (acceptable(project)) return project;
+    // Underground plant raises the cost per passing the bank prices on: when
+    // the lifetime plan would breach the bot's cost-per-passing test, keep
+    // only the burials that save the most for what they cost more up front,
+    // and at last string the area aerial wherever it can be.
+    if (opts.methods === 'lifetime') {
+      for (const minGain of LIFETIME_FALLBACK_GAINS) {
+        const cheaper = planProject(state, candidate.node, from, budget, ctx, opts, minGain);
+        if (acceptable(cheaper)) return cheaper;
+      }
+      const aerial = planProject(state, candidate.node, from, budget, ctx, { ...opts, methods: 'aerial' });
+      if (acceptable(aerial)) return aerial;
+    }
   }
   return null;
 }
@@ -1053,7 +1152,8 @@ export function cashFloor(state: GameState, opts: SmartOptions): number {
   return (
     opts.floorMonths * fixedCosts(state) +
     estimateNextDebtService(state) +
-    expectedInstalls(state, opts.floorInstallDays, opts.marketingPerPassing)
+    expectedInstalls(state, opts.floorInstallDays, opts.marketingPerPassing) +
+    opts.floorStormYears * expectedRepairsPerYear(state)
   );
 }
 
@@ -1259,8 +1359,9 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idle
     // lifetime cost per passing kept under opts.loanLifetimeCpp); else what its
     // own cash builds (amber too).
     const lifetimeOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.loanLifetimeCpp;
+    const ownOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.ownLifetimeCpp;
     let project = room > 0 ? chooseProject(state, Math.max(0, own) + room, opts, loanBand(opts), true, lifetimeOk) : null;
-    if (!project && own > 0) project = chooseProject(state, own, opts);
+    if (!project && own > 0) project = chooseProject(state, own, opts, defaultBand(opts), false, ownOk);
     if (!project) {
       memo.idleKey = key;
       break;
@@ -1358,6 +1459,10 @@ export const RURAL_OPTIONS: Partial<SmartOptions> = {
   borrowWhenShort: true,
   minNewUnits: 10,
   maxStreetCpp: Infinity,
+  // Round 3's cash rules (no storm reserve): the bot is about the bank's CPP
+  // spread, so it keeps borrowing for red lanes rather than holding cash.
+  stormReserveYears: 0,
+  floorStormYears: 0,
   name: 'rural',
 };
 
@@ -1602,9 +1707,9 @@ function randomDebtCommand(state: GameState, send: Send, rng: Rng): void {
 
 /**
  * A random price change (round 4 too): prices up or down (sometimes out of
- * range: rejected), some tiers retired (at least one stays offered unless the
- * draw is junk), the SMB multiplier, and a grandfathering period of 0 to
- * GRANDFATHER_MONTHS_MAX months, the default (omitted), or junk.
+ * range: rejected), some tiers retired (1 Gig always stays offered), the SMB
+ * multiplier, and a grandfathering period: the default (omitted), 0 (a rise
+ * passed on at the next bill), 1 to GRANDFATHER_MONTHS_MAX months, or junk.
  */
 function randomPricing(send: Send, rng: Rng): void {
   const tiers = TIER_DEFAULTS.map((t) => ({
@@ -1614,7 +1719,13 @@ function randomPricing(send: Send, rng: Rng): void {
   }));
   const roll = rng.next();
   const grandfather =
-    roll < 0.35 ? {} : roll < 0.9 ? { grandfatherMonths: rng.int(0, GRANDFATHER_MONTHS_MAX) } : { grandfatherMonths: rng.chance(0.5) ? -1 : 2.5 };
+    roll < 0.35
+      ? {}
+      : roll < 0.55
+        ? { grandfatherMonths: 0 }
+        : roll < 0.9
+          ? { grandfatherMonths: rng.int(1, GRANDFATHER_MONTHS_MAX) }
+          : { grandfatherMonths: rng.chance(0.5) ? -1 : 2.5 };
   send({ type: 'setPricing', tiers, smbMultiplier: 1 + rng.int(0, 20) / 10, ...grandfather });
 }
 

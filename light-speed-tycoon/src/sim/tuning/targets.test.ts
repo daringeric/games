@@ -4,7 +4,8 @@
 // borrows responsibly (SMART) over five years against the same operator
 // without loans, a borrower who takes every dollar offered (LEVERED), a
 // rural-heavy borrower (RURAL), a careless overbuilder (CARELESS) and a player
-// who does nothing (IDLE).
+// who does nothing (IDLE). The round-4 targets (build method, storms, prices,
+// the frozen line) are in targets4.test.ts.
 //
 // When a balance.ts change breaks one of these, re-tune rather than widen a
 // band: `TUNE_REPORT=1 npx vitest run src/sim/tuning/report.test.ts` prints the

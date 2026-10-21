@@ -18,6 +18,7 @@ import {
   CPP_TARGET,
   FROZEN_ACCELERATION_CLOSES,
   INCUMBENT_PRICE,
+  LOAN_ROUNDING,
   MAX_SPLITTERS_PER_CABINET,
   OLT_CARD_COST,
   OLT_MAX_CARDS,
@@ -59,6 +60,7 @@ import {
   covenantMetrics,
   cureOptions,
   estimateNextDebtService,
+  estimateSweep,
   formatMultiple,
   fundingHint,
   formatRateBps,
@@ -70,7 +72,7 @@ import { estimateCashAtClose, formatMoney, monthlyBurn, runwayMonths } from './f
 import { applyCommand, runDays } from './game';
 import { incumbentPromoPrice } from './incumbent';
 import { REPAIR_TRAILING_MONTHS } from './metrics';
-import { getService, outageImpact, ponPortsUsed, quoteConvert } from './network';
+import { getService, outageImpact, outageService, ponPortsUsed, quoteConvert } from './network';
 import { churnProbability, closeDayAfter, marketingBoost, stateTakeRate, unitsByTier } from './sales';
 import { deserialize, hashState, serialize } from './save';
 import { cornerName } from './streets';
@@ -411,7 +413,9 @@ describe('covenantCure', () => {
     const p = plan(state, 'covenantCure');
     expect(p.commands).toEqual([]);
     expect(p.advice.why).toContain(formatMoney(option.amount));
-    expect(p.advice.title).toBe(`Grow operating cash flow by ${formatMoney(option.amount)} a year`);
+    // The title on the same basis as the text: operating cash flow raised to (about) this.
+    const to = Math.round(option.after.annualOperatingCashFlow / LOAN_ROUNDING) * LOAN_ROUNDING;
+    expect(p.advice.title).toBe(`Grow operating cash flow to about ${formatMoney(to)} a year`);
     expect(p.advice.why).not.toMatch(/\bdraw\b|take a .*loan/i);
   });
 
@@ -678,7 +682,11 @@ describe('outages', () => {
     expect(p.advice.why).toContain(`${units} subscriber`);
     expect(p.advice.why).toContain('4 days');
     expect(p.advice.why).toContain(formatMoney(2_345));
-    expect(p.advice.why).toContain(pct(outageChurnProbability(4)));
+    // Out no day yet (the outage starts today), and 3 more before the repair on the 4th: churn for 3 days,
+    // charged at the closes after today and after the last day out.
+    expect(p.advice.why).toContain(pct(outageChurnProbability(3)));
+    const [first, last] = [closeName(state.day), closeName(state.day + 3)];
+    expect(p.advice.why).toContain(first === last ? `at the ${first} close` : `at the ${first} and ${last} closes`);
     expect(p.commands).toEqual([]);
   });
 
@@ -687,10 +695,10 @@ describe('outages', () => {
     expect(planFor(state, 'outages')).toBeNull();
     breakSpan(state, state.network.spans[0]!, 3, 999);
     expect(planFor(state, 'outages')).not.toBeNull();
-    // Nobody left on the streets it cuts off.
-    const cut = getService(state).interruptedSegments;
-    expect(cut.size).toBeGreaterThan(0);
-    state.sales.accounts = state.sales.accounts.filter((a) => !cut.has(state.city.parcels[a.parcel]!.segment));
+    // Nobody left whom it cuts off.
+    const { cutOff } = outageService(state, getService(state));
+    expect(cutOff.size).toBeGreaterThan(0);
+    state.sales.accounts = state.sales.accounts.filter((a) => !cutOff.has(a.parcel));
     expect(planFor(state, 'outages')).toBeNull();
   });
 });
@@ -1228,7 +1236,9 @@ describe('buildBriefing', () => {
     const state = fixture('v3-grid');
     const b = buildBriefing(state)!;
     expect(b.forward.nextPayment).toBe(estimateNextDebtService(state));
-    expect(b.forward.projectedCash).toBe(estimateCashAtClose(state) - estimateNextDebtService(state));
+    // Frozen: the close also takes the sweep.
+    expect(b.forward.sweep).toBe(estimateSweep(state));
+    expect(b.forward.projectedCash).toBe(estimateCashAtClose(state) - estimateNextDebtService(state) - estimateSweep(state));
     expect(b.forward.closesUntilCalled).toBe(closesUntilAcceleration(state));
     expect(b.forward.runwayMonths).toBe(runwayMonths(state));
     expect(b.headline.debt).toBe(totalDebt(state));

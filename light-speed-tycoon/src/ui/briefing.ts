@@ -528,7 +528,12 @@ function forwardRows(b: Briefing): ForwardRow[] {
       key: 'projectedCash',
       label: 'Cash projected at that close',
       value: formatMoney(f.projectedCash),
-      detail: f.nextPayment > 0 ? 'after the loan payment' : 'at today’s pace',
+      detail:
+        f.sweep > 0
+          ? `after the loan payment and the frozen-line sweep (≈ ${formatMoney(f.sweep)})`
+          : f.nextPayment > 0
+            ? 'after the loan payment'
+            : 'at today’s pace',
       tone: f.projectedCash < 0 ? 'negative' : null,
     },
     {

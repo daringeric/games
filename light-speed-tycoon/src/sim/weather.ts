@@ -20,7 +20,7 @@
 // Daily (game.tick, after advanceNetwork and before stepSales):
 //   stepWeather(state, rng)
 // Month close (finance.closeMonth, right after sales.closeSalesMonth, which
-// reads the month's outage days for churn):
+// charges outage churn for the month's days in Weather.cutOff):
 //   closeWeatherMonth(state)
 
 import {
@@ -46,18 +46,21 @@ import {
   STORM_UNDERGROUND_DAMAGE_CHANCE,
 } from './balance';
 import { formatMoney, groupThousands, postEntry } from './finance';
-import { getService } from './network';
+import { getService, outageService } from './network';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
 import { accountUnits } from './sales';
 import { cornerName } from './streets';
 import type {
+  AccountOutage,
   CableMethod,
   CableSpan,
   City,
   GameState,
   NodeId,
+  ParcelId,
   SegmentId,
+  ServiceSnapshot,
   Storm,
   StormRisk,
   StreetSegment,
@@ -73,6 +76,13 @@ const DAYS_PER_YEAR = 365;
  * the cap keeps a hand-edited save that starts a month near it loadable.
  */
 const MONTH_DAYS_MAX = 31;
+/**
+ * Most days one Weather.cutOff count can hold. An entry lasts only while its
+ * subscriber is cut off plus the rest of that month; the cap keeps a street
+ * that outages keep cutting off for months a sane number (the churn it
+ * charges is capped at OUTAGE_CHURN_MAX long before).
+ */
+export const CUT_OFF_DAYS_MAX = 366;
 
 /** Month totals with nothing in them. */
 export function emptyWeatherMonth(): WeatherMonth {
@@ -81,7 +91,7 @@ export function emptyWeatherMonth(): WeatherMonth {
 
 /** Weather for a new game and for saves migrated from schemaVersion 3: no storms yet. */
 export function newWeather(): Weather {
-  return { storms: [], nextStormId: 1, month: emptyWeatherMonth() };
+  return { storms: [], nextStormId: 1, month: emptyWeatherMonth(), cutOff: [] };
 }
 
 /**
@@ -115,9 +125,14 @@ export function newWeather(): Weather {
  *    notice.
  * 4. Month accrual: every segment in getService(state).interruptedSegments
  *    adds 1 to its WeatherMonth.segmentOutageDays entry (sorted, one per
- *    segment), and the subscribed units on parcels of interrupted segments
- *    add to outageUnitDays; storms, spansDamaged and repairs counted up as
- *    they happen above.
+ *    segment); every account cut off today (network.outageService: an
+ *    outage cuts its own cabinet off from its street, and no other cabinet
+ *    that still reaches it has a port free for it) adds 1 day to its
+ *    Weather.cutOff entry (its units: the most cut off on one day) and its
+ *    units to outageUnitDays; an entry carried over a close (days 0) whose
+ *    account has service again is dropped (that outage is over and fully
+ *    charged), as are entries of parcels with no account any more. Storms,
+ *    spansDamaged and repairs counted up as they happen above.
  */
 export function stepWeather(state: GameState, rng: Rng): void {
   repairSpans(state);
@@ -139,17 +154,82 @@ export interface WeatherClose {
 
 /**
  * Month close (finance.closeMonth, right after sales.closeSalesMonth, which
- * reads segmentOutageDays for outage churn): return the month's totals and
- * reset weather.month to emptyWeatherMonth(). Outages themselves carry on
- * across the close. Implemented by the contract.
+ * charged outage churn for each Weather.cutOff entry's days, outageChargeOf):
+ * return the month's totals, reset weather.month to emptyWeatherMonth(), and
+ * keep the entries of accounts still cut off, their days moved to `charged`
+ * (so the next close charges only the days that outage adds: its base churn
+ * is charged once); the rest are dropped. Outages themselves carry on across
+ * the close.
  */
 export function closeWeatherMonth(state: GameState): WeatherClose {
-  const month = state.weather.month;
-  state.weather.month = emptyWeatherMonth();
+  const { weather } = state;
+  const month = weather.month;
+  weather.month = emptyWeatherMonth();
+  if (weather.cutOff.length > 0) {
+    const { cutOff } = outageService(state, getService(state));
+    const kept: AccountOutage[] = [];
+    for (const entry of weather.cutOff) {
+      // Cut off at the close (so the account exists).
+      if (!cutOff.has(entry.parcel)) continue;
+      kept.push({ parcel: entry.parcel, days: 0, charged: Math.min(CUT_OFF_DAYS_MAX, entry.charged + entry.days), units: entry.units });
+    }
+    weather.cutOff = kept;
+  }
   return { outageUnitDays: month.outageUnitDays, storms: month.storms, spansDamaged: month.spansDamaged, repairs: month.repairs };
 }
 
-/** Days `segment` was interrupted by outages in the open month (WeatherMonth.segmentOutageDays; 0 when absent). Binary search. */
+/** Binary search of Weather.cutOff (ascending by parcel). */
+function cutOffEntry(state: GameState, parcel: ParcelId): AccountOutage | undefined {
+  const entries = state.weather.cutOff;
+  let lo = 0;
+  let hi = entries.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const entry = entries[mid] as AccountOutage;
+    if (entry.parcel === parcel) return entry;
+    if (entry.parcel < parcel) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return undefined;
+}
+
+/**
+ * The account on `parcel`'s current or latest outage (Weather.cutOff): its
+ * days cut off since the last close (`days`, not charged yet), the days of
+ * the same outage charged at earlier closes (`charged`: it was still cut off
+ * then) and the most of its units cut off on one day; null when there is
+ * none.
+ */
+export function cutOffOf(state: GameState, parcel: ParcelId): { days: number; charged: number; units: number } | null {
+  const entry = cutOffEntry(state, parcel);
+  return entry ? { days: entry.days, charged: entry.charged, units: entry.units } : null;
+}
+
+/**
+ * Outage churn probability for `days` more days of an outage that has
+ * already been charged for `charged` days: outageChurnProbability(charged +
+ * days) - outageChurnProbability(charged), so one outage pays its base once
+ * however many closes it spans.
+ */
+export function outageChurnFor(charged: number, days: number): number {
+  return outageChurnProbability(charged + days) - outageChurnProbability(charged);
+}
+
+/**
+ * What a close charges the account on `parcel` for outages: the churn
+ * probability of its Weather.cutOff days since the last close
+ * (outageChurnFor) and the most of its units cut off on one day; null when it
+ * was not cut off since. sales.closeSalesMonth adds the probability, times
+ * the share of the account's units that were cut off, to each unit's churn.
+ */
+export function outageChargeOf(state: GameState, parcel: ParcelId): { probability: number; units: number } | null {
+  if (state.weather.cutOff.length === 0) return null;
+  const entry = cutOffEntry(state, parcel);
+  if (!entry || entry.days === 0) return null;
+  return { probability: outageChurnFor(entry.charged, entry.days), units: entry.units };
+}
+
+/** Days `segment` was interrupted (no cabinet reached it) in the open month (WeatherMonth.segmentOutageDays; 0 when absent). Binary search. */
 export function outageDaysOn(state: GameState, segment: SegmentId): number {
   const days = state.weather.month.segmentOutageDays;
   let lo = 0;
@@ -165,11 +245,10 @@ export function outageDaysOn(state: GameState, segment: SegmentId): number {
 }
 
 /**
- * Extra churn probability at the close for a unit whose street was
- * interrupted `days` days in the month: 0 for 0 days, else
+ * Extra churn probability for a subscriber one outage cut off `days` days
+ * (its own days, Weather.cutOff): 0 for 0 days, else
  * min(OUTAGE_CHURN_MAX, OUTAGE_CHURN_BASE + OUTAGE_CHURN_PER_DAY x days).
- * sales.closeSalesMonth adds it to the unit's churn probability.
- * Implemented by the contract.
+ * Charged at the closes the days fall before (outageChurnFor: the base once).
  */
 export function outageChurnProbability(days: number): number {
   if (!(days > 0)) return 0;
@@ -337,29 +416,30 @@ function daysPhrase(min: number, max: number): string {
   return min === max ? plural(min, 'day', 'days') : `${groupThousands(min)} to ${plural(max, 'day', 'days')}`;
 }
 
-/** Subscribed units on parcels whose serving segment `cut` says is cut off. */
-function unitsOn(state: GameState, cut: (segment: SegmentId) => boolean): number {
+/** Subscribed units of the accounts cut off in `now` but not in `then` (network.outageService). */
+function unitsCutOff(state: GameState, now: ReadonlySet<ParcelId>, then: ReadonlySet<ParcelId>): number {
+  if (now.size === 0) return 0;
   let units = 0;
-  for (const account of state.sales.accounts) {
-    const parcel = state.city.parcels[account.parcel];
-    if (parcel && cut(parcel.segment)) units += accountUnits(account);
-  }
+  for (const account of state.sales.accounts) if (now.has(account.parcel) && !then.has(account.parcel)) units += accountUnits(account);
   return units;
 }
 
-/** Subscribed units newly without service: on segments interrupted now that were not in `before`. */
-function newlyCutOff(state: GameState, before: ReadonlySet<SegmentId>): number {
-  const after = getService(state).interruptedSegments;
-  if (after.size === 0) return 0;
-  return unitsOn(state, (segment) => after.has(segment) && !before.has(segment));
+/** Who is cut off on `service` (network.outageService). */
+function cutOffOn(state: GameState, service: ServiceSnapshot): ReadonlySet<ParcelId> {
+  return outageService(state, service).cutOff;
+}
+
+/** Subscribed units newly without service: accounts cut off now that were not in `before`. */
+function newlyCutOff(state: GameState, before: ReadonlySet<ParcelId>): number {
+  return unitsCutOff(state, cutOffOn(state, getService(state)), before);
 }
 
 /** Step 1: count repairs down, put spans back in service, tell the player. */
 function repairSpans(state: GameState): void {
   const { network } = state;
   if (!network.spans.some((span) => span.outage !== null)) return;
-  // Who was cut off before today's repairs (a snapshot set: never mutated).
-  const before = getService(state).interruptedSegments;
+  // Who was cut off before today's repairs.
+  const before = cutOffOn(state, getService(state));
   const restored: CableSpan[] = [];
   let changed = false;
   let longest = 0;
@@ -381,8 +461,7 @@ function repairSpans(state: GameState): void {
   if (!changed && restored.length === 0) return;
   network.version++;
   if (restored.length === 0) return;
-  const after = getService(state).interruptedSegments;
-  const units = before.size === 0 ? 0 : unitsOn(state, (segment) => before.has(segment) && !after.has(segment));
+  const units = unitsCutOff(state, before, cutOffOn(state, getService(state)));
   const where = streetsPhrase(streetNamesOf(state, restored));
   const back =
     units > 0
@@ -455,7 +534,7 @@ function stormHits(state: GameState, rng: Rng): void {
   weather.month.storms += 1;
   if (damage.length === 0) return;
 
-  const before = getService(state).interruptedSegments;
+  const before = cutOffOn(state, getService(state));
   let minDays = Infinity;
   let maxDays = 0;
   for (const d of damage) {
@@ -492,7 +571,7 @@ function digIns(state: GameState, rng: Rng): void {
     cuts.push({ span, daysLeft: drawOutageDays('underground', rng), repairCost: repairCost(segment, 'underground') });
   }
   for (const cut of cuts) {
-    const before = getService(state).interruptedSegments;
+    const before = cutOffOn(state, getService(state));
     cut.span.outage = { cause: 'digIn', storm: null, startDay: state.day, daysLeft: cut.daysLeft, repairCost: cut.repairCost };
     network.version++;
     const street = city.segments[cut.span.segment]?.name ?? 'a street';
@@ -510,32 +589,53 @@ function digIns(state: GameState, rng: Rng): void {
   }
 }
 
-/** Step 4: count today's interrupted segments and subscriber-days into the month. */
+/** Step 4: count today's interrupted segments, cut-off subscribers and subscriber-days. */
 function accrueOutages(state: GameState): void {
-  const interrupted = getService(state).interruptedSegments;
-  if (interrupted.size === 0) return;
-  const month = state.weather.month;
-  const today = [...interrupted].sort((a, b) => a - b);
-  // Merge two ascending lists, one entry per segment.
-  const merged: { segment: SegmentId; days: number }[] = [];
-  const old = month.segmentOutageDays;
-  let i = 0;
-  let j = 0;
-  while (i < old.length || j < today.length) {
-    const entry = old[i];
-    const segment = today[j];
-    if (segment === undefined || (entry !== undefined && entry.segment < segment)) {
-      merged.push(entry as { segment: SegmentId; days: number });
-      i++;
-    } else if (entry === undefined || segment < entry.segment) {
-      merged.push({ segment, days: 1 });
-      j++;
-    } else {
-      merged.push({ segment, days: Math.min(MONTH_DAYS_MAX, entry.days + 1) });
-      i++;
-      j++;
+  const service = getService(state);
+  const { weather } = state;
+  if (service.cutOffCabinets.size === 0 && weather.cutOff.length === 0) return;
+  const month = weather.month;
+  const interrupted = service.interruptedSegments;
+  if (interrupted.size > 0) {
+    const today = [...interrupted].sort((a, b) => a - b);
+    // Merge two ascending lists, one entry per segment.
+    const merged: { segment: SegmentId; days: number }[] = [];
+    const old = month.segmentOutageDays;
+    let i = 0;
+    let j = 0;
+    while (i < old.length || j < today.length) {
+      const entry = old[i];
+      const segment = today[j];
+      if (segment === undefined || (entry !== undefined && entry.segment < segment)) {
+        merged.push(entry as { segment: SegmentId; days: number });
+        i++;
+      } else if (entry === undefined || segment < entry.segment) {
+        merged.push({ segment, days: 1 });
+        j++;
+      } else {
+        merged.push({ segment, days: Math.min(MONTH_DAYS_MAX, entry.days + 1) });
+        i++;
+        j++;
+      }
     }
+    month.segmentOutageDays = merged;
   }
-  month.segmentOutageDays = merged;
-  month.outageUnitDays += unitsOn(state, (segment) => interrupted.has(segment));
+  // Accounts are ascending by parcel, so the entries stay ascending.
+  const cutOff = cutOffOn(state, service);
+  const next: AccountOutage[] = [];
+  let unitDays = 0;
+  for (const account of state.sales.accounts) {
+    const entry = weather.cutOff.length > 0 ? cutOffEntry(state, account.parcel) : undefined;
+    const units = accountUnits(account);
+    if (units > 0 && cutOff.has(account.parcel)) {
+      unitDays += units;
+      next.push(
+        entry
+          ? { parcel: account.parcel, days: Math.min(CUT_OFF_DAYS_MAX, entry.days + 1), charged: entry.charged, units: Math.max(entry.units, units) }
+          : { parcel: account.parcel, days: 1, charged: 0, units },
+      );
+    } else if (entry && entry.days > 0) next.push(entry);
+  }
+  weather.cutOff = next;
+  month.outageUnitDays += unitDays;
 }

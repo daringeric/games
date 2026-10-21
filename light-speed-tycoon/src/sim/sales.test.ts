@@ -1551,9 +1551,9 @@ describe('churn causes', () => {
     const list = TIER_DEFAULTS[1]!.price;
     const lock = Math.round(list / 2);
     state.sales.accounts = city.parcels.map((p) => ({ ...account(p.id, 1, { fiber1g: p.units }), locks: [lockOf('fiber1g', lock, closeDayAfter(40, 1), 'notice')] }));
-    const segments = [...new Set(city.parcels.map((p) => p.segment))].sort((a, b) => a - b);
     const outageDays = 6;
-    state.weather.month.segmentOutageDays = segments.map((segment) => ({ segment, days: outageDays }));
+    // Every account was cut off 6 days and has service again by the close.
+    state.weather.cutOff = state.sales.accounts.map((a) => ({ parcel: a.parcel, days: outageDays, charged: 0, units: accountUnits(a) }));
     state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600 }];
     const units = subscriberUnits(state);
     const close = closeAt(state);
@@ -1638,11 +1638,14 @@ describe('the incumbent\'s local price', () => {
 });
 
 describe('outages', () => {
-  /** Next day's sales step with `segments` interrupted (written into today's service snapshot). */
+  /** Next day's sales step with `segments` interrupted, cut off from every cabinet (written into today's service snapshot). */
   function stepCut(state: GameState, segments: readonly number[]): void {
     state.day++;
     const service = getService(state);
-    for (const segment of segments) service.interruptedSegments.add(segment);
+    for (const segment of segments) {
+      service.interruptedSegments.add(segment);
+      service.cutOffCabinets.set(segment, new Set(service.segmentCabinets.get(segment) ?? []));
+    }
     withRng(state, 'sales', (rng) => stepSales(state, rng));
   }
 

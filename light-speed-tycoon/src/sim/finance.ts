@@ -97,7 +97,12 @@ interface CloseFlows {
   /** OVERHEAD_PER_MONTH and pole rent for today's live aerial spans (positive = money out). */
   overhead: number;
   poleRent: number;
-  /** Installs still to come this month at the month's pace so far (capex, <= 0). */
+  /**
+   * Installs still to come this month (capex, <= 0): the days left at the
+   * pace of the month so far and the last closed month together, so a
+   * projection made early in the month (the briefing's, on the 1st) does not
+   * scale one day's installs up to a month or leave the month's out.
+   */
   installsLeft: number;
 }
 
@@ -110,13 +115,17 @@ function estimateCloseFlows(state: GameState): CloseFlows {
   const month = sales.month;
   let installs = 0;
   for (const entry of finance.monthToDate) if (entry.category === 'install') installs += entry.amount;
+  // The pace: this month's installs so far with the last closed month's, over their days.
+  const last = finance.reports.at(-1);
+  const lastInstalls = last ? (last.totals.install ?? 0) : 0;
+  const lastDays = last ? (MONTH_LENGTHS[last.month - 1] as number) : 0;
   return {
     revenue: Math.round((month.revenueDollarDays + monthlyRecurringRevenue(state) * left) / daysInMonth),
     marketing: Math.round((month.marketingDollarDays + sales.marketingPerMonth * left) / daysInMonth),
     support: Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (month.subscriberUnitDays + subscriberUnits(state) * left)) / daysInMonth),
     overhead: OVERHEAD_PER_MONTH,
     poleRent: monthlyPoleRent(state),
-    installsLeft: Math.round((installs * left) / date.day),
+    installsLeft: Math.round(((installs + lastInstalls) * left) / (date.day + lastDays)),
   };
 }
 
@@ -126,7 +135,8 @@ function estimateCloseFlows(state: GameState): CloseFlows {
  * plus today's subscribers at today's prices for the days of the month not
  * yet accrued), less pole rent for today's live aerial spans, the overhead,
  * marketing and support (accrued so far plus today's rates for the days
- * left), and installs for the days left at the month's pace so far. Exact on
+ * left), and installs for the days left at the pace of this month so far and
+ * the last closed month together (CloseFlows.installsLeft). Exact on
  * the month's last day, when nothing is left to accrue; before that an
  * estimate (signups, churn and commands change it). The payment reminder
  * (debt.endDebtDay) and the Bank's next payment compare it with

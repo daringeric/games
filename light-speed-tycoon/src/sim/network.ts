@@ -45,10 +45,14 @@
 //   their own Parcel.segment (never via another street they touch).
 // - cableRoute caps aerial detours at AERIAL_DETOUR_MAX_RATIO x the shortest route.
 // - Round 4: a live span with an outage (weather.ts) carries no light. The
-//   snapshot's interruptedSegments runs the coverage rule again without the
-//   out spans (same cabinets): lit segments it no longer lights are
-//   interrupted. litSegments, passings and everything else stay
-//   outage-agnostic (scorecards ignore outages, accounts are never dropped
+//   snapshot runs the coverage rule again without the out spans (same
+//   cabinets): a cabinet that no longer reaches a lit segment is cut off
+//   from it (cutOffCabinets), and lit segments no cabinet reaches any more
+//   are interrupted. A subscriber whose own cabinet is cut off is served
+//   meanwhile by another cabinet that still reaches its street with a port
+//   free, else has no service (outageService: the service rule on the
+//   working view, without dropping anyone). litSegments, passings and
+//   everything else stay outage-agnostic (scorecards ignore outages, accounts are never dropped
 //   for one). convertSpan rebuilds a live aerial span underground in place
 //   (its own permit and construction; the aerial cable serves until then).
 
@@ -90,7 +94,7 @@ import { canAfford, formatMoney, groupThousands, postEntry } from './finance';
 import { cppBand } from './metrics';
 import { postNotice } from './notices';
 import type { Rng } from './rng';
-import { accountUnits, serviceChanges } from './sales';
+import { accountPorts, accountUnits, cabinetPortCapacity, cabinetPortsUsed, serviceChanges } from './sales';
 import type { ServiceView } from './sales';
 import {
   cornerName,
@@ -1119,17 +1123,40 @@ export function computeService(state: GameState): ServiceSnapshot {
   return snapshotFrom(state, liveReach(state));
 }
 
-/** A network's reach today and the lit segments its outages cut off (both day-independent). */
+/** A network's reach today and what its outages cut off (all day-independent). */
 interface LiveReach {
   reach: Reach;
   interrupted: Set<SegmentId>;
+  cutOff: Map<SegmentId, ReadonlySet<CabinetId>>;
+}
+
+/**
+ * The cabinets of `reach` that reach each lit segment but no longer do in
+ * `working` (the same network with fewer live spans), per segment that has
+ * any, ascending by segment; and the segments no cabinet reaches in
+ * `working` at all.
+ */
+function cutOffBy(reach: Reach, working: Reach): { interrupted: Set<SegmentId>; cutOff: Map<SegmentId, ReadonlySet<CabinetId>> } {
+  const interrupted = new Set<SegmentId>();
+  const cutOff = new Map<SegmentId, ReadonlySet<CabinetId>>();
+  // reach.serving is ascending by segment, so both come out ascending.
+  for (const segment of reach.serving.keys()) {
+    const still = working.reachers.get(segment) ?? [];
+    if (still.length === 0) interrupted.add(segment);
+    const lost = (reach.reachers.get(segment) ?? []).filter((c) => !still.includes(c));
+    if (lost.length > 0) cutOff.set(segment, new Set(lost));
+  }
+  return { interrupted, cutOff };
 }
 
 /**
  * The coverage rule on the network as it stands: live spans and live
  * cabinets. Round 4: when any live span is out (CableSpan.outage), the rule
- * runs again on the live spans minus those, with the same cabinets; the
- * segments lit in the first run but not in the second are interrupted.
+ * runs again on the live spans minus those, with the same cabinets; a
+ * cabinet that reaches a lit segment in the first run but not in the second
+ * is cut off from it (its subscribers there are served by another or have no
+ * service: outageService), and a segment no cabinet reaches in the second
+ * run is interrupted.
  */
 function liveReach(state: GameState): LiveReach {
   const { city, network } = state;
@@ -1142,17 +1169,74 @@ function liveReach(state: GameState): LiveReach {
   }
   const cabinets = network.cabinets.filter((c) => c.stage === 'live');
   const reach = computeReach(city, liveSegments, cabinets);
-  const interrupted = new Set<SegmentId>();
-  if (workingSegments.size < liveSegments.size) {
-    const working = computeReach(city, workingSegments, cabinets);
-    // reach.serving is ascending by segment, so the set comes out ascending.
-    for (const segment of reach.serving.keys()) if (!working.serving.has(segment)) interrupted.add(segment);
+  if (workingSegments.size === liveSegments.size) return { reach, interrupted: new Set(), cutOff: new Map() };
+  return { reach, ...cutOffBy(reach, computeReach(city, workingSegments, cabinets)) };
+}
+
+/** Whether an outage cuts a subscriber on `segment` wired to `cabinet` off (ServiceSnapshot.cutOffCabinets). */
+export function isCutOff(service: ServiceSnapshot, segment: SegmentId, cabinet: CabinetId): boolean {
+  if (service.cutOffCabinets.size === 0) return false;
+  return service.cutOffCabinets.get(segment)?.has(cabinet) ?? false;
+}
+
+/**
+ * Who an outage leaves without service today (outageService): the parcels
+ * of the accounts cut off, and the splitter ports the other accounts it cut
+ * off from their own cabinet borrow on the cabinets serving them meanwhile.
+ */
+export interface OutageService {
+  cutOff: ReadonlySet<ParcelId>;
+  lent: ReadonlyMap<CabinetId, number>;
+}
+
+const NO_OUTAGE: OutageService = { cutOff: new Set(), lent: new Map() };
+
+/**
+ * The service rule (sales.serviceChanges) applied to the working view of an
+ * outage, without dropping anyone: in account order, an account whose own
+ * cabinet `cutOffCabinets` lists for its street is served meanwhile by the
+ * first other cabinet of the street's `segmentCabinets` that still reaches it
+ * and has the ports free (ports lent earlier in the pass counted); with none
+ * it has no service.
+ */
+function outageServiceOf(
+  state: GameState,
+  cutOffCabinets: ReadonlyMap<SegmentId, ReadonlySet<CabinetId>>,
+  segmentCabinets: ReadonlyMap<SegmentId, readonly CabinetId[]>,
+): OutageService {
+  if (cutOffCabinets.size === 0) return NO_OUTAGE;
+  let used: Map<CabinetId, number> | null = null;
+  const capacity = new Map<CabinetId, number>();
+  for (const cabinet of state.network.cabinets) capacity.set(cabinet.id, cabinetPortCapacity(cabinet));
+  const cutOff = new Set<ParcelId>();
+  const lent = new Map<CabinetId, number>();
+  for (const account of state.sales.accounts) {
+    const parcel = state.city.parcels[account.parcel];
+    const lost = parcel ? cutOffCabinets.get(parcel.segment) : undefined;
+    if (!parcel || !lost?.has(account.cabinet)) continue;
+    used ??= cabinetPortsUsed(state);
+    const ports = accountPorts(state, account);
+    const free = (c: CabinetId) => (capacity.get(c) ?? 0) - (used?.get(c) ?? 0) - (lent.get(c) ?? 0);
+    const standIn = (segmentCabinets.get(parcel.segment) ?? []).find((c) => !lost.has(c) && free(c) >= ports);
+    if (standIn === undefined) cutOff.add(account.parcel);
+    else lent.set(standIn, (lent.get(standIn) ?? 0) + ports);
   }
-  return { reach, interrupted };
+  return { cutOff, lent };
+}
+
+/**
+ * Who an outage leaves without service today on `service` (a snapshot of
+ * `state`'s network): see OutageService and outageServiceOf. An account is cut
+ * off when the outage cuts its own cabinet off from its street
+ * (ServiceSnapshot.cutOffCabinets) and no other cabinet that still reaches the
+ * street has a port free for it. Pure; O(accounts) while any span is out.
+ */
+export function outageService(state: GameState, service: ServiceSnapshot): OutageService {
+  return outageServiceOf(state, service.cutOffCabinets, service.segmentCabinets);
 }
 
 /** Snapshot for today from a network's reach (the only day-dependent part is which parcels exist). */
-function snapshotFrom(state: GameState, { reach, interrupted }: LiveReach): ServiceSnapshot {
+function snapshotFrom(state: GameState, { reach, interrupted, cutOff }: LiveReach): ServiceSnapshot {
   const { city, network, day } = state;
   const litSegments = new Set<SegmentId>();
   const servingCabinet = new Map<SegmentId, CabinetId>();
@@ -1199,6 +1283,7 @@ function snapshotFrom(state: GameState, { reach, interrupted }: LiveReach): Serv
     passedParcels,
     passings,
     interruptedSegments: new Set(interrupted),
+    cutOffCabinets: new Map(cutOff),
   };
 }
 
@@ -1416,33 +1501,42 @@ export function convertSpan(state: GameState, span: SpanId, rng: Rng): CommandRe
 
 /** What one span's outage cuts off today (outageImpact). */
 export interface OutageImpact {
-  /** Interrupted segments this span's repair alone would bring back, ascending. */
+  /** Segments this span's repair alone would bring a cut-off cabinet back to (ServiceSnapshot.cutOffCabinets), ascending. */
   segments: SegmentId[];
-  /** Subscribed units on parcels those segments serve. */
+  /** Subscribed units of the accounts cut off today (outageService) that the repair would bring back. */
   subscribers: number;
 }
 
 /**
- * What the outage on `span` cuts off today: the coverage rule run with that
- * span repaired (every other outage kept), and the interrupted segments it
- * would light again, with their subscribers. Empty for a span without an
- * outage or an unknown id. A street cut off by two outages in a row is
- * counted for neither (it needs both repaired). For the inspect card, the
- * span panel and the advisor. Pure.
+ * What the outage on `span` cuts off today: with that span repaired (every
+ * other outage kept), the segments a cabinet cut off from them would reach
+ * again, and the subscribed units of the accounts that would have service
+ * again (outageService on that view). Empty for a span without an outage
+ * or an unknown id. A street cut off by two outages in a row is counted for
+ * neither (it needs both repaired). For the inspect card, the span panel and
+ * the advisor. Pure.
  */
 export function outageImpact(state: GameState, span: SpanId): OutageImpact {
   const target = state.network.spans.find((s) => s.id === span);
   const service = getService(state);
-  if (!target || target.outage === null || service.interruptedSegments.size === 0) return { segments: [], subscribers: 0 };
+  if (!target || target.outage === null || service.cutOffCabinets.size === 0) return { segments: [], subscribers: 0 };
+  const now = outageService(state, service);
   const working = new Set<SegmentId>();
   for (const s of state.network.spans) if (s.stage === 'live' && (s.outage === null || s.id === span)) working.add(s.segment);
-  const reach = computeReach(state.city, working, state.network.cabinets.filter((c) => c.stage === 'live'));
-  const segments = [...service.interruptedSegments].filter((segment) => reach.serving.has(segment)).sort((a, b) => a - b);
-  const cut = new Set(segments);
+  const cabinets = state.network.cabinets.filter((c) => c.stage === 'live');
+  // The outage-agnostic reach getService just used (memoized with the snapshot).
+  const full = serviceCache.get(state)?.reach.reach ?? liveReach(state).reach;
+  const repaired = cutOffBy(full, computeReach(state.city, working, cabinets)).cutOff;
+  const segments: SegmentId[] = [];
+  for (const [segment, lost] of service.cutOffCabinets) {
+    const still = repaired.get(segment);
+    if ([...lost].some((c) => !still?.has(c))) segments.push(segment);
+  }
+  segments.sort((a, b) => a - b);
   let subscribers = 0;
-  for (const account of state.sales.accounts) {
-    const parcel = state.city.parcels[account.parcel];
-    if (parcel && cut.has(parcel.segment)) subscribers += accountUnits(account);
+  if (now.cutOff.size > 0) {
+    const then = outageServiceOf(state, repaired, service.segmentCabinets);
+    for (const account of state.sales.accounts) if (now.cutOff.has(account.parcel) && !then.cutOff.has(account.parcel)) subscribers += accountUnits(account);
   }
   return { segments, subscribers };
 }

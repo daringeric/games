@@ -130,7 +130,7 @@ function bruteCoverage(w: number, h: number, mx: number, my: number): number {
 
 describe('weather contract', () => {
   it('starts with no storms and an empty month', () => {
-    expect(newWeather()).toEqual({ storms: [], nextStormId: 1, month: emptyWeatherMonth() });
+    expect(newWeather()).toEqual({ storms: [], nextStormId: 1, month: emptyWeatherMonth(), cutOff: [] });
     expect(newWeather()).not.toBe(newWeather());
     expect(makeTestState().weather).toEqual(newWeather());
   });

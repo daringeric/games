@@ -8,14 +8,24 @@
 // invariants.test.ts (long mixed sessions). Pure and deterministic: bots draw
 // from their own Rng, never from the game's streams.
 
-import { CABINET_COST, CABINET_REACH_FT, SMB_MULTIPLIER_DEFAULT, SPLITTER_COST, TIER_DEFAULTS, TIER_PRICE_MAX, TIER_PRICE_MIN } from '../balance';
+import {
+  CABINET_COST,
+  CABINET_REACH_FT,
+  POLE_RENT_PER_POLE_PER_MONTH,
+  SMB_MULTIPLIER_DEFAULT,
+  SPLITTER_COST,
+  TIER_DEFAULTS,
+  TIER_PRICE_MAX,
+  TIER_PRICE_MIN,
+} from '../balance';
 import { dayOf, MONTH_LENGTHS } from '../calendar';
 import { creditLimit, penaltyBps, termCapacity } from '../debt';
 import { applyCommand, newGame, tick } from '../game';
 import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
 import { orderFees, quoteCable, spanCharges } from '../network';
-import { otherEnd, parcelsServedBy, segmentsAtNode, segmentsWithin } from '../streets';
+import { otherEnd, parcelsServedBy, polesOnSegment, segmentsAtNode, segmentsWithin } from '../streets';
+import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
 import type {
   CableMethod,
   City,
@@ -387,8 +397,77 @@ export function cumulativeOperatingCashFlow(result: RunResult, toMonth = result.
   return flow;
 }
 
+/** What owning the run's plant costs a year at its last close: pole rent on its aerial spans and the expected storm and dig-in repairs (weather.stormRisk by method). */
+export function plantRunningCostPerYear(result: RunResult): { poleRent: number; repairs: number } {
+  const { state } = result;
+  let poles = 0;
+  let repairs = 0;
+  for (const span of state.network.spans) {
+    const segment = state.city.segments[span.segment];
+    if (!segment) continue;
+    if (span.method === 'aerial') poles += polesOnSegment(segment);
+    repairs += stormRisk(state, segment, span.method).repairCostPerYear;
+  }
+  return { poleRent: poles * POLE_RENT_PER_POLE_PER_MONTH * 12, repairs };
+}
+
+/** What storms are expected to cost the run's plant a year at its last close (weather.stormRisk per span, by its method). */
+export interface StormExposure {
+  /** Repair dollars. */
+  repairs: number;
+  /** Subscriber-days without service: each span's expected days out x the subscribers on its street. */
+  subscriberDaysOut: number;
+  /** Cancellations: each span's expected outages x its street's subscribers x the outage churn of an average outage. */
+  outageChurn: number;
+}
+
+/**
+ * The run's storm exposure (StormExposure) at its last close. Realized storm
+ * losses (MonthlyReport.ops) depend on where the storms happened to fall, and
+ * two runs of one seed see different storms once their plant differs (each
+ * storm draws per span in its area from the weather stream), so comparing
+ * strategies on a few seeds compares their luck as much as their plant; this
+ * compares the plant.
+ */
+export function stormExposure(result: RunResult): StormExposure {
+  const { state } = result;
+  const subscribers = new Map<SegmentId, number>();
+  for (const account of state.sales.accounts) {
+    const parcel = state.city.parcels[account.parcel];
+    if (!parcel) continue;
+    let units = 0;
+    for (const id of Object.keys(account.tierUnits) as TierId[]) units += account.tierUnits[id];
+    subscribers.set(parcel.segment, (subscribers.get(parcel.segment) ?? 0) + units);
+  }
+  const exposure: StormExposure = { repairs: 0, subscriberDaysOut: 0, outageChurn: 0 };
+  for (const span of state.network.spans) {
+    const segment = state.city.segments[span.segment];
+    if (!segment) continue;
+    const risk = stormRisk(state, segment, span.method);
+    const subs = subscribers.get(span.segment) ?? 0;
+    exposure.repairs += risk.repairCostPerYear;
+    exposure.subscriberDaysOut += risk.outageDaysPerYear * subs;
+    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method));
+  }
+  return exposure;
+}
+
+/**
+ * Cost per passing over `years` of owning the plant: lifetime outside-plant
+ * capex plus `years` x its yearly running cost (plantRunningCostPerYear),
+ * over the passings at the last close; null with nothing passed. The
+ * aerial-versus-underground trade-off in one figure: aerial is cheaper up
+ * front and dearer to own, underground the reverse.
+ */
+export function ownershipCostPerPassing(result: RunResult, years = VALUE_YEARS): number | null {
+  const last = result.reports.at(-1);
+  if (!last || last.passings <= 0) return null;
+  const running = plantRunningCostPerYear(result);
+  return (result.state.finance.capex.osp + years * (running.poleRent + running.repairs)) / last.passings;
+}
+
 /** Years of trailing operating cash flow runValue counts: the horizon SMART weighs a street's running costs over (SMART_DEFAULTS.horizonYears). */
-export const VALUE_YEARS = 10;
+export const VALUE_YEARS = 12;
 
 /**
  * What the run has built, valued at its last close: cash - debt + `years` x
@@ -403,10 +482,10 @@ export function runValue(result: RunResult, years = VALUE_YEARS): number {
   if (!last) return result.state.finance.cash;
   const debt = reportDebt(last);
   if (result.gameOver) return last.cashEnd - debt;
-  const window = result.kpis.slice(-12);
+  const trailing = result.kpis.slice(-12);
   let flow = 0;
-  for (const kpi of window) flow += kpi.operatingCashFlow;
-  const annual = window.length > 0 ? (flow * 12) / window.length : 0;
+  for (const kpi of trailing) flow += kpi.operatingCashFlow;
+  const annual = trailing.length > 0 ? (flow * 12) / trailing.length : 0;
   return last.cashEnd - debt + years * annual;
 }
 

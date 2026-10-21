@@ -11,6 +11,11 @@
 // half the town or more by month 60 without a covenant breach, at ~7%; a
 // rural-heavy borrower pays the red CPP spread; borrowing every dollar offered
 // ends in a default).
+// Round 4: storms, pole rent, the underground bore, prices, the take-rate and
+// churn weights moved (targets4.test.ts: a careful operator buries 20-35% of
+// its plant, an all-aerial copy is clearly more exposed to storms, default
+// prices are the best constant price, hikes lose subscribers, a frozen-line
+// hoarder repays through the call or defaults); see DESIGN.md, "Round 4 tuning".
 
 import type { CppBand, ParcelKind, TermYears, TierId } from './types';
 
@@ -27,8 +32,12 @@ export const TILE_FT = 60;
 
 /** Aerial strand + lash, dollars per ft (excludes make-ready). */
 export const AERIAL_COST_PER_FT = 11;
-/** Underground directional bore + conduit, dollars per ft (soil). */
-export const UNDERGROUND_COST_PER_FT = 28;
+/**
+ * Underground directional bore + conduit, dollars per ft (soil). Round 4: 28
+ * -> 26, the lowest that keeps dense underground runs near CPP_TARGET (the
+ * $850-1,150 probe band), so burying a short block can pay for itself.
+ */
+export const UNDERGROUND_COST_PER_FT = 26;
 /** Extra dollars per ft for underground on rock, shown as its own quote line (rock bore ~ $50/ft all-in). */
 export const UNDERGROUND_ROCK_SURCHARGE_PER_FT = 22;
 /** Aerial make-ready: utility work per pole on each new aerial segment (polesOnSegment), non-refundable. */
@@ -56,12 +65,12 @@ export const AERIAL_DETOUR_MAX_RATIO = 1.5;
 // ---------------------------------------------------------------------------
 
 // Aerial needs pole attachment + make-ready, underground needs a city permit.
-export const MAKE_READY_DAYS_MIN = 45;
-export const MAKE_READY_DAYS_MAX = 120;
+export const MAKE_READY_DAYS_MIN = 30;
+export const MAKE_READY_DAYS_MAX = 90;
 /** Chance a make-ready job hits a long delay (pole replacement, utility backlog). */
-export const MAKE_READY_LONG_CHANCE = 0.2;
-export const MAKE_READY_LONG_DAYS_MIN = 150;
-export const MAKE_READY_LONG_DAYS_MAX = 270;
+export const MAKE_READY_LONG_CHANCE = 0.15;
+export const MAKE_READY_LONG_DAYS_MIN = 120;
+export const MAKE_READY_LONG_DAYS_MAX = 210;
 export const PERMIT_DAYS_MIN = 14;
 export const PERMIT_DAYS_MAX = 45;
 /**
@@ -81,7 +90,14 @@ export const PERMITTING_CANCEL_REFUND = 1;
 // ---------------------------------------------------------------------------
 
 export const POLE_SPACING_FT = 150;
-export const POLE_RENT_PER_POLE_PER_MONTH = 8;
+/**
+ * Pole attachment rent, per pole on live aerial cable, posted at each close.
+ * Round 4: 2 -> 7 (pole attachment, inspection and the utility's annual
+ * fees): aerial plant is cheaper up front and dearer to keep, so the careful
+ * operator buries the short blocks, where one pole's rent covers little
+ * cable. About 4-5% of a careful operator's revenue (5-6% for an all-aerial one).
+ */
+export const POLE_RENT_PER_POLE_PER_MONTH = 7;
 
 // ---------------------------------------------------------------------------
 // Cabinets (fiber distribution hubs), splitters and coverage
@@ -148,7 +164,14 @@ export interface TierDefault {
   popularity: number;
 }
 
-/** The fixed tier lineup and its starting prices, in display order. */
+/**
+ * The fixed tier lineup and its starting prices, in display order. The
+ * prices are also the market reference churn and the advisor compare with.
+ * Round 4: 55/70/95 -> 60/75/95, with the take-rate and churn weights below,
+ * so the defaults are what the market bears: a careful operator playing five
+ * years at constant multiples of these prices does best at x1 (the sweep in
+ * tuning/harness.ts; it was x1.3 before).
+ */
 export const TIER_DEFAULTS: readonly TierDefault[] = [
   { id: 'fiber500', name: '500 Mbps', downMbps: 500, upMbps: 500, price: 60, popularity: 1 },
   { id: 'fiber1g', name: '1 Gig', downMbps: 1_000, upMbps: 1_000, price: 75, popularity: 0.8 },
@@ -179,17 +202,23 @@ export const INCUMBENT_UP_MBPS = 20;
 // Businesses value a tier at the price they pay against the incumbent's
 // business price (INCUMBENT_PRICE x SMB_MULTIPLIER_DEFAULT): their price term
 // is multiplied by smbMultiplier / SMB_MULTIPLIER_DEFAULT (1 at the default).
+// At the default prices the best tier (1 Gig) is worth 0.65 over the cable
+// offer: a 55% target for homes (round 4: base 0.31 -> 0.356, per advantage
+// 0.25 -> 0.3; was 49%). Every 10% on all prices costs ~3 points of target
+// take; churn (below) does the rest of keeping the defaults the best price.
+// TAKE_RATE_MAX 0.6 -> 0.7 leaves a faster tier at the slower tier's price
+// above a slower one (only a price far below the defaults reaches it).
 // ---------------------------------------------------------------------------
 
 export const TAKE_SPEED_WEIGHT = 0.2;
 export const TAKE_SPEED_RATIO_CAP = 4;
 export const TAKE_UPLOAD_WEIGHT = 0.02;
 export const TAKE_UPLOAD_RATIO_CAP = 10;
-export const TAKE_PRICE_WEIGHT = 0.7;
-export const TAKE_RATE_BASE = 0.08;
-export const TAKE_RATE_PER_ADVANTAGE = 0.62;
+export const TAKE_PRICE_WEIGHT = 1;
+export const TAKE_RATE_BASE = 0.356;
+export const TAKE_RATE_PER_ADVANTAGE = 0.3;
 export const TAKE_RATE_MIN = 0.03;
-export const TAKE_RATE_MAX = 0.6;
+export const TAKE_RATE_MAX = 0.7;
 /** Target take rate multiplier by building kind. */
 export const TAKE_RATE_KIND_FACTOR: Readonly<Record<ParcelKind, number>> = { home: 1, mdu: 0.8, smb: 0.6 };
 
@@ -223,10 +252,15 @@ export const MARKETING_HALF_SAT_PER_PASSING = 3;
 //       x max(0, price_t - default price_t) / default price_t))
 // (a business's price_t and default price_t both times its multiplier:
 // smbMultiplier and SMB_MULTIPLIER_DEFAULT).
+// Round 4: CHURN_PRICE_SENSITIVITY 2 -> 10: subscribers compare what they pay
+// with the market's price (TIER_DEFAULTS), and 10% over it doubles their
+// churn. With the take-rate weights above this puts the best constant price
+// at the defaults; a player who prices above them loses subscribers month
+// after month, on top of the one-off step when a price lock ends.
 // ---------------------------------------------------------------------------
 
 export const CHURN_MONTHLY_BASE = 0.011;
-export const CHURN_PRICE_SENSITIVITY = 2;
+export const CHURN_PRICE_SENSITIVITY = 10;
 export const CHURN_MONTHLY_MAX = 0.2;
 
 // ---------------------------------------------------------------------------
@@ -367,13 +401,15 @@ export const PAYMENT_REMINDER_DAYS = 5;
 export const DRAW_PRESETS: readonly number[] = [10_000, 25_000];
 
 // ---------------------------------------------------------------------------
-// Round 4 (architect's initial guesses; the round-4 tuner owns these values).
-// Every rule they feed is documented in the module that applies it.
-// Integrator's interim values (marked "interim"): ARR_SPIKE_CAP,
-// INCUMBENT_PROMO_TAKE_RATE and the storm radius were eased from the first
-// guesses so the round-2/3 balance targets (tuning/targets.test.ts) hold with
-// storms and incumbent promos on. The SMART bot still builds all-aerial and
-// never converts, so this is not the round-4 tune (see DESIGN.md, Round 4).
+// Round 4. Every rule these feed is documented in the module that applies it.
+// Tuned by the headless bots (tuning/targets4.test.ts, DESIGN.md "Round 4
+// tuning"): the integrator's ARR_SPIKE_CAP, INCUMBENT_PROMO_TAKE_RATE and storm
+// radius held; storms come a little more often, damage aerial spans a little
+// more, and a repair costs mostly the crew's call-out (so short aerial blocks
+// are the dearest to keep per foot); an outage costs more subscribers. With
+// pole rent (above) that makes underground pay on the short blocks and aerial
+// on the long ones. Repairs cost a careful operator ~2.5% of revenue (100 seeds;
+// an all-aerial one ~3.1%).
 // ---------------------------------------------------------------------------
 
 // Loan polish (debt.ts) ------------------------------------------------------
@@ -384,7 +420,7 @@ export const DRAW_PRESETS: readonly number[] = [10_000, 25_000];
  * price spike cannot inflate borrowing capacity (honest growth of a few
  * percent a month is untouched).
  */
-export const ARR_SPIKE_CAP = 1.5; // interim (first guess 1.1: it also capped honest ramp-up growth)
+export const ARR_SPIKE_CAP = 1.5; // first guess 1.1 also capped honest ramp-up growth
 /** While frozen, each close sweeps this share of the month's positive operating cash flow to repay debt. */
 export const FROZEN_SWEEP_SHARE = 0.5;
 /** ...but never takes cash below this reserve. */
@@ -433,7 +469,7 @@ export const PROMO_MAX_MONTHS = 12;
  */
 export const PROMO_HORIZON_MONTHS = 24;
 /** The incumbent answers when your take rate in a cabinet area reaches this ... */
-export const INCUMBENT_PROMO_TAKE_RATE = 0.45; // interim (first guess 0.35, below the ~49% default target take rate: promos ran nearly everywhere)
+export const INCUMBENT_PROMO_TAKE_RATE = 0.45; // first guess 0.35 sat under the default target take rate: promos ran nearly everywhere
 /** ... on at least this many passings there. */
 export const INCUMBENT_PROMO_MIN_PASSINGS = 100;
 /** Dollars a month the incumbent's promo price is below INCUMBENT_PRICE. */
@@ -455,15 +491,15 @@ export const CHURN_TOTAL_MAX = 0.8;
 
 /** No storms or dig-ins before this day (the first year is for building). */
 export const STORM_START_DAY = 365;
-/** Chance a storm hits on any day from STORM_START_DAY. */
-export const STORM_CHANCE_PER_DAY = 1 / 60;
+/** Chance a storm hits on any day from STORM_START_DAY (round 4: 1/60 -> 1/50, about 7 a year). */
+export const STORM_CHANCE_PER_DAY = 1 / 50;
 /** Radius of the area a storm hits, map cells. */
-export const STORM_RADIUS_MIN = 5; // interim (first guess 8)
-export const STORM_RADIUS_MAX = 15; // interim (first guess 30: a storm covered up to half a 96x64 town, ~9% of revenue in repairs for all-aerial play)
+export const STORM_RADIUS_MIN = 5; // first guess 8
+export const STORM_RADIUS_MAX = 15; // first guess 30: a storm covered up to half a 96x64 town, ~9% of revenue in repairs for all-aerial play
 /** Storm severity 1..this (uniform), scaling the damage chances. */
 export const STORM_SEVERITY_MAX = 3;
-/** Chance per unit of severity that a storm damages a live span in its area: aerial ... */
-export const STORM_AERIAL_DAMAGE_CHANCE = 0.12;
+/** Chance per unit of severity that a storm damages a live span in its area: aerial (round 4: 0.06 -> 0.07; ~0.06 outages a span-year) ... */
+export const STORM_AERIAL_DAMAGE_CHANCE = 0.07;
 /** ... and underground (washouts; rare). */
 export const STORM_UNDERGROUND_DAMAGE_CHANCE = 0.002;
 /** Dig-ins a year per mile (5,280 ft) of live underground cable. */
@@ -474,14 +510,22 @@ export const OUTAGE_DAYS_AERIAL_MAX = 6;
 /** ... and underground (digging to the break takes longer). */
 export const OUTAGE_DAYS_UNDERGROUND_MIN = 4;
 export const OUTAGE_DAYS_UNDERGROUND_MAX = 12;
-/** Repair cost of a damaged span: base + per ft of the span, by method. */
-export const REPAIR_BASE_AERIAL = 2_000;
-export const REPAIR_PER_FT_AERIAL = 4;
+/**
+ * Repair cost of a damaged span: base + per ft of the span, by method. Round
+ * 4: aerial per ft 3 -> 1, so an aerial repair is mostly the crew's call-out
+ * (a short block costs nearly as much to fix as a long one).
+ */
+export const REPAIR_BASE_AERIAL = 1_200;
+export const REPAIR_PER_FT_AERIAL = 1;
 export const REPAIR_BASE_UNDERGROUND = 4_000;
 export const REPAIR_PER_FT_UNDERGROUND = 1;
 /**
- * Extra churn at the close for a subscribed unit whose street was interrupted
- * d days in the month: min(OUTAGE_CHURN_MAX, OUTAGE_CHURN_BASE + OUTAGE_CHURN_PER_DAY x d), 0 when d is 0.
+ * Extra churn for a subscribed unit one outage cut off d days (its own days
+ * without service, charged at the closes they fall before; an outage over a
+ * close pays the base once, weather.outageChurnFor):
+ * min(OUTAGE_CHURN_MAX, OUTAGE_CHURN_BASE + OUTAGE_CHURN_PER_DAY x d), 0 when d is 0.
+ * Round 4: 0.01 + 0.004/day (max 0.1) -> 0.05 + 0.01/day (max 0.25): about
+ * one in eleven subscribers cut off for an average aerial outage leaves.
  */
 export const OUTAGE_CHURN_BASE = 0.05;
 export const OUTAGE_CHURN_PER_DAY = 0.01;

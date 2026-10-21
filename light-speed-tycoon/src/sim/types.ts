@@ -303,12 +303,19 @@ export interface Storm {
 /** Running weather totals for the open month, reset by each close (weather.closeWeatherMonth). */
 export interface WeatherMonth {
   /**
-   * Days each lit segment spent interrupted by an outage this month, sorted
-   * by segment ascending, one entry per segment, days >= 1 (segments never
-   * interrupted are absent). Sales churn reads it at the close (weather.outageDaysOn).
+   * Days each lit segment spent interrupted (ServiceSnapshot.interruptedSegments:
+   * no cabinet reaches it) this month, sorted by segment ascending, one entry
+   * per segment, days >= 1 (segments never interrupted are absent). The
+   * street's record (weather.outageDaysOn); churn goes by each subscriber's
+   * own days (Weather.cutOff).
    */
   segmentOutageDays: { segment: SegmentId; days: number }[];
-  /** Subscriber-days without service this month: over the month's days, subscribed units on interrupted segments. */
+  /**
+   * Subscriber-days without service this month: over the month's days, the
+   * subscribed units of accounts cut off (network.outageService: an outage
+   * cuts their own cabinet off from their street and no other cabinet that
+   * still reaches it has a port free for them).
+   */
   outageUnitDays: number;
   /** Storms that hit this month. */
   storms: number;
@@ -318,12 +325,39 @@ export interface WeatherMonth {
   repairs: number;
 }
 
+/**
+ * One subscriber's outage (Weather.cutOff): the account on `parcel` was cut
+ * off `days` days since the last close (not charged yet), after `charged`
+ * days of the same outage charged at earlier closes (it was still cut off at
+ * them), with at most `units` of its units cut off on one day (units it adds
+ * later were not cut off).
+ */
+export interface AccountOutage {
+  parcel: ParcelId;
+  /** >= 0; days + charged >= 1. */
+  days: number;
+  /** >= 0. */
+  charged: number;
+  /** >= 1. */
+  units: number;
+}
+
 export interface Weather {
   /** Storms of the last STORM_LOG_DAYS days, oldest first. */
   storms: Storm[];
   /** Id the next storm gets (>= 1, greater than every id in storms). */
   nextStormId: number;
   month: WeatherMonth;
+  /**
+   * Round 4: subscribers cut off by outages this month, or still cut off at
+   * the last close, one entry per account (by parcel, ascending). Each day an
+   * account is cut off (network.outageService) adds a day; each close charges
+   * the days since the last one (sales.closeSalesMonth, weather.outageChargeOf)
+   * and keeps only the accounts still cut off, their days counted as charged
+   * (weather.closeWeatherMonth), so an outage over a close pays its base churn
+   * once.
+   */
+  cutOff: AccountOutage[];
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +717,12 @@ export interface Tier {
   upMbps: number;
   /** Monthly price for a household, whole dollars, TIER_PRICE_MIN..TIER_PRICE_MAX. */
   price: number;
-  /** Sold to new customers. Subscribers already on an unoffered tier keep it (grandfathered). */
+  /**
+   * Sold to new customers. Round 4: subscribers on a tier that is not offered
+   * move at the next close to the offered tier nearest in price, and some
+   * cancel (sales.closeSalesMonth step 4); round 3 let them keep it, so a v3
+   * save with such subscribers gets a 'rulesUpdated' notice at load.
+   */
   offered: boolean;
 }
 
@@ -1407,11 +1446,16 @@ export interface FundingHint {
  * never offered.
  */
 export interface CureOption {
-  /** repayCredit / prepayLoan: a command that cures it now; grow: the yearly operating cash flow that would (no command). */
-  kind: 'repayCredit' | 'prepayLoan' | 'grow';
+  /**
+   * repayCredit / prepayLoan: a command that cures it now; grow: the yearly
+   * operating cash flow that would (no command); repayAll: repaying the line
+   * and every loan in full (debt.repayAllCure: never among cureOptions, only
+   * debt.cureFor).
+   */
+  kind: 'repayCredit' | 'prepayLoan' | 'grow' | 'repayAll';
   /** The loan to prepay (prepayLoan), else null. */
   loan: LoanId | null;
-  /** Dollars to repay or prepay; for grow, the extra annual operating cash flow needed. */
+  /** Dollars to repay or prepay (repayAll: everything owed); for grow, the extra annual operating cash flow needed. */
   amount: number;
   /** Covenant figures after it (for grow: with that cash flow). */
   after: CovenantMetrics;
@@ -1593,8 +1637,14 @@ export interface Briefing {
     nextCloseDay: number;
     /** Estimated debt service at the next close (debt.estimateNextDebtService). */
     nextPayment: number;
-    /** Cash projected at the next close's debt step (finance.estimateCashAtClose), less the next payment. */
+    /**
+     * Cash projected after the next close: at its debt step
+     * (finance.estimateCashAtClose), less the next payment and, while the line
+     * is frozen, the sweep (debt.estimateSweep).
+     */
     projectedCash: number;
+    /** The frozen-line sweep expected at the next close (debt.estimateSweep: 0 unless frozen), included in projectedCash. */
+    sweep: number;
     /** finance.runwayMonths: null when not burning. */
     runwayMonths: number | null;
     /** Frozen: closes until the bank calls the loans (debt.closesUntilAcceleration), else null. */
@@ -1658,10 +1708,20 @@ export interface ServiceSnapshot {
   passings: number;
   /**
    * Round 4: lit segments with no light today because an outage cuts them off
-   * (their own span is out, or every live path to the CO or to their cabinet
-   * runs through a span that is out). Still lit and passed (passings and
-   * scorecards ignore outages), but their subscribers have no service and no
-   * one signs up there until repairs finish. Empty when no span is out.
+   * from every cabinet in segmentCabinets (their own span is out, or every
+   * live path from each cabinet to them, or from it to the CO, runs through a
+   * span that is out, or is too long). Still lit and passed (passings and
+   * scorecards ignore outages). Empty when no span is out.
    */
   interruptedSegments: Set<SegmentId>;
+  /**
+   * Round 4: for each lit segment an outage cuts off from one or more of its
+   * segmentCabinets, those cabinets (all of them for an interrupted
+   * segment). A subscriber whose own cabinet (Account.cabinet) is listed for
+   * its street is served meanwhile by another of them that still reaches it
+   * with a port free, else has no service (network.outageService); while
+   * the street's servingCabinet is listed, new signups there go only to such
+   * a cabinet. Empty when no span is out.
+   */
+  cutOffCabinets: Map<SegmentId, ReadonlySet<CabinetId>>;
 }

@@ -94,7 +94,7 @@ function outage(storm = 1): Save {
  * Give a parsed current-version save every round-4 record, shaped as the
  * round-4 rules write them: a logged storm and its outage on a live span
  * (made aerial) that is also being converted underground, the month's outage
- * totals and repair entry, a grandfathered price lock, an intro promo, an
+ * totals and repair entry, a subscriber cut off for 2 days, a grandfathered price lock, an intro promo, an
  * incumbent promo on the first cabinet, a frozen line the bank has called,
  * and the first report's ops and round-4 debt figures.
  */
@@ -107,6 +107,7 @@ function populateRound4(s: Save): void {
     storms: [{ id: 1, day: Math.max(0, s.day - 1), x: 1, y: 1, radius: 8, severity: 2, spans: [span.id], repairCost: 1_500 }],
     nextStormId: 2,
     month: { segmentOutageDays: [{ segment: 0, days: 1 }, { segment: 1, days: 2 }], outageUnitDays: 5, storms: 1, spansDamaged: 1, repairs: 1_500 },
+    cutOff: [{ parcel: s.sales.accounts[0].parcel, days: 2, charged: 0, units: 1 }],
   };
   s.finance.monthToDate.push({ day: s.day, category: 'repair', amount: -1_500, memo: 'Storm repairs' });
   s.finance.cash -= 1_500;
@@ -652,8 +653,16 @@ describe('deserialize errors', () => {
       expect(state.sales.incumbentPromos).toHaveLength(1);
       expect(state.debt.acceleration?.closesLeft).toBe(2);
       expect(state.finance.reports[0]?.ops?.storms).toBe(1);
+      expect(state.weather.cutOff).toHaveLength(1);
       expect(deserialize(serialize(state))).toEqual(state);
       expect(serialize(deserialize(text))).toBe(text);
+    });
+
+    it('loads a round-4 save written before subscribers\' days cut off were kept, with none waiting', () => {
+      const early = withRound4((s) => delete s.weather.cutOff);
+      const state = deserialize(early);
+      expect(state.weather.cutOff).toEqual([]);
+      expect(Object.keys(state.weather)).toEqual(Object.keys(newWeather()));
     });
 
     const round4Cases: Array<[string, (save: Save) => void, RegExp]> = [
@@ -667,6 +676,13 @@ describe('deserialize errors', () => {
       ['outage days on an unknown segment', (s) => (s.weather.month.segmentOutageDays[0].segment = 999), /weather\.month\.segmentOutageDays\[0\]\.segment should be an integer in 0\.\./],
       ['outage days past a month', (s) => (s.weather.month.segmentOutageDays[0].days = 32), /weather\.month\.segmentOutageDays\[0\]\.days should be an integer in 1\.\.31, got 32/],
       ['outage days out of order', (s) => s.weather.month.segmentOutageDays.reverse(), /weather\.month\.segmentOutageDays \(by segment\)\[1\] should be greater/],
+      ['days cut off on an unknown parcel', (s) => (s.weather.cutOff[0].parcel = 9_999), /weather\.cutOff\[0\]\.parcel should be an integer in 0\.\./],
+      ['negative days cut off', (s) => (s.weather.cutOff[0].days = -1), /weather\.cutOff\[0\]\.days should be an integer in 0\.\./],
+      ['an outage with no days at all', (s) => (s.weather.cutOff[0].days = 0), /weather\.cutOff\[0\]\.charged should be an integer in 1\.\./],
+      ['negative days charged', (s) => (s.weather.cutOff[0].charged = -1), /weather\.cutOff\[0\]\.charged should be an integer in 0\.\./],
+      ['zero units cut off', (s) => (s.weather.cutOff[0].units = 0), /weather\.cutOff\[0\]\.units should be an integer in 1\.\./],
+      ['days cut off out of order', (s) => s.weather.cutOff.push({ ...s.weather.cutOff[0] }), /weather\.cutOff \(by parcel\)\[1\] should be greater/],
+      ['days cut off that are not a list', (s) => (s.weather.cutOff = {}), /weather\.cutOff should be an array/],
       ['an outage on a permitting span', (s) => (s.network.spans.find((x: Save) => x.stage === 'permitting').outage = outage()), /network\.spans\[\d+\]\.outage should be null while permitting/],
       ['an outage with an unknown cause', (s) => (s.network.spans.find((x: Save) => x.outage).outage.cause = 'alien'), /\.outage\.cause should be one of "storm", "digIn", got "alien"/],
       ['an outage from a storm never logged', (s) => (s.network.spans.find((x: Save) => x.outage).outage.storm = 99), /\.outage\.storm should be an integer in 1\.\.\d+, got 99/],
@@ -1128,15 +1144,19 @@ describe('schemaVersion 3 saves', () => {
     expect(state.debt.acceleration).toBeNull();
     expect(state.finance.reports.every((r) => r.ops === undefined && r.debt?.sweep === undefined)).toBe(true);
 
-    // Everything else is the player's own, untouched (but the notice explaining the new frozen rules).
+    // Everything else is the player's own, untouched (but the notices explaining the round-4 rules
+    // that reach this game: one per unoffered tier with subscribers, and the new frozen rules).
     const frozen = v3.debt.covenant.stage === 'frozen';
+    const retired = v3.sales.pricing.tiers.filter(
+      (t: Save) => !t.offered && v3.sales.accounts.some((a: Save) => a.tierUnits[t.id] > 0),
+    ).length;
     const { schemaVersion: _from, ...kept } = v3;
     const { schemaVersion: _to, ...rest } = withoutRound4(state);
-    const added = frozen ? 1 : 0;
+    const added = retired + (frozen ? 1 : 0);
     expect(rest.notices.slice(0, v3.notices.length)).toEqual(kept.notices);
     expect({ ...rest, notices: kept.notices, nextNoticeId: kept.nextNoticeId }).toEqual(kept);
     expect(rest.nextNoticeId).toBe(v3.nextNoticeId + added);
-    expect(state.notices.slice(v3.notices.length).map((n) => n.kind)).toEqual(frozen ? ['rulesUpdated'] : []);
+    expect(state.notices.slice(v3.notices.length).map((n) => n.kind)).toEqual(Array.from({ length: added }, () => 'rulesUpdated'));
 
     // Same key order as a fresh game everywhere round 4 added keys, so a migrated game hashes like a fresh one.
     const fresh = newGame(state.seed, { city: state.city });
@@ -1160,7 +1180,8 @@ describe('schemaVersion 3 saves', () => {
     expect(note.message).toMatch(/while your credit line is frozen, the bank takes \d+% of each month's operating cash flow/);
     expect(note.message).toContain(`after ${FROZEN_ACCELERATION_CLOSES} frozen month closes in a row it calls the loans`);
     // Saving and loading the migrated game doesn't repeat it.
-    expect(deserialize(serialize(grid)).notices.filter((n) => n.kind === 'rulesUpdated')).toHaveLength(1);
+    const told = grid.notices.filter((n) => n.kind === 'rulesUpdated').length;
+    expect(deserialize(serialize(grid)).notices.filter((n) => n.kind === 'rulesUpdated')).toHaveLength(told);
 
     const town = deserialize(v3Fixture('v3-town'));
     expect(town.debt.covenant.stage).toBe('compliant');
@@ -1181,7 +1202,7 @@ describe('schemaVersion 3 saves', () => {
     paid.debt.loans = [];
     const cleared = deserialize(JSON.stringify(paid));
     expect(cleared.debt.frozenCloses).toBe(0);
-    expect(cleared.notices.some((n) => n.kind === 'rulesUpdated')).toBe(false);
+    expect(cleared.notices.some((n) => n.kind === 'rulesUpdated' && /frozen/.test(n.message))).toBe(false);
   });
 
   it.each(['v3-grid', 'v3-town'] as const)('keeps playing the frozen %s save through month closes', (name) => {
