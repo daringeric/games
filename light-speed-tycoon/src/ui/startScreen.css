@@ -1,0 +1,399 @@
+/* Round 4b: the start screen (startScreen.ts): company name, difficulty cards,
+   the town, Start. Imported by main.ts after style.css. Toy Town look: the
+   pill-card, the theme variables themeCss.ts publishes (--card, --text,
+   --active, --radius, --touch, ...) and the display/UI fonts, never literal
+   colors. Fits a 390x844 phone with no sideways scroll, and a short landscape
+   phone by scrolling its body while Start stays in view.
+
+   Owner: start-screen workstream. */
+
+.start-screen {
+  width: min(600px, calc(100vw - 24px));
+  max-width: none;
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  padding: 0;
+  overflow: hidden;
+  color: var(--text);
+  /* The page itself is not selectable (#app); the form is. */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.start-screen[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Light enough that the town behind it shows through. */
+.start-screen::backdrop {
+  background: rgb(35 48 58 / 30%);
+}
+
+.start-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 16px 6px 22px;
+}
+
+.start-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+.start-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 4px;
+  color: var(--accent);
+  font: 700 13px / 1.2 var(--font-display);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.start-kicker::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.start-title {
+  margin: 0;
+  font: 600 26px / 1.1 var(--font-display);
+}
+
+.start-lede {
+  margin: 6px 0 0;
+  color: var(--text-2);
+  font: 700 14px / 1.4 var(--font-ui);
+}
+
+.start-back {
+  flex: none;
+  padding: 0 14px 0 8px;
+  background: var(--hover);
+  font-size: 15px;
+}
+
+.start-back .icon,
+.start-reroll .icon,
+.start-suggest .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.start-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  gap: 16px;
+  padding: 8px 22px 16px;
+}
+
+.start-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.start-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.start-label {
+  margin: 0;
+  color: var(--text-2);
+  font: 800 12px / 1.2 var(--font-ui);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.start-count {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.start-note {
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+}
+
+.start-name-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.field.start-name {
+  flex: 1 1 220px;
+  width: auto;
+  min-width: 0;
+  min-height: var(--touch);
+  padding: 0 14px;
+  border-radius: 12px;
+  font: 600 18px / 1.2 var(--font-display);
+}
+
+.start-suggest,
+.start-reroll {
+  flex: none;
+  background: var(--chip);
+  box-shadow: inset 0 0 0 2px var(--card-border);
+  font-size: 15px;
+}
+
+.start-suggest:hover,
+.start-reroll:hover {
+  background: var(--hover);
+}
+
+.start-name-msg {
+  margin: 0;
+  min-height: 1.4em;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.start-name-msg.start-name-error {
+  color: var(--danger);
+  font-weight: 800;
+}
+
+/* Difficulty cards: a 2x2 grid of radio cards, easiest first. */
+.start-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.start-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    'dot name'
+    'dot cash'
+    'feel feel';
+  /* Rows pack at the top, so cards side by side line up when one's text wraps longer. */
+  align-content: start;
+  align-items: center;
+  gap: 2px 10px;
+  min-height: var(--touch);
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow:
+    inset 0 0 0 2px var(--card-border),
+    0 3px 0 var(--shadow);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+
+.start-card:hover {
+  background: var(--hover);
+}
+
+.start-card:active {
+  transform: translateY(1px);
+}
+
+.start-card:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.start-card[aria-checked='true'] {
+  background: color-mix(in srgb, var(--active) 9%, var(--card));
+  box-shadow:
+    inset 0 0 0 3px var(--active),
+    0 3px 0 var(--active-shadow);
+}
+
+.start-card-dot {
+  grid-area: dot;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 2px var(--card-border);
+  background: var(--card);
+}
+
+.start-card[aria-checked='true'] .start-card-dot {
+  box-shadow: inset 0 0 0 6px var(--active);
+}
+
+.start-card-name {
+  grid-area: name;
+  font: 600 17px / 1.15 var(--font-display);
+}
+
+.start-card-cash {
+  grid-area: cash;
+  color: var(--success);
+  font-size: 15px;
+}
+
+.start-card-feel {
+  grid-area: feel;
+  margin-top: 6px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+/* The town the game will generate. */
+.start-town {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  padding: 10px 10px 10px 14px;
+  border-radius: 14px;
+  background: var(--chip);
+}
+
+.start-town-icon {
+  color: var(--accent);
+}
+
+.start-town-line {
+  flex: 1 1 160px;
+  min-width: 0;
+  margin: 0;
+  font: 600 17px / 1.25 var(--font-display);
+  overflow-wrap: anywhere;
+}
+
+.start-reroll {
+  background: var(--card);
+}
+
+.start-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 22px 16px;
+  border-top: 1px dashed var(--card-border);
+}
+
+.btn.start-go,
+.btn.start-go:hover {
+  min-width: 160px;
+  min-height: 48px;
+  padding: 0 28px;
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+  font-size: 19px;
+}
+
+.btn.start-go:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none;
+}
+
+/* Phones: tighter padding, the cards stay two across (one across on the narrowest). */
+@media (max-width: 600px) {
+  .start-screen {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+    max-height: calc(100dvh - 16px);
+  }
+
+  .start-head {
+    padding: 14px 12px 4px 16px;
+  }
+
+  .start-title {
+    font-size: 22px;
+  }
+
+  .start-lede {
+    font-size: 13px;
+  }
+
+  .start-body {
+    gap: 14px;
+    padding: 6px 16px 12px;
+  }
+
+  .start-cards {
+    gap: 8px;
+  }
+
+  .start-card {
+    padding: 10px 12px;
+    gap: 2px 8px;
+  }
+
+  .start-card-name {
+    font-size: 16px;
+  }
+
+  .start-card-feel {
+    font-size: 12.5px;
+  }
+
+  .start-actions {
+    padding: 10px 16px 12px;
+  }
+
+  .btn.start-go,
+  .btn.start-go:hover {
+    flex: 1;
+  }
+}
+
+@media (max-width: 340px) {
+  .start-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Short landscape screens: a smaller heading so more of the form shows. */
+@media (max-height: 500px) {
+  .start-head {
+    padding-top: 10px;
+  }
+
+  .start-title {
+    font-size: 20px;
+  }
+
+  .start-lede {
+    display: none;
+  }
+
+  .start-card-feel {
+    margin-top: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .start-card {
+    transition: none;
+  }
+}

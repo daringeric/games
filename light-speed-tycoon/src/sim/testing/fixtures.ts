@@ -2,18 +2,22 @@
 
 import { ARR_TRAILING_MONTHS, BASE_RATE_BPS, CABINET_START_SPLITTERS, START_YEAR, TILE_FT } from '../balance';
 import { dayOf } from '../calendar';
+import { customerSnapshot } from '../customers';
 import { annualOperatingCashFlow, creditLimit, levelPayment, trailingArr } from '../debt';
 import { newGame } from '../game';
+import { fixedOverheadLines } from '../overhead';
 import { monthlyRecurringRevenue } from '../sales';
 import type {
   CabinetId,
   City,
+  CustomerStats,
   DebtStats,
   GameState,
   LedgerCategory,
   MonthlyReport,
   NodeId,
   OpsStats,
+  OverheadLines,
   Parcel,
   ParcelKind,
   SegmentId,
@@ -312,9 +316,11 @@ export function noDebtStats(state: GameState): DebtStats {
 /**
  * The report.ops a round-4 close writes when none of the round-4 events
  * happened (no storms, tier moves, price steps or incumbent promos), from the
- * state right after that close.
+ * state right after that close. Round 4c/4d: with the overhead lines of a
+ * month with no subscribers (overhead.fixedOverheadLines on today's plant,
+ * nothing per customer), unless `overhead` gives them.
  */
-export function quietOpsStats(state: GameState): OpsStats {
+export function quietOpsStats(state: GameState, overhead: OverheadLines | null = { ...fixedOverheadLines(state), perCustomer: 0, support: 0 }): OpsStats {
   return {
     lastNoticeId: state.nextNoticeId - 1,
     tierMoves: 0,
@@ -327,7 +333,18 @@ export function quietOpsStats(state: GameState): OpsStats {
     repairs: 0,
     incumbentPromos: 0,
     mrr: monthlyRecurringRevenue(state),
+    outageCredits: 0,
+    overhead,
   };
+}
+
+/**
+ * Round 4c/4d: the report.customers a close writes in a month with no
+ * referral credits or campaigns, from the state right after that close
+ * (customers.customerSnapshot: happiness buckets and the per-area snapshot).
+ */
+export function quietCustomerStats(state: GameState): CustomerStats {
+  return { ...customerSnapshot(state), referralSignups: 0, referralCredits: 0, campaignSpend: 0 };
 }
 
 function ordinalSuffix(n: number): string {

@@ -3,19 +3,21 @@ import {
   ACCELERATION_CLOSES,
   COVENANT_CURE_CLOSES,
   CPP_AMBER_MULTIPLIER,
-  FROZEN_ACCELERATION_CLOSES,
-  FROZEN_SWEEP_SHARE,
   CPP_SPREAD_BPS,
   CPP_TARGET,
+  DEFAULT_SUPPORT_LEVEL,
+  FROZEN_ACCELERATION_CLOSES,
+  FROZEN_SWEEP_SHARE,
   INSOLVENCY_GRACE_MONTHS,
   LATE_FEE_MIN,
   LATE_FEE_SHARE,
   OLT_START_PON_PORTS,
-  OVERHEAD_PER_MONTH,
+  OVERHEAD_BASE_PER_MONTH,
   PENALTY_STEP_UP_BPS,
   POLE_RENT_PER_POLE_PER_MONTH,
+  REFERRAL_CREDIT,
   START_CASH,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
+  SUPPORT_LEVELS,
   TERM_LOAN_MIN,
 } from './balance';
 import { dateOf, DAYS_PER_YEAR, formatMonth, MONTH_LENGTHS } from './calendar';
@@ -41,6 +43,7 @@ import {
   canAfford,
   checkInsolvency,
   closeMonth,
+  estimateCashAtClose,
   estimateMonthOperatingCashFlow,
   formatMoney,
   groupThousands,
@@ -52,10 +55,11 @@ import {
 } from './finance';
 import { applyCommand, runDays, tick } from './game';
 import { operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
+import { fixedOverheadLines, livePlant, perCustomerCost } from './overhead';
 import { getService } from './network';
 import { Rng } from './rng';
-import { subscriberUnits } from './sales';
-import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats, quietOpsStats } from './testing/fixtures';
+import { accrueDay, monthlyRecurringRevenue, subscriberUnits } from './sales';
+import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats, quietCustomerStats, quietOpsStats } from './testing/fixtures';
 import type { BuildStage, CableMethod, City, Command, CovenantStage, GameState, LedgerEntry, MonthlyReport, SegmentId, TermLoan } from './types';
 
 // Default grid: horizontal segments 0..8 are 240 ft (2 poles), vertical 9..16 are 120 ft (1 pole).
@@ -79,6 +83,21 @@ function addSpan(state: GameState, segment: SegmentId, method: CableMethod, stag
     outage: null,
     conversion: null,
   });
+}
+
+/** The fixed overhead a close posts for today's plant: base + per plant (overhead.fixedOverheadLines). */
+function fixedOverhead(state: GameState): number {
+  const lines = fixedOverheadLines(state);
+  return lines.base + lines.perPlant;
+}
+
+/** The ledger entries overhead.closeOverhead posts for today's plant, dated `day` and labelled `label` ($0 lines left out). */
+function fixedOverheadEntries(state: GameState, day: number, label: string): LedgerEntry[] {
+  const lines = fixedOverheadLines(state);
+  const entries: LedgerEntry[] = [];
+  if (lines.base !== 0) entries.push({ day, category: 'overhead', amount: -lines.base, memo: `Overhead for ${label}: office and systems` });
+  if (lines.perPlant !== 0) entries.push({ day, category: 'overhead', amount: -lines.perPlant, memo: expect.stringMatching(new RegExp(`^Plant upkeep for ${label}: `)) as unknown as string });
+  return entries;
 }
 
 describe('formatting', () => {
@@ -201,11 +220,14 @@ describe('closeMonth', () => {
     state.day = 31; // Feb 1
     const report = close(state, 42);
     const rent = 4 * POLE_RENT_PER_POLE_PER_MONTH;
-    const net = -21_000 - rent - OVERHEAD_PER_MONTH;
+    // Base and upkeep of the two live aerial spans (no cabinet, no customers).
+    const overhead = fixedOverhead(state);
+    expect(overhead).toBeGreaterThan(OVERHEAD_BASE_PER_MONTH);
+    const net = -21_000 - rent - overhead;
     expect(report).toEqual({
       year: 2027,
       month: 1,
-      totals: { construction: -6_000, equipment: -16_200, refund: 1_200, poleRent: -rent, overhead: -OVERHEAD_PER_MONTH },
+      totals: { construction: -6_000, equipment: -16_200, refund: 1_200, poleRent: -rent, overhead: -overhead },
       net,
       cashEnd: START_CASH + net,
       passings: 42,
@@ -214,6 +236,7 @@ describe('closeMonth', () => {
       debt: noDebtStats(state),
       // Every round-4 close records its operating figures.
       ops: quietOpsStats(state),
+      customers: quietCustomerStats(state),
     });
     expect(Object.keys(report.totals)).toEqual(['construction', 'equipment', 'refund', 'poleRent', 'overhead']);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -226,10 +249,12 @@ describe('closeMonth', () => {
     addSpan(state, 0, 'aerial');
     state.day = 59; // Mar 1: February just ended
     const before = state.finance.monthToDate;
+    const overhead = fixedOverheadEntries(state, 58, 'Feb 2027');
+    expect(overhead).toHaveLength(2);
     close(state);
     expect(before).toEqual([
       { day: 58, category: 'poleRent', amount: -2 * POLE_RENT_PER_POLE_PER_MONTH, memo: `Pole rent for Feb 2027: 2 poles x ${formatMoney(POLE_RENT_PER_POLE_PER_MONTH)}` },
-      { day: 58, category: 'overhead', amount: -OVERHEAD_PER_MONTH, memo: 'Overhead for Feb 2027' },
+      ...overhead,
     ]);
     expect(state.finance.reports[0]).toMatchObject({ year: 2027, month: 2 });
   });
@@ -238,17 +263,19 @@ describe('closeMonth', () => {
     const state = makeState();
     addSpan(state, 0, 'underground');
     state.day = 365; // Jan 1 2028
+    const overhead = fixedOverhead(state);
     const report = close(state);
     expect(report).toEqual({
       year: 2027,
       month: 12,
-      totals: { overhead: -OVERHEAD_PER_MONTH },
-      net: -OVERHEAD_PER_MONTH,
-      cashEnd: START_CASH - OVERHEAD_PER_MONTH,
+      totals: { overhead: -overhead },
+      net: -overhead,
+      cashEnd: START_CASH - overhead,
       passings: 0,
       stats: ZERO_STATS,
       debt: noDebtStats(state),
       ops: quietOpsStats(state),
+      customers: quietCustomerStats(state),
     });
   });
 
@@ -280,25 +307,29 @@ describe('closeMonth', () => {
     ];
     state.sales.connectsTotal = 5;
     state.sales.fullCabinets = [cabinet];
-    state.sales.month = { revenueDollarDays: 31 * 125, marketingDollarDays: 31 * 1_000, subscriberUnitDays: 31 * 2, grossAdds: 5, lostService: 3 };
+    state.sales.month = { revenueDollarDays: 31 * 125, marketingDollarDays: 31 * 1_000, subscriberUnitDays: 31 * 2, grossAdds: 5, lostService: 3, outageCreditDollarDays: 0 };
     state.finance.capex = { osp: 1_000, connect: 4_250, co: 18_000 };
     state.day = 31;
     const before = state.finance.monthToDate;
+    const fixed = fixedOverheadLines(state);
+    const plant = livePlant(state);
     const report = close(state, 8);
 
     expect(before.map((e) => [e.day, e.category, e.memo])).toEqual([
       [30, 'poleRent', `Pole rent for Jan 2027: 2 poles x ${formatMoney(POLE_RENT_PER_POLE_PER_MONTH)}`],
-      [30, 'overhead', 'Overhead for Jan 2027'],
+      [30, 'overhead', 'Overhead for Jan 2027: office and systems'],
+      [30, 'overhead', `Plant upkeep for Jan 2027: ${plant.cabinets} cabinets, ${(Math.round(plant.miles * 10) / 10).toFixed(1)} miles of cable`],
       [30, 'revenue', 'Subscriber billing for Jan 2027: 2 subscribers'],
       [30, 'marketing', 'Marketing for Jan 2027'],
-      [30, 'overhead', 'Customer support'],
+      [30, 'overhead', 'Customer costs for Jan 2027: 2 customers on Good support'],
     ]);
     expect(report.totals).toEqual({
       revenue: 125,
       poleRent: -2 * POLE_RENT_PER_POLE_PER_MONTH,
-      overhead: -OVERHEAD_PER_MONTH - 2 * SUPPORT_COST_PER_SUB_PER_MONTH,
+      overhead: -(fixed.base + fixed.perPlant + 2 * perCustomerCost(state)),
       marketing: -1_000,
     });
+    expect(report.ops!.overhead).toEqual({ ...fixed, perCustomer: 2 * perCustomerCost(state), support: 2 * SUPPORT_LEVELS[DEFAULT_SUPPORT_LEVEL].costPerSub });
     const subscribers = subscriberUnits(state);
     expect(report.stats).toEqual({
       subscribers,
@@ -316,18 +347,89 @@ describe('closeMonth', () => {
       ponPorts: OLT_START_PON_PORTS,
       fullCabinets: 1,
     });
-    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0 });
+    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0, outageCreditDollarDays: 0 });
   });
 
   it('checks milestones and insolvency after the report is filed', () => {
     const state = makeState();
-    state.finance.cash = OVERHEAD_PER_MONTH - 1;
+    state.finance.cash = fixedOverhead(state) - 1;
     state.day = 31;
     const report = close(state, 3);
     expect(state.milestones).toEqual([{ id: 'firstLight', day: 31 }]);
     expect(report.cashEnd).toBe(-1);
     expect(state.finance.negativeMonths).toBe(1);
     expect(state.notices.map((n) => n.kind)).toEqual(['milestone', 'insolvencyWarning']);
+  });
+});
+
+describe('outage credits (round 4b)', () => {
+  /** Two homes subscribed on 1 Gig at the grid's cabinet, no marketing. */
+  function trading(): GameState {
+    const state = makeState();
+    const cabinet = addLivePlant(state)!;
+    state.sales.marketingPerMonth = 0;
+    state.sales.accounts = [
+      { parcel: 0, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] },
+      { parcel: 2, cabinet, tierUnits: { fiber500: 0, fiber1g: 1, fiber2g: 0 }, since: 0, locks: [] },
+    ];
+    return state;
+  }
+
+  it('reports the month\'s outage credits in ops, with revenue already net of them', () => {
+    const state = trading();
+    const rate = monthlyRecurringRevenue(state) / 2;
+    // January: parcel 0 cut off for 10 days.
+    for (let d = 0; d < 31; d++) accrueDay(state, d < 10 ? { cutOff: new Set([0]), lent: new Map() } : null);
+    state.day = 31;
+    const report = close(state, 8);
+    expect(report.ops!.outageCredits).toBe(Math.round((rate * 10) / 31));
+    expect(report.totals.revenue).toBe(Math.round((rate * (31 + 21)) / 31));
+    expect(report.totals.revenue! + report.ops!.outageCredits).toBeCloseTo(2 * rate, -0.5);
+    // The cut-off home's 10 days are not charged per customer either.
+    expect(report.totals.overhead).toBe(-fixedOverhead(state) - Math.round((perCustomerCost(state) * (31 + 21)) / 31));
+    expect(report.ops!.overhead!.perCustomer).toBe(Math.round((perCustomerCost(state) * (31 + 21)) / 31));
+  });
+
+  it('projects the close\'s cash from billing net of credits: exact on the month\'s last day', () => {
+    const state = trading();
+    for (let d = 0; d < 31; d++) {
+      state.day = d;
+      accrueDay(state, d < 10 ? { cutOff: new Set([0]), lent: new Map() } : null);
+    }
+    state.day = 30;
+    const projected = estimateCashAtClose(state);
+    state.day = 31;
+    const report = close(state, 8);
+    expect(report.cashEnd).toBe(projected);
+    // Round 4c/4d: the referral credits the close posts as 'marketing' are in the projection too.
+    const referred = trading();
+    referred.customers.referrals = true;
+    for (let d = 0; d < 31; d++) {
+      referred.day = d;
+      accrueDay(referred);
+    }
+    referred.customers.month.referralMilli = 3_400;
+    referred.day = 30;
+    const withCredits = estimateCashAtClose(referred);
+    referred.day = 31;
+    const referredReport = close(referred, 8);
+    expect(referredReport.customers?.referralCredits).toBe(3 * 2 * REFERRAL_CREDIT);
+    expect(referredReport.cashEnd).toBe(withCredits);
+    // Mid-month it bills today's subscribers for the days left (an outage under way is assumed repaired).
+    const mid = trading();
+    for (let d = 0; d <= 14; d++) {
+      mid.day = d;
+      accrueDay(mid, { cutOff: new Set([0]), lent: new Map() });
+    }
+    const plain = trading();
+    for (let d = 0; d <= 14; d++) {
+      plain.day = d;
+      accrueDay(plain);
+    }
+    // The cut-off home's 15 days: billing not charged, and no per-customer overhead charged for them either.
+    const credit = (15 * monthlyRecurringRevenue(mid)) / 2 / 31;
+    const perCustomer = (15 * perCustomerCost(mid)) / 31;
+    expect(Math.abs(estimateCashAtClose(plain) - estimateCashAtClose(mid) - (credit - perCustomer))).toBeLessThanOrEqual(1.5);
   });
 });
 
@@ -376,7 +478,7 @@ describe('checkInsolvency', () => {
     negativeClose(state, 31);
     expect(state.finance.negativeMonths).toBe(1);
     const notices = state.notices.length;
-    state.finance.cash = OVERHEAD_PER_MONTH; // ends the close at exactly 0
+    state.finance.cash = fixedOverhead(state); // ends the close at exactly 0
     state.day = 59;
     close(state);
     expect(state.finance.cash).toBe(0);
@@ -654,7 +756,8 @@ describe('closeMonth: missed payments and default', () => {
     state.debt.loans = [makeLoan({ id: 1 }), makeLoan({ id: 2, originatedDay: 0, balance: TERM_LOAN_MIN, principal: TERM_LOAN_MIN })];
     state.debt.loans[1]!.originatedDay = monthStartOf(state) + 2;
     state.debt.nextLoanId = 3;
-    state.finance.cash = OVERHEAD_PER_MONTH;
+    // Exactly the close's running costs (no plant, no customers: the base), so nothing is left for the payment.
+    state.finance.cash = fixedOverhead(state);
     return state;
   }
 

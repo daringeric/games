@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { Container } from 'pixi.js';
 import type { Application } from 'pixi.js';
 import { applyCommand, newGame, runDays } from '../sim/game';
+import { getService } from '../sim/network';
 import { Rng } from '../sim/rng';
 import { shortestPath } from '../sim/streets';
 import type { Command, CommandResult, GameState } from '../sim/types';
@@ -38,7 +39,12 @@ function midGame(): GameState {
   const far = (k: number) => city.nodes.reduce((best, n) => (Math.abs(n.x - city.nodes[co]!.x) + Math.abs(n.y - city.nodes[co]!.y) === k ? n.id : best), co);
   applyCommand(state, { type: 'placeCabinet', node: co });
   applyCommand(state, { type: 'layCable', segments: shortestPath(city, co, far(10)) ?? [], method: 'underground' });
-  runDays(state, 120);
+  // Round 4c/4d: a lit street switches over years (customers.ts); a campaign
+  // the day the first streets light signs the first subscribers in time.
+  let day = 0;
+  for (; day < 120 && getService(state).passings === 0; day++) runDays(state, 1);
+  applyCommand(state, { type: 'runCampaign', cabinet: state.network.cabinets[0]!.id });
+  runDays(state, 120 - day);
   applyCommand(state, { type: 'addSplitter', cabinet: state.network.cabinets[0]!.id });
   applyCommand(state, { type: 'placeCabinet', node: far(10) });
   applyCommand(state, { type: 'addOltCard' });

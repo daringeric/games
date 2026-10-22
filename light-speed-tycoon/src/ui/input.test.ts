@@ -62,6 +62,7 @@ function rig(tool: ToolId, drawFromCorner = true): Rig {
     dragEnd: vi.fn(),
     dragCancel: vi.fn(),
     toggleOverlay: vi.fn(),
+    toggleExposureOverlay: vi.fn(),
   };
   new Input(canvas as unknown as HTMLCanvasElement, camera as unknown as Camera, 1, handlers as unknown as InputHandlers);
   const event = (e: Record<string, unknown>) => ({ pointerType: 'mouse', pointerId: 1, button: 0, buttons: 0, preventDefault: () => {}, ...e });
@@ -147,6 +148,28 @@ describe('Input', () => {
     r.key('keydown', ' ');
     r.key('keyup', ' ');
     expect(r.handlers.togglePause).toHaveBeenCalledTimes(1);
+  });
+
+  it('toggles the cost overlay on O and the storm-exposure overlay on E (either case), and nothing else', () => {
+    const r = rig('inspect');
+    r.key('keydown', 'e');
+    expect(r.handlers.toggleExposureOverlay).toHaveBeenCalledTimes(1);
+    expect(r.handlers.toggleOverlay).not.toHaveBeenCalled();
+    r.key('keydown', 'E');
+    expect(r.handlers.toggleExposureOverlay).toHaveBeenCalledTimes(2);
+    r.key('keydown', 'o');
+    expect(r.handlers.toggleOverlay).toHaveBeenCalledTimes(1);
+    expect(r.handlers.toggleExposureOverlay).toHaveBeenCalledTimes(2);
+    expect(r.handlers.pickTool).not.toHaveBeenCalled();
+    expect(r.handlers.setSpeed).not.toHaveBeenCalled();
+  });
+
+  it('leaves E to a text field being typed in (the start screen\'s company name)', () => {
+    const r = rig('inspect');
+    for (const fn of windowListeners.get('keydown') ?? []) {
+      fn({ key: 'e', repeat: false, ctrlKey: false, metaKey: false, altKey: false, target: { tagName: 'INPUT' }, preventDefault: () => {} } as never);
+    }
+    expect(r.handlers.toggleExposureOverlay).not.toHaveBeenCalled();
   });
 
   it('clicks on a press that does not move, and cancels on a right click', () => {

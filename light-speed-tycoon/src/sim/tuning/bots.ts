@@ -41,6 +41,24 @@
 //     contested passings (opts.promoMarketingPerPassing);
 //   - it never ignores a frozen line: past a warning it takes debt.cureOptions'
 //     first repayment, else deleverages, and builds nothing until compliant.
+//   Round 4b:
+//   - it answers each incumbent promo with what incumbent.bestIncumbentAnswer
+//     chooses when it starts (opts.incumbentAnswer 'best': the retention
+//     offer, an intro promo while it runs, or nothing);
+//   - its lifetime method choice weighs a street's expected outage cost
+//     twice (opts.stormWeight: a storm year costs cash and covenant headroom
+//     at once) over a 13-year horizon, so it buries the storm-exposed streets
+//     and strings the sheltered ones;
+//   - below the Seed round's purse (Bootstrapped, Shoestring) it plays lean
+//     (LEAN_OPTIONS): cheap aerial plant, densest streets first, a short
+//     runway, the intro promo while it pays, and a bridge loan when cash runs
+//     under its floor with the line used up.
+// - TWO_GIG_ONLY / NO_CHEAP_TIER (round 4b): SMART offering only 2 Gig, or 1 Gig
+//   and 2 Gig, at their default prices from day 0 (lineupBot).
+// - AGGRESSIVE (round 4b): SMART with every price x0.8 from day 0.
+// - SMART-lite (round 4b): SMART without loans, rebuilds or promo answers.
+// - ADVISOR_FOLLOWER (round 4b): sends the top suggestion's commands
+//   (advisor.advicePlans) every look, nothing else.
 // - LEVERED: borrows to the limit (every term loan termCapacity allows plus the
 //   whole credit line, ignoring covenants and the quote's warning), overbuilds
 //   (SMART's project picker, amber and red allowed, heavy marketing) and keeps
@@ -69,14 +87,21 @@
 // - MIXED: SMART plus random removals, price changes (grandfathered or not,
 //   tiers retired and re-offered), intro promos, underground rebuilds, budget
 //   changes, extra splitters and OLT cards, credit-line draws and repayments,
-//   term loans and prepayments (and junk of each): every command type, for
-//   the invariant sessions.
+//   term loans and prepayments, round 4b's retention offers, snoozes and
+//   briefing notes (and junk of each): every command type, for the
+//   invariant sessions.
 //
 // Bots read the game only through public sim functions and change it only
 // through `send` (applyCommand). Their randomness comes from their own Rng.
+// The round-4b experiments at the end of this file (incumbent promo answers,
+// the intro promo in a fresh area and in a mature town) start from a copy of
+// a bot's game, with an incumbent promo injected when none runs (a test-only
+// state edit, ensureIncumbentPromo).
 
 import {
   AERIAL_FT_PER_DAY,
+  AWARENESS_ON_LIT,
+  BUILD_METHOD_HORIZON_YEARS,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
   CABINET_REACH_FT,
@@ -84,9 +109,14 @@ import {
   COVENANT_MAX_LEVERAGE,
   COVENANT_MIN_COVERAGE,
   CPP_TARGET,
+  CUSTOMER_QUOTE_MONTHS,
   GRANDFATHER_MONTHS_MAX,
-  INSTALL_COST_HOME,
+  INCUMBENT_PRICE,
+  INCUMBENT_PROMO_MIN_PASSINGS,
+  INCUMBENT_PROMO_MONTHS,
+  INCUMBENT_PROMO_QUIET_MONTHS,
   LOAN_ROUNDING,
+  LOST_CUSTOMER_MONTHS,
   MAKE_READY_DAYS_MAX,
   MAKE_READY_DAYS_MIN,
   MAKE_READY_LONG_CHANCE,
@@ -95,17 +125,17 @@ import {
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
   MDU_ROUTER_COST,
+  METHOD_UPFRONT_WEIGHT,
   OLT_CARD_COST,
   OLT_MAX_CARDS,
-  OVERHEAD_PER_MONTH,
   PERMIT_DAYS_MAX,
   PERMIT_DAYS_MIN,
   POLE_RENT_PER_POLE_PER_MONTH,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
-  SIGNUP_RAMP_PER_DAY,
+  SMB_MULTIPLIER_DEFAULT,
   SPLITTER_COST,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
+  START_CASH,
   TERM_LOAN_MIN,
   TERM_LOAN_YEARS,
   TIER_DEFAULTS,
@@ -126,8 +156,25 @@ import {
   termCapacity,
   totalDebt,
 } from '../debt';
-import { activePromos } from '../incumbent';
-import { cppBand } from '../metrics';
+import { advicePlans, advise, buildTrough } from '../advisor';
+import {
+  awarenessGainPerDay,
+  customerAreas,
+  dealFactor,
+  happinessReport,
+  marketingAwarenessPerDay,
+  quoteCampaign,
+  quoteMarketing,
+  quoteReferrals,
+  quoteSupport,
+  SUPPORT_LEVEL_IDS,
+  switchRate,
+  womSwitchFactor,
+} from '../customers';
+import { estimateMonthlyOverhead, fixedCostsPerMonth, overheadTotal, perCustomerCost } from '../overhead';
+import { difficultyLevel } from '../company';
+import { activePromos, areaTakeRates, bestIncumbentAnswer, incumbentPromoPrice } from '../incumbent';
+import { cppBand, reportKpis } from '../metrics';
 import {
   cableRoute,
   getService,
@@ -144,11 +191,12 @@ import { deriveSeed, Rng } from '../rng';
 import {
   accountUnits,
   cabinetPortCapacity,
+  closeDayAfter,
   cabinetPortsUsed,
   installCost,
   installsPaused,
-  marketingBoost,
   monthlyRecurringRevenue,
+  quotePromo,
   subscriberUnits,
   targetTakeRate,
   tierMix,
@@ -160,19 +208,28 @@ import type {
   Command,
   CovenantMetrics,
   GameState,
+  IncumbentAnswer,
+  IncumbentPromo,
   IntroPromo,
   NodeId,
   ParcelId,
   ParcelKind,
+  PromoQuote,
+  CampaignQuote,
+  ReferralQuote,
+  SupportQuote,
   SegmentId,
   SpanId,
   StormRisk,
   StreetSegment,
+  SupportLevel,
   TermYears,
+  TierId,
 } from '../types';
-import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
-import { cheapestMethod, streetTree, treePath } from './harness';
-import type { BotFactory, Send } from './harness';
+import { DAYS_PER_BILL, outageChurnProbability, stormRisk } from '../weather';
+import { areaCurves, averageArpu, cheapestMethod, constantPriceBot, cumulativeOperatingCashFlow, runBot, runValue, streetTree, treePath } from './harness';
+import type { BotFactory, RunResult, Send } from './harness';
+import { newGame } from '../game';
 
 // ---------------------------------------------------------------------------
 // SMART
@@ -182,10 +239,13 @@ import type { BotFactory, Send } from './harness';
 export const SMART_MARKETING_PER_PASSING = 2;
 
 /**
- * SMART's answer to an incumbent promo: while the cable company runs one in
- * any of its areas, new signups get this intro offer (a modest match of the
- * cable company's discount for a few months). Extra marketing on the
- * contested passings (promoMarketingPerPassing) did no better over 20 seeds.
+ * SMART's intro offer (a modest match of the cable company's discount for a
+ * few months; the same as sales.SUGGESTED_PROMO): round 4's answer to an
+ * incumbent promo (incumbentAnswer 'introPromo': new signups get it while
+ * the cable company runs one in any of its areas), the lean operator's offer
+ * while it pays, and the one the round-4b intro-promo experiments set. Extra
+ * marketing on the contested passings (promoMarketingPerPassing) did no
+ * better over 20 seeds.
  */
 export const SMART_INTRO_PROMO: IntroPromo = { percentOff: 20, months: 3 };
 
@@ -197,6 +257,9 @@ export const SMART_INTRO_PROMO: IntroPromo = { percentOff: 20, months: 3 };
  */
 export type MethodPolicy = 'lifetime' | 'aerial' | 'underground';
 
+/** How a bot answers the incumbent's promos (SmartOptions.incumbentAnswer). */
+export type IncumbentAnswerPolicy = 'introPromo' | 'best' | 'retention' | 'none';
+
 export interface SmartOptions {
   /** Marketing dollars per passing per month. */
   marketingPerPassing: number;
@@ -206,7 +269,7 @@ export interface SmartOptions {
   reserveMonths: number;
   /**
    * Extra reserve months of the part of fixed costs that revenue does not
-   * cover yet (overhead + marketing - (MRR - support)): the runway through the
+   * cover yet (running costs + marketing - MRR): the runway through the
    * ramp before the first homes pay for the office.
    */
   burnMonths: number;
@@ -256,6 +319,12 @@ export interface SmartOptions {
   borrowWhenShort: boolean;
   /** Smallest term loan it takes (it borrows in chunks); at least TERM_LOAN_MIN. */
   minLoan: number;
+  /**
+   * Round 4b: with cash under its floor and the line used up, take a term
+   * loan (within the loan buffers) that restores the floor plus this many
+   * months of the last close's operating deficit (0: never; bridge).
+   */
+  bridgeMonths: number;
   /** Loan amounts are rounded up to a multiple of this. */
   loanStep: number;
   /** Cash floor below which it draws on the line: months of fixed costs (overhead + marketing) ... */
@@ -276,8 +345,28 @@ export interface SmartOptions {
   methods: MethodPolicy;
   /** Years of running costs (pole rent, repairs, outage churn) the lifetime method choice weighs against the up-front difference. */
   horizonYears: number;
+  /**
+   * Round 4c/4d: what a dollar spent up front counts for in the lifetime
+   * method choice against a dollar of running costs (the advisor's
+   * METHOD_UPFRONT_WEIGHT: growth is bound by capital).
+   */
+  upfrontWeight: number;
   /** Weight of the make-ready wait in the lifetime method choice (1: the margin lost while waiting, in full). */
   waitWeight: number;
+  /**
+   * Round 4b: the lifetime method choice buries a street only when what it
+   * saves over the horizon is at least this multiple of what burying costs
+   * more up front (0: whenever it is cheaper over the horizon). Money is what
+   * the careful operator is short of: a dollar not spent on a bore passes
+   * more homes, which the bank lends against.
+   */
+  buryGain: number;
+  /**
+   * Round 4b: weight of a street's expected outage cost (storm repairs and
+   * the outage churn of its subscribers) in the lifetime method choice (1:
+   * as expected).
+   */
+  stormWeight: number;
   /** Years of expected repairs on its plant (expectedRepairsPerYear) kept in the reserve: a bad storm is not a missed payment. */
   stormReserveYears: number;
   /** Rebuild storm-hit aerial spans underground when it pays back (round 4). */
@@ -288,10 +377,55 @@ export interface SmartOptions {
   convertPaybackYears: number;
   /** Extra marketing dollars a month per passing where the incumbent runs a promo (0: no answer by marketing). */
   promoMarketingPerPassing: number;
-  /** The intro promo it runs while any incumbent promo runs in its areas (null: none). */
+  /** The intro promo it runs while any incumbent promo runs in its areas (null: none), when incumbentAnswer is 'introPromo'. */
   introPromo: IntroPromo | null;
+  /**
+   * Round 4b: how it answers an incumbent promo in one of its areas:
+   *   introPromo - opts.introPromo for new signups while any incumbent promo runs (round 4);
+   *   best       - what incumbent.bestIncumbentAnswer chooses when the promo starts
+   *                (the retention offer, an intro promo while it runs, or nothing);
+   *   retention  - always the retention offer (answerIncumbent);
+   *   none       - ignore it.
+   */
+  incumbentAnswer: IncumbentAnswerPolicy;
+  /** Round 4b: run this intro promo whenever sales.quotePromo says it pays (checked every 4 weeks; null: never). */
+  promoWhenPays: IntroPromo | null;
+  /** Round 4b: an intro promo it keeps set whenever no answer to the incumbent wants another (the intro-promo experiments; null: none). */
+  standingPromo: IntroPromo | null;
+  /** Round 4b: false leaves the intro promo and the incumbent's promos to someone else (a wrapper bot in an experiment). */
+  managePromo: boolean;
+  /** Round 4b: within a cabinet area, which streets a budget-limited project takes first: the nearest, or the most units per dollar. */
+  streetOrder: 'distance' | 'density';
   /** Past a covenant warning, cure (debt.cureOptions) or deleverage, and build nothing until compliant. */
   cure: boolean;
+  /**
+   * Round 4c/4d: a project it pays for with its own cash must leave the cash
+   * the advisor's runway arithmetic says its ramp needs (advisor.buildTrough:
+   * the deepest the cash falls over the months after the build, the new
+   * area's installs and running costs against its signups) above the cash
+   * floor; a smaller project is tried when the first does not fit
+   * (TROUGH_BUDGET_SHARES). The lean operator's rule: with a small purse the
+   * months before the first homes pay are what ends a company.
+   */
+  troughCheck: boolean;
+  /**
+   * Round 4c/4d: when no lifetime plan of an area passes its cost-per-passing
+   * test even keeping only the best burials (LIFETIME_FALLBACK_GAINS), string
+   * it aerial wherever it can (true, round 4's rule) or leave the area for
+   * later (false: an exposed street strung aerial costs more in repairs than
+   * the area brings).
+   */
+  aerialFallback: boolean;
+  /** Add splitters (and OLT cards) as ports fill (false: the plant's ports stay as they are, as the customers forecast assumes). */
+  capacity: boolean;
+
+  // Round 4c/4d: the growth levers (judged every LEVER_JUDGE_DAYS)
+  /** Buy a neighborhood campaign in an area whenever customers.quoteCampaign says it pays there and its cost is spare cash. */
+  campaigns: boolean;
+  /** The support level it keeps, 'quote': the level customers.quoteSupport says is worth the most when it pays, or 'keep': whatever is set. */
+  support: SupportLevel | 'quote' | 'keep';
+  /** Referral credits on or off, 'quote': switched when customers.quoteReferrals says the switch pays, or 'keep': whatever is set. */
+  referrals: boolean | 'quote' | 'keep';
   /** RunResult.bot. */
   name: string;
 }
@@ -325,6 +459,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   ownLifetimeCpp: 0.98 * CPP_TARGET,
   borrowWhenShort: false,
   minLoan: 25_000,
+  bridgeMonths: 0,
   loanStep: 5_000,
   floorMonths: 1,
   floorInstallDays: 60,
@@ -333,15 +468,29 @@ export const SMART_DEFAULTS: SmartOptions = {
   allowRed: false,
   redOnly: false,
   methods: 'lifetime',
-  horizonYears: 12,
+  horizonYears: BUILD_METHOD_HORIZON_YEARS,
+  upfrontWeight: METHOD_UPFRONT_WEIGHT,
   waitWeight: 1,
+  buryGain: 0,
+  stormWeight: 1,
   stormReserveYears: 2,
   convert: true,
   convertHits: 2,
   convertPaybackYears: 10,
   promoMarketingPerPassing: 0,
   introPromo: SMART_INTRO_PROMO,
+  incumbentAnswer: 'best',
+  promoWhenPays: null,
+  standingPromo: null,
+  managePromo: true,
+  streetOrder: 'distance',
   cure: true,
+  troughCheck: false,
+  aerialFallback: false,
+  capacity: true,
+  campaigns: false,
+  support: 'keep',
+  referrals: 'keep',
   name: 'smart',
 };
 
@@ -360,6 +509,8 @@ interface Project {
   /** Install spend its expected signups will take over the reserve's horizon (part of its budget). */
   connect: number;
   newUnits: number;
+  /** The streets with homes it lights (its targets, not the feeder or paths between them). */
+  lit: SegmentId[];
 }
 
 // ---------------------------------------------------------------------------
@@ -368,22 +519,21 @@ interface Project {
 
 /** What one subscriber is worth to the method choice and the rebuild test, at today's prices. */
 export interface SubscriberEconomics {
-  /** Monthly margin of one household subscriber: the signup tier mix's price less support. */
+  /** What one household subscriber pays a month: the signup tier mix's price. */
+  price: number;
+  /** Its monthly margin: price less the running cost per customer (overhead.perCustomerCost, the support level's cost included). */
   margin: number;
-  /** What losing one costs: a new install plus the margin lost while the signup ramp refills its place (capped at the horizon). */
+  /** What losing one costs: LOST_CUSTOMER_MONTHS of its margin (weather.methodYearlyCost's rule, the advisor's per-street method choice). */
   lostValue: number;
 }
 
-export function subscriberEconomics(state: GameState, opts: SmartOptions = SMART_DEFAULTS): SubscriberEconomics {
+export function subscriberEconomics(state: GameState): SubscriberEconomics {
   const { pricing } = state.sales;
   const mix = tierMix(pricing, 'home');
   let price = 0;
   for (const tier of pricing.tiers) price += mix[tier.id] * tier.price;
-  const margin = Math.max(0, price - SUPPORT_COST_PER_SUB_PER_MONTH);
-  const boost = marketingBoost(opts.marketingPerPassing * 1_000, 1_000);
-  const monthlyRamp = SIGNUP_RAMP_PER_DAY * (1 + boost) * 30;
-  const refillMonths = Math.min(12 * opts.horizonYears, monthlyRamp > 0 ? 1 / monthlyRamp : Infinity);
-  return { margin, lostValue: INSTALL_COST_HOME + margin * refillMonths };
+  const margin = Math.max(0, price - perCustomerCost(state));
+  return { price, margin, lostValue: LOST_CUSTOMER_MONTHS * margin };
 }
 
 /** Expected days from order to light for a span of `method` on `segment`: permitting (make-ready's long tail included) plus construction. */
@@ -414,21 +564,31 @@ function riskOf(state: GameState, segment: StreetSegment, method: CableMethod): 
   return risk;
 }
 
-/** Expected yearly cost of the outages on a span of `method` carrying `subscribers`: repairs plus the subscribers they cost. */
+/**
+ * Expected yearly cost of the outages on a span of `method` carrying
+ * `subscribers` (weather.methodYearlyCost's rule, with the bot's own
+ * estimate of the street's subscribers): the expected storm and dig-in
+ * repairs, and per outage (its mean days out, the canopy counted) the
+ * cancellations it causes at SubscriberEconomics.lostValue each and the
+ * days of service not billed.
+ */
 function outageCostPerYear(state: GameState, segment: StreetSegment, method: CableMethod, subscribers: number, econ: SubscriberEconomics): number {
   const risk = riskOf(state, segment, method);
-  const churn = risk.outagesPerYear * subscribers * outageChurnProbability(meanOutageDays(method)) * econ.lostValue;
-  return risk.repairCostPerYear + churn;
+  if (!(risk.outagesPerYear > 0) || !(subscribers > 0)) return risk.repairCostPerYear;
+  const days = risk.outageDaysPerYear / risk.outagesPerYear;
+  const perOutage = outageChurnProbability(days) * econ.lostValue + (days / DAYS_PER_BILL) * econ.price;
+  return risk.repairCostPerYear + risk.outagesPerYear * subscribers * perOutage;
 }
 
 /**
- * What cabling `segment` with `method` costs over opts.horizonYears: its
- * charges (construction, rock, make-ready) and its share of an order's fees,
- * plus the horizon's pole rent and expected outage cost (weather.stormRisk
- * repairs, and the outage churn of its own street's `own` subscribers: the
- * street grid gives the rest of the plant a second path, so an outage cuts
- * off little more than the street itself), plus opts.waitWeight x the margin
- * `waiting` subscribers lose while it waits for permits and make-ready
+ * What cabling `segment` with `method` costs over opts.horizonYears, the
+ * advisor's per-street rule (weather.lifetimeMethodCost) with the bot's
+ * settings: opts.upfrontWeight x its charges (construction, rock,
+ * make-ready) and its share of an order's fees, plus opts.horizonYears x
+ * its running costs (pole rent, and opts.stormWeight x the expected outage
+ * cost: repairs, and the outage churn and unbilled days of its own street's
+ * `own` subscribers), plus opts.waitWeight x the margin `waiting`
+ * subscribers lose while it waits for permits and make-ready
  * (expectedLeadDays: the street lights that much later).
  */
 export function lifetimeCost(
@@ -442,9 +602,9 @@ export function lifetimeCost(
 ): number {
   const upfront = spanCharges(segment, method).total + orderFees(method) * Math.min(1, segment.lengthFt / opts.orderMaxFt);
   const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 : 0;
-  const yearly = rent + outageCostPerYear(state, segment, method, own, econ);
+  const yearly = rent + opts.stormWeight * outageCostPerYear(state, segment, method, own, econ);
   const wait = waiting > 0 ? opts.waitWeight * (expectedLeadDays(segment, method) / 30) * waiting * econ.margin : 0;
-  return upfront + opts.horizonYears * yearly + wait;
+  return opts.upfrontWeight * upfront + opts.horizonYears * yearly + wait;
 }
 
 /**
@@ -465,8 +625,9 @@ export function chooseMethod(
   if (opts.methods === 'aerial') return 'aerial';
   const aerial = lifetimeCost(state, segment, 'aerial', own, waiting, opts, econ);
   const underground = lifetimeCost(state, segment, 'underground', own, waiting, opts, econ);
+  minGain = Math.max(minGain, opts.buryGain);
   if (minGain <= 0) return underground < aerial ? 'underground' : 'aerial';
-  // Only when what it saves over the horizon is at least minGain x what it costs more up front.
+  // Only when what it saves over the horizon is at least minGain x what it costs more up front (beyond its weight).
   const extra = spanCharges(segment, 'underground').total - spanCharges(segment, 'aerial').total;
   return aerial - underground >= minGain * Math.max(1, extra) ? 'underground' : 'aerial';
 }
@@ -527,17 +688,37 @@ function streetSubscribers(state: GameState, segment: SegmentId, rates: Readonly
 }
 
 /**
- * Share of a take-rate gap the signup ramp closes within `days` at a marketing
- * budget of `perPassing` dollars per passing per month (the boost does not
- * depend on the town's size at a fixed spend per passing), at most 1.
+ * Share of a freshly lit street's take-rate gap that switches within `days`
+ * at a marketing budget of `perPassing` dollars per passing per month (the
+ * marketing gain does not depend on the town's size at a fixed spend per
+ * passing), at most 1: the customers model day by day (awareness from
+ * AWARENESS_ON_LIT growing by time, marketing and word of mouth,
+ * customers.awarenessGainPerDay; switching at customers.switchRate at the
+ * deal factor `deal` and word of mouth from `happyShare` of its customers
+ * happy), without campaigns or the intro promo.
  */
-export function installShare(days: number, perPassing: number): number {
-  const boost = marketingBoost(perPassing * 1_000, 1_000);
-  // 1 - (1 - r)^days, by repeated multiplication (no Math.pow in the sim).
-  const r = SIGNUP_RAMP_PER_DAY * (1 + boost);
+export function installShare(days: number, perPassing: number, deal = 1, happyShare = 0): number {
+  const gain = awarenessGainPerDay(marketingAwarenessPerDay(perPassing * 1_000, 1_000), 0, happyShare, false);
+  const wom = womSwitchFactor(happyShare, false);
+  let awareness = AWARENESS_ON_LIT;
   let left = 1;
-  for (let d = 0; d < days; d++) left *= 1 - r;
+  for (let d = 0; d < days; d++) {
+    left *= 1 - switchRate(awareness, deal, wom, 1, 1);
+    awareness += (1 - awareness) * Math.min(1, gain);
+  }
   return Math.min(1, 1 - left);
+}
+
+/**
+ * installShare at the game's deal (customers.dealFactor of its prices for
+ * households) with word of mouth from its customers' happy share today
+ * (none before the first customer), for a marketing budget of `perPassing`.
+ */
+export function stateInstallShare(state: GameState, days: number, perPassing: number): number {
+  const deal = dealFactor(state.sales.pricing, 'home', INCUMBENT_PRICE, state.sales.promo);
+  const units = subscriberUnits(state);
+  const happy = units > 0 ? happinessReport(state).happy / units : 0;
+  return installShare(days, perPassing, deal, happy);
 }
 
 /**
@@ -567,8 +748,8 @@ export function daysUntilPlannedLive(state: GameState): number {
  * (expectedInstalls over opts.installDays).
  */
 export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAULTS, debtService = 0): number {
-  const fixed = OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
-  const earning = monthlyRecurringRevenue(state) - SUPPORT_COST_PER_SUB_PER_MONTH * subscriberUnits(state);
+  const fixed = fixedCosts(state);
+  const earning = monthlyRecurringRevenue(state);
   const uncovered = Math.max(0, fixed + debtService - earning);
   const burnMonths = opts.burnMonths + daysUntilPlannedLive(state) / 30;
   return (
@@ -621,7 +802,7 @@ export function expectedInstalls(state: GameState, days: number, marketingPerPas
   const subscribed = new Map<ParcelId, number>();
   for (const account of sales.accounts) subscribed.set(account.parcel, accountUnits(account));
   const routers = new Set(sales.routerParcels);
-  const share = installShare(days, marketingPerPassing);
+  const share = stateInstallShare(state, days, marketingPerPassing);
   const rates = takeRates(state);
   let cost = 0;
   for (const segment of planned.servingCabinet.keys()) cost += streetConnectCost(state, segment, subscribed, routers, share, rates);
@@ -819,6 +1000,16 @@ function planProject(
       }
       return { segment: entry.segment, path, subs: streetSubscribers(state, entry.segment, ctx.rates) };
     });
+  if (opts.streetOrder === 'density') {
+    // Most units per dollar of the street and its path first (a small budget takes the best streets).
+    const density = (t: { segment: SegmentId; path: SegmentId[] }) => {
+      let cost = 0;
+      for (const id of t.path) cost += cheapestMethod(city.segments[id] as StreetSegment).cost;
+      return (ctx.units[t.segment] as number) / Math.max(1, cost);
+    };
+    const score = new Map(targets.map((t) => [t.segment, density(t)]));
+    targets.sort((x, y) => (score.get(y.segment) as number) - (score.get(x.segment) as number) || x.segment - y.segment);
+  }
 
   // Method per new segment, for the whole area, on running costs first (each
   // street's own subscribers). Then make-ready timing: a street whose way to
@@ -847,7 +1038,7 @@ function planProject(
   };
   const build = new Set<SegmentId>(feeder);
   let estimate = fixed + costOf(feeder);
-  const accepted: Array<{ segments: SegmentId[]; units: number; connect: number }> = [];
+  const accepted: Array<{ segment: SegmentId; segments: SegmentId[]; units: number; connect: number }> = [];
   let newUnits = 0;
   let connect = 0;
   for (const target of targets) {
@@ -862,7 +1053,7 @@ function planProject(
     estimate += addCost;
     newUnits += units;
     connect += addConnect;
-    accepted.push({ segments: adds, units, connect: addConnect });
+    accepted.push({ segment: target.segment, segments: adds, units, connect: addConnect });
   }
 
   // Exact cost from quotes; drop the farthest streets until it fits.
@@ -876,7 +1067,7 @@ function planProject(
     ];
     let cost = fixed;
     for (const order of orders) cost += quoteCable(state, order.segments, order.method).cost;
-    if (cost + connect <= budget) return { node, oltCard, orders, cost, connect, newUnits };
+    if (cost + connect <= budget) return { node, oltCard, orders, cost, connect, newUnits, lit: accepted.map((a) => a.segment) };
     const last = accepted.pop();
     if (!last) return null;
     for (const id of last.segments) build.delete(id);
@@ -893,7 +1084,7 @@ const BAND_RANK = { green: 0, amber: 1, red: 2 } as const;
  * is at least each of these multiples of their extra up-front cost, then all
  * aerial where poled.
  */
-const LIFETIME_FALLBACK_GAINS: readonly number[] = [0.25, 0.5];
+const LIFETIME_FALLBACK_GAINS: readonly number[] = [0.25, 0.5, 1, 2];
 
 const streetReachCache = new WeakMap<City, SegmentId[][]>();
 
@@ -960,9 +1151,9 @@ function chooseProject(
     plannedLit: plannedService(state).servingCabinet,
     routers: new Set(state.sales.routerParcels),
     subscribed: new Map(state.sales.accounts.map((a) => [a.parcel, accountUnits(a)])),
-    installShare: installShare(opts.installDays, opts.marketingPerPassing),
+    installShare: stateInstallShare(state, opts.installDays, opts.marketingPerPassing),
     rates: takeRates(state),
-    econ: subscriberEconomics(state, opts),
+    econ: subscriberEconomics(state),
   };
   const reach = streetReach(city);
   const buildCost = segmentBuildCosts(city, opts.methods);
@@ -1003,8 +1194,10 @@ function chooseProject(
         const cheaper = planProject(state, candidate.node, from, budget, ctx, opts, minGain);
         if (acceptable(cheaper)) return cheaper;
       }
-      const aerial = planProject(state, candidate.node, from, budget, ctx, { ...opts, methods: 'aerial' });
-      if (acceptable(aerial)) return aerial;
+      if (opts.aerialFallback) {
+        const aerial = planProject(state, candidate.node, from, budget, ctx, { ...opts, methods: 'aerial' });
+        if (acceptable(aerial)) return aerial;
+      }
     }
   }
   return null;
@@ -1044,7 +1237,7 @@ function fundCapacity(state: GameState, send: Send, opts: SmartOptions, cost: nu
 function addCapacity(state: GameState, send: Send, opts: SmartOptions): void {
   const used = cabinetPortsUsed(state);
   const full = new Set(state.sales.fullCabinets);
-  const cushion = OVERHEAD_PER_MONTH;
+  const cushion = overheadTotal(estimateMonthlyOverhead(state));
   for (const cabinet of [...state.network.cabinets]) {
     if (cabinet.splitters >= MAX_SPLITTERS_PER_CABINET) continue;
     const ports = used.get(cabinet.id) ?? 0;
@@ -1098,9 +1291,9 @@ function largestOk(max: number, step: number, ok: (amount: number) => boolean): 
   return lo * step;
 }
 
-/** Overhead + this month's marketing. */
+/** A month of running costs at today's size (overhead.fixedCostsPerMonth: base, per customer with support, per plant) + this month's marketing. */
 function fixedCosts(state: GameState): number {
-  return OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
+  return fixedCostsPerMonth(state);
 }
 
 /**
@@ -1199,6 +1392,23 @@ function manageCredit(state: GameState, send: Send, opts: SmartOptions): void {
   const want = Math.ceil((floor - cash) / LOAN_ROUNDING) * LOAN_ROUNDING;
   const amount = Math.min(want, lineRoom(state, opts));
   if (amount >= 1) send({ type: 'drawCredit', amount });
+  if (opts.bridgeMonths > 0 && state.finance.cash < floor) bridge(state, send, opts, floor);
+}
+
+/**
+ * Round 4b: cash under the floor with the line used up: a term loan within
+ * the loan buffers (safeTermLoan) that restores the floor and covers
+ * opts.bridgeMonths of the last close's operating deficit, so a young network
+ * still short of break-even never misses a payment for want of cash the bank
+ * would lend.
+ */
+function bridge(state: GameState, send: Send, opts: SmartOptions, floor: number): void {
+  const last = state.finance.reports.at(-1);
+  const flow = last ? (reportKpis(last)?.operatingCashFlow ?? 0) : 0;
+  const need = floor - state.finance.cash + opts.bridgeMonths * Math.max(0, -flow);
+  const room = safeTermLoan(state, opts);
+  const amount = Math.min(room, Math.max(opts.minLoan, TERM_LOAN_MIN, Math.ceil(need / opts.loanStep) * opts.loanStep));
+  if (amount >= TERM_LOAN_MIN && amount >= Math.min(need, room)) send({ type: 'takeTermLoan', amount, termYears: opts.termYears });
 }
 
 /**
@@ -1274,13 +1484,68 @@ function marketingBudget(state: GameState, opts: SmartOptions): number {
   return Math.min(MARKETING_MAX_PER_MONTH, Math.round(wanted));
 }
 
-/** The intro promo (opts.introPromo) runs while the incumbent runs a promo in any of its areas, and stops after. */
-function answerWithPromo(state: GameState, send: Send, opts: SmartOptions): void {
-  if (opts.introPromo === null) return;
-  const want = activePromos(state).length > 0 ? opts.introPromo : null;
-  const have = state.sales.promo;
-  const same = want === null ? have === null : have !== null && have.percentOff === want.percentOff && have.months === want.months;
-  if (!same) send({ type: 'setPromo', promo: want });
+/** What a bot remembers between looks about intro promos and its answers to the incumbent. */
+export interface PromoMemo {
+  /** The answer chosen for each incumbent promo it met, by `${cabinet}:${startDay}` (policy 'best'). */
+  answers: Map<string, IncumbentAnswer['kind']>;
+  /** The intro promo bestIncumbentAnswer chose for a promo it answers that way. */
+  offers: Map<string, IntroPromo>;
+  /** Day promoWhenPays was last judged, and its verdict. */
+  judgedDay: number;
+  pays: boolean;
+}
+
+export function newPromoMemo(): PromoMemo {
+  return { answers: new Map(), offers: new Map(), judgedDay: -Infinity, pays: false };
+}
+
+const PROMO_JUDGE_DAYS = 28;
+
+function samePromo(a: IntroPromo | null, b: IntroPromo | null): boolean {
+  return a === null ? b === null : b !== null && a.percentOff === b.percentOff && a.months === b.months;
+}
+
+/**
+ * Answer the incumbent's promos (opts.incumbentAnswer) and keep the intro
+ * promo set to what the answers and opts.promoWhenPays want:
+ * - 'introPromo': opts.introPromo while the incumbent runs a promo in any of its areas (round 4);
+ * - 'best': when it first meets a promo, incumbent.bestIncumbentAnswer decides: the
+ *   retention offer (answerIncumbent, once), an intro promo while that promo runs, or nothing;
+ * - 'retention': the retention offer at every promo it meets;
+ * - 'none': nothing.
+ * Else opts.promoWhenPays while sales.quotePromo says it pays (judged every 4 weeks).
+ */
+function answerIncumbentPromos(state: GameState, send: Send, opts: SmartOptions, memo: PromoMemo): void {
+  const running = activePromos(state);
+  let want: IntroPromo | null = null;
+  if (opts.incumbentAnswer === 'introPromo') {
+    if (running.length > 0) want = opts.introPromo;
+  } else if (opts.incumbentAnswer !== 'none') {
+    for (const promo of running) {
+      const key = `${promo.cabinet}:${promo.startDay}`;
+      let kind = memo.answers.get(key);
+      if (kind === undefined) {
+        if (opts.incumbentAnswer === 'retention') kind = 'retention';
+        else {
+          const answer = bestIncumbentAnswer(state, promo.cabinet);
+          kind = answer.kind;
+          if (answer.promo) memo.offers.set(key, answer.promo);
+        }
+        memo.answers.set(key, kind);
+        if (kind === 'retention' && !promo.answered) send({ type: 'answerIncumbent', cabinet: promo.cabinet });
+      }
+      if (kind === 'introPromo') want ??= memo.offers.get(key) ?? null;
+    }
+  }
+  if (want === null && opts.promoWhenPays !== null) {
+    if (state.day - memo.judgedDay >= PROMO_JUDGE_DAYS) {
+      memo.judgedDay = state.day;
+      memo.pays = quotePromo(state, opts.promoWhenPays).pays;
+    }
+    if (memo.pays) want = opts.promoWhenPays;
+  }
+  want ??= opts.standingPromo;
+  if (!samePromo(want, state.sales.promo)) send({ type: 'setPromo', promo: want });
 }
 
 /** Storm hits per span in the weather log (Storm.spans, the last STORM_LOG_DAYS days). */
@@ -1323,7 +1588,7 @@ function convertHitSpans(state: GameState, send: Send, opts: SmartOptions): void
     .filter((s) => s.stage === 'live' && s.method === 'aerial' && s.conversion === null && (hits.get(s.id) ?? 0) >= opts.convertHits)
     .sort((a, b) => (hits.get(b.id) ?? 0) - (hits.get(a.id) ?? 0) || a.id - b.id);
   if (candidates.length === 0) return;
-  const econ = subscriberEconomics(state, opts);
+  const econ = subscriberEconomics(state);
   for (const span of candidates) {
     const quote = quoteConvert(state, span.id);
     if (!quote.ok) continue;
@@ -1334,16 +1599,100 @@ function convertHitSpans(state: GameState, send: Send, opts: SmartOptions): void
   }
 }
 
+/** Days between two looks at the growth levers (SmartOptions campaigns, support, referrals). */
+export const LEVER_JUDGE_DAYS = 28;
+
+/**
+ * Round 4c/4d: the growth levers, every LEVER_JUDGE_DAYS: the support level
+ * (opts.support: a fixed level, or 'quote': the level customers.quoteSupport
+ * values most when that pays), referral credits (opts.referrals: fixed, or
+ * 'quote': switched when customers.quoteReferrals says the switch pays) and
+ * neighborhood campaigns (opts.campaigns: in each area where
+ * customers.quoteCampaign accepts one and says it pays, best value for its
+ * cost first, while the cost is cash above its reserve).
+ */
+function manageLevers(state: GameState, send: Send, opts: SmartOptions, memo: SmartMemo): void {
+  if (opts.support !== 'quote' && opts.support !== 'keep' && opts.support !== state.customers.supportLevel) send({ type: 'setSupport', level: opts.support });
+  if (typeof opts.referrals === 'boolean' && opts.referrals !== state.customers.referrals) send({ type: 'setReferrals', on: opts.referrals });
+  if (state.day - memo.leversDay < LEVER_JUDGE_DAYS) return;
+  memo.leversDay = state.day;
+  if (opts.support === 'quote') {
+    let best: { level: SupportLevel; value: number } | null = null;
+    for (const level of SUPPORT_LEVEL_IDS) {
+      if (level === state.customers.supportLevel) continue;
+      const quote = quoteSupport(state, level);
+      if (quote.ok && quote.pays && (!best || quote.netValue > best.value)) best = { level, value: quote.netValue };
+    }
+    if (best) send({ type: 'setSupport', level: best.level });
+  }
+  if (opts.referrals === 'quote') {
+    const on = !state.customers.referrals;
+    if (quoteReferrals(state, on).pays) send({ type: 'setReferrals', on });
+  }
+  if (opts.campaigns && !installsPaused(state)) {
+    const quotes = customerAreas(state)
+      .map((area) => quoteCampaign(state, area.cabinet))
+      .filter((q) => q.ok && q.pays)
+      .sort((a, b) => b.valueGained / Math.max(1, b.cost) - a.valueGained / Math.max(1, a.cost) || a.cabinet - b.cabinet);
+    for (const quote of quotes) {
+      if (state.finance.cash - borrowerReserve(state, opts) < quote.cost) break;
+      send({ type: 'runCampaign', cabinet: quote.cabinet });
+    }
+  }
+}
+
+/** What SMART remembers between weekly looks. */
+export interface SmartMemo {
+  /** The scan key of the last look that found nothing worth building. */
+  idleKey: string | null;
+  promo: PromoMemo;
+  /** Day the growth levers were last judged (manageLevers). */
+  leversDay: number;
+}
+
+export function newSmartMemo(): SmartMemo {
+  return { idleKey: null, promo: newPromoMemo(), leversDay: -Infinity };
+}
+
+/** Budget shares a trough-checked operator tries, largest first, until a project leaves its ramp's cash (SmartOptions.troughCheck). */
+export const TROUGH_BUDGET_SHARES: readonly number[] = [1, 0.8, 0.65, 0.5, 0.4, 0.3, 0.2];
+
+/**
+ * The cash `project` needs to come through its ramp (advisor.buildTrough on
+ * the project as a build plan: its cabinet, its cable by method, the units
+ * and streets it lights).
+ */
+export function projectTrough(state: GameState, project: Project): number {
+  const aerial: SegmentId[] = [];
+  const underground: SegmentId[] = [];
+  for (const order of project.orders) (order.method === 'aerial' ? aerial : underground).push(...order.segments);
+  const here = state.network.cabinets.some((c) => c.node === project.node);
+  const commands: Command[] = here ? [] : [{ type: 'placeCabinet', node: project.node }];
+  return buildTrough(state, {
+    node: project.node,
+    feeder: [],
+    reach: [],
+    aerial,
+    underground,
+    commands,
+    cost: project.cost,
+    passings: project.newUnits,
+    cpp: project.newUnits > 0 ? projectCpp(project) : null,
+    lit: project.lit,
+  });
+}
+
 /** One weekly look by the careful operator (shared by SMART, RURAL, MIXED and the round-4 variants). */
-function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idleKey: string | null }): void {
+function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartMemo): void {
   const budget = marketingBudget(state, opts);
   if (budget !== state.sales.marketingPerMonth) send({ type: 'setMarketing', perMonth: budget });
-  answerWithPromo(state, send, opts);
+  if (opts.managePromo) answerIncumbentPromos(state, send, opts, memo.promo);
 
   const hold = opts.borrow ? cureOrDeleverage(state, send, opts) : false;
   if (opts.borrow) manageCredit(state, send, opts);
-  addCapacity(state, send, opts);
+  if (opts.capacity) addCapacity(state, send, opts);
   if (hold) return;
+  manageLevers(state, send, opts, memo);
   convertHitSpans(state, send, opts);
 
   for (let i = 0; i < opts.maxProjectsPerLook; i++) {
@@ -1361,7 +1710,17 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idle
     const lifetimeOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.loanLifetimeCpp;
     const ownOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.ownLifetimeCpp;
     let project = room > 0 ? chooseProject(state, Math.max(0, own) + room, opts, loanBand(opts), true, lifetimeOk) : null;
-    if (!project && own > 0) project = chooseProject(state, own, opts, defaultBand(opts), false, ownOk);
+    if (!project && own > 0) {
+      if (opts.troughCheck) {
+        // The lean operator: the largest project whose ramp its cash comes through.
+        const spare = state.finance.cash - cashFloor(state, opts);
+        const fits = (p: Project) => ownOk(p) && p.cost + projectTrough(state, p) <= spare;
+        for (const share of TROUGH_BUDGET_SHARES) {
+          project = chooseProject(state, own * share, opts, defaultBand(opts), false, fits);
+          if (project) break;
+        }
+      } else project = chooseProject(state, own, opts, defaultBand(opts), false, ownOk);
+    }
     if (!project) {
       memo.idleKey = key;
       break;
@@ -1373,13 +1732,130 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: { idle
   if (opts.borrow) manageCredit(state, send, opts);
 }
 
+/**
+ * Round 4b: SMART's settings when its starting purse is below the Seed
+ * round's (Bootstrapped, Shoestring). The Seed-round SMART keeps a long
+ * runway and buries the streets that pay back over 12 years; with half the
+ * money that leaves one small area that never covers the $9,000 overhead. The
+ * lean operator puts every dollar it can into cheap plant instead: aerial
+ * unless a bore pays back four times over its horizon (buryGain, with storms
+ * weighed as expected over 12 years: it cannot afford durability), the most
+ * units per dollar first and no street dearer than the cost-per-passing
+ * target, a two-month runway plus half a year of installs, $1 of marketing a
+ * passing, the intro promo while sales.quotePromo says it pays, and a term
+ * loan within its buffers whenever cash falls under its floor with the line
+ * used up (bridgeMonths).
+ */
+export const LEAN_OPTIONS: Partial<SmartOptions> = {
+  troughCheck: true,
+  burnMonths: 2,
+  installDays: 180,
+  stormWeight: 1,
+  horizonYears: 12,
+  streetOrder: 'density',
+  maxStreetCpp: CPP_TARGET,
+  marketingPerPassing: 1,
+  bridgeMonths: 3,
+  promoWhenPays: SMART_INTRO_PROMO,
+};
+
+/** The starting cash of `state`'s difficulty (company.difficultyLevel). */
+export function startCashOf(state: GameState): number {
+  return difficultyLevel(state.company.difficulty).startCash;
+}
+
+/**
+ * The careful operator. Its settings are SMART_DEFAULTS, under LEAN_OPTIONS
+ * when the game's starting cash is below START_CASH (round 4b: the
+ * difficulty levels differ only in it), under `options`.
+ */
 export function smartBot(options: Partial<SmartOptions> = {}): BotFactory {
-  const opts: SmartOptions = { ...SMART_DEFAULTS, ...options };
+  const seedRound: SmartOptions = { ...SMART_DEFAULTS, ...options };
+  const lean: SmartOptions = { ...SMART_DEFAULTS, ...LEAN_OPTIONS, ...options };
   return () => {
-    const memo = { idleKey: null as string | null };
-    return { name: opts.name, act: (state, send) => smartAct(state, send, opts, memo) };
+    const memo = newSmartMemo();
+    let opts: SmartOptions | null = null;
+    return {
+      name: seedRound.name,
+      act: (state, send) => {
+        opts ??= startCashOf(state) < START_CASH ? lean : seedRound;
+        smartAct(state, send, opts, memo);
+      },
+    };
   };
 }
+
+// ---------------------------------------------------------------------------
+// Round 4b: lineups, the aggressive operator, SMART-lite, the advisor follower
+// ---------------------------------------------------------------------------
+
+/**
+ * `makeInner` (a bot that keeps whatever prices it finds, e.g. SMART) with
+ * only the `offered` tiers offered, at their TIER_DEFAULTS prices, from its
+ * first look on (SMB multiplier at its default).
+ */
+export function lineupBot(offered: readonly TierId[], makeInner: BotFactory): BotFactory {
+  return (seed) => {
+    const inner = makeInner(seed);
+    let set = false;
+    return {
+      name: inner.name,
+      act(state, send) {
+        if (!set) {
+          const tiers = TIER_DEFAULTS.map((t) => ({ id: t.id, price: t.price, offered: offered.includes(t.id) }));
+          set = send({ type: 'setPricing', tiers, smbMultiplier: SMB_MULTIPLIER_DEFAULT }).ok;
+        }
+        inner.act(state, send);
+      },
+    };
+  };
+}
+
+/** TWO_GIG_ONLY: SMART offering only 2 Gig, at its default price, from day 0. */
+export function twoGigOnlyBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return lineupBot(['fiber2g'], smartBot({ name: 'two-gig-only', ...options }));
+}
+
+/** NO_CHEAP_TIER: SMART offering 1 Gig and 2 Gig (no 500 Mbps), at their default prices, from day 0. */
+export function noCheapTierBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return lineupBot(['fiber1g', 'fiber2g'], smartBot({ name: 'no-cheap-tier', ...options }));
+}
+
+/** AGGRESSIVE's prices: every tier this multiple of its TIER_DEFAULTS price, kept from day 0. */
+export const AGGRESSIVE_PRICE_MULTIPLIER = 0.8;
+
+/** AGGRESSIVE: SMART pushing its take rate with every price at AGGRESSIVE_PRICE_MULTIPLIER of the defaults (harness.constantPriceBot). */
+export function aggressiveBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return constantPriceBot(smartBot({ name: 'aggressive', ...options }), AGGRESSIVE_PRICE_MULTIPLIER);
+}
+
+/**
+ * SMART-lite (round 4b, the advisor follower's yardstick): the careful
+ * operator without loans, rebuilds or any answer to the incumbent's promos
+ * (no intro promo, no retention offer): what a cautious player who only
+ * builds with the starting cash gets.
+ */
+export const SMART_LITE_OPTIONS: Partial<SmartOptions> = { borrow: false, convert: false, incumbentAnswer: 'none', name: 'smart-lite' };
+
+export function smartLiteBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return smartBot({ ...SMART_LITE_OPTIONS, ...options });
+}
+
+/**
+ * ADVISOR_FOLLOWER (round 4b): every BOT_INTERVAL_DAYS, if the top
+ * suggestion (advisor.advicePlans(state)[0]) has commands, it sends them in
+ * order and stops at the first rejection; otherwise it does nothing. It keeps
+ * the default marketing budget and never snoozes. The expand plan carries
+ * coverage.buildOutPlan's commands, so following it builds what was costed.
+ */
+export const advisorFollowerBot: BotFactory = () => ({
+  name: 'advisor-follower',
+  act(state, send) {
+    const top = advicePlans(state)[0];
+    if (!top) return;
+    for (const cmd of top.commands) if (!send(cmd).ok) break;
+  },
+});
 
 // ---------------------------------------------------------------------------
 // ALL_AERIAL / ALL_UNDERGROUND (round 4)
@@ -1508,7 +1984,7 @@ function borrowEverything(state: GameState, send: Send): boolean {
 export function leveredBot(options: Partial<SmartOptions> = {}): BotFactory {
   const opts: SmartOptions = { ...SMART_DEFAULTS, ...LEVERED_OPTIONS, ...options };
   return () => {
-    const memo = { idleKey: null as string | null };
+    const memo = newSmartMemo();
     let lending = false;
     return {
       name: opts.name,
@@ -1577,7 +2053,7 @@ export function frozenHoarderBot(options: Partial<HoarderOptions> & Partial<Smar
     ...options,
   };
   return () => {
-    const memo = { idleKey: null as string | null };
+    const memo = newSmartMemo();
     let borrowed = false;
     return {
       name: opts.name,
@@ -1746,25 +2222,97 @@ function randomConvert(state: GameState, send: Send, rng: Rng): void {
 }
 
 /**
+ * Round 4b: answer a running incumbent promo with the retention offer (a
+ * random one, answered or not: an answered one is rejected), or junk (no
+ * promo there, a cabinet that does not exist).
+ */
+function randomAnswer(state: GameState, send: Send, rng: Rng): void {
+  const running = activePromos(state);
+  if (running.length > 0 && rng.chance(0.85)) send({ type: 'answerIncumbent', cabinet: rng.pick(running).cabinet });
+  else if (state.network.cabinets.length > 0 && rng.chance(0.5)) send({ type: 'answerIncumbent', cabinet: rng.pick(state.network.cabinets).id });
+  else send({ type: 'answerIncumbent', cabinet: -1 });
+}
+
+/**
+ * Round 4b: what a player does with the briefing: snooze one of today's
+ * suggestions (advise), note the ones a briefing showed (noteAdviceShown, as
+ * the UI does at a close), or junk keys the sim must reject.
+ */
+function randomAdviceCommand(state: GameState, send: Send, rng: Rng): void {
+  const keys = advise(state).map((a) => a.key);
+  const roll = rng.next();
+  if (roll < 0.45) {
+    if (keys.length > 0) send({ type: 'snoozeAdvice', key: rng.pick(keys) });
+    else send({ type: 'snoozeAdvice', key: 'expand:node:-1' });
+  } else if (roll < 0.9) {
+    send({ type: 'noteAdviceShown', keys: keys.filter(() => rng.chance(0.8)) });
+  } else {
+    const junk = rng.int(0, 2);
+    if (junk === 0) send({ type: 'snoozeAdvice', key: 'not a key' });
+    else if (junk === 1) send({ type: 'noteAdviceShown', keys: ['takeRate', 'takeRate'] });
+    else send({ type: 'snoozeAdvice', key: '' });
+  }
+}
+
+/**
+ * Round 4c/4d: a growth-lever command: a neighborhood campaign in a random
+ * area (often one the sim must refuse: running, cooling down, unlit), a
+ * support level, referral credits on or off, or junk (an unknown cabinet,
+ * level or flag).
+ */
+function randomLeverCommand(state: GameState, send: Send, rng: Rng): void {
+  const roll = rng.next();
+  if (roll < 0.4) {
+    const cabinets = state.network.cabinets;
+    if (cabinets.length > 0 && rng.chance(0.85)) send({ type: 'runCampaign', cabinet: rng.pick(cabinets).id });
+    else send({ type: 'runCampaign', cabinet: -1 });
+  } else if (roll < 0.65) {
+    send({ type: 'setSupport', level: rng.pick(SUPPORT_LEVEL_IDS) });
+  } else if (roll < 0.88) {
+    send({ type: 'setReferrals', on: rng.chance(0.5) });
+  } else {
+    const junk = rng.int(0, 2);
+    if (junk === 0) send({ type: 'setSupport', level: 'premium' as SupportLevel });
+    else if (junk === 1) send({ type: 'setReferrals', on: 1 as unknown as boolean });
+    else send({ type: 'runCampaign', cabinet: 0.5 });
+  }
+}
+
+/** Chance per look that MIXED sends a growth-lever command (valid or junk: randomLeverCommand). */
+const MIXED_LEVER_CHANCE = 0.2;
+
+/**
  * SMART plus, each weekly look, a few random extras from its own Rng: cancel
  * or remove a span (any stage), remove a cabinet, add a splitter or an OLT
  * card, change prices (randomPricing) or the marketing budget, set an intro
  * promo (randomPromo), rebuild a span underground (randomConvert), a
- * financing command (randomDebtCommand), or send junk the sim must reject.
+ * financing command (randomDebtCommand), round 4b's retention offer
+ * (randomAnswer) and briefing commands (randomAdviceCommand), round 4c/4d's
+ * growth levers (randomLeverCommand, from a second Rng so the older mix plays
+ * as before), or send junk the sim must reject. SMART leaves the intro promo
+ * and the incumbent's promos to these random commands (managePromo false).
  */
 export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
-  const opts: SmartOptions = { ...SMART_DEFAULTS, ...options };
+  const opts: SmartOptions = { ...SMART_DEFAULTS, managePromo: false, ...options };
   return (seed) => {
     const rng = new Rng(deriveSeed(seed, 'bot:mixed'));
-    const memo = { idleKey: null as string | null };
+    // The growth levers draw from their own stream, so the round-4b command mix (rng) plays as before.
+    const leverRng = new Rng(deriveSeed(seed, 'bot:mixed:levers'));
+    const memo = newSmartMemo();
     return {
       name: 'mixed',
       act(state, send) {
         smartAct(state, send, opts, memo);
+        if (leverRng.chance(MIXED_LEVER_CHANCE)) randomLeverCommand(state, send, leverRng);
         const extras = rng.int(0, 3);
         for (let i = 0; i < extras; i++) {
           if (rng.chance(0.25)) {
             randomDebtCommand(state, send, rng);
+            continue;
+          }
+          if (rng.chance(0.12)) {
+            if (rng.chance(0.5)) randomAnswer(state, send, rng);
+            else randomAdviceCommand(state, send, rng);
             continue;
           }
           const roll = rng.next();
@@ -1799,4 +2347,699 @@ export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
       },
     };
   };
+}
+
+// ---------------------------------------------------------------------------
+// Round 4b: controlled experiments on the incumbent's promo and the intro promo
+// ---------------------------------------------------------------------------
+
+/** A plain-JSON copy of a game (GameState is plain data: README). */
+function copyState(state: GameState): GameState {
+  return JSON.parse(JSON.stringify(state)) as GameState;
+}
+
+/**
+ * Test-only state edit: an incumbent promo at the cabinet area with the most
+ * passings among those with customers (round 4c/4d: the incumbent answers a
+ * take rate, so a promo where nobody has signed up yet tests nothing; any
+ * area when none has customers), starting today with the rule's length, price and quiet months
+ * (incumbent.reviewIncumbent's record), unless one already runs (then the
+ * running one with the most passings). Returns its cabinet and whether it
+ * was injected.
+ */
+export function ensureIncumbentPromo(state: GameState): { cabinet: number; injected: boolean } {
+  const areas = areaTakeRates(state);
+  const passingsOf = (cabinet: number) => areas.find((a) => a.cabinet === cabinet)?.passings ?? 0;
+  const running = activePromos(state).sort((a, b) => passingsOf(b.cabinet) - passingsOf(a.cabinet) || a.cabinet - b.cabinet);
+  if (running[0]) return { cabinet: running[0].cabinet, injected: false };
+  const signed = (a: { takeRate: number }) => (a.takeRate > 0 ? 1 : 0);
+  const area = [...areas].sort((a, b) => signed(b) - signed(a) || b.passings - a.passings || a.cabinet - b.cabinet)[0];
+  if (!area) throw new Error('ensureIncumbentPromo: no cabinet area');
+  const endDay = closeDayAfter(state.day, INCUMBENT_PROMO_MONTHS);
+  const promo: IncumbentPromo = {
+    cabinet: area.cabinet,
+    startDay: state.day,
+    endDay,
+    price: incumbentPromoPrice(),
+    quietUntil: closeDayAfter(endDay, INCUMBENT_PROMO_QUIET_MONTHS),
+    triggerTakePct: Math.round(area.takeRate * 100),
+    answered: false,
+    answeredWithPromo: false,
+  };
+  state.sales.incumbentPromos = [...state.sales.incumbentPromos.filter((p) => p.cabinet !== area.cabinet), promo].sort((a, b) => a.cabinet - b.cabinet);
+  return { cabinet: area.cabinet, injected: true };
+}
+
+/** The answers the incumbent-promo experiment compares. */
+export type AnswerPolicy = 'ignore' | 'retention' | 'introPromo' | 'best';
+export const ANSWER_POLICIES: readonly AnswerPolicy[] = ['ignore', 'retention', 'introPromo', 'best'];
+/** The experiment starts from SMART's game at this month's close ... */
+export const ANSWER_EXPERIMENT_MONTH = 30;
+/** ... and plays the promo and a year after it. */
+export const ANSWER_EXPERIMENT_MONTHS = INCUMBENT_PROMO_MONTHS + 12;
+
+export interface AnswerExperiment {
+  cabinet: number;
+  /** The promo was injected (no promo ran in SMART's areas at that month). */
+  injected: boolean;
+  /** What incumbent.bestIncumbentAnswer chose at the promo's start. */
+  chosen: IncumbentAnswer['kind'];
+  /** Its quoted net value. */
+  netValue: number;
+  /** Cumulative operating cash flow over the experiment's months, by answer. */
+  ocf: Record<AnswerPolicy, number>;
+  /** Cancellations the incumbent's promos caused over them, by answer. */
+  incumbentChurn: Record<AnswerPolicy, number>;
+}
+
+/**
+ * The controlled experiment on the incumbent's promo: SMART's game at the
+ * close of `month` with a promo at its largest area (ensureIncumbentPromo),
+ * then `months` of SMART operating the network it has (no new areas, so
+ * build timing does not drown the answer) under each answer to that promo:
+ * ignore it; the retention offer (answerIncumbent) at its start; SMART's
+ * intro promo (SMART_INTRO_PROMO) for new signups while it runs; or what
+ * incumbent.bestIncumbentAnswer chooses at its start (that intro promo while
+ * it runs, the retention offer, or nothing). Any later promo is ignored in
+ * every case.
+ */
+export function incumbentAnswerExperiment(seed: number, month = ANSWER_EXPERIMENT_MONTH, months = ANSWER_EXPERIMENT_MONTHS): AnswerExperiment {
+  const start = runBot(seed, smartBot(), month).state;
+  const { cabinet, injected } = ensureIncumbentPromo(start);
+  const promo = start.sales.incumbentPromos.find((p) => p.cabinet === cabinet) as IncumbentPromo;
+  const best = bestIncumbentAnswer(start, cabinet);
+  const operator = smartBot({ maxProjectsPerLook: 0, managePromo: false });
+  const ocf = {} as Record<AnswerPolicy, number>;
+  const incumbentChurn = {} as Record<AnswerPolicy, number>;
+  for (const policy of ANSWER_POLICIES) {
+    const answering: BotFactory = (s) => {
+      const inner = operator(s);
+      let decided = false;
+      let offer: IntroPromo | null = null;
+      return {
+        name: `answer-${policy}`,
+        act(state, send) {
+          if (!decided) {
+            decided = true;
+            const kind = policy === 'best' ? bestIncumbentAnswer(state, cabinet).kind : policy;
+            if (kind === 'retention') send({ type: 'answerIncumbent', cabinet });
+            if (kind === 'introPromo') offer = policy === 'best' ? (bestIncumbentAnswer(state, cabinet).promo ?? SMART_INTRO_PROMO) : SMART_INTRO_PROMO;
+          }
+          const want = offer !== null && state.day < promo.endDay ? offer : null;
+          if (!samePromo(want, state.sales.promo)) send({ type: 'setPromo', promo: want });
+          inner.act(state, send);
+        },
+      };
+    };
+    const run = runBot(seed, answering, months, { state: copyState(start) });
+    ocf[policy] = cumulativeOperatingCashFlow(run);
+    incumbentChurn[policy] = run.reports.reduce((t, r) => t + (r.ops?.incumbentChurn ?? 0), 0);
+  }
+  return { cabinet, injected, chosen: best.kind, netValue: best.netValue, ocf, incumbentChurn };
+}
+
+/**
+ * The fresh-area intro-promo experiment starts from SMART's game at this
+ * month's close (its first areas just lit; or the first close with a lit
+ * area, at the latest FRESH_PROMO_LATEST_MONTH) ...
+ */
+export const FRESH_PROMO_MONTH = 4;
+export const FRESH_PROMO_LATEST_MONTH = 12;
+/** ... and plays this long, comparing the operating cash flow at each of FRESH_PROMO_CHECK_MONTHS. */
+export const FRESH_PROMO_MONTHS = 24;
+export const FRESH_PROMO_CHECK_MONTHS: readonly number[] = [12, 18, 24];
+/** The mature-town experiment starts at this month's close and plays a year with no new areas ... */
+export const MATURE_PROMO_MONTH = 48;
+export const MATURE_PROMO_MONTHS = 12;
+/**
+ * ... once SMART, building nothing new, has finished what it was building
+ * then (at most this many more closes): streets that light during the year
+ * would be a fresh area, where the promo's boost is meant to pay.
+ */
+export const MATURE_SETTLE_MONTHS_MAX = 6;
+
+export interface PromoExperiment {
+  /** sales.quotePromo(SMART_INTRO_PROMO) at the start. */
+  quote: PromoQuote;
+  /** Cumulative operating cash flow with the intro promo and without, at each checked month. */
+  withPromo: number[];
+  without: number[];
+}
+
+/**
+ * The intro promo in a fresh area: SMART's game at FRESH_PROMO_MONTH (areas
+ * lit in the last weeks, most households still to sign up; later when
+ * nothing is lit yet) with an
+ * incumbent promo at its largest area (ensureIncumbentPromo), played on by
+ * SMART (building as usual) with SMART_INTRO_PROMO for new signups while the
+ * incumbent's promo runs, against SMART ignoring it.
+ */
+export function freshPromoExperiment(seed: number): PromoExperiment {
+  let start = runBot(seed, smartBot(), FRESH_PROMO_MONTH).state;
+  // A long make-ready can leave nothing lit yet: then the first close after it with an area.
+  for (let month = FRESH_PROMO_MONTH; areaTakeRates(start).length === 0 && month < FRESH_PROMO_LATEST_MONTH; month++) {
+    start = runBot(seed, smartBot(), 1, { state: start }).state;
+  }
+  ensureIncumbentPromo(start);
+  const quote = quotePromo(start, SMART_INTRO_PROMO);
+  const play = (incumbentAnswer: IncumbentAnswerPolicy) => {
+    const run = runBot(seed, smartBot({ incumbentAnswer, introPromo: SMART_INTRO_PROMO }), FRESH_PROMO_MONTHS, { state: copyState(start) });
+    return FRESH_PROMO_CHECK_MONTHS.map((m) => cumulativeOperatingCashFlow(run, m));
+  };
+  return { quote, withPromo: play('introPromo'), without: play('none') };
+}
+
+/**
+ * The intro promo in a mature town: SMART's game at MATURE_PROMO_MONTH, then
+ * SMART building nothing new until all its plant is live (at most
+ * MATURE_SETTLE_MONTHS_MAX closes), played MATURE_PROMO_MONTHS on by SMART
+ * building nothing new, with SMART_INTRO_PROMO set throughout against none
+ * (any incumbent promo ignored).
+ */
+export function maturePromoExperiment(seed: number): PromoExperiment {
+  let start = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
+  const building = (state: GameState) => state.network.spans.some((s) => s.stage !== 'live') || state.network.cabinets.some((c) => c.stage !== 'live');
+  for (let month = 0; month < MATURE_SETTLE_MONTHS_MAX && building(start); month++) {
+    start = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none' }), 1, { state: start }).state;
+  }
+  const quote = quotePromo(start, SMART_INTRO_PROMO);
+  const play = (standingPromo: IntroPromo | null) => {
+    const run = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), MATURE_PROMO_MONTHS, { state: copyState(start) });
+    return [cumulativeOperatingCashFlow(run)];
+  };
+  return { quote, withPromo: play(SMART_INTRO_PROMO), without: play(null) };
+}
+
+// ---------------------------------------------------------------------------
+// Round 4c/4d: CASUAL, the lever and lineup variants, the experiments
+// ---------------------------------------------------------------------------
+
+/** CASUAL lays at most this many streets with homes ("a few dense streets near the CO"). */
+export const CASUAL_STREETS = 8;
+/** It looks for its cabinet's corner within this street distance of the CO. */
+export const CASUAL_SEARCH_FT = 2_400;
+/** It spends at most this share of its cash on its plant. */
+export const CASUAL_BUDGET_SHARE = 0.4;
+
+/**
+ * CASUAL's one build: a cabinet at the corner within CASUAL_SEARCH_FT of
+ * the CO whose reach holds the most homes, cabled from the CO, and up to
+ * CASUAL_STREETS of the streets with homes in its reach, densest (units per
+ * dollar of cable) first, each with its street path back to the cabinet,
+ * every segment by its cheapest method (aerial where poled), within
+ * CASUAL_BUDGET_SHARE of its cash. True once ordered.
+ */
+function casualBuild(state: GameState, send: Send): boolean {
+  const { city } = state;
+  const reach = streetReach(city);
+  const units = unitsBySegment(state);
+  const near = streetTree(city, city.coNode, CASUAL_SEARCH_FT);
+  const corners = [...near.dist.keys()]
+    .map((node) => {
+      let n = 0;
+      for (const seg of reach[node] as SegmentId[]) n += units[seg] as number;
+      return { node, units: n, dist: near.dist.get(node) ?? 0 };
+    })
+    .filter((c) => c.units > 0)
+    .sort((a, b) => b.units - a.units || a.dist - b.dist || a.node - b.node);
+  const budget = CASUAL_BUDGET_SHARE * state.finance.cash;
+  for (const corner of corners) {
+    const node = corner.node;
+    const cabinetCost = quoteCabinet(state, node);
+    if (!cabinetCost.ok) continue;
+    const feeder = node === city.coNode ? [] : (cableRoute(state, city.coNode, node, 'aerial') ?? null);
+    if (feeder === null) continue;
+    const tree = streetTree(city, node, CABINET_REACH_FT);
+    const streets = (reach[node] as SegmentId[])
+      .filter((seg) => (units[seg] as number) > 0)
+      .map((seg) => ({ seg, density: (units[seg] as number) / Math.max(1, cheapestMethod(city.segments[seg] as StreetSegment).cost) }))
+      .sort((a, b) => b.density - a.density || a.seg - b.seg)
+      .slice(0, CASUAL_STREETS);
+    const chosen = streets.map(({ seg }) => {
+      const s = city.segments[seg] as StreetSegment;
+      const da = tree.dist.get(s.a) ?? Infinity;
+      const db = tree.dist.get(s.b) ?? Infinity;
+      return [seg, ...treePath(city, tree, da <= db ? s.a : s.b)];
+    });
+    const quoteOf = (picked: SegmentId[][]) => {
+      const all = new Set<SegmentId>(feeder);
+      for (const path of picked) for (const id of path) all.add(id);
+      const byMethod: Record<CableMethod, SegmentId[]> = { aerial: [], underground: [] };
+      for (const id of all) byMethod[cheapestMethod(city.segments[id] as StreetSegment).method].push(id);
+      const orders = [...groupOrders(city, byMethod.aerial, 'aerial', SMART_DEFAULTS.orderMaxFt), ...groupOrders(city, byMethod.underground, 'underground', SMART_DEFAULTS.orderMaxFt)];
+      let cost = cabinetCost.cost;
+      for (const order of orders) cost += quoteCable(state, order.segments, order.method).cost;
+      return { orders, cost };
+    };
+    let plan = quoteOf(chosen);
+    while (plan.cost > budget && chosen.length > 1) {
+      chosen.pop();
+      plan = quoteOf(chosen);
+    }
+    if (plan.cost > budget) continue;
+    if (!send({ type: 'placeCabinet', node }).ok) continue;
+    for (const order of plan.orders) send({ type: 'layCable', segments: order.segments, method: order.method });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * CASUAL (round 4c/4d, spec F): a first-time player. On its first look it
+ * lays a few dense streets near the CO with one cabinet (casualBuild); then
+ * it keeps the default prices, the default marketing budget and Good
+ * support, runs no campaigns, takes no loans, and adds a splitter (with an
+ * OLT card when no PON port is free) when its cabinet is full and cash
+ * allows.
+ */
+export function casualBot(): BotFactory {
+  return () => {
+    let built = false;
+    return {
+      name: 'casual',
+      act(state, send) {
+        if (!built) built = casualBuild(state, send);
+        for (const cabinet of [...state.network.cabinets]) {
+          if (!state.sales.fullCabinets.includes(cabinet.id) || cabinet.splitters >= MAX_SPLITTERS_PER_CABINET) continue;
+          const { olt } = state.network;
+          const card = ponPortsUsed(state) >= olt.ponPorts;
+          if (card && olt.cards >= OLT_MAX_CARDS) continue;
+          if (state.finance.cash < SPLITTER_COST + (card ? OLT_CARD_COST : 0)) continue;
+          if (card && !send({ type: 'addOltCard' }).ok) continue;
+          send({ type: 'addSplitter', cabinet: cabinet.id });
+        }
+      },
+    };
+  };
+}
+
+/** DISCOUNT's prices: every tier this multiple of its TIER_DEFAULTS price (about 17% below), kept from day 0. */
+export const DISCOUNT_PRICE_MULTIPLIER = 0.83;
+/** OVERPRICED's prices: every tier this multiple of its TIER_DEFAULTS price, kept from day 0. */
+export const OVERPRICED_PRICE_MULTIPLIER = 1.2;
+
+/** DISCOUNT (round 4c/4d, spec I.7): SMART with every price DISCOUNT_PRICE_MULTIPLIER of the defaults. */
+export function discountBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return constantPriceBot(smartBot({ name: 'discount', ...options }), DISCOUNT_PRICE_MULTIPLIER);
+}
+
+/** OVERPRICED (round 4c/4d, spec I.7): SMART with every price OVERPRICED_PRICE_MULTIPLIER of the defaults. */
+export function overpricedBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return constantPriceBot(smartBot({ name: 'overpriced', ...options }), OVERPRICED_PRICE_MULTIPLIER);
+}
+
+/** SMART pulling every growth lever by its quote: campaigns where they pay, the support level and referral credits by quote. */
+export const SMART_LEVERS_OPTIONS: Partial<SmartOptions> = { campaigns: true, support: 'quote', referrals: 'quote', name: 'smart-levers' };
+
+export function smartLeversBot(options: Partial<SmartOptions> = {}): BotFactory {
+  return smartBot({ ...SMART_LEVERS_OPTIONS, ...options });
+}
+
+/** SMART operating the network it has: no new areas, no promo management (the experiments' operator). */
+const OPERATOR_OPTIONS: Partial<SmartOptions> = { maxProjectsPerLook: 0, managePromo: false, convert: false };
+
+/**
+ * `makeInner` with `first` sent on its first look (before the inner bot
+ * acts): an experiment arm's one decision.
+ */
+function withFirst(first: (state: GameState, send: Send) => void, makeInner: BotFactory, name: string): BotFactory {
+  return (seed) => {
+    const inner = makeInner(seed);
+    let done = false;
+    return {
+      name,
+      act(state, send) {
+        if (!done) {
+          done = true;
+          first(state, send);
+        }
+        inner.act(state, send);
+      },
+    };
+  };
+}
+
+/** Cumulative operating cash flow less install capex (cash before plant and financing) over months 1..toMonth. */
+export function operatingLessInstalls(run: RunResult, toMonth = run.reports.length): number {
+  let flow = 0;
+  for (let i = 0; i < Math.min(toMonth, run.reports.length); i++) {
+    const report = run.reports[i] as RunResult['reports'][number];
+    flow += (run.kpis[i]?.operatingCashFlow ?? 0) + (report.totals.install ?? 0);
+  }
+  return flow;
+}
+
+// The marketing forecast ---------------------------------------------------------
+
+/** The marketing-forecast check quotes at these month closes of SMART's game. */
+export const MARKETING_FORECAST_MONTHS: readonly number[] = [24, 36];
+
+export interface MarketingForecastCheck {
+  month: number;
+  /** quoteMarketing(today's budget).signupsPerMonth x CUSTOMER_QUOTE_MONTHS. */
+  quoted: number;
+  /** Units connected (stats.grossAdds) over the next CUSTOMER_QUOTE_MONTHS closes, SMART operating its network with the same budget and no new areas. */
+  realized: number;
+  /** Diagnostics: cabinets turning signups away at the start, passings at the start and the end. */
+  fullAtStart: number;
+  passingsStart: number;
+  passingsEnd: number;
+}
+
+/**
+ * The marketing forecast against what the sim then does: SMART's game at the
+ * close of `month`, quoteMarketing at its budget, then CUSTOMER_QUOTE_MONTHS
+ * of SMART operating that network as it stands, under the forecast's own
+ * assumptions (customers.forecastCustomers: no new streets and no new ports,
+ * so no new areas or splitters; the same marketing per passing).
+ */
+export function marketingForecastCheck(seed: number, month: number): MarketingForecastCheck {
+  const start = runBot(seed, smartBot(), month).state;
+  const quote = quoteMarketing(start, start.sales.marketingPerMonth);
+  const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, capacity: false }), CUSTOMER_QUOTE_MONTHS, { state: copyState(start) });
+  let realized = 0;
+  for (const report of run.reports) realized += report.stats?.grossAdds ?? 0;
+  return {
+    month,
+    quoted: quote.signupsPerMonth * CUSTOMER_QUOTE_MONTHS,
+    realized,
+    fullAtStart: start.sales.fullCabinets.length,
+    passingsStart: getService(start).passings,
+    passingsEnd: run.reports.at(-1)?.passings ?? 0,
+  };
+}
+
+// Campaigns -----------------------------------------------------------------------------
+
+/** Months each lever experiment plays after its decision (the quotes' horizon). */
+export const LEVER_EXPERIMENT_MONTHS = CUSTOMER_QUOTE_MONTHS;
+/** A freshly lit area: its cabinet went live within this many days of the close the experiment starts from ... */
+export const FRESH_AREA_DAYS = 60;
+/** ... found at the first such close up to this month. */
+export const FRESH_AREA_LATEST_MONTH = 18;
+/** A well-signed area: lit at least this many months at MATURE_PROMO_MONTH, the one with the highest take rate (INCUMBENT_PROMO_MIN_PASSINGS passings or more). */
+export const SIGNED_AREA_MONTHS = 36;
+
+export interface LeverArm {
+  /** Cumulative operating cash flow over LEVER_EXPERIMENT_MONTHS with the lever and without. */
+  withLever: number;
+  without: number;
+  /** Subscribers at the end with and without. */
+  subsWith: number;
+  subsWithout: number;
+}
+
+export interface CampaignArm extends LeverArm {
+  cabinet: number;
+  quote: CampaignQuote;
+  /**
+   * The campaign's realized worth in its own area over LEVER_EXPERIMENT_MONTHS:
+   * the extra subscriber-months there (CustomerStats.areas at each close, with
+   * against without) x what a unit pays less overhead.perCustomerCost (the
+   * quote's margin), less its cost. Its own area only, so the rest of the
+   * network's luck (storms, the sales stream's draws) does not drown it.
+   */
+  areaValue: number;
+}
+
+export interface CampaignExperiment {
+  fresh: CampaignArm | null;
+  signed: CampaignArm | null;
+}
+
+/** Fewest unsigned lit units an area needs to be the campaign experiment's fresh area. */
+export const FRESH_AREA_MIN_UNSIGNED = 40;
+
+/**
+ * SMART's game at the first close (from month 1 up to FRESH_AREA_LATEST_MONTH)
+ * with a cabinet live for at most FRESH_AREA_DAYS whose area has
+ * FRESH_AREA_MIN_UNSIGNED or more lit units not signed up (the one with the
+ * most), and that cabinet; null if none.
+ */
+function freshAreaStart(seed: number): { state: GameState; cabinet: number } | null {
+  let state = newGame(seed);
+  const bot = smartBot();
+  for (let month = 1; month <= FRESH_AREA_LATEST_MONTH; month++) {
+    state = runBot(seed, bot, 1, { state }).state;
+    const areas = customerAreas(state).filter((a) => {
+      const cabinet = state.network.cabinets.find((c) => c.id === a.cabinet);
+      return cabinet && cabinet.liveDay !== null && state.day - cabinet.liveDay <= FRESH_AREA_DAYS && a.passings - a.subscribed >= FRESH_AREA_MIN_UNSIGNED;
+    });
+    const best = areas.sort((a, b) => b.passings - b.subscribed - (a.passings - a.subscribed) || a.cabinet - b.cabinet)[0];
+    if (best) return { state, cabinet: best.cabinet };
+  }
+  return null;
+}
+
+/** SMART's game at MATURE_PROMO_MONTH and its best-signed area lit SIGNED_AREA_MONTHS or more; null if none. */
+function signedAreaStart(seed: number): { state: GameState; cabinet: number } | null {
+  const state = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
+  const best = customerAreas(state)
+    .filter((a) => (a.monthsLit ?? 0) >= SIGNED_AREA_MONTHS && a.passings >= INCUMBENT_PROMO_MIN_PASSINGS && a.takeRate !== null)
+    .sort((a, b) => (b.takeRate ?? 0) - (a.takeRate ?? 0) || a.cabinet - b.cabinet)[0];
+  return best ? { state, cabinet: best.cabinet } : null;
+}
+
+/** One lever decision played both ways from `start` by SMART operating its network (no new areas) for `months`, and both runs. */
+function leverRuns(seed: number, start: GameState, decide: (state: GameState, send: Send) => void, operator: Partial<SmartOptions> = {}, months = LEVER_EXPERIMENT_MONTHS): { a: RunResult; b: RunResult } {
+  const play = (lever: boolean) => {
+    const bot = withFirst(lever ? decide : () => {}, smartBot({ ...OPERATOR_OPTIONS, ...operator }), lever ? 'lever' : 'none');
+    return runBot(seed, bot, months, { state: copyState(start) });
+  };
+  return { a: play(true), b: play(false) };
+}
+
+function armOf(a: RunResult, b: RunResult): LeverArm {
+  return {
+    withLever: cumulativeOperatingCashFlow(a),
+    without: cumulativeOperatingCashFlow(b),
+    subsWith: a.reports.at(-1)?.stats?.subscribers ?? 0,
+    subsWithout: b.reports.at(-1)?.stats?.subscribers ?? 0,
+  };
+}
+
+/** Subscribed units of cabinet `cabinet`'s area summed over the run's closes (CustomerStats.areas): its subscriber-months. */
+function areaUnitMonths(run: RunResult, cabinet: number): number {
+  let months = 0;
+  for (const report of run.reports) months += report.customers?.areas.find((a) => a.cabinet === cabinet)?.units ?? 0;
+  return months;
+}
+
+/**
+ * The campaign experiment: a neighborhood campaign in a freshly lit area
+ * (freshAreaStart) and in a well-signed one (signedAreaStart), each against
+ * none, by realized operating cash flow over LEVER_EXPERIMENT_MONTHS
+ * (the campaign's cost is in it) and by quoteCampaign at the start.
+ */
+export function campaignExperiment(seed: number): CampaignExperiment {
+  const arm = (start: { state: GameState; cabinet: number } | null): CampaignArm | null => {
+    if (!start) return null;
+    const quote = quoteCampaign(start.state, start.cabinet);
+    const { a, b } = leverRuns(seed, start.state, (_, send) => {
+      send({ type: 'runCampaign', cabinet: start.cabinet });
+    });
+    const margin = subscriberEconomics(start.state).margin;
+    const areaValue = (areaUnitMonths(a, start.cabinet) - areaUnitMonths(b, start.cabinet)) * margin - quote.cost;
+    return { cabinet: start.cabinet, quote, areaValue, ...armOf(a, b) };
+  };
+  return { fresh: arm(freshAreaStart(seed)), signed: arm(signedAreaStart(seed)) };
+}
+
+// Support level ---------------------------------------------------------------------
+
+/** The support experiment starts at this close of an all-aerial (high outage exposure) and an all-underground (low) SMART's game ... */
+export const SUPPORT_EXPERIMENT_MONTH = 24;
+/** ... and compares the levels over a short and a long horizon (months). */
+export const SUPPORT_SHORT_MONTHS = CUSTOMER_QUOTE_MONTHS;
+export const SUPPORT_LONG_MONTHS = 36;
+
+export interface SupportCase {
+  /** Cumulative operating cash flow less installs over the horizon, by level. */
+  value: Record<SupportLevel, number>;
+  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level. */
+  worth: Record<SupportLevel, number>;
+  /** Subscribers at the end, by level. */
+  subscribers: Record<SupportLevel, number>;
+  /** quoteSupport('great') at the start. */
+  greatQuote: SupportQuote;
+}
+
+export interface SupportExperiment {
+  high: { short: SupportCase; long: SupportCase };
+  low: { short: SupportCase; long: SupportCase };
+}
+
+function supportCase(seed: number, start: GameState, months: number): SupportCase {
+  const value = {} as Record<SupportLevel, number>;
+  const worth = {} as Record<SupportLevel, number>;
+  const subscribers = {} as Record<SupportLevel, number>;
+  for (const level of SUPPORT_LEVEL_IDS) {
+    const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: copyState(start) });
+    value[level] = operatingLessInstalls(run);
+    worth[level] = runValue(run);
+    subscribers[level] = run.reports.at(-1)?.stats?.subscribers ?? 0;
+  }
+  return { value, worth, subscribers, greatQuote: quoteSupport(start, 'great') };
+}
+
+/**
+ * The support experiment: Basic, Good and Great from SUPPORT_EXPERIMENT_MONTH
+ * of an all-aerial SMART's game (high outage exposure) and an
+ * all-underground one (low), each over SUPPORT_SHORT_MONTHS and
+ * SUPPORT_LONG_MONTHS, SMART operating its network (no new areas), valued by
+ * operating cash flow less installs (operatingLessInstalls: a cancellation
+ * refilled costs a new install).
+ */
+export function supportExperiment(seed: number): SupportExperiment {
+  const high = runBot(seed, allAerialBot(), SUPPORT_EXPERIMENT_MONTH).state;
+  const low = runBot(seed, allUndergroundBot(), SUPPORT_EXPERIMENT_MONTH).state;
+  return {
+    high: { short: supportCase(seed, high, SUPPORT_SHORT_MONTHS), long: supportCase(seed, high, SUPPORT_LONG_MONTHS) },
+    low: { short: supportCase(seed, low, SUPPORT_SHORT_MONTHS), long: supportCase(seed, low, SUPPORT_LONG_MONTHS) },
+  };
+}
+
+// Referral credits ------------------------------------------------------------------
+
+/** The referral experiment starts from SMART's game at this close (young areas: customers next to many unsigned lit homes). */
+export const REFERRAL_YOUNG_MONTH = 15;
+
+export interface ReferralArm extends LeverArm {
+  quote: ReferralQuote;
+  /** Realized: the extra subscriber-months with credits on x the margin a unit brings, less the credits paid. */
+  subsValue: number;
+  /** Happy share of the customers and unsigned share of the lit homes at the start. */
+  happyShare: number;
+  unsignedShare: number;
+}
+
+export interface ReferralExperiment {
+  many: ReferralArm;
+  few: ReferralArm;
+}
+
+/**
+ * The referral experiment: credits on against off from REFERRAL_YOUNG_MONTH
+ * of SMART's game, SMART operating its network for LEVER_EXPERIMENT_MONTHS,
+ * by realized value (ReferralArm.subsValue) and quoteReferrals at the start:
+ * `many` as the game stands there (Good support: happy customers next to
+ * many unsigned lit homes), `few` with Basic support set first in both arms
+ * (customers merely okay: few happy ones to bring neighbors).
+ */
+export function referralExperiment(seed: number): ReferralExperiment {
+  const young = runBot(seed, smartBot(), REFERRAL_YOUNG_MONTH).state;
+  const arm = (start: GameState, operator: Partial<SmartOptions>): ReferralArm => {
+    const units = subscriberUnits(start);
+    const passings = getService(start).passings;
+    const { a, b } = leverRuns(
+      seed,
+      start,
+      (_, send) => {
+        send({ type: 'setReferrals', on: true });
+      },
+      operator,
+    );
+    const margin = subscriberEconomics(start).margin;
+    let extra = 0;
+    let credits = 0;
+    for (const r of a.reports) {
+      extra += r.stats?.subscribers ?? 0;
+      credits += r.customers?.referralCredits ?? 0;
+    }
+    for (const r of b.reports) extra -= r.stats?.subscribers ?? 0;
+    return {
+      quote: quoteReferrals(start, true),
+      subsValue: extra * margin - credits,
+      happyShare: units > 0 ? happinessReport(start).happy / units : 0,
+      unsignedShare: passings > 0 ? (passings - units) / passings : 0,
+      ...armOf(a, b),
+    };
+  };
+  const basic = copyState(young);
+  basic.customers.supportLevel = 'basic';
+  return { many: arm(young, {}), few: arm(basic, { support: 'basic' }) };
+}
+
+// Switching speed by price -------------------------------------------------------
+
+/** The switching experiment starts from SMART's game at this close (its first areas lit) ... */
+export const SWITCHING_EXPERIMENT_MONTH = 12;
+/** ... and plays the network it has this long under each lineup. */
+export const SWITCHING_EXPERIMENT_MONTHS = 48;
+/** An area "reaches the ceiling" once its take rate is this share of its ceiling (AreaCurve.ceiling). */
+export const CEILING_SHARE = 0.9;
+
+export interface SwitchingArm {
+  /** Pooled over the areas lit at the start: whole months until their take rate reached CEILING_SHARE of their ceiling (null: not within the run). */
+  monthsToCeiling: number | null;
+  /** Their ceiling take rate and their take rate at the end. */
+  ceiling: number;
+  take: number;
+  /** Their take rate at each close of the run. */
+  takes: number[];
+  /** Revenue per subscriber-month over the run (ARPU), and revenue per home they pass in the last 12 months. */
+  arpu: number;
+  revenuePerHome: number;
+  /** Cumulative operating cash flow over the run. */
+  ocf: number;
+}
+
+export interface SwitchingExperiment {
+  /** The cabinets whose areas were lit at the start. */
+  cabinets: number[];
+  standard: SwitchingArm;
+  discount: SwitchingArm;
+  overpriced: SwitchingArm;
+}
+
+/**
+ * Switching speed by price, on one fixed set of areas: SMART's game at
+ * SWITCHING_EXPERIMENT_MONTH, then SWITCHING_EXPERIMENT_MONTHS of SMART
+ * operating the network it has (no new areas) at the default prices, at
+ * DISCOUNT_PRICE_MULTIPLIER of them and at OVERPRICED_PRICE_MULTIPLIER (set
+ * on the first day, the default grandfathering for a rise), measured on the
+ * areas lit at the start (their pooled take rate against their pooled
+ * ceiling: harness.areaCurves).
+ */
+export function switchingExperiment(seed: number): SwitchingExperiment {
+  const start = runBot(seed, smartBot(), SWITCHING_EXPERIMENT_MONTH).state;
+  const service = getService(start);
+  const cabinets = start.network.cabinets.filter((c) => c.liveDay !== null && (service.cabinetCoverage.get(c.id)?.passings ?? 0) > 0).map((c) => c.id);
+  const arm = (multiplier: number): SwitchingArm => {
+    const inner = smartBot(OPERATOR_OPTIONS);
+    const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
+    const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: copyState(start) });
+    const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
+    let target = 0;
+    let passings = 0;
+    for (const c of curves) {
+      target += c.ceiling * c.passings;
+      passings += c.passings;
+    }
+    const ceiling = passings > 0 ? target / passings : 0;
+    const takes = run.reports.map((report) => {
+      let units = 0;
+      let homes = 0;
+      for (const area of report.customers?.areas ?? []) {
+        if (!cabinets.includes(area.cabinet)) continue;
+        units += area.units;
+        homes += area.passings;
+      }
+      return homes > 0 ? units / homes : 0;
+    });
+    const reached = takes.findIndex((t) => t >= CEILING_SHARE * ceiling);
+    let revenue = 0;
+    for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
+    const lastPassings = run.reports.at(-1)?.passings ?? 0;
+    return {
+      monthsToCeiling: reached < 0 ? null : reached + 1,
+      ceiling,
+      take: takes.at(-1) ?? 0,
+      takes,
+      arpu: averageArpu(run) ?? 0,
+      revenuePerHome: lastPassings > 0 ? revenue / lastPassings : 0,
+      ocf: cumulativeOperatingCashFlow(run),
+    };
+  };
+  return { cabinets, standard: arm(1), discount: arm(DISCOUNT_PRICE_MULTIPLIER), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER) };
 }

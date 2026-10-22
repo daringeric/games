@@ -1,12 +1,21 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  AWARENESS_MARKETING_HALF_SAT_PER_PASSING,
+  AWARENESS_MARKETING_MAX_PER_DAY,
   CHURN_MONTHLY_BASE,
   CHURN_MONTHLY_MAX,
-  CHURN_PRICE_SENSITIVITY,
+  CHURN_TOTAL_MAX,
+  DEMAND_RESERVATION_SOFTNESS,
+  DEMAND_SEGMENTS,
   GRANDFATHER_MONTHS_DEFAULT,
   GRANDFATHER_MONTHS_MAX,
   GRANDFATHER_STEP_SHARE,
+  HAPPINESS_GOOD_DEAL_MAX,
+  HAPPINESS_PER_PRICE_OVER_MARKET,
+  HAPPINESS_PER_PRICE_UNDER_MARKET,
+  HAPPY_CHURN_FLOOR,
+  HAPPY_SCORE_MIN,
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
   INCUMBENT_PROMO_CHURN,
@@ -15,26 +24,27 @@ import {
   INSTALL_COST_HOME,
   INSTALL_COST_MDU_UNIT,
   INSTALL_COST_SMB,
-  MARKETING_HALF_SAT_PER_PASSING,
-  MARKETING_MAX_BOOST,
   MARKETING_MAX_PER_MONTH,
   MDU_PORTS_PER_BUILDING,
   MDU_ROUTER_COST,
   NOTICE_LOG_MAX,
-  OVERHEAD_PER_MONTH,
   PRICE_STEP_CHURN_MAX,
   PRICE_STEP_CHURN_PER_RISE,
   PROMO_HORIZON_MONTHS,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
+  PROMO_SIGNUP_BOOST,
   PROMO_STEP_SHARE,
+  RETENTION_PERCENT_OFF,
+  RETENTION_STEP_SHARE,
   SMB_MULTIPLIER_DEFAULT,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
-  SPLIT_RATIO,
   SPLITTER_COST,
+  SPLIT_RATIO,
   START_CASH,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
+  SUPPORT_LEVELS,
+  SWITCH_BASE_PER_DAY,
   TAKE_PRICE_WEIGHT,
   TAKE_RATE_BASE,
   TAKE_RATE_KIND_FACTOR,
@@ -51,9 +61,11 @@ import {
   TIER_RETIRE_CHURN_BASE,
   TIER_RETIRE_CHURN_MAX,
   TIER_RETIRE_CHURN_PER_RISE,
-  CHURN_TOTAL_MAX,
 } from './balance';
+import type { DemandSegment } from './balance';
 import { dateOf, dayOf, MONTH_LENGTHS } from './calendar';
+import { formatMoney } from './finance';
+import { AWARENESS_PPM, churnFromScore, dealFactor, marketingAwarenessPerDay, priceScores, PROMO_BOOST_YOUNG_DAYS, stepCustomers } from './customers';
 import { incumbentChurnFor } from './incumbent';
 import { applyCommand, newGame, runDays } from './game';
 import { getService, quoteRemoveCabinet, quoteRemoveSpan } from './network';
@@ -80,6 +92,14 @@ import {
   setPromo,
   stateTakeRate,
   stepChurnProbability,
+  segmentDemand,
+  quotePromo,
+  reservationPrice,
+  reservationSuit,
+  promoAdvice,
+  promoSignupFactor,
+  retentionPrice,
+  SUGGESTED_PROMO,
   stepShare,
   totalChurn,
   unitsByTier,
@@ -87,7 +107,6 @@ import {
   INSTALLS_RESUMED_PREFIX,
   installCost,
   installsPaused,
-  marketingBoost,
   monthlyRecurringRevenue,
   segmentOffset,
   setMarketing,
@@ -101,7 +120,7 @@ import {
 } from './sales';
 import type { SalesClose } from './sales';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import type { Account, CabinetId, City, GameState, IntroPromo, ParcelKind, PriceLock, Pricing, Tier, TierId, TierSetting } from './types';
+import type { Account, CabinetId, City, GameState, IntroPromo, ParcelKind, PriceLock, Pricing, PromoQuote, Tier, TierId, TierSetting } from './types';
 import { outageChurnProbability } from './weather';
 
 // The sales town: 4x4 blocks of 4x2 cells with the CO (and its cabinet) in the
@@ -118,19 +137,31 @@ interface Lit {
   cabinet: CabinetId;
 }
 
-function litTown(opts: { city?: City; rngSales?: number; splitters?: number; marketing?: number } = {}): Lit {
+/**
+ * TOWN (or `city`) every street lit from one cabinet at the CO. Round 4c/4d:
+ * everybody there knows you (fullyAware) unless `aware` is false, so tests of
+ * the signup mechanics do not wait for awareness to grow.
+ */
+function litTown(opts: { city?: City; rngSales?: number; splitters?: number; marketing?: number; aware?: boolean } = {}): Lit {
   const state = makeTestState(opts.city ?? TOWN, { rngSales: opts.rngSales ?? 54321 });
   const cabinet = addLivePlant(state, { splitters: opts.splitters ?? ROOMY }) as CabinetId;
   if (opts.marketing !== undefined) state.sales.marketingPerMonth = opts.marketing;
   // Years of overhead and marketing with no plant to pay for: never let a sales test go bankrupt.
   state.finance.cash = START_CASH * 10;
+  if (opts.aware !== false) fullyAware(state);
   return { state, cabinet };
 }
 
-/** Advance to the next day and run only the sales step (no month close, no network progress). */
+/** Round 4c/4d: every lit street known to everybody (CustomersState.streets at AWARENESS_PPM, lit today). */
+function fullyAware(state: GameState): void {
+  state.customers.streets = [...getService(state).litSegments].sort((a, b) => a - b).map((segment) => ({ segment, litDay: state.day, awareness: AWARENESS_PPM }));
+}
+
+/** Advance to the next day and run only the customers and sales steps (no month close, no network progress, no weather). */
 function step(state: GameState, days = 1): void {
   for (let i = 0; i < days; i++) {
     state.day++;
+    stepCustomers(state);
     withRng(state, 'sales', (rng) => stepSales(state, rng));
   }
 }
@@ -189,7 +220,7 @@ const ALL_KINDS: readonly ParcelKind[] = ['home', 'mdu', 'smb'];
  * ends), for tests of the base take-rate model in towns big enough to trigger it.
  */
 function quietIncumbent(state: GameState, cabinet: CabinetId): void {
-  state.sales.incumbentPromos = [{ cabinet, startDay: 0, endDay: 1, price: INCUMBENT_PRICE, quietUntil: 1_000_000 }];
+  state.sales.incumbentPromos = [{ cabinet, startDay: 0, endDay: 1, price: INCUMBENT_PRICE, quietUntil: 1_000_000, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
 }
 
 /**
@@ -203,15 +234,90 @@ function closeAt(state: GameState): SalesClose {
   return withRng(state, 'sales', (rng) => closeSalesMonth(state, rng, MONTH_LENGTHS[date.month - 1]!, state.day - 1));
 }
 
+/** clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE x advantage, TAKE_RATE_MIN, TAKE_RATE_MAX). */
+function clampedTake(advantage: number): number {
+  return Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage));
+}
+
+/** The balance.ts demand-segment model for one segment, written out independently: its take (before the kind factor) and mix weights. */
+function segmentModel(pricing: Pricing, seg: DemandSegment, kind: ParcelKind = 'home', incumbentPrice = INCUMBENT_PRICE): { take: number; weights: Record<TierId, number> } {
+  const factor = kind === 'smb' ? pricing.smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
+  const speed = (down: number) => TAKE_SPEED_WEIGHT * Math.min(Math.min(down, seg.maxUsefulMbps) / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP);
+  const incumbent = speed(INCUMBENT_DOWN_MBPS) + TAKE_UPLOAD_WEIGHT - (TAKE_PRICE_WEIGHT * seg.priceWeight * incumbentPrice) / INCUMBENT_PRICE;
+  const reservation = seg.maxPriceRatio * incumbentPrice;
+  let take = 0;
+  const weights = tierUnits({});
+  for (const t of pricing.tiers) {
+    if (!t.offered) continue;
+    const paid = t.price * factor;
+    const suit = paid <= reservation ? 1 : Math.max(0, 1 - (paid - reservation) / reservation / DEMAND_RESERVATION_SOFTNESS);
+    if (suit <= 0) continue;
+    const value =
+      speed(t.downMbps) + TAKE_UPLOAD_WEIGHT * Math.min(t.upMbps / INCUMBENT_UP_MBPS, TAKE_UPLOAD_RATIO_CAP) - ((TAKE_PRICE_WEIGHT * seg.priceWeight * t.price) / INCUMBENT_PRICE) * factor;
+    take = Math.max(take, suit * clampedTake(value - incumbent));
+    weights[t.id] = TIER_DEFAULTS.find((d) => d.id === t.id)!.popularity * Math.max(0, value - incumbent) * suit;
+  }
+  return { take, weights };
+}
+
+/** The whole model: sum over DEMAND_SEGMENTS of share x take, times the kind factor. */
+function modelTake(pricing: Pricing, kind: ParcelKind = 'home', incumbentPrice = INCUMBENT_PRICE): number {
+  let take = 0;
+  for (const seg of DEMAND_SEGMENTS) take += seg.share * segmentModel(pricing, seg, kind, incumbentPrice).take;
+  return take * TAKE_RATE_KIND_FACTOR[kind];
+}
+
+/** Round 4's single-segment target (the best offered tier's advantage over the incumbent), for comparison. */
+function round4Take(pricing: Pricing): number {
+  return clampedTake(Math.max(...pricing.tiers.filter((t) => t.offered).map(value)) - INCUMBENT);
+}
+
 describe('targetTakeRate', () => {
-  it('follows the documented formula for the default lineup', () => {
+  it('follows the documented demand-segment formula for the default lineup', () => {
     const pricing = defaultPricing();
-    const advantage = Math.max(...pricing.tiers.map(value)) - INCUMBENT;
-    const raw = TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage;
-    const clamped = Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, raw));
-    for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(pricing, kind)).toBeCloseTo(clamped * TAKE_RATE_KIND_FACTOR[kind], 12);
+    for (const kind of ALL_KINDS) expect(targetTakeRate(pricing, kind)).toBeCloseTo(modelTake(pricing, kind), 12);
+    // Every tier at or under a segment's reservation suits it fully: its take is the plain clamp of its best advantage.
+    const shares = DEMAND_SEGMENTS.reduce((sum, seg) => sum + seg.share, 0);
+    expect(shares).toBeCloseTo(1, 12);
+  });
+
+  it('keeps the default lineup near round 4\'s target', () => {
+    const pricing = defaultPricing();
+    const round4 = round4Take(pricing);
+    expect(Math.abs(targetTakeRate(pricing, 'home') - round4)).toBeLessThan(0.02);
+  });
+
+  it('loses the value seekers without a cheap tier: 2 Gig only and 1 Gig + 2 Gig sign up clearly fewer', () => {
+    const full = targetTakeRate(defaultPricing(), 'home');
+    const twoGig = targetTakeRate(pricingWith({}, { fiber500: false, fiber1g: false }), 'home');
+    const noCheap = targetTakeRate(pricingWith({}, { fiber500: false }), 'home');
+    expect(twoGig).toBeLessThan(full * 0.6);
+    expect(noCheap).toBeLessThan(full * 0.85);
+    expect(twoGig).toBeLessThan(noCheap);
+    // Round 4's single model kept most of the target for a 2 Gig-only lineup.
+    expect(round4Take(pricingWith({}, { fiber500: false, fiber1g: false }))).toBeGreaterThan(full * 0.85);
+    // Who is lost: the price-sensitive households, who find no plan they would pay for.
+    const value = segmentDemand(pricingWith({}, { fiber500: false, fiber1g: false })).find((s) => s.segment === 'value')!;
+    expect(value).toMatchObject({ takeRate: 0, tier: null });
+    expect(segmentDemand(defaultPricing()).find((s) => s.segment === 'value')!.tier).toBe('fiber500');
+  });
+
+  it('has no cliff when every price rises a little', () => {
+    const scaled = (x: number) => pricingWith(Object.fromEntries(TIER_DEFAULTS.map((t) => [t.id, Math.round(t.price * x * 100) / 100])));
+    let previous = targetTakeRate(scaled(1), 'home');
+    let biggest = 0;
+    for (let step = 1; step <= 60; step++) {
+      const next = targetTakeRate(scaled(1 + step / 100), 'home');
+      expect(next).toBeLessThanOrEqual(previous + 1e-12);
+      biggest = Math.max(biggest, previous - next);
+      previous = next;
     }
+    // A 1% rise never costs more than about three points, though value seekers drop out over that range ...
+    expect(biggest).toBeLessThan(0.03);
+    // ... where a hard reservation (no softness) would drop the whole segment's take in one step.
+    const value = DEMAND_SEGMENTS.find((s) => s.id === 'value')!;
+    expect(biggest).toBeLessThan((value.share * clampedTake(0)) / 3);
+    expect(targetTakeRate(scaled(1.6), 'home')).toBeLessThan(targetTakeRate(scaled(1), 'home') - value.share * clampedTake(0) * 0.9);
   });
 
   it('falls as the price rises', () => {
@@ -230,17 +336,30 @@ describe('targetTakeRate', () => {
     expect(r2g).toBeGreaterThan(r1g);
   });
 
-  it('only counts the best offered tier', () => {
+  it('counts only each segment\'s best suiting tier', () => {
     const all = defaultPricing();
-    const best = all.tiers.reduce((a, b) => (value(b) > value(a) ? b : a));
-    expect(targetTakeRate(all, 'home')).toBeCloseTo(targetTakeRate(only(best.id, best.price), 'home'), 12);
+    // Dropping a tier no segment likes best changes nobody's take (it only moves the mix).
+    const best = new Set(segmentDemand(all).map((s) => s.tier));
+    for (const tier of all.tiers) {
+      if (best.has(tier.id)) continue;
+      const without = pricingWith({}, { [tier.id]: false });
+      expect(targetTakeRate(without, 'home')).toBeCloseTo(targetTakeRate(all, 'home'), 12);
+      expect(tierMix(without)[tier.id]).toBe(0);
+    }
   });
 
-  it('clamps to TAKE_RATE_MIN..TAKE_RATE_MAX before the kind factor', () => {
+  it('signs nobody up when no tier suits any segment, and clamps at TAKE_RATE_MAX before the kind factor', () => {
     const priced = (price: number) => pricingWith({ fiber500: price, fiber1g: price, fiber2g: price });
     for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(priced(1_000_000), kind)).toBeCloseTo(TAKE_RATE_MIN * TAKE_RATE_KIND_FACTOR[kind], 12);
+      expect(targetTakeRate(priced(1_000_000), kind)).toBe(0);
       expect(targetTakeRate(priced(-1_000_000), kind)).toBeCloseTo(TAKE_RATE_MAX * TAKE_RATE_KIND_FACTOR[kind], 12);
+    }
+    // Each segment's take is 0 exactly when no tier suits it, and within the clamp otherwise.
+    for (let price = TIER_PRICE_MIN; price <= TIER_PRICE_MAX; price += 20) {
+      for (const seg of segmentDemand(priced(price))) {
+        expect(seg.takeRate).toBeLessThanOrEqual(TAKE_RATE_MAX);
+        expect(seg.takeRate === 0).toBe(seg.tier === null);
+      }
     }
   });
 
@@ -262,6 +381,7 @@ describe('targetTakeRate', () => {
     const rates: number[] = [];
     for (let m = SMB_MULTIPLIER_MIN; m <= SMB_MULTIPLIER_MAX; m += 0.5) {
       rates.push(targetTakeRate(at(m), 'smb'));
+      expect(targetTakeRate(at(m), 'smb')).toBeCloseTo(modelTake(at(m), 'smb'), 12);
       expect(targetTakeRate(at(m), 'home')).toBe(targetTakeRate(defaultPricing(), 'home'));
       expect(targetTakeRate(at(m), 'mdu')).toBe(targetTakeRate(defaultPricing(), 'mdu'));
     }
@@ -271,6 +391,42 @@ describe('targetTakeRate', () => {
     expect(targetTakeRate(defaultPricing(), 'smb')).toBeCloseTo(targetTakeRate(defaultPricing(), 'home') * TAKE_RATE_KIND_FACTOR.smb, 12);
     // Below it, businesses sign up more readily.
     expect(targetTakeRate(at(SMB_MULTIPLIER_MIN), 'smb')).toBeGreaterThan(targetTakeRate(defaultPricing(), 'smb'));
+    // Round 4b: at the top multiplier only speed seekers still find a plan they would pay for (round 4 kept every
+    // business at TAKE_RATE_MIN or more; a segment priced out entirely now signs up nobody).
+    const top = segmentDemand(at(SMB_MULTIPLIER_MAX), 'smb');
+    expect(top.filter((seg) => seg.tier !== null).map((seg) => seg.segment)).toEqual(['speed']);
+    expect(rates.at(-1)!).toBeGreaterThan(0);
+  });
+});
+
+describe('segmentDemand', () => {
+  it('reports each segment\'s share, take and favourite tier, in DEMAND_SEGMENTS order', () => {
+    const pricing = defaultPricing();
+    const segments = segmentDemand(pricing);
+    expect(segments.map((seg) => seg.segment)).toEqual(DEMAND_SEGMENTS.map((seg) => seg.id));
+    for (const [i, seg] of segments.entries()) {
+      const model = segmentModel(pricing, DEMAND_SEGMENTS[i]!);
+      expect(seg.share).toBe(DEMAND_SEGMENTS[i]!.share);
+      expect(seg.takeRate).toBeCloseTo(model.take, 12);
+      const favourite = TIER_IDS.reduce((a, b) => (model.weights[b] > model.weights[a] ? b : a));
+      expect(seg.tier).toBe(favourite);
+    }
+  });
+
+  it('prices segments out at their reservation (maxPriceRatio x the incumbent\'s local price), softly', () => {
+    const value = DEMAND_SEGMENTS.find((s) => s.id === 'value')!;
+    const reservation = reservationPrice('value');
+    expect(reservation).toBeCloseTo(value.maxPriceRatio * INCUMBENT_PRICE, 12);
+    expect(reservationPrice('value', INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT)).toBeLessThan(reservation);
+    expect(reservationSuit(reservation, reservation)).toBe(1);
+    expect(reservationSuit(reservation * (1 + DEMAND_RESERVATION_SOFTNESS / 2), reservation)).toBeCloseTo(0.5, 12);
+    expect(reservationSuit(reservation * (1 + DEMAND_RESERVATION_SOFTNESS), reservation)).toBe(0);
+    // A cheap tier just over the value seekers' reservation keeps some of them; well over it, none.
+    const near = segmentDemand(only('fiber500', Math.ceil(reservation * (1 + DEMAND_RESERVATION_SOFTNESS / 2)))).find((s) => s.segment === 'value')!;
+    const far = segmentDemand(only('fiber500', Math.ceil(reservation * (1 + DEMAND_RESERVATION_SOFTNESS)) + 1)).find((s) => s.segment === 'value')!;
+    expect(near.takeRate).toBeGreaterThan(0);
+    expect(near.tier).toBe('fiber500');
+    expect(far).toMatchObject({ takeRate: 0, tier: null });
   });
 });
 
@@ -281,23 +437,31 @@ describe('tierMix', () => {
     const pricing = defaultPricing();
     expect(tierMix(pricing, 'smb')).toEqual(tierMix(pricing));
     expect(tierMix(pricing, 'mdu')).toEqual(tierMix(pricing));
-    // Dearer business prices push businesses from the dearest tier toward the cheapest.
-    // (A little dearer: far enough up, no tier beats the incumbent and offered tiers split evenly.)
+    // Dearer business prices push businesses off the dearest tier. (Round 4b: they also price the value-seeking
+    // businesses out first, and those took the cheapest tier, so its share no longer has to rise.)
     const dearer = SMB_MULTIPLIER_DEFAULT * 1.25;
     const dear = tierMix({ ...pricing, smbMultiplier: dearer }, 'smb');
     expect(sum(dear)).toBeCloseTo(1, 12);
-    expect(dear.fiber500).toBeGreaterThan(tierMix(pricing).fiber500);
     expect(dear.fiber2g).toBeLessThan(tierMix(pricing).fiber2g);
+    expect(dear).not.toEqual(tierMix(pricing));
     expect(tierMix({ ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX })).toEqual(tierMix(pricing));
   });
 
-  it('splits signups over offered tiers by popularity x advantage', () => {
+  it('sums the segments\' popularity x advantage x suit mixes, weighted by share x take', () => {
     const pricing = defaultPricing();
     const mix = tierMix(pricing);
     expect(sum(mix)).toBeCloseTo(1, 12);
-    const weight = (t: Tier) => TIER_DEFAULTS.find((d) => d.id === t.id)!.popularity * Math.max(0, value(t) - INCUMBENT);
-    const total = pricing.tiers.reduce((s, t) => s + weight(t), 0);
-    for (const tier of pricing.tiers) expect(mix[tier.id]).toBeCloseTo(weight(tier) / total, 12);
+    const expected = tierUnits({});
+    let total = 0;
+    for (const seg of DEMAND_SEGMENTS) {
+      const model = segmentModel(pricing, seg);
+      const weights = TIER_IDS.reduce((s, id) => s + model.weights[id], 0);
+      for (const id of TIER_IDS) expected[id] += seg.share * model.take * (model.weights[id] / weights);
+      total += seg.share * model.take;
+    }
+    for (const id of TIER_IDS) expect(mix[id]).toBeCloseTo(expected[id] / total, 12);
+    // Value seekers mostly take 500 Mbps, so it leads the mix.
+    expect(mix.fiber500).toBeGreaterThan(mix.fiber1g);
   });
 
   it('gives unoffered tiers nothing', () => {
@@ -308,7 +472,7 @@ describe('tierMix', () => {
     expect(tierMix(only('fiber1g', TIER_PRICE_MAX))).toEqual({ fiber500: 0, fiber1g: 1, fiber2g: 0 });
   });
 
-  it('splits evenly when no offered tier beats the incumbent', () => {
+  it('splits evenly when nobody would sign up', () => {
     expect(tierMix(pricingWith({ fiber500: 1e6, fiber1g: 1e6, fiber2g: 1e6 }))).toEqual({
       fiber500: 1 / 3,
       fiber1g: 1 / 3,
@@ -366,22 +530,22 @@ describe('prices, installs and ports', () => {
     );
   });
 
-  it('boosts the ramp with diminishing returns on marketing', () => {
+  it('raises awareness with diminishing returns on marketing (round 4c/4d: in place of the ramp boost)', () => {
     const passings = 1_000;
-    expect(marketingBoost(0, passings)).toBe(0);
+    expect(marketingAwarenessPerDay(0, passings)).toBe(0);
     let previous = 0;
     for (const m of [1_000, 2_000, 4_000, 8_000, 16_000, 32_000]) {
-      const boost = marketingBoost(m, passings);
-      expect(boost).toBeGreaterThan(previous);
-      // Doubling the budget less than doubles the boost.
-      if (previous > 0) expect(boost).toBeLessThan(2 * previous);
-      expect(boost).toBeLessThan(MARKETING_MAX_BOOST);
-      previous = boost;
+      const gain = marketingAwarenessPerDay(m, passings);
+      expect(gain).toBeGreaterThan(previous);
+      // Doubling the budget less than doubles the gain.
+      if (previous > 0) expect(gain).toBeLessThan(2 * previous);
+      expect(gain).toBeLessThan(AWARENESS_MARKETING_MAX_PER_DAY);
+      previous = gain;
     }
-    // Half the maximum at MARKETING_HALF_SAT_PER_PASSING dollars per passing.
-    expect(marketingBoost(MARKETING_HALF_SAT_PER_PASSING * passings, passings)).toBeCloseTo(MARKETING_MAX_BOOST / 2, 12);
+    // Half the maximum at AWARENESS_MARKETING_HALF_SAT_PER_PASSING dollars per passing.
+    expect(marketingAwarenessPerDay(AWARENESS_MARKETING_HALF_SAT_PER_PASSING * passings, passings)).toBeCloseTo(AWARENESS_MARKETING_MAX_PER_DAY / 2, 12);
     // The same budget does less in a bigger footprint.
-    expect(marketingBoost(5_000, 2 * passings)).toBeLessThan(marketingBoost(5_000, passings));
+    expect(marketingAwarenessPerDay(5_000, 2 * passings)).toBeLessThan(marketingAwarenessPerDay(5_000, passings));
   });
 
   it('rounds segment targets with a fixed offset in [0, 1)', () => {
@@ -399,31 +563,36 @@ describe('prices, installs and ports', () => {
 });
 
 describe('signups', () => {
-  it('ramps the take rate toward the target over a year or two', () => {
+  it('switches toward the target over years: slowly while few know you, then most of the way (round 4c/4d)', () => {
     const target = targetTakeRate(defaultPricing(), 'home');
+    // Once everybody knows you the gap closes at SWITCH_BASE_PER_DAY a day while churn reopens it:
+    // the take rate settles near target x r / (r + churn a day).
+    const churnPerDay = CHURN_MONTHLY_BASE / (365 / 12);
+    const settle = (target * SWITCH_BASE_PER_DAY) / (SWITCH_BASE_PER_DAY + churnPerDay);
     let early = 0;
     let late = 0;
     for (const rngSales of [1, 2, 3]) {
-      const { state, cabinet } = litTown({ rngSales });
+      const { state, cabinet } = litTown({ rngSales, aware: false });
       // The base model: the incumbent never answers here (see incumbent.test.ts for when it does).
       quietIncumbent(state, cabinet);
       runDays(state, 30);
       const first = takeRate(state);
-      runDays(state, 700);
+      runDays(state, 5 * 365 - 30);
       const last = takeRate(state);
-      expect(first).toBeLessThan(0.75 * target);
-      expect(last).toBeGreaterThan(0.8 * target);
+      expect(first).toBeLessThan(0.25 * target);
+      expect(last).toBeGreaterThan(0.7 * settle);
       expect(last).toBeLessThan(1.15 * target);
       early += first;
       late += last;
     }
-    expect(late).toBeGreaterThan(2 * early);
+    expect(late / 3).toBeGreaterThan(0.85 * settle);
+    expect(late).toBeGreaterThan(3 * early);
   });
 
   it('connects new accounts on the serving cabinet, sorted by parcel, dated the day they connect', () => {
     const { state, cabinet } = litTown({ marketing: LOUD });
     const sinceSeen = new Map<number, number>();
-    for (let d = 0; d < 60; d++) {
+    for (let d = 0; d < 120; d++) {
       step(state);
       for (const a of state.sales.accounts) if (!sinceSeen.has(a.parcel)) sinceSeen.set(a.parcel, state.day);
     }
@@ -509,8 +678,9 @@ describe('signups', () => {
     let quiet = 0;
     let loud = 0;
     for (const rngSales of [1, 2, 3, 4]) {
-      const a = litTown({ rngSales, marketing: 0 }).state;
-      const b = litTown({ rngSales, marketing: LOUD }).state;
+      // Round 4c/4d: marketing works through awareness, so start where a newly lit street does.
+      const a = litTown({ rngSales, marketing: 0, aware: false }).state;
+      const b = litTown({ rngSales, marketing: LOUD, aware: false }).state;
       step(a, 45);
       step(b, 45);
       quiet += subscriberUnits(a);
@@ -852,8 +1022,10 @@ describe('accruals and billing', () => {
     const price = unitPrice(state.sales.pricing, 'fiber1g', 'home');
     const january = state.finance.reports[0]!;
     expect(january.totals.revenue).toBe(Math.round((price * 21) / 31));
-    // Overhead is the fixed monthly charge plus support for the same 21 days.
-    expect(january.totals.overhead).toBe(-(OVERHEAD_PER_MONTH + Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * 21) / 31)));
+    // Overhead is the fixed lines plus support (in the per-customer line) for the same 21 days (round 4c/4d: overhead.ts's lines).
+    const lines = january.ops!.overhead!;
+    expect(january.totals.overhead).toBe(-(lines.base + lines.perCustomer + lines.perPlant));
+    expect(lines.support).toBe(Math.round((SUPPORT_LEVELS[state.customers.supportLevel].costPerSub * 21) / 31));
     expect(january.totals.marketing).toBeUndefined();
     expect(january.stats!.grossAdds).toBe(0);
   });
@@ -932,7 +1104,9 @@ describe('accruals and billing', () => {
 
 describe('closeSalesMonth', () => {
   it('posts revenue, marketing and support on the last day, churns, and resets the month', () => {
-    const { state } = litTown({ marketing: LOUD });
+    const { state, cabinet } = litTown({ marketing: LOUD });
+    // A few subscribers from day 0, and the month's signups on top.
+    state.sales.accounts = [0, 1, 2, 3, 4, 5].map((p) => account(p, cabinet, { fiber1g: 1 }));
     step(state, 30);
     const month = { ...state.sales.month };
     const subs = subscriberUnits(state);
@@ -942,7 +1116,9 @@ describe('closeSalesMonth', () => {
     expect(close).toEqual({
       revenue: Math.round(month.revenueDollarDays / 31),
       marketing: Math.round(month.marketingDollarDays / 31),
-      support: Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * month.subscriberUnitDays) / 31),
+      // Round 4c/4d: support at the game's level, inside the per-customer overhead line overhead.ts prices and posts.
+      support: Math.round((SUPPORT_LEVELS[state.customers.supportLevel].costPerSub * month.subscriberUnitDays) / 31),
+      perCustomer: close.perCustomer,
       subscriberDays: month.subscriberUnitDays,
       grossAdds: month.grossAdds,
       churned: subs - subscriberUnits(state),
@@ -951,14 +1127,16 @@ describe('closeSalesMonth', () => {
       priceChurn: 0,
       outageChurn: 0,
       incumbentChurn: 0,
+      outageCredits: 0,
     });
     const entries = state.finance.monthToDate.filter((e) => e.category !== 'install');
     expect(entries).toEqual([
       { day: 30, category: 'revenue', amount: close.revenue, memo: `Subscriber billing for Jan 2027: ${subs} subscribers` },
       { day: 30, category: 'marketing', amount: -close.marketing, memo: 'Marketing for Jan 2027' },
-      { day: 30, category: 'overhead', amount: -close.support, memo: 'Customer support' },
+      { day: 30, category: 'overhead', amount: -close.perCustomer, memo: expect.any(String) },
     ]);
-    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0 });
+    expect(close.perCustomer).toBeGreaterThanOrEqual(close.support);
+    expect(state.sales.month).toEqual({ revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0, outageCreditDollarDays: 0 });
   });
 
   it('skips empty charges', () => {
@@ -970,6 +1148,7 @@ describe('closeSalesMonth', () => {
       revenue: 0,
       marketing: 0,
       support: 0,
+      perCustomer: 0,
       subscriberDays: 0,
       grossAdds: 0,
       churned: 0,
@@ -978,6 +1157,7 @@ describe('closeSalesMonth', () => {
       priceChurn: 0,
       outageChurn: 0,
       incumbentChurn: 0,
+      outageCredits: 0,
     });
     expect(state.finance.monthToDate).toEqual([]);
   });
@@ -989,28 +1169,41 @@ describe('closeSalesMonth', () => {
 });
 
 describe('churn', () => {
-  it('rises with price above the default, up to CHURN_MONTHLY_MAX', () => {
+  it('rises with price above the default, up to CHURN_MONTHLY_MAX, and falls below it to the happy floor (round 4c/4d)', () => {
     for (const d of TIER_DEFAULTS) {
       const tier = defaultPricing().tiers.find((t) => t.id === d.id)!;
       expect(churnProbability(tier)).toBeCloseTo(CHURN_MONTHLY_BASE, 12);
-      expect(churnProbability({ ...tier, price: Math.max(1, d.price - 20) })).toBeCloseTo(CHURN_MONTHLY_BASE, 12);
+      // Round 4c/4d: a good deal makes customers happier (goodDeal), down to HAPPY_CHURN_FLOOR of the base.
+      const lower = Math.max(1, d.price - 20);
+      const under = (d.price - lower) / d.price;
+      expect(churnProbability({ ...tier, price: lower })).toBeCloseTo(
+        CHURN_MONTHLY_BASE * Math.max(HAPPY_CHURN_FLOOR, 1 - Math.min(HAPPINESS_GOOD_DEAL_MAX, HAPPINESS_PER_PRICE_UNDER_MARKET * under)),
+        12,
+      );
+      expect(churnProbability({ ...tier, price: lower })).toBeLessThan(CHURN_MONTHLY_BASE);
       const higher = { ...tier, price: Math.round(d.price * 1.5) };
       const over = (higher.price - d.price) / d.price;
-      expect(churnProbability(higher)).toBeCloseTo(Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over)), 12);
+      // The price-over-market factor replaces round 4's price sensitivity: the same churn at the same weight.
+      expect(churnProbability(higher)).toBeCloseTo(Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * over)), 12);
       expect(churnProbability({ ...tier, price: 1_000_000 })).toBe(CHURN_MONTHLY_MAX);
     }
   });
 
-  it('churns businesses on the price they pay: more above the default multiplier, the same at it', () => {
+  it('churns businesses on the price they pay: more above the default multiplier, less below, the same at it', () => {
     for (const tier of defaultPricing().tiers) {
       expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_DEFAULT)).toBe(churnProbability(tier));
       expect(churnProbability(tier, 'home', SMB_MULTIPLIER_MAX)).toBe(churnProbability(tier));
       const over = SMB_MULTIPLIER_MAX / SMB_MULTIPLIER_DEFAULT - 1;
       expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MAX)).toBeCloseTo(
-        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over)),
+        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * over)),
         12,
       );
-      expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MIN)).toBe(churnProbability(tier));
+      const under = 1 - SMB_MULTIPLIER_MIN / SMB_MULTIPLIER_DEFAULT;
+      expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MIN)).toBeCloseTo(
+        CHURN_MONTHLY_BASE * Math.max(HAPPY_CHURN_FLOOR, 1 - Math.min(HAPPINESS_GOOD_DEAL_MAX, HAPPINESS_PER_PRICE_UNDER_MARKET * under)),
+        12,
+      );
+      expect(churnProbability(tier, 'home', SMB_MULTIPLIER_MIN)).toBe(churnProbability(tier));
     }
   });
 
@@ -1140,12 +1333,14 @@ describe('performance', () => {
       state.day++;
       getService(state); // the network's share of the day, not timed here
       const start = performance.now();
+      // Round 4c/4d: the customers step (awareness, waits, memories) belongs to the day's sales work.
+      stepCustomers(state);
       withRng(state, 'sales', (rng) => stepSales(state, rng));
       times.push(performance.now() - start);
     }
     expect(subscriberUnits(state)).toBeGreaterThan(100);
     times.sort((a, b) => a - b);
-    // Typically ~0.2 ms.
+    // Typically ~0.3 ms.
     expect(times[times.length >> 1]!).toBeLessThan(1);
   });
 });
@@ -1549,20 +1744,27 @@ describe('churn causes', () => {
     const state = makeTestState(city, { rngSales: 3 });
     state.day = 40;
     const list = TIER_DEFAULTS[1]!.price;
-    const lock = Math.round(list / 2);
+    // Round 4c/4d: a lock below the list price but above the cable promo's price for that kind of plan,
+    // so the incumbent's part (its priceVsCable factor's share of the happiness churn) is not 0.
+    const promoPrice = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
+    const lock = list - Math.round((list - (promoPrice * list) / INCUMBENT_PRICE) / 4);
     state.sales.accounts = city.parcels.map((p) => ({ ...account(p.id, 1, { fiber1g: p.units }), locks: [lockOf('fiber1g', lock, closeDayAfter(40, 1), 'notice')] }));
     const outageDays = 6;
     // Every account was cut off 6 days and has service again by the close.
     state.weather.cutOff = state.sales.accounts.map((a) => ({ parcel: a.parcel, days: outageDays, charged: 0, units: accountUnits(a) }));
-    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600 }];
+    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: promoPrice, quietUntil: 600, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     const units = subscriberUnits(state);
     const close = closeAt(state);
+    const p = priceScores('fiber1g', 'mdu', lock, SMB_MULTIPLIER_DEFAULT, promoPrice);
+    const score = SUPPORT_LEVELS[state.customers.supportLevel].happiness + p.priceVsCable + p.priceVsMarket + p.goodDeal;
+    const calm = churnFromScore(score - p.priceVsCable);
     const parts = {
-      regular: churnProbability({ ...state.sales.pricing.tiers[1]!, price: lock }, 'mdu'),
+      regular: calm,
       price: stepChurnProbability(lock, list, 1),
       outage: outageChurnProbability(outageDays),
-      incumbent: INCUMBENT_PROMO_CHURN,
+      incumbent: churnFromScore(score) - calm,
     };
+    expect(parts.incumbent).toBeGreaterThan(0);
     expect(incumbentChurnFor(state, 1)).toBe(INCUMBENT_PROMO_CHURN);
     expect(close.churned).toBe(units - subscriberUnits(state));
     expectNear(close.churned, units, totalChurn(parts));
@@ -1586,7 +1788,7 @@ describe('churn causes', () => {
     quiet.sales.accounts = city.parcels.map((p) => account(p.id, 1, { fiber500: p.units }));
     const noisy = structuredClone(quiet);
     // The promo runs at another cabinet; the outage on a street nobody here lives on.
-    noisy.sales.incumbentPromos = [{ cabinet: 2, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600 }];
+    noisy.sales.incumbentPromos = [{ cabinet: 2, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     noisy.weather.month.segmentOutageDays = [{ segment: city.segments.length - 1, days: 9 }];
     expect(city.parcels.some((p) => p.segment === city.segments.length - 1)).toBe(false);
     const a = closeAt(quiet);
@@ -1600,18 +1802,15 @@ describe('the incumbent\'s local price', () => {
   it('lowers the target take rate where it is cheaper', () => {
     const pricing = defaultPricing();
     const promo = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
-    const incumbent = TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - (TAKE_PRICE_WEIGHT * promo) / INCUMBENT_PRICE;
-    const advantage = Math.max(...pricing.tiers.map(value)) - incumbent;
-    const clamped = Math.min(TAKE_RATE_MAX, Math.max(TAKE_RATE_MIN, TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage));
     for (const kind of ALL_KINDS) {
-      expect(targetTakeRate(pricing, kind, promo)).toBeCloseTo(clamped * TAKE_RATE_KIND_FACTOR[kind], 12);
+      expect(targetTakeRate(pricing, kind, promo)).toBeCloseTo(modelTake(pricing, kind, promo), 12);
       expect(targetTakeRate(pricing, kind, promo)).toBeLessThan(targetTakeRate(pricing, kind));
       expect(targetTakeRate(pricing, kind, INCUMBENT_PRICE)).toBe(targetTakeRate(pricing, kind));
     }
     expect(tierMix(pricing, 'home', INCUMBENT_PRICE)).toEqual(tierMix(pricing));
   });
 
-  it('signs up fewer households where its promo runs, and says so in the local target', () => {
+  it('signs up fewer households where its promo runs, more slowly, and says so in the local target (round 4c/4d: its deal is worse there)', () => {
     // Two big apartment buildings on one street: enough units for the averages to show.
     const city = makeGridCity({ cols: 1, rows: 1, blockW: 2, blockH: 1, parcelKinds: () => ({ kind: 'mdu', units: 500 }) });
     let calm = 0;
@@ -1619,7 +1818,7 @@ describe('the incumbent\'s local price', () => {
     for (const rngSales of [1, 2, 3]) {
       const a = litTown({ city, rngSales, marketing: LOUD, splitters: 1 });
       const b = litTown({ city, rngSales, marketing: LOUD, splitters: 1 });
-      b.state.sales.incumbentPromos = [{ cabinet: b.cabinet, startDay: 0, endDay: 10_000, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 10_000 }];
+      b.state.sales.incumbentPromos = [{ cabinet: b.cabinet, startDay: 0, endDay: 10_000, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 10_000, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
       step(a.state, 365);
       step(b.state, 365);
       calm += subscriberUnits(a.state);
@@ -1627,10 +1826,21 @@ describe('the incumbent\'s local price', () => {
       expect(stateTakeRate(b.state, 'mdu', b.cabinet)).toBeLessThan(stateTakeRate(b.state, 'mdu'));
       expect(stateTakeRate(a.state, 'mdu', a.cabinet)).toBe(stateTakeRate(a.state, 'mdu'));
     }
-    // About in proportion to the two targets.
-    const ratio = stateTakeRateAt(INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT) / stateTakeRateAt(INCUMBENT_PRICE);
-    expect(contested / calm).toBeGreaterThan(ratio - 0.06);
-    expect(contested / calm).toBeLessThan(Math.min(ratio + 0.06, 0.97));
+    // A year of switching with everybody aware and no closes: each gap shrinks by (1 - rate) a day, the
+    // contested one from a lower target at the slower rate its worse deal gives (customers.dealFactor).
+    const promoPrice = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
+    const ratio = stateTakeRateAt(promoPrice) / stateTakeRateAt(INCUMBENT_PRICE);
+    const filled = (rate: number) => {
+      let left = 1;
+      for (let d = 0; d < 365; d++) left -= left * rate;
+      return 1 - left;
+    };
+    const slow = dealFactor(defaultPricing(), 'mdu', promoPrice) / dealFactor(defaultPricing(), 'mdu');
+    expect(slow).toBeLessThan(1);
+    const expected = (ratio * filled(SWITCH_BASE_PER_DAY * slow)) / filled(SWITCH_BASE_PER_DAY);
+    expect(contested / calm).toBeLessThan(ratio);
+    expect(contested / calm).toBeGreaterThan(expected - 0.06);
+    expect(contested / calm).toBeLessThan(expected + 0.06);
     function stateTakeRateAt(price: number): number {
       return targetTakeRate(defaultPricing(), 'mdu', price);
     }
@@ -1713,6 +1923,14 @@ describe('quotePricing', () => {
       fresh * stepChurnProbability(old1g, old1g + 14, GRANDFATHER_STEP_SHARE) +
       (stepChurnProbability(promoHolder.price, old1g + 14, PROMO_STEP_SHARE) - stepChurnProbability(promoHolder.price, old1g, PROMO_STEP_SHARE));
     expect(q.expectedChurn).toBe(Math.round(expected));
+    // Round 4c (spec C): less what those expected to cancel would pay after the change: 1 Gig at its new
+    // price (the business on 1 Gig at its multiplier), the promo holder at its promo price (its lock holds).
+    expect(state.city.parcels[0]!.kind === 'smb' && state.sales.accounts[0]!.tierUnits.fiber1g === 1).toBe(true);
+    const step = stepChurnProbability(old1g, old1g + 14, GRANDFATHER_STEP_SHARE);
+    const promoStep = stepChurnProbability(promoHolder.price, old1g + 14, PROMO_STEP_SHARE) - stepChurnProbability(promoHolder.price, old1g, PROMO_STEP_SHARE);
+    const lost = (fresh - 1) * step * (old1g + 14) + step * Math.round((old1g + 14) * state.sales.pricing.smbMultiplier) + promoStep * promoHolder.price;
+    expect(q.mrrAfterChurn).toBe(Math.round(q.mrrAfterLocks - lost));
+    expect(q.mrrAfterChurn).toBeLessThan(q.mrrAfterLocks);
   });
 
   it('quotes a notice rise ending at the next close with the full step', () => {
@@ -1734,6 +1952,10 @@ describe('quotePricing', () => {
     expect(q.mrrNow).toBe(monthlyRecurringRevenue(state));
     expect(q.mrrAfterLocks).toBe(monthlyRecurringRevenue(state) - moving * (listOf(state, 'fiber2g') - listOf(state, 'fiber1g')));
     expect(q.expectedChurn).toBe(Math.round(moving * retireChurnProbability(listOf(state, 'fiber2g'), listOf(state, 'fiber1g'))));
+    // Round 4c (spec C): the MRR preview counts the cancellations it lists, at what they would pay after the move.
+    const lost = moving * retireChurnProbability(listOf(state, 'fiber2g'), listOf(state, 'fiber1g')) * listOf(state, 'fiber1g');
+    expect(q.mrrAfterChurn).toBe(Math.round(q.mrrAfterLocks - lost));
+    expect(q.mrrAfterChurn).toBeLessThan(q.mrrAfterLocks);
   });
 
   it('says what setPricing would say about a bad request, and quotes today\'s figures', () => {
@@ -1753,6 +1975,7 @@ describe('quotePricing', () => {
       mrrAfterLocks: mrr,
       unitsMoving: 0,
       expectedChurn: 0,
+      mrrAfterChurn: mrr,
     });
     expect(quotePricing(state, settings(state.sales.pricing), 1.5, GRANDFATHER_MONTHS_MAX + 1).ok).toBe(false);
   });
@@ -1778,5 +2001,303 @@ describe('round-4 determinism', () => {
     for (const kind of ['priceStep', 'tierRetired'] as const) expect(kinds.has(kind), kind).toBe(true);
     // Through a save and load too.
     expect(serialize(deserialize(serialize(a)))).toBe(serialize(a));
+  });
+});
+
+describe('round 4b contract: demand segments, the promo quote, retention steps', () => {
+  it('segmentDemand adds up to targetTakeRate for every kind and lineup', () => {
+    const lineups: Pricing[] = [defaultPricing(), { ...defaultPricing(), tiers: defaultPricing().tiers.map((t) => ({ ...t, offered: t.id === 'fiber2g' })) }];
+    for (const pricing of lineups) {
+      for (const kind of ['home', 'mdu', 'smb'] as const) {
+        const segments = segmentDemand(pricing, kind);
+        expect(segments.length).toBeGreaterThan(0);
+        let shares = 0;
+        let take = 0;
+        for (const s of segments) {
+          shares += s.share;
+          take += s.share * s.takeRate * TAKE_RATE_KIND_FACTOR[kind];
+          if (s.tier !== null) expect(pricing.tiers.find((t) => t.id === s.tier)?.offered).toBe(true);
+        }
+        expect(shares).toBeCloseTo(1, 9);
+        expect(take).toBeCloseTo(targetTakeRate(pricing, kind), 9);
+      }
+    }
+  });
+
+  it('quotePromo refuses what setPromo would refuse', () => {
+    const state = makeTestState(TOWN);
+    expect(quotePromo(state, null).ok).toBe(true);
+    expect(quotePromo(state, { percentOff: 20, months: 3 }).ok).toBe(true);
+    expect(quotePromo(state, { percentOff: 0, months: 3 }).ok).toBe(false);
+    expect(quotePromo(state, { percentOff: 20, months: 0 }).ok).toBe(false);
+    state.gameOver = { day: 0, reason: 'insolvent', message: 'Out of cash' };
+    expect(quotePromo(state, { percentOff: 20, months: 3 })).toMatchObject({ ok: false, reasons: ['Game over: Out of cash'], advice: '' });
+  });
+
+  it('a retention lock steps up with RETENTION_STEP_SHARE', () => {
+    expect(stepShare('retention')).toBe(RETENTION_STEP_SHARE);
+  });
+});
+
+describe('the intro promo speeds signups up', () => {
+  /** Signups over 20 days in towers with and without `offer`, everybody aware, the streets lit `age` days ago (and the incumbent contesting them when asked). */
+  function race(offer: IntroPromo, age: number, contested = false): { plain: number; promoted: number } {
+    let plain = 0;
+    let promoted = 0;
+    for (const rngSales of [1, 2, 3, 4, 5, 6]) {
+      const a = litTown({ city: towers(), rngSales, marketing: LOUD, splitters: 2 });
+      const b = litTown({ city: towers(), rngSales, marketing: LOUD, splitters: 2 });
+      for (const lit of [a, b]) {
+        lit.state.day = age;
+        for (const street of lit.state.customers.streets) street.litDay = 0;
+        if (contested) lit.state.sales.incumbentPromos = [{ cabinet: lit.cabinet, startDay: 0, endDay: 10_000, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 10_000, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
+      }
+      b.state.sales.promo = offer;
+      step(a.state, 20);
+      step(b.state, 20);
+      plain += subscriberUnits(a.state);
+      promoted += subscriberUnits(b.state);
+    }
+    return { plain, promoted };
+  }
+
+  /**
+   * A one-month offer whose discount does not move its customers to another happiness bucket than the list
+   * price's (word of mouth, measured in customers.test.ts, would then differ between the races), so only the
+   * boost and the deal show: the deepest one short of HAPPY_SCORE_MIN when a customer at the list price
+   * (score 0) is not happy, else (round 4c/4d tuning: HAPPY_SCORE_MIN <= 0, both are happy) a 30% one, deep
+   * enough that its boost stands clear of the little a one-month offer adds to the deal.
+   */
+  function unhappyOffer(): IntroPromo {
+    const percentOff =
+      HAPPY_SCORE_MIN > 0 ? Math.min(PROMO_MAX_PERCENT_OFF, Math.ceil((100 * HAPPY_SCORE_MIN) / HAPPINESS_PER_PRICE_UNDER_MARKET) - 1) : Math.min(PROMO_MAX_PERCENT_OFF, 30);
+    expect(percentOff).toBeGreaterThan(0);
+    return { percentOff, months: 1 };
+  }
+
+  it('multiplies switching by 1 + PROMO_SIGNUP_BOOST x percentOff / 100 on young streets, besides the deal it adds', () => {
+    expect(promoSignupFactor(null)).toBe(1);
+    expect(promoSignupFactor({ percentOff: 20, months: 3 })).toBeCloseTo(1 + (PROMO_SIGNUP_BOOST * 20) / 100, 12);
+    const offer = unhappyOffer();
+    const { plain, promoted } = race(offer, 0);
+    // Early on signups are about gap x rate: the promo's factor, times the little it lifts the target and the deal.
+    const lift = targetTakeRate(defaultPricing(), 'mdu', INCUMBENT_PRICE, offer) / targetTakeRate(defaultPricing(), 'mdu');
+    const deal = dealFactor(defaultPricing(), 'mdu', INCUMBENT_PRICE, offer) / dealFactor(defaultPricing(), 'mdu');
+    expect(deal).toBeGreaterThan(1);
+    const expected = promoSignupFactor(offer) * lift * deal;
+    expect(promoted / plain).toBeGreaterThan(expected * 0.85);
+    expect(promoted / plain).toBeLessThan(expected * 1.1);
+  });
+
+  it('gives a mature street only the deal it adds, and a contested one its full boost (round 4c, spec C)', () => {
+    const offer = unhappyOffer();
+    const lift = targetTakeRate(defaultPricing(), 'mdu', INCUMBENT_PRICE, offer) / targetTakeRate(defaultPricing(), 'mdu');
+    const deal = dealFactor(defaultPricing(), 'mdu', INCUMBENT_PRICE, offer) / dealFactor(defaultPricing(), 'mdu');
+    const mature = race(offer, PROMO_BOOST_YOUNG_DAYS + 30);
+    expect(mature.promoted / mature.plain).toBeLessThan(lift * deal * 1.1);
+    expect(mature.promoted / mature.plain).toBeLessThan(promoSignupFactor(offer) * 0.85);
+    const fought = race(offer, PROMO_BOOST_YOUNG_DAYS + 30, true);
+    expect(fought.promoted / fought.plain).toBeGreaterThan(promoSignupFactor(offer) * 0.9);
+  });
+});
+
+describe('quotePromo', () => {
+  /** TOWN lit over a year ago (round 4c: no street young), with each street's subscribers one short of its target take rate (a mature town). */
+  function mature(): GameState {
+    const { state, cabinet } = litTown();
+    state.day = PROMO_BOOST_YOUNG_DAYS + 30;
+    const take = targetTakeRate(state.sales.pricing, 'home');
+    const accounts: Account[] = [];
+    for (const segment of state.city.segments) {
+      const homes = state.city.parcels.filter((p) => p.segment === segment.id);
+      const n = Math.max(0, Math.ceil(take * homes.length) - 1);
+      for (const parcel of homes.slice(0, n)) accounts.push(account(parcel.id, cabinet, { fiber1g: 1 }));
+    }
+    state.sales.accounts = accounts.sort((a, b) => a.parcel - b.parcel);
+    return state;
+  }
+
+  it('pays in a freshly lit town, where many households are waiting, and says so', () => {
+    const { state } = litTown();
+    const before = JSON.stringify(state);
+    const q = quotePromo(state, { ...SUGGESTED_PROMO });
+    expect(JSON.stringify(state)).toBe(before);
+    expect(q.ok).toBe(true);
+    expect(q.waitingUnits).toBeGreaterThan(HOMES / 3);
+    expect(q.extraSignups).toBeGreaterThan(0);
+    expect(q.extraSignups).toBeLessThanOrEqual(q.waitingUnits);
+    expect(q.pays).toBe(true);
+    expect(q.valueGained).toBeGreaterThan(q.discountCost);
+    expect(q.advice).toMatch(/^Pays now: about \d+ households on newly lit streets are waiting to sign up/);
+    expect(q.advice).toContain('in a mature town it would mostly discount people who would sign up anyway');
+    // A deep, long offer costs more in discounts than bringing them in sooner is worth.
+    const deep = quotePromo(state, { percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS });
+    expect(deep.discountCost).toBeGreaterThan(q.discountCost);
+    expect(deep.pays).toBe(false);
+    expect(deep.advice).toMatch(/^Doesn't pay at this discount: .*a smaller or shorter offer may pay while streets are newly lit/);
+  });
+
+  it('finds less to gain in a mature town, where it mostly discounts people who would sign up anyway', () => {
+    const offer: IntroPromo = { percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS };
+    const fresh = quotePromo(litTown().state, offer);
+    const state = mature();
+    const q = quotePromo(state, offer);
+    expect(q.waitingUnits).toBeGreaterThan(0);
+    expect(q.waitingUnits).toBeLessThan(fresh.waitingUnits / 3);
+    expect(q.extraSignups).toBeLessThan(fresh.extraSignups);
+    expect(q.valueGained).toBeLessThan(fresh.valueGained);
+    // Round 4c (spec C): the offer the panel starts at pays in the fresh town and not in the mature one.
+    expect(quotePromo(litTown().state, { ...SUGGESTED_PROMO }).pays).toBe(true);
+    const settled = quotePromo(state, { ...SUGGESTED_PROMO });
+    expect(settled.pays).toBe(false);
+    expect(settled.advice).toMatch(/^Doesn't pay now: your streets were lit over a year ago/);
+    // Everyone who wants fiber signed up: nobody waits, nothing to gain.
+    state.sales.accounts = state.city.parcels.map((p) => account(p.id, state.network.cabinets[0]!.id, { fiber1g: 1 }));
+    expect(quotePromo(state, { ...SUGGESTED_PROMO })).toMatchObject({ waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }).advice).toMatch(/^Nobody is waiting to sign up now: an intro promo pays once you light new areas/);
+  });
+
+  it('says when it pays: newly lit areas or the cable company\'s promo, not a mature town', () => {
+    const quote = (over: Partial<PromoQuote>): PromoQuote => ({
+      ok: true,
+      reasons: [],
+      promo: { ...SUGGESTED_PROMO },
+      waitingUnits: 40,
+      extraSignups: 8,
+      discountCost: 1_000,
+      valueGained: 2_000,
+      pays: true,
+      advice: '',
+      ...over,
+    });
+    expect(promoAdvice(quote({}), 30, 0)).toMatch(/^Pays now: about 40 households on newly lit streets are waiting/);
+    expect(promoAdvice(quote({}), 0, 30)).toMatch(/^Pays now: about 40 households where the cable company's promo runs are waiting/);
+    expect(promoAdvice(quote({}), 0, 0)).toMatch(/^Pays now: about 40 households are waiting/);
+    expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 30, 0)).toMatch(/^Doesn't pay at this discount/);
+    expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 30)).toMatch(/^Doesn't pay at this discount/);
+    expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 0)).toBe(
+      "Doesn't pay now: your streets were lit over a year ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.",
+    );
+    expect(promoAdvice(quote({ waitingUnits: 0 }), 0, 0)).toMatch(/^Nobody is waiting/);
+    expect(promoAdvice(quote({ waitingUnits: 1 }), 1, 0)).toMatch(/^Pays now: about 1 household on newly lit streets is waiting/);
+  });
+
+  it('quotes nothing for no promo, but says when one pays', () => {
+    const q = quotePromo(litTown().state, null);
+    expect(q).toMatchObject({ ok: true, promo: null, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
+    expect(q.waitingUnits).toBeGreaterThan(0);
+    expect(q.advice).toMatch(/speeds up signups on streets lit in the last year and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway\.$/);
+  });
+
+  it('counts only one cabinet\'s streets when asked', () => {
+    const { state, cabinet } = litTown();
+    const all = quotePromo(state, { ...SUGGESTED_PROMO });
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }, cabinet)).toEqual(all);
+    expect(quotePromo(state, { ...SUGGESTED_PROMO }, cabinet + 1_000)).toMatchObject({ waitingUnits: 0, extraSignups: 0 });
+  });
+});
+
+describe('outage days are not billed', () => {
+  it('leaves units cut off out of billing and support, and credits their rate', () => {
+    const { state, cabinet } = litTown();
+    const cut = 0;
+    const other = state.city.parcels.find((p) => p.segment !== state.city.parcels[cut]!.segment)!.id;
+    state.sales.accounts = [account(cut, cabinet, { fiber1g: 1 }), account(other, cabinet, { fiber500: 2 })].sort((a, b) => a.parcel - b.parcel);
+    const rate1g = listOf(state, 'fiber1g');
+    const rate500 = listOf(state, 'fiber500');
+    const daysOut = 10;
+    const days = MONTH_LENGTHS[0]!;
+    for (let d = 0; d < days; d++) accrueDay(state, d < daysOut ? { cutOff: new Set([cut]), lent: new Map() } : null);
+    const month = state.sales.month;
+    expect(month.outageCreditDollarDays).toBe(rate1g * daysOut);
+    expect(month.revenueDollarDays).toBe(rate1g * (days - daysOut) + 2 * rate500 * days);
+    expect(month.subscriberUnitDays).toBe(1 * (days - daysOut) + 2 * days);
+    state.day = days - 1;
+    const close = closeAt(state);
+    const full = (rate1g + 2 * rate500) * days;
+    // Revenue and credits add up to a full month's billing (each rounded once).
+    expect(Math.abs(close.revenue + close.outageCredits - full / days)).toBeLessThanOrEqual(1);
+    expect(close.outageCredits).toBe(Math.round((rate1g * daysOut) / days));
+    expect(close.support).toBe(Math.round((SUPPORT_LEVELS[state.customers.supportLevel].costPerSub * (3 * days - daysOut)) / days));
+    const memo = state.finance.monthToDate.find((e) => e.category === 'revenue')!.memo;
+    expect(memo).toContain(`(${formatMoney(close.outageCredits)} not billed for outage days)`);
+  });
+
+  it('is applied by the daily sales step to whoever the outage cuts off', () => {
+    const { state, cabinet } = litTown();
+    // Nobody signs up at these prices, so only the two accounts bill.
+    for (const tier of state.sales.pricing.tiers) tier.price = TIER_PRICE_MAX;
+    const cutSeg = state.city.parcels[0]!.segment;
+    const other = state.city.parcels.find((p) => p.segment !== cutSeg)!.id;
+    state.sales.accounts = [account(0, cabinet, { fiber1g: 1 }), account(other, cabinet, { fiber1g: 1 })].sort((a, b) => a.parcel - b.parcel);
+    for (let d = 0; d < 5; d++) {
+      state.day++;
+      const service = getService(state);
+      service.interruptedSegments.add(cutSeg);
+      service.cutOffCabinets.set(cutSeg, new Set(service.segmentCabinets.get(cutSeg) ?? []));
+      withRng(state, 'sales', (rng) => stepSales(state, rng));
+    }
+    expect(state.sales.accounts).toHaveLength(2);
+    expect(state.sales.month.outageCreditDollarDays).toBe(5 * TIER_PRICE_MAX);
+    expect(state.sales.month.revenueDollarDays).toBe(5 * TIER_PRICE_MAX);
+    expect(state.sales.month.subscriberUnitDays).toBe(5);
+  });
+});
+
+describe('retention locks at the close', () => {
+  const city = towers(60);
+  /** Every unit on 1 Gig at cabinet 1, where the incumbent's promo runs all month (answered or not), on the given locks. */
+  function contested(answered: boolean, lockFor: (list: number) => PriceLock | null, rngSales = 3): { state: GameState; units: number; list: number } {
+    const state = makeTestState(city, { rngSales });
+    state.day = 40;
+    const list = listOf(state, 'fiber1g');
+    const lock = lockFor(list);
+    state.sales.accounts = city.parcels.map((p) => ({ ...account(p.id, 1, { fiber1g: p.units }), locks: lock ? [lock] : [] }));
+    state.sales.incumbentPromos = [{ cabinet: 1, startDay: 0, endDay: 400, price: INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT, quietUntil: 600, triggerTakePct: 45, answered, answeredWithPromo: false }];
+    return { state, units: subscriberUnits(state), list };
+  }
+
+  /** Round 4c/4d: the part of a unit's churn the cable promo's priceVsCable factor adds, paying `paid` on 1 Gig. */
+  function cablePart(paid: number): number {
+    const p = priceScores('fiber1g', 'mdu', paid, SMB_MULTIPLIER_DEFAULT, INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT);
+    const score = SUPPORT_LEVELS.good.happiness + p.priceVsCable + p.priceVsMarket + p.goodDeal;
+    return churnFromScore(score) - churnFromScore(score - p.priceVsCable);
+  }
+
+  it('cost INCUMBENT_PROMO_CHURN at the list price, none on the retention offer, which steps back up with RETENTION_STEP_SHARE when it ends', () => {
+    const until = closeDayAfter(40, 1);
+    const plain = contested(false, () => null);
+    const a = closeAt(plain.state);
+    // The incumbent is folded into happiness, calibrated so an ignored promo costs what round 4b's did.
+    expect(cablePart(plain.list)).toBeCloseTo(INCUMBENT_PROMO_CHURN, 12);
+    expectNear(a.incumbentChurn, plain.units, INCUMBENT_PROMO_CHURN);
+    const kept = contested(true, (list) => lockOf('fiber1g', retentionPrice(list), until, 'retention'));
+    const offer = retentionPrice(kept.list);
+    expect(offer).toBe(Math.max(1, Math.round((kept.list * (100 - RETENTION_PERCENT_OFF)) / 100)));
+    const b = closeAt(kept.state);
+    // The default retention offer answers the promo in full (balance HAPPINESS_CABLE_PREMIUM_TOLERATED).
+    expect(cablePart(offer)).toBe(0);
+    expectNear(b.incumbentChurn, kept.units, cablePart(offer));
+    expect(b.incumbentChurn).toBeLessThan(a.incumbentChurn);
+    expectNear(b.priceChurn, kept.units, stepChurnProbability(offer, kept.list, RETENTION_STEP_SHARE));
+    const notice = kept.state.notices.find((n) => n.kind === 'priceStep')!;
+    expect(notice.message).toMatch(/whose retention offers ended at the Feb 2027 close/);
+    expect(kept.state.sales.accounts.every((acc) => acc.locks.length === 0)).toBe(true);
+  });
+
+  it('charge what a unit pays its share of the promo\'s churn, answered or not (round 4c/4d)', () => {
+    const later = closeDayAfter(40, 6);
+    const cheaper = (list: number) => lockOf('fiber1g', retentionPrice(list) - 5, later, 'promo');
+    const answered = contested(true, cheaper);
+    const ignored = contested(false, cheaper);
+    const a = closeAt(answered.state);
+    const b = closeAt(ignored.state);
+    const paid = retentionPrice(answered.list) - 5;
+    expectNear(a.incumbentChurn, answered.units, cablePart(paid));
+    expectNear(b.incumbentChurn, ignored.units, cablePart(paid));
+    // A dearer lock (a grandfathered price above the offer) feels the cheaper cable deal more.
+    const dearer = contested(true, (list) => lockOf('fiber1g', retentionPrice(list) + 1, later, 'grandfather'));
+    expect(cablePart(retentionPrice(dearer.list) + 1)).toBeGreaterThan(cablePart(paid));
+    expectNear(closeAt(dearer.state).incumbentChurn, dearer.units, cablePart(retentionPrice(dearer.list) + 1));
   });
 });

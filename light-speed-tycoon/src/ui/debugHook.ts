@@ -30,8 +30,17 @@ export interface DebugHook {
    * URL has ?briefing=1 (the stored preference) or ?briefing=<frequency>.
    */
   setBriefing(setting: BriefingSetting): void;
-  /** Round 4: whether the month-end briefing sheet is open. */
+  /** Round 4: whether the month-end briefing sheet is open (round 4c/4d: not the full books the report panel opens on their own). */
   briefingOpen(): boolean;
+  /**
+   * Round 4b: whether the start screen is open. Debug pages skip it on a
+   * first launch (and on a fresh ?seed link) unless the URL has ?start=1
+   * (see START_PARAM); the menu's New game and the game-over dialog show it
+   * on every page.
+   */
+  startScreenOpen(): boolean;
+  /** Round 4c/4d: whether the Customers dashboard is open. */
+  customersOpen(): boolean;
 }
 
 declare global {
@@ -42,6 +51,19 @@ declare global {
 
 /** The URL flag that turns the hook on in a production build. */
 export const DEBUG_PARAM = 'debug';
+
+/** Round 4b: on a debug page, ?start=1 shows the first-launch start screen that debug pages otherwise skip. */
+export const START_PARAM = 'start';
+
+/**
+ * Round 4b: whether a page with no game to resume shows the start screen
+ * (true), or starts a Seed-round game with the default company name at once
+ * (false: debug pages, which every e2e test opens, unless ?start=1).
+ */
+export function showsFirstLaunchStart(search: string): boolean {
+  const params = new URLSearchParams(search);
+  return params.get(DEBUG_PARAM) !== '1' || params.get(START_PARAM) === '1';
+}
 
 /** Whether to expose the hook: always in dev, else only with debug=1 in the query string. */
 export function debugHookEnabled(search: string, dev: boolean): boolean {

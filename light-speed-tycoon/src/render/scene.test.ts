@@ -9,7 +9,9 @@ import { applyCommand, newGame, runDays } from '../sim/game';
 import { getService } from '../sim/network';
 import { makeGridCity } from '../sim/testing/fixtures';
 import type { GameState, ParcelId } from '../sim/types';
-import { costOverlayThresholds, overlayBand } from './cityLayer';
+import { generateCity } from '../sim/citygen';
+import { cityExposure, exposureBand } from '../sim/weather';
+import { costOverlayThresholds, drawExposureOverlay, EXPOSURE_BANDS, exposureBands, overlayBand } from './cityLayer';
 import { OverlayLayer } from './overlay';
 import type { OverlaySpec } from './overlay';
 import { drawParcel, ParcelLayer } from './parcelLayer';
@@ -524,5 +526,72 @@ describe('storms and outages on the map', () => {
     expect(stormFade(STORM_SHOW_DAYS / 2)).toBeCloseTo(0.5);
     expect(stormFade(STORM_SHOW_DAYS)).toBe(0);
     expect(stormFade(STORM_SHOW_DAYS * 3)).toBe(0);
+  });
+});
+
+describe('storm-exposure overlay (round 4b)', () => {
+  /** A Graphics that remembers the colour of every stroke. */
+  class StrokeRecorder extends Graphics {
+    readonly colors: string[] = [];
+    override stroke(...args: Parameters<Graphics['stroke']>): this {
+      const style = args[0] as unknown;
+      const color = typeof style === 'object' && style !== null && 'color' in style ? (style as { color: unknown }).color : style;
+      if (typeof color === 'string') this.colors.push(color.toUpperCase());
+      return super.stroke(...args);
+    }
+  }
+
+  it('colors every street by its exposure band, light to dark, exposed drawn last', () => {
+    const city = generateCity(2027);
+    const bands = exposureBands(city);
+    const exposure = cityExposure(city);
+    expect(bands).toEqual(city.segments.map((s) => exposureBand(exposure[s.id]!)));
+    const g = new StrokeRecorder();
+    const counts = drawExposureOverlay(g, city, toyTown);
+    for (const band of EXPOSURE_BANDS) expect(counts[band], band).toBe(bands.filter((b) => b === band).length);
+    expect(counts.sheltered + counts.moderate + counts.exposed).toBe(city.segments.length);
+    // A generated town has all three bands, one stroke each, in order.
+    expect(counts.sheltered).toBeGreaterThan(0);
+    expect(counts.exposed).toBeGreaterThan(0);
+    expect(g.colors).toEqual(EXPOSURE_BANDS.map((band) => toyTown.exposureOverlay.band[band].toUpperCase()));
+  });
+
+  it('uses band colours that darken with exposure and read over the cream roads and the grass', () => {
+    const { band } = toyTown.exposureOverlay;
+    const lum = (c: string) => luminance(rgb(c));
+    expect(lum(band.sheltered)).toBeGreaterThan(lum(band.moderate));
+    expect(lum(band.moderate)).toBeGreaterThan(lum(band.exposed));
+    for (const under of [toyTown.road.fill, toyTown.board.grass]) {
+      for (const color of Object.values(band)) expect(washContrast(color, toyTown.exposureOverlay.alpha, under), `${color} on ${under}`).toBeGreaterThanOrEqual(1.3);
+    }
+    // Not the cost overlay's colours: the two overlays never read alike.
+    for (const color of Object.values(band)) expect(Object.values(toyTown.cpp).map((c) => c.toUpperCase())).not.toContain(color.toUpperCase());
+  });
+
+  it('toggles on the scene, drawing a frame only on a change, and redraws for a new city', () => {
+    const state = newGame(7, { city: makeGridCity() });
+    const s = scene();
+    s.sync(state);
+    s.takeDirty();
+    expect(s.stats().exposureOverlay).toBeNull();
+    s.setExposureOverlay(true);
+    expect(s.takeDirty()).toBe(true);
+    s.setExposureOverlay(true);
+    expect(s.takeDirty()).toBe(false);
+    const counts = s.stats().exposureOverlay!;
+    const bands = exposureBands(state.city);
+    for (const band of EXPOSURE_BANDS) expect(counts[band]).toBe(bands.filter((b) => b === band).length);
+    s.setExposureOverlay(false);
+    expect(s.takeDirty()).toBe(true);
+    expect(s.stats().exposureOverlay).toBeNull();
+    // A new city keeps the choice and draws its own streets.
+    s.setExposureOverlay(true);
+    const other = newGame(8, { city: makeGridCity({ cols: 4 }) });
+    s.sync(other);
+    const drawn = s.stats().exposureOverlay!;
+    expect(drawn.sheltered + drawn.moderate + drawn.exposed).toBe(other.city.segments.length);
+    // The cost overlay is a separate layer: the scene shows whatever it is told (MapControls keeps them apart).
+    s.setCostOverlay('cheapest');
+    expect(s.stats()).toMatchObject({ costOverlay: 'cheapest' });
   });
 });

@@ -23,15 +23,18 @@ import { creditLimit, penaltyBps, termCapacity } from '../debt';
 import { applyCommand, newGame, tick } from '../game';
 import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
-import { orderFees, quoteCable, spanCharges } from '../network';
+import { getService, orderFees, quoteCable, spanCharges } from '../network';
+import { stateTakeRate } from '../sales';
 import { otherEnd, parcelsServedBy, polesOnSegment, segmentsAtNode, segmentsWithin } from '../streets';
-import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
+import { cityExposure, exposureBand, meanOutageDays, outageChurnProbability, stormRisk, streetCanopy } from '../weather';
 import type {
+  CabinetId,
   CableMethod,
   City,
   Command,
   CommandResult,
   CovenantStage,
+  ExposureBand,
   GameOver,
   GameState,
   MonthlyReport,
@@ -87,6 +90,8 @@ export interface RunResult {
   capacityAfterClose: number[];
   /** Round 4: notices posted during the run, by kind (every one, though the game's log keeps only the newest). */
   notices: Partial<Record<NoticeKind, number>>;
+  /** Round 4b: every incumbent promo that started during the run (Sales.incumbentPromos records), in order of start. */
+  incumbentPromos: Array<{ cabinet: CabinetId; startDay: number }>;
 }
 
 export interface RunOptions {
@@ -127,6 +132,16 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     lastNotice = state.nextNoticeId - 1;
   };
   const noSubscriberYet = () => state.sales.accounts.length === 0 && state.sales.connectsTotal === 0;
+  const promoSeen = new Set<string>(state.sales.incumbentPromos.map((p) => `${p.cabinet}:${p.startDay}`));
+  const incumbentPromos: Array<{ cabinet: CabinetId; startDay: number }> = [];
+  const countPromos = () => {
+    for (const p of state.sales.incumbentPromos) {
+      const key = `${p.cabinet}:${p.startDay}`;
+      if (promoSeen.has(key)) continue;
+      promoSeen.add(key);
+      incumbentPromos.push({ cabinet: p.cabinet, startDay: p.startDay });
+    }
+  };
   const send: Send = (cmd) => {
     const cashBefore = state.finance.cash;
     const result = applyCommand(state, cmd);
@@ -146,7 +161,10 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     const closes = state.finance.reports.length;
     tick(state);
     countNotices();
-    if (state.finance.reports.length > closes) capacityAfterClose.push(borrowingCapacity(state));
+    if (state.finance.reports.length > closes) {
+      capacityAfterClose.push(borrowingCapacity(state));
+      countPromos();
+    }
     opts.afterTick?.(state);
   }
   const reports = state.finance.reports.slice(startReports);
@@ -171,6 +189,7 @@ export function runBot(seed: number, makeBot: BotFactory, months: number, opts: 
     capacityBeforeFirstSubscriber,
     capacityAfterClose,
     notices,
+    incumbentPromos,
   };
 }
 
@@ -281,6 +300,96 @@ export function passedShare(result: RunResult, month: number): number | null {
   if (!report) return null;
   const units = unitsPresent(result.state.city, reportLastDay(report));
   return units > 0 ? report.passings / units : null;
+}
+
+// ---------------------------------------------------------------------------
+// Round 4c/4d: cabinet areas over time (switching speed and ceiling)
+// ---------------------------------------------------------------------------
+
+/** One cabinet area of a run: when its cabinet went live, its ceiling and its take rate at each close since. */
+export interface AreaCurve {
+  cabinet: CabinetId;
+  liveDay: number;
+  /** Passings at the run's end. */
+  passings: number;
+  /**
+   * Its ceiling take rate at the run's end: the target take rate of every
+   * unit it passes (sales.stateTakeRate of its kind there, the incumbent's
+   * local price and the run's prices) over its passings.
+   */
+  ceiling: number;
+  /** Take rate (subscribed units / passings, CustomerStats.areas) at each close from the one its cabinet went live in, with the whole months since it went live. */
+  takes: Array<{ months: number; take: number }>;
+}
+
+/** Every cabinet area of the run that went live and is active at its end (CustomerStats.areas at each close, cabinet liveDay). */
+export function areaCurves(result: RunResult): AreaCurve[] {
+  const { state } = result;
+  const service = getService(state);
+  const target = new Map<CabinetId, number>();
+  for (const [segment, cabinet] of service.servingCabinet) {
+    for (const pid of parcelsServedBy(state.city, segment)) {
+      const parcel = state.city.parcels[pid];
+      if (!parcel || parcel.appearsDay > state.day) continue;
+      target.set(cabinet, (target.get(cabinet) ?? 0) + parcel.units * stateTakeRate(state, parcel.kind, cabinet));
+    }
+  }
+  const curves: AreaCurve[] = [];
+  for (const cabinet of state.network.cabinets) {
+    if (cabinet.liveDay === null || !service.activeCabinets.has(cabinet.id)) continue;
+    const passings = service.cabinetCoverage.get(cabinet.id)?.passings ?? 0;
+    if (passings <= 0) continue;
+    const takes: Array<{ months: number; take: number }> = [];
+    for (const report of result.reports) {
+      const area = report.customers?.areas.find((a) => a.cabinet === cabinet.id);
+      const last = reportLastDay(report);
+      if (!area || area.passings <= 0 || last < cabinet.liveDay) continue;
+      takes.push({ months: Math.floor(((last - cabinet.liveDay) * 12) / 365), take: area.units / area.passings });
+    }
+    curves.push({ cabinet: cabinet.id, liveDay: cabinet.liveDay, passings, ceiling: (target.get(cabinet.id) ?? 0) / passings, takes });
+  }
+  return curves;
+}
+
+/**
+ * Take rate at the run's end over the cabinet areas lit between
+ * `minMonths` and `maxMonths` months before it (units / passings pooled;
+ * null when there are none): spec I.7's "take on areas lit 3-5 years".
+ */
+export function takeOfAreasLit(result: RunResult, minMonths: number, maxMonths: number): number | null {
+  let units = 0;
+  let passings = 0;
+  for (const curve of areaCurves(result)) {
+    const months = ((result.state.day - curve.liveDay) * 12) / 365;
+    if (months < minMonths || months > maxMonths) continue;
+    const last = curve.takes.at(-1);
+    if (!last) continue;
+    units += last.take * curve.passings;
+    passings += curve.passings;
+  }
+  return passings > 0 ? units / passings : null;
+}
+
+/** Whole months after its cabinet went live until an area's take first reached `share` of its ceiling; null if it never did in the run. */
+export function monthsToCeiling(curve: AreaCurve, share: number): number | null {
+  for (const point of curve.takes) if (point.take >= share * curve.ceiling) return point.months;
+  return null;
+}
+
+/**
+ * Median over the run's areas lit at least `minMonths` before its end of
+ * monthsToCeiling(`share`), an area that never got there counting as the
+ * months it has been lit plus one (later than any that did); null with no
+ * such area.
+ */
+export function medianMonthsToCeiling(result: RunResult, share: number, minMonths: number): number | null {
+  const values: number[] = [];
+  for (const curve of areaCurves(result)) {
+    const lit = Math.floor(((result.state.day - curve.liveDay) * 12) / 365);
+    if (lit < minMonths || curve.ceiling <= 0) continue;
+    values.push(monthsToCeiling(curve, share) ?? lit + 1);
+  }
+  return values.length > 0 ? median(values) : null;
 }
 
 /** 1-based month of the first close with operating cash flow > 0, or null. */
@@ -447,7 +556,7 @@ export function stormExposure(result: RunResult): StormExposure {
     const subs = subscribers.get(span.segment) ?? 0;
     exposure.repairs += risk.repairCostPerYear;
     exposure.subscriberDaysOut += risk.outageDaysPerYear * subs;
-    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method));
+    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method, streetCanopy(state.city, segment)));
   }
   return exposure;
 }
@@ -466,7 +575,12 @@ export function ownershipCostPerPassing(result: RunResult, years = VALUE_YEARS):
   return (result.state.finance.capex.osp + years * (running.poleRent + running.repairs)) / last.passings;
 }
 
-/** Years of trailing operating cash flow runValue counts: the horizon SMART weighs a street's running costs over (SMART_DEFAULTS.horizonYears). */
+/**
+ * Years of trailing operating cash flow runValue counts (and the years
+ * ownershipCostPerPassing counts running costs for): round 4's horizon for
+ * SMART's method choice (round 4b weighs storms twice over 13 years:
+ * SMART_DEFAULTS.horizonYears, stormWeight).
+ */
 export const VALUE_YEARS = 12;
 
 /**
@@ -931,4 +1045,40 @@ export function treePath(city: City, tree: StreetTree, node: number): SegmentId[
     at = otherEnd(city.segments[seg] as StreetSegment, at);
   }
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Round 4b: storm exposure bands
+// ---------------------------------------------------------------------------
+
+/** Share of a town's street feet in each storm-exposure band (weather.exposureBand of weather.segmentExposure). */
+export function exposureBandShares(city: City): Record<ExposureBand, number> {
+  const exposure = cityExposure(city);
+  const feet: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  let total = 0;
+  for (const seg of city.segments) {
+    feet[exposureBand(exposure[seg.id] ?? 1)] += seg.lengthFt;
+    total += seg.lengthFt;
+  }
+  for (const band of Object.keys(feet) as ExposureBand[]) feet[band] = total > 0 ? feet[band] / total : 0;
+  return feet;
+}
+
+/**
+ * Expected storm damage per span-year of aerial cable in each exposure band:
+ * weather.stormRisk(..., 'aerial').outagesPerYear averaged over the town's
+ * poled streets in the band (0 for a band with none).
+ */
+export function expectedDamageByBand(state: GameState): Record<ExposureBand, number> {
+  const exposure = cityExposure(state.city);
+  const sum: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  const count: Record<ExposureBand, number> = { sheltered: 0, moderate: 0, exposed: 0 };
+  for (const seg of state.city.segments) {
+    if (!seg.hasPoles) continue;
+    const band = exposureBand(exposure[seg.id] ?? 1);
+    sum[band] += stormRisk(state, seg, 'aerial').outagesPerYear;
+    count[band]++;
+  }
+  for (const band of Object.keys(sum) as ExposureBand[]) sum[band] = count[band] > 0 ? sum[band] / count[band] : 0;
+  return sum;
 }

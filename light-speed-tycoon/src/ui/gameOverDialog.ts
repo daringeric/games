@@ -17,9 +17,9 @@ export interface GameOverActions {
   exportGame(): void;
 }
 
-/** The dialog's subtitle: how the town's company ended. */
-export function gameOverSubtitle(reason: GameOverReason, townName: string): string {
-  return reason === 'default' ? `${townName} has defaulted on its loans.` : `${townName} has gone bankrupt.`;
+/** The dialog's subtitle: how the company ended (round 4b: by its name, GameState.company.name). */
+export function gameOverSubtitle(reason: GameOverReason, companyName: string): string {
+  return reason === 'default' ? `${companyName} has defaulted on its loans.` : `${companyName} has gone bankrupt.`;
 }
 
 export class GameOverDialog {
@@ -34,11 +34,11 @@ export class GameOverDialog {
   }
 
   /** Show (or refresh) the dialog for this ending. */
-  show(over: GameOver, townName: string, actions: GameOverActions): void {
+  show(over: GameOver, companyName: string, actions: GameOverActions): void {
     this.close();
     const sheet = openSheet({
       title: 'Game over',
-      subtitle: gameOverSubtitle(over.reason, townName),
+      subtitle: gameOverSubtitle(over.reason, companyName),
       className: 'game-over',
       // Esc and the close button leave the frozen town on screen; the menu still offers load, new and export.
       backdropCloses: false,

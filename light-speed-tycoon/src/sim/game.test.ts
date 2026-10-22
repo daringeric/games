@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_DIFFICULTY,
+  DIFFICULTY_LEVELS,
   GRANDFATHER_MONTHS_MAX,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
@@ -10,7 +12,6 @@ import {
   MARKETING_MAX_PER_MONTH,
   OLT_START_CARDS,
   OLT_START_PON_PORTS,
-  OVERHEAD_PER_MONTH,
   PERMIT_DAYS_MAX,
   PERMIT_DAYS_MIN,
   PERMITTING_CANCEL_REFUND,
@@ -20,14 +21,19 @@ import {
   STORM_START_DAY,
   TERM_LOAN_MIN,
 } from './balance';
+import { newAdvisorState } from './advisor';
 import { dayOf, MONTH_LENGTHS } from './calendar';
 import { generateCity } from './citygen';
+import { COMPANY_NAME_MAX, defaultCompanyName } from './company';
 import { newDebt, rateOf } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService, layCable, quoteCable } from './network';
 import { deriveSeed, Rng, withRng } from './rng';
+import { hashState } from './save';
 import { defaultPricing, newSales, stepSales } from './sales';
-import { addLivePlant, makeGridCity, noDebtStats, quietOpsStats } from './testing/fixtures';
+import { addLivePlant, makeGridCity, noDebtStats, quietCustomerStats, quietOpsStats } from './testing/fixtures';
+import { AWARENESS_PPM, newCustomers, stepCustomers } from './customers';
+import { overheadTotal } from './overhead';
 import { newWeather } from './weather';
 import type { City, Command, GameState, MonthlyReport } from './types';
 
@@ -46,6 +52,141 @@ function closedOn(report: MonthlyReport): number {
   return dayOf({ year: report.year, month: report.month, day: 1 }) + (MONTH_LENGTHS[report.month - 1] as number);
 }
 
+describe('newGame: company and difficulty (round 4b)', () => {
+  it('starts every difficulty with its own starting cash and nothing else different', () => {
+    const city = makeGridCity();
+    const base = newGame(42, { city });
+    expect(base.company).toEqual({ name: defaultCompanyName(city.name), difficulty: DEFAULT_DIFFICULTY });
+    expect(base.finance.cash).toBe(START_CASH);
+    for (const level of DIFFICULTY_LEVELS) {
+      const state = newGame(42, { city, difficulty: level.id });
+      expect(state.company.difficulty).toBe(level.id);
+      expect(state.finance.cash).toBe(level.startCash);
+      // Only the cash (and the difficulty on record) differ: the same seed replays the same town and streams.
+      expect({ ...state, company: base.company, finance: { ...state.finance, cash: START_CASH } }).toEqual(base);
+    }
+  });
+
+  it('lists four levels, easiest first, with Seed round at START_CASH', () => {
+    expect(DIFFICULTY_LEVELS.map((l) => l.id)).toEqual(['angel', 'seed', 'bootstrapped', 'shoestring']);
+    expect(DIFFICULTY_LEVELS.find((l) => l.id === DEFAULT_DIFFICULTY)?.startCash).toBe(START_CASH);
+    for (let i = 1; i < DIFFICULTY_LEVELS.length; i++) {
+      expect(DIFFICULTY_LEVELS[i]!.startCash).toBeLessThan(DIFFICULTY_LEVELS[i - 1]!.startCash);
+    }
+  });
+
+  it('keeps the chosen company name, normalized', () => {
+    const state = newGame(42, { city: makeGridCity(), companyName: '  Otter   Junction Fiber ' });
+    expect(state.company.name).toBe('Otter Junction Fiber');
+  });
+
+  it('refuses a bad name or an unknown difficulty', () => {
+    const city = makeGridCity();
+    expect(() => newGame(42, { city, companyName: '   ' })).toThrow(RangeError);
+    expect(() => newGame(42, { city, companyName: 'x'.repeat(COMPANY_NAME_MAX + 1) })).toThrow(RangeError);
+    expect(() => newGame(42, { city, difficulty: 'nightmare' as never })).toThrow(RangeError);
+  });
+
+  it('replays one seed and difficulty identically', () => {
+    const run = () => {
+      const state = newGame(9, { city: makeGridCity(), difficulty: 'shoestring', companyName: 'Wren Light & Wire' });
+      applyCommand(state, { type: 'placeCabinet', node: 0 });
+      applyCommand(state, { type: 'layCable', segments: [0, 1], method: 'aerial' });
+      runDays(state, 120);
+      return hashState(state);
+    };
+    expect(run()).toBe(run());
+  });
+});
+
+describe('round 4b commands: field types', () => {
+  it('rejects malformed answerIncumbent, snoozeAdvice and noteAdviceShown without touching the game', () => {
+    const state = game();
+    const before = JSON.stringify(state);
+    const bad: unknown[] = [
+      { type: 'answerIncumbent' },
+      { type: 'answerIncumbent', cabinet: '1' },
+      { type: 'snoozeAdvice' },
+      { type: 'snoozeAdvice', key: 7 },
+      { type: 'noteAdviceShown' },
+      { type: 'noteAdviceShown', keys: 'expand' },
+      { type: 'noteAdviceShown', keys: [1] },
+    ];
+    for (const cmd of bad) expect(applyCommand(state, cmd as Command).ok).toBe(false);
+    expect(JSON.stringify(state)).toBe(before);
+  });
+
+  it('records the suggestions a briefing showed, for free', () => {
+    const state = game();
+    expect(applyCommand(state, { type: 'noteAdviceShown', keys: ['expand:node:3', 'cashRunway'] })).toEqual({ ok: true, cost: 0 });
+    expect(state.advisor.shown.map((e) => e.key)).toEqual(['cashRunway', 'expand:node:3']);
+  });
+});
+
+describe('round 4c/4d commands: dispatch', () => {
+  /** A lit grid with subscribers and cash to spare. */
+  function lit(): GameState {
+    const state = game();
+    addLivePlant(state, { splitters: 4 });
+    runDays(state, 40);
+    return state;
+  }
+
+  it('hands runCampaign, setSupport and setReferrals to the customers model', () => {
+    const state = lit();
+    const cabinet = state.network.cabinets[0]!.id;
+    expect(applyCommand(state, { type: 'setSupport', level: 'great' })).toEqual({ ok: true, cost: 0 });
+    expect(state.customers.supportLevel).toBe('great');
+    expect(applyCommand(state, { type: 'setReferrals', on: true })).toEqual({ ok: true, cost: 0 });
+    expect(state.customers.referrals).toBe(true);
+    const cash = state.finance.cash;
+    const result = applyCommand(state, { type: 'runCampaign', cabinet });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.cost).toBeGreaterThan(0);
+    expect(state.finance.cash).toBe(cash - (result.ok ? result.cost : 0));
+    expect(state.customers.campaigns.map((c) => c.cabinet)).toEqual([cabinet]);
+  });
+
+  it('checks field types before the customers model sees them, and lets it check values', () => {
+    const state = lit();
+    const before = JSON.stringify(state);
+    const bad: [unknown, string][] = [
+      [{ type: 'runCampaign' }, 'runCampaign needs a cabinet id'],
+      [{ type: 'runCampaign', cabinet: '1' }, 'runCampaign needs a cabinet id'],
+      [{ type: 'setSupport' }, 'setSupport needs a support level'],
+      [{ type: 'setSupport', level: 2 }, 'setSupport needs a support level'],
+      [{ type: 'setReferrals' }, 'setReferrals needs on: true or false'],
+      [{ type: 'setReferrals', on: 'yes' }, 'setReferrals needs on: true or false'],
+    ];
+    for (const [cmd, reason] of bad) expect(applyCommand(state, cmd as Command)).toEqual({ ok: false, reason });
+    // Values are the model's to check, naming what it wants.
+    const level = applyCommand(state, { type: 'setSupport', level: 'superb' as never });
+    expect(level.ok).toBe(false);
+    expect(!level.ok && level.reason).toMatch(/Basic, Good, Great/);
+    expect(applyCommand(state, { type: 'runCampaign', cabinet: 9_999 }).ok).toBe(false);
+    expect(JSON.stringify(state)).toBe(before);
+  });
+
+  it('rejects all three once the game is over', () => {
+    const state = lit();
+    state.gameOver = { day: state.day, reason: 'insolvent', message: 'Out of cash' };
+    const cabinet = state.network.cabinets[0]!.id;
+    for (const cmd of [{ type: 'runCampaign', cabinet }, { type: 'setSupport', level: 'basic' }, { type: 'setReferrals', on: true }] as Command[]) {
+      expect(applyCommand(state, cmd)).toEqual({ ok: false, reason: 'Game over: Out of cash' });
+    }
+    expect(state.customers.supportLevel).toBe('good');
+  });
+
+  it('steps the customers model each day after the weather and before sales: lit streets become known', () => {
+    const state = game();
+    addLivePlant(state);
+    expect(state.customers.streets).toEqual([]);
+    tick(state);
+    expect(state.customers.streets.map((s) => s.segment)).toEqual([...getService(state).litSegments].sort((a, b) => a - b));
+    expect(state.customers.streets.every((s) => s.litDay === 1)).toBe(true);
+  });
+});
+
 describe('newGame', () => {
   it('starts a fresh game on the given city', () => {
     const city = makeGridCity();
@@ -53,6 +194,7 @@ describe('newGame', () => {
     expect(state).toEqual({
       schemaVersion: 4,
       seed: 42,
+      company: { name: defaultCompanyName(city.name), difficulty: DEFAULT_DIFFICULTY },
       day: 0,
       rng: { events: deriveSeed(42, 'events'), sales: deriveSeed(42, 'sales'), weather: deriveSeed(42, 'weather') },
       nextId: 1,
@@ -67,7 +209,9 @@ describe('newGame', () => {
       finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
       debt: newDebt(),
       sales: newSales(),
+      customers: newCustomers(),
       weather: newWeather(),
+      advisor: newAdvisorState(),
       milestones: [],
       notices: [],
       nextNoticeId: 1,
@@ -414,12 +558,14 @@ describe('tick and runDays', () => {
     expect(state.day).toBe(31);
     // January bills all 31 of its days: day 0 accrues with the first tick.
     const marketing = MARKETING_DEFAULT_PER_MONTH;
-    const net = -cable - CABINET_PRICE - OVERHEAD_PER_MONTH - marketing;
+    // Round 4c/4d: the overhead is overhead.ts's (its lines are in report.ops.overhead; finance and overhead tests pin them).
+    const overhead = overheadTotal(state.finance.reports[0]!.ops!.overhead!);
+    const net = -cable - CABINET_PRICE - overhead - marketing;
     expect(state.finance.reports).toEqual([
       {
         year: 2027,
         month: 1,
-        totals: { construction: -cable, equipment: -CABINET_PRICE, overhead: -OVERHEAD_PER_MONTH, marketing: -marketing },
+        totals: { construction: -cable, equipment: -CABINET_PRICE, overhead: -overhead, marketing: -marketing },
         net,
         cashEnd: START_CASH + net,
         passings: 0,
@@ -440,6 +586,7 @@ describe('tick and runDays', () => {
         },
         debt: noDebtStats(state),
         ops: quietOpsStats(state),
+        customers: quietCustomerStats(state),
       },
     ]);
     expect(state.finance.cash).toBe(START_CASH + net);
@@ -454,12 +601,13 @@ describe('tick and runDays', () => {
     );
     expect(state.finance.reports.map(closedOn)).toEqual([31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365]);
     runDays(state, 31);
-    const idle = -(OVERHEAD_PER_MONTH + MARKETING_DEFAULT_PER_MONTH);
+    const overhead = overheadTotal(state.finance.reports.at(-1)!.ops!.overhead!);
+    const idle = -(overhead + MARKETING_DEFAULT_PER_MONTH);
     const january = state.finance.reports.at(-1)!;
     expect(january).toMatchObject({
       year: 2028,
       month: 1,
-      totals: { overhead: -OVERHEAD_PER_MONTH, marketing: -MARKETING_DEFAULT_PER_MONTH },
+      totals: { overhead: -overhead, marketing: -MARKETING_DEFAULT_PER_MONTH },
       net: idle,
     });
     let cash = START_CASH;
@@ -606,11 +754,14 @@ describe('the daily tick, round 2', () => {
     const state = game();
     addLivePlant(state);
     state.sales.marketingPerMonth = MARKETING_MAX_PER_MONTH;
+    // Round 4c/4d: everybody on the lit streets knows you already, so a month signs people up.
+    state.customers.streets = [...getService(state).litSegments].sort((a, b) => a - b).map((segment) => ({ segment, litDay: 0, awareness: AWARENESS_PPM }));
     expect(state.sales.month.marketingDollarDays).toBe(0);
-    // Days 1..30's sales steps alone, run by hand on a copy.
+    // Days 1..30's customers and sales steps alone, run by hand on a copy.
     const stepOnly = structuredClone(state);
     for (let day = 1; day <= 30; day++) {
       stepOnly.day = day;
+      stepCustomers(stepOnly);
       withRng(stepOnly, 'sales', (rng) => stepSales(stepOnly, rng));
     }
     expect(stepOnly.sales.accounts.length).toBeGreaterThan(0);

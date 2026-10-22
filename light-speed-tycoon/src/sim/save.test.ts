@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   ACCELERATION_WARNING_CLOSES,
+  DEFAULT_DIFFICULTY,
   FROZEN_ACCELERATION_CLOSES,
+  INCUMBENT_PROMO_TAKE_RATE,
   INSOLVENCY_GRACE_MONTHS,
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
@@ -14,6 +16,9 @@ import {
   TIER_PRICE_MAX,
 } from './balance';
 import { dateOf, MONTH_LENGTHS } from './calendar';
+import { newAdvisorState } from './advisor';
+import { defaultCompanyName } from './company';
+import { newCustomers } from './customers';
 import { closesUntilAcceleration, creditAvailable, newDebt, termCapacity, totalDebt, trailingArr } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
@@ -35,10 +40,13 @@ const MIXED_LOTS: GridCityOptions['parcelKinds'] = (p) =>
 
 /**
  * A game mid-flight and mid-month (Mar 25): live and permitting spans, a live
- * cabinet, closed months, open month-to-date entries, subscribers on homes,
+ * cabinet, closed months, open month-to-date entries, subscribers on
  * businesses and apartment buildings (with building routers), a half-accrued
- * month, a milestone and its notice. Default grid: horizontal segments 0..8,
- * vertical 9..16, CO at node 0.
+ * month, a milestone and its notice, and (round 4c/4d) a neighborhood
+ * campaign bought the day the cabinet lit its first streets: a lit street
+ * now switches over years, not weeks (customers.ts), and the campaign is what
+ * signs the first customers within the month. Default grid: horizontal
+ * segments 0..8, vertical 9..16, CO at node 0.
  */
 function playedGame(cityOpts: GridCityOptions = {}): GameState {
   const state = newGame(7, { city: makeGridCity({ parcelKinds: MIXED_LOTS, ...cityOpts }) });
@@ -46,7 +54,10 @@ function playedGame(cityOpts: GridCityOptions = {}): GameState {
   applyCommand(state, { type: 'placeCabinet', node: 0 });
   applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
   applyCommand(state, { type: 'layCable', segments: [2], method: 'aerial' });
-  runDays(state, 80);
+  let day = 0;
+  for (; day < 80 && getService(state).passings === 0; day++) runDays(state, 1);
+  expect(applyCommand(state, { type: 'runCampaign', cabinet: state.network.cabinets[0]!.id }).ok).toBe(true);
+  runDays(state, 80 - day);
   applyCommand(state, { type: 'layCable', segments: [1], method: 'underground' });
   runDays(state, 3);
   return state;
@@ -115,7 +126,9 @@ function populateRound4(s: Save): void {
   const tier = (['fiber500', 'fiber1g', 'fiber2g'] as const).find((t) => account.tierUnits[t] > 0);
   account.locks = [{ tier, price: 50, untilDay: s.day + 40, reason: 'grandfather' }];
   s.sales.promo = { percentOff: 20, months: 3 };
-  s.sales.incumbentPromos = [{ cabinet: s.network.cabinets[0].id, startDay: s.day, endDay: s.day + 90, price: 55, quietUntil: s.day + 270 }];
+  s.sales.incumbentPromos = [
+    { cabinet: s.network.cabinets[0].id, startDay: s.day, endDay: s.day + 90, price: 55, quietUntil: s.day + 270, triggerTakePct: 47, answered: false, answeredWithPromo: false },
+  ];
   s.debt.credit.balance = 5_000;
   s.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
   s.debt.frozenCloses = 6;
@@ -1003,6 +1016,16 @@ function withoutRound4(state: GameState): Save {
   delete copy.sales.incumbentPromos;
   delete copy.debt.frozenCloses;
   delete copy.debt.acceleration;
+  // Round 4b: the company (difficulty 'seed', named after the town), the advisor's memory, outage credits.
+  expect(copy.company).toEqual({ name: defaultCompanyName(state.city.name), difficulty: DEFAULT_DIFFICULTY });
+  expect(copy.advisor).toEqual(newAdvisorState());
+  expect(copy.sales.month.outageCreditDollarDays).toBe(0);
+  delete copy.company;
+  delete copy.advisor;
+  delete copy.sales.month.outageCreditDollarDays;
+  // Round 4c/4d: the customers model at its defaults.
+  expect(copy.customers).toEqual(newCustomers());
+  delete copy.customers;
   return copy;
 }
 
@@ -1268,5 +1291,195 @@ describe('schemaVersion 3 saves', () => {
     expect(stray.sales.promo).toBeNull();
     expect(stray.network.spans[0]?.outage).toBeNull();
     expect(stray.sales.accounts[0]?.locks).toEqual([]);
+  });
+});
+
+/**
+ * Give a parsed current-version save every round-4b record: a chosen company
+ * at another difficulty, a snoozed and a shown suggestion, a retention lock
+ * on an answered incumbent promo, outage credits accrued this month and in
+ * the first report's ops (populateRound4 first, so the promo exists).
+ */
+function populateRound4b(s: Save): void {
+  populateRound4(s);
+  s.company = { name: 'Wren Light & Wire', difficulty: 'shoestring' };
+  s.advisor = {
+    snoozes: [{ key: 'addSplitter:cabinet:3', untilDay: s.day + 60, severity: 'important' }],
+    shown: [
+      { key: 'expand:node:5', firstDay: Math.max(0, s.day - 31), lastDay: s.day, times: 2 },
+      { key: 'pricing:fiber2g', firstDay: s.day, lastDay: s.day, times: 1 },
+    ],
+  };
+  const account = s.sales.accounts[0];
+  account.locks[0].reason = 'retention';
+  // It replaced a grandfathered price promised for longer, which it gives back when it ends.
+  account.locks[0].resume = { price: account.locks[0].price + 5, untilDay: account.locks[0].untilDay + 365, reason: 'grandfather' };
+  s.sales.incumbentPromos[0].answered = true;
+  s.sales.month.outageCreditDollarDays = 1_234;
+  s.finance.reports[0].ops.outageCredits = 40;
+}
+
+describe('round 4b: schemaVersion 4 extended in place', () => {
+  const base = (): Save => JSON.parse(serialize(borrowedGame()));
+  const with4b = (mutate: (save: Save) => void = () => {}): string => {
+    const save = base();
+    populateRound4b(save);
+    mutate(save);
+    return JSON.stringify(save);
+  };
+
+  it('loads and round-trips the company, the advisor, retention locks, answered promos and outage credits', () => {
+    const text = with4b();
+    const state = deserialize(text);
+    expect(state.company).toEqual({ name: 'Wren Light & Wire', difficulty: 'shoestring' });
+    expect(state.advisor.snoozes.map((s) => s.key)).toEqual(['addSplitter:cabinet:3']);
+    expect(state.advisor.shown.map((s) => s.times)).toEqual([2, 1]);
+    expect(state.sales.accounts[0]?.locks[0]?.reason).toBe('retention');
+    expect(state.sales.accounts[0]?.locks[0]?.resume?.reason).toBe('grandfather');
+    expect(state.sales.incumbentPromos[0]).toMatchObject({ triggerTakePct: 47, answered: true, answeredWithPromo: false });
+    expect(state.sales.month.outageCreditDollarDays).toBe(1_234);
+    expect(state.finance.reports[0]?.ops?.outageCredits).toBe(40);
+    expect(serialize(deserialize(text))).toBe(text);
+  });
+
+  it('upgrades a v4 save written before round 4b: defaults where newGame puts them, so it hashes like a fresh save', () => {
+    const save = base();
+    populateRound4(save);
+    const full: Save = JSON.parse(JSON.stringify(save));
+    delete save.company;
+    delete save.advisor;
+    delete save.sales.month.outageCreditDollarDays;
+    delete save.sales.incumbentPromos[0].triggerTakePct;
+    delete save.sales.incumbentPromos[0].answered;
+    delete save.sales.incumbentPromos[0].answeredWithPromo;
+    for (const report of save.finance.reports) delete report.ops?.outageCredits;
+    const state = deserialize(JSON.stringify(save));
+    expect(state.company).toEqual({ name: defaultCompanyName(state.city.name), difficulty: DEFAULT_DIFFICULTY });
+    expect(state.advisor).toEqual(newAdvisorState());
+    expect(state.sales.month.outageCreditDollarDays).toBe(0);
+    expect(state.sales.incumbentPromos[0]).toMatchObject({ triggerTakePct: Math.round(INCUMBENT_PROMO_TAKE_RATE * 100), answered: false, answeredWithPromo: false });
+    expect(state.finance.reports.every((r) => r.ops === undefined || r.ops.outageCredits === 0)).toBe(true);
+    // Same key order as a save that always had them.
+    full.company = state.company;
+    full.advisor = state.advisor;
+    full.sales.month.outageCreditDollarDays = 0;
+    full.sales.incumbentPromos[0].triggerTakePct = Math.round(INCUMBENT_PROMO_TAKE_RATE * 100);
+    full.sales.incumbentPromos[0].answered = false;
+    full.sales.incumbentPromos[0].answeredWithPromo = false;
+    for (const report of full.finance.reports) if (report.ops) report.ops.outageCredits = 0;
+    expect(serialize(state)).toBe(JSON.stringify(full));
+    const fresh = newGame(state.seed, { city: state.city });
+    expect(Object.keys(state)).toEqual(Object.keys(fresh));
+    expect(Object.keys(state.sales.month)).toEqual(Object.keys(fresh.sales.month));
+  });
+
+  it('upgrades a company name an earlier round-4b build accepted with invisible characters in it', () => {
+    const named = (name: string): GameState => deserialize(with4b((s) => (s.company.name = name)));
+    // Cleaned to what is visible, or the town's default name when nothing is.
+    expect(named('‮Wren Fiber').company.name).toBe('Wren Fiber');
+    expect(named('Wren​ Fiber').company.name).toBe('Wren Fiber');
+    for (const blank of ['​', 'ㅤ', '⠀', '⁠⁠']) {
+      const state = named(blank);
+      expect(state.company.name, JSON.stringify(blank)).toBe(defaultCompanyName(state.city.name));
+    }
+    // A name malformed under the old rules too is still rejected, not repaired.
+    expectSaveError(with4b((s) => (s.company.name = ' ​Wren')), /company\.name should be a company name/);
+  });
+
+  it.each(['v1-grid', 'v1-town', 'v2-grid', 'v2-town', 'v3-grid', 'v3-town'] as const)(
+    'gives the frozen %s save the Seed round and a company named after its town',
+    (name) => {
+      const text = readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8');
+      const state = deserialize(text);
+      expect(state.company).toEqual({ name: defaultCompanyName(state.city.name), difficulty: DEFAULT_DIFFICULTY });
+      expect(state.company.name).toBe(`${state.city.name} Fiber`);
+      expect(state.advisor).toEqual(newAdvisorState());
+      expect(state.sales.month.outageCreditDollarDays).toBe(0);
+      expect(Object.keys(state)).toEqual(Object.keys(newGame(state.seed, { city: state.city })));
+    },
+  );
+
+  const cases: Array<[string, (save: Save) => void, RegExp]> = [
+    ['a null company', (s) => (s.company = null), /company should be an object, got null/],
+    ['an empty company name', (s) => (s.company.name = ''), /company\.name should be a company name/],
+    ['a company name with spaces around it', (s) => (s.company.name = ' Wren Fiber'), /company\.name should be a company name/],
+    ['a company name with doubled spaces', (s) => (s.company.name = 'Wren  Fiber'), /company\.name should be a company name/],
+    ['a company name too long', (s) => (s.company.name = 'x'.repeat(33)), /company\.name should be a company name \(1-32 characters/],
+    ['a company name with a control character', (s) => (s.company.name = 'Wren\u0007Fiber'), /company\.name should be a company name/],
+    ['a company name that is not a string', (s) => (s.company.name = 7), /company\.name should be a string, got 7/],
+    ['an unknown difficulty', (s) => (s.company.difficulty = 'nightmare'), /company\.difficulty should be one of "angel", "seed", "bootstrapped", "shoestring", got "nightmare"/],
+    ['an advisor that is a list', (s) => (s.advisor = []), /advisor should be an object, got an array/],
+    ['snoozes that are not a list', (s) => (s.advisor.snoozes = {}), /advisor\.snoozes should be an array/],
+    ['a snooze key with a space', (s) => (s.advisor.snoozes[0].key = 'add splitter'), /advisor\.snoozes\[0\]\.key should be a suggestion key/],
+    ['an empty snooze key', (s) => (s.advisor.snoozes[0].key = ''), /advisor\.snoozes\[0\]\.key should be a suggestion key/],
+    ['a snooze of unknown severity', (s) => (s.advisor.snoozes[0].severity = 'mild'), /advisor\.snoozes\[0\]\.severity should be one of "urgent", "important", "tip"/],
+    ['a snooze ending before day 0', (s) => (s.advisor.snoozes[0].untilDay = -1), /advisor\.snoozes\[0\]\.untilDay should be an integer >= 0/],
+    ['two snoozes on one key', (s) => s.advisor.snoozes.push({ ...s.advisor.snoozes[0] }), /advisor\.snoozes \(by key\)\[1\] should come after/],
+    ['shown suggestions out of order', (s) => s.advisor.shown.reverse(), /advisor\.shown \(by key\)\[1\] should come after/],
+    ['a suggestion shown in the future', (s) => (s.advisor.shown[1].lastDay = s.day + 1), /advisor\.shown\[1\]\.lastDay should be an integer in \d+\.\.\d+/],
+    ['a run that ends before it starts', (s) => (s.advisor.shown[0].lastDay = s.advisor.shown[0].firstDay - 1), /advisor\.shown\[0\]\.lastDay should be an integer in/],
+    ['a suggestion shown zero times', (s) => (s.advisor.shown[0].times = 0), /advisor\.shown\[0\]\.times should be an integer in 1\.\./],
+    ['negative outage credits accrued', (s) => (s.sales.month.outageCreditDollarDays = -1), /sales\.month\.outageCreditDollarDays should be an integer >= 0, got -1/],
+    ['report ops without outage credits after round 4b', (s) => (s.finance.reports[0].ops.outageCredits = -2), /finance\.reports\[0\]\.ops\.outageCredits should be an integer >= 0, got -2/],
+    ['an incumbent promo trigger over 100%', (s) => (s.sales.incumbentPromos[0].triggerTakePct = 101), /sales\.incumbentPromos\[0\]\.triggerTakePct should be an integer in 0\.\.100, got 101/],
+    ['an incumbent promo answered "yes"', (s) => (s.sales.incumbentPromos[0].answered = 'yes'), /sales\.incumbentPromos\[0\]\.answered should be true or false/],
+    ['a lock to resume on a grandfathered lock', (s) => (s.sales.accounts[0].locks[0].reason = 'grandfather'), /locks\[0\]\.resume is only on a retention lock, got one on a grandfather lock/],
+    ['a lock to resume at no more than the retention price', (s) => (s.sales.accounts[0].locks[0].resume.price = s.sales.accounts[0].locks[0].price), /locks\[0\]\.resume\.price should be an integer in/],
+    ['a lock to resume that ends with the retention lock', (s) => (s.sales.accounts[0].locks[0].resume.untilDay = s.sales.accounts[0].locks[0].untilDay), /locks\[0\]\.resume\.untilDay should be an integer >=/],
+    ['a retention lock to resume', (s) => (s.sales.accounts[0].locks[0].resume.reason = 'retention'), /locks\[0\]\.resume\.reason should be one of "grandfather", "notice", "promo"/],
+    ['an incumbent promo answered with a promo "yes"', (s) => (s.sales.incumbentPromos[0].answeredWithPromo = 'yes'), /sales\.incumbentPromos\[0\]\.answeredWithPromo should be true or false/],
+  ];
+
+  it.each(cases)('rejects %s', (_name, mutate, message) => {
+    expectSaveError(with4b(mutate), message);
+  });
+
+  it('either rejects or loads a playable game for any single-field corruption of a round-4b record', () => {
+    const save0: Save = JSON.parse(serialize(borrowedGame({ cols: 1, rows: 1, blockW: 2, blockH: 2 })));
+    populateRound4b(save0);
+    const text = JSON.stringify(save0);
+    expect(() => deserialize(text)).not.toThrow();
+    const ROUND4B = new Set(['company', 'advisor', 'outageCreditDollarDays', 'outageCredits', 'triggerTakePct', 'answered', 'answeredWithPromo', 'locks']);
+    const paths: Array<Array<string | number>> = [];
+    const walk = (value: unknown, path: Array<string | number>): void => {
+      if (path.some((key) => typeof key === 'string' && ROUND4B.has(key))) paths.push(path);
+      if (Array.isArray(value)) value.forEach((v, i) => walk(v, [...path, i]));
+      else if (typeof value === 'object' && value !== null) {
+        for (const [key, v] of Object.entries(value)) walk(v, [...path, key]);
+      }
+    };
+    walk(save0, []);
+    expect(paths.length).toBeGreaterThan(20);
+    const DELETE = Symbol('delete');
+    const replacements: unknown[] = [DELETE, null, 'x', '', -1, 0, 1, 1.5, true, {}, [], 1e9];
+    const failures: string[] = [];
+    for (const path of paths) {
+      for (const replacement of replacements) {
+        const save: Save = JSON.parse(text);
+        const parent = path.slice(0, -1).reduce((node: Save, key) => node[key], save);
+        const key = path[path.length - 1] as string | number;
+        if (replacement === DELETE) delete parent[key];
+        else parent[key] = replacement;
+        const label = `${path.join('.')} = ${replacement === DELETE ? '<deleted>' : JSON.stringify(replacement)}`;
+        let state: GameState;
+        try {
+          state = deserialize(JSON.stringify(save));
+        } catch (err) {
+          if (!(err instanceof SaveError)) failures.push(`${label}: threw ${String(err)}`);
+          continue;
+        }
+        try {
+          applyCommand(state, { type: 'snoozeAdvice', key: 'cashRunway' });
+          applyCommand(state, { type: 'noteAdviceShown', keys: ['expand:node:5'] });
+          applyCommand(state, { type: 'answerIncumbent', cabinet: state.network.cabinets[0]?.id ?? 1 });
+          runDays(state, 70);
+          getService(state);
+          deserialize(serialize(state));
+        } catch (err) {
+          failures.push(`${label}: loaded, then ${String(err)}`);
+        }
+      }
+    }
+    expect(failures).toEqual([]);
   });
 });

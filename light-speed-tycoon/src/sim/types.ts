@@ -39,6 +39,24 @@
 //       the new DebtStats fields, and the round-4 notice kinds. v3 saves
 //       migrate with no storms, locks or promos (save.ts migrateV3toV4); v1
 //       and v2 saves migrate v1 -> v2 -> v3 -> v4.
+//       Round 4b extends v4 in place (round 4 was never released, so no
+//       version bump): GameState.company (name, difficulty), GameState.advisor
+//       (snoozed and recently shown suggestions), the 'retention' price lock
+//       and IncumbentPromo.triggerTakePct / answered, MonthAccrual.
+//       outageCreditDollarDays and OpsStats.outageCredits. A v4 save written
+//       before these fields gets them on load (save.ts upgradeEarlyV4); older
+//       saves get them from migrateV3toV4 (difficulty 'seed', the name
+//       company.defaultCompanyName(town)).
+//       Round 4c/4d extends v4 in place again (still unreleased):
+//       GameState.customers (support level, referral credits, per-street
+//       awareness, neighborhood campaigns, per-account happiness memory,
+//       install-wait memory, the month's referral and campaign figures),
+//       OpsStats.overhead (the overhead's base / per-customer / per-plant
+//       lines; null on reports from earlier builds) and MonthlyReport.customers
+//       (happiness counts, referral and campaign figures and per-area take-rate
+//       history; absent on reports from earlier builds). A v4 save written
+//       before them gets customers.newCustomers() and ops.overhead = null on
+//       load (save.ts upgradeEarlyV4); older saves get them from migrateV3toV4.
 
 export type NodeId = number;
 export type SegmentId = number;
@@ -452,6 +470,70 @@ export interface MonthlyReport {
    * 1-3 saves; present on every report a round-4 close writes.
    */
   ops?: OpsStats;
+  /**
+   * Round 4c/4d: customer figures at month end (happiness, referrals,
+   * campaigns, per-area take-rate history for the Customers dashboard).
+   * Absent on reports written before round 4c/4d; present on every report a
+   * round-4cd close writes (customers.closeCustomersMonth).
+   */
+  customers?: CustomerStats;
+}
+
+/**
+ * Round 4c/4d: the overhead a month close posted ('overhead' ledger
+ * entries), by line. base + perCustomer + perPlant = -(totals.overhead) of
+ * the report exactly (whole dollars). See overhead.ts.
+ */
+export interface OverheadLines {
+  /** OVERHEAD_BASE_PER_MONTH: the part that does not grow with the business. */
+  base: number;
+  /** Per subscribed unit: (OVERHEAD_PER_CUSTOMER_PER_MONTH + the support level's cost) x subscriber-days / days in the month. */
+  perCustomer: number;
+  /** Of perCustomer, the support level's part (SUPPORT_LEVELS[level].costPerSub x subscriber-days / days). */
+  support: number;
+  /** Per unit of live plant: live cabinets x OVERHEAD_PER_CABINET_PER_MONTH + route-miles of live cable x OVERHEAD_PER_MILE_PER_MONTH. */
+  perPlant: number;
+}
+
+/**
+ * Round 4c/4d: what one more month costs to run at today's size and rates
+ * (overhead.overheadRates), for the rate card, the dashboard and the
+ * quotes. Dollars a month; perMile may be fractional.
+ */
+export interface OverheadRates {
+  base: number;
+  /** Per subscribed unit a month: OVERHEAD_PER_CUSTOMER_PER_MONTH + support. */
+  perCustomer: number;
+  /** The support level's cost per subscribed unit a month (SUPPORT_LEVELS). */
+  support: number;
+  supportLevel: SupportLevel;
+  perCabinet: number;
+  perMile: number;
+  /** Live plant today: cabinets and route-miles of live cable (not rounded). */
+  cabinets: number;
+  miles: number;
+}
+
+/** Round 4c/4d: customer figures a month close records (MonthlyReport.customers). */
+export interface CustomerStats {
+  /** Subscribed units by happiness bucket at month end (after churn); they sum to stats.subscribers. */
+  happy: number;
+  okay: number;
+  unhappy: number;
+  /** Signups credited to referrals in the month (whole units) and the credits they cost (2 x REFERRAL_CREDIT each, in totals.marketing). */
+  referralSignups: number;
+  referralCredits: number;
+  /** Neighborhood campaigns bought in the month, dollars (in totals.marketing). */
+  campaignSpend: number;
+  /** Per active cabinet with lit streets at month end: units passed on the streets it serves and subscribed units on its accounts, ascending cabinet. */
+  areas: AreaSnapshot[];
+}
+
+/** One cabinet area at a month close (CustomerStats.areas): the take-rate history the dashboard's trend reads. */
+export interface AreaSnapshot {
+  cabinet: CabinetId;
+  passings: number;
+  units: number;
 }
 
 /** Round-4 figures captured at a month close (finance.closeMonth assembles them). */
@@ -485,6 +567,19 @@ export interface OpsStats {
   incumbentPromos: number;
   /** What every subscriber pays for a full month at month end, price locks included (sales.monthlyRecurringRevenue after churn). */
   mrr: number;
+  /**
+   * Round 4b: billing not charged for days subscribers had no service
+   * because of outages (round(MonthAccrual.outageCreditDollarDays / days in
+   * the month)), dollars >= 0. Revenue in `totals` is already net of it.
+   * Reports written by an earlier round-4 build get 0 on load.
+   */
+  outageCredits: number;
+  /**
+   * Round 4c/4d: the month's overhead by line (sums to -(totals.overhead)),
+   * or null on reports written before round 4c/4d (the summary then shows
+   * one overhead line).
+   */
+  overhead: OverheadLines | null;
 }
 
 /**
@@ -772,9 +867,11 @@ export interface Account {
  *   grandfather - a price rise grandfathered for months (setPricing grandfatherMonths >= 1)
  *   notice      - a price rise passed on at the next bill (setPricing grandfatherMonths 0)
  *   promo       - it signed up on the intro promo (Sales.promo)
+ *   retention   - round 4b: a retention offer answering the incumbent's promo
+ *                 in its cabinet area (answerIncumbent), until that promo ends
  * The reason sets the churn share of the price step when the lock ends.
  */
-export type PriceLockReason = 'grandfather' | 'notice' | 'promo';
+export type PriceLockReason = 'grandfather' | 'notice' | 'promo' | 'retention';
 
 /** A price an account's units on one tier pay until a month close (Account.locks). */
 export interface PriceLock {
@@ -789,6 +886,24 @@ export interface PriceLock {
    */
   untilDay: number;
   reason: PriceLockReason;
+  /**
+   * Round 4b, on a 'retention' lock only (absent otherwise): the dearer lock
+   * it replaced that was promised past the incumbent promo's end (a
+   * grandfathered or intro-promo price), so the offer never cuts that
+   * promise short. When the retention lock ends at a close, its units go
+   * back to this price (a step from the retention price, RETENTION_STEP_SHARE)
+   * until resume.untilDay, with resume.reason, instead of to the list price.
+   */
+  resume?: PriceLockResume;
+}
+
+/** Round 4b: the lock a retention lock gives back when it ends (PriceLock.resume): never itself a retention lock. */
+export interface PriceLockResume {
+  /** Household monthly price, whole dollars >= 1, above the retention lock's. */
+  price: number;
+  /** A month-close day after the retention lock's untilDay. */
+  untilDay: number;
+  reason: Exclude<PriceLockReason, 'retention'>;
 }
 
 /** The intro offer new signups get (Sales.promo): a discount off the list price for their first months. */
@@ -819,8 +934,34 @@ export interface IncumbentPromo {
   endDay: number;
   /** The incumbent's promo price there, whole dollars a month, 1..INCUMBENT_PRICE. */
   price: number;
-  /** No new promo at this cabinet before this day (>= endDay); the record is dropped at the first close on or after it. */
+  /**
+   * No new promo at this cabinet before this day (>= endDay). Round 4b: the
+   * record is kept after it as the area's memory (at most one record per
+   * cabinet; a new promo replaces it): the next promo there needs the area's
+   * take rate at least triggerTakePct / 100 + INCUMBENT_PROMO_RETRIGGER_POINTS
+   * (incumbent.reviewIncumbent), so a mature area does not cycle forever. It
+   * is dropped when its cabinet no longer exists.
+   */
   quietUntil: number;
+  /** Round 4b: your take rate in the area when it started, whole percent 0..100 (round(takeRate x 100)). */
+  triggerTakePct: number;
+  /**
+   * Round 4b: the player answered it with a retention offer
+   * (answerIncumbent: 'retention' price locks for the area's subscribers
+   * until endDay). The advisor's card about it clears; at most one answer
+   * per promo.
+   */
+  answered: boolean;
+  /**
+   * Round 4b: the player set an intro promo while it ran where
+   * incumbent.bestIncumbentAnswer recommended one (setPromo: see
+   * incumbent.setIntroPromo), and it is still set. The advisor's card about it
+   * clears too, but unlike `answered` it spares no churn (the intro promo
+   * speeds up signups; only a retention offer keeps subscribers), and a
+   * retention offer can still be made. Back to false when the intro promo is
+   * taken away (setPromo null) while it runs.
+   */
+  answeredWithPromo: boolean;
 }
 
 /**
@@ -837,12 +978,20 @@ export interface MonthAccrual {
   revenueDollarDays: number;
   /** Sum over the month's daily steps of marketingPerMonth. Spend at close = round(/ days in the month). */
   marketingDollarDays: number;
-  /** Sum over the month's daily steps of subscribed units. Support cost at close = round(SUPPORT_COST_PER_SUB_PER_MONTH x / days). */
+  /** Sum over the month's daily steps of subscribed units (outage days left out). The per-customer overhead at close (overhead.postCustomerOverhead) is priced from it. */
   subscriberUnitDays: number;
   /** Units connected so far this month. */
   grossAdds: number;
   /** Units disconnected so far this month because service went away. */
   lostService: number;
+  /**
+   * Round 4b: sum over the month's daily steps of the monthly rate of the
+   * units cut off that day (network.outageService), which revenueDollarDays
+   * leaves out: outage days are not billed (nor charged support:
+   * subscriberUnitDays leaves those units out too). The close reports
+   * round(/ days in the month) as OpsStats.outageCredits. >= 0.
+   */
+  outageCreditDollarDays: number;
 }
 
 export interface Sales {
@@ -972,9 +1121,167 @@ export interface RngStreams {
   weather: number;
 }
 
+/**
+ * Round 4b: how hard the game is. Levels differ ONLY in starting cash for now
+ * (balance.DIFFICULTY_LEVELS: Angel-backed, Seed round = START_CASH,
+ * Bootstrapped, Shoestring); more knobs may follow.
+ */
+export type DifficultyId = 'angel' | 'seed' | 'bootstrapped' | 'shoestring';
+
+/** Round 4b: the player's company (chosen on the start screen; never renamed mid-game). */
+export interface Company {
+  /**
+   * Display name, e.g. "Otter Junction Fiber": a string already normalized by
+   * company.normalizeCompanyName (trimmed, inner whitespace collapsed to one
+   * space, no control characters), 1..COMPANY_NAME_MAX UTF-16 code units.
+   * The UI renders it as text only (textContent), never as HTML.
+   */
+  name: string;
+  difficulty: DifficultyId;
+}
+
+/**
+ * Round 4b: a suggestion the player dismissed (snoozeAdvice). advise() leaves
+ * out an advice with this key while state.day < untilDay, unless its severity
+ * is now above the snoozed one (the situation got materially worse).
+ */
+export interface AdviceSnooze {
+  /** Advice.key it silences (1..ADVICE_KEY_MAX_LENGTH characters). */
+  key: string;
+  /** A close day (the 1st of a month) after the day it was snoozed: hidden before it, shown again from it. */
+  untilDay: number;
+  /** The advice's severity when it was snoozed. */
+  severity: AdviceSeverity;
+}
+
+/**
+ * Round 4b: a suggestion shown in recent month-end briefings
+ * (noteAdviceShown): how many briefings in a row have shown it, so the
+ * advisor never repeats it word for word (Advice.repeat).
+ */
+export interface AdviceShown {
+  key: string;
+  /** Day of the first briefing of the current run that showed it. */
+  firstDay: number;
+  /** Day of the latest briefing that showed it (>= firstDay). */
+  lastDay: number;
+  /** Briefings in a row that showed it, >= 1. */
+  times: number;
+}
+
+/** Round 4b: what the advisor remembers between briefings (saved, so it survives reloads). */
+export interface AdvisorState {
+  /** Snoozed suggestions, ascending key, one per key, at most ADVISOR_MEMORY_MAX. */
+  snoozes: AdviceSnooze[];
+  /** Suggestions the latest briefing showed, ascending key, one per key, at most ADVISOR_MEMORY_MAX. */
+  shown: AdviceShown[];
+}
+
+// ---------------------------------------------------------------------------
+// Customers (round 4c/4d; customers.ts owns the rules, sales.ts applies them
+// to signups and churn). Saved in GameState.customers; plain JSON, integers.
+// ---------------------------------------------------------------------------
+
+/** Round 4c/4d: how much customer support the company pays for (balance.SUPPORT_LEVELS). */
+export type SupportLevel = 'basic' | 'good' | 'great';
+
+/**
+ * Round 4c/4d: one lit street's awareness (CustomersState.streets). Kept
+ * for every lit segment (customers.stepCustomers adds a street the day it is
+ * first lit, at AWARENESS_ON_LIT, and drops it the day it is no longer lit);
+ * an interrupted street (an outage) stays lit and keeps its entry.
+ */
+export interface StreetAwareness {
+  segment: SegmentId;
+  /** Day this run of being lit began (0..state.day). */
+  litDay: number;
+  /** Share of the street's households that know you, in parts per million: 0..customers.AWARENESS_PPM (1,000,000). */
+  awareness: number;
+}
+
+/**
+ * Round 4c/4d: a neighborhood campaign in one cabinet's area
+ * (runCampaign): an awareness burst at full strength for CAMPAIGN_DAYS,
+ * fading to nothing over CAMPAIGN_FADE_DAYS. The record is kept as the
+ * area's memory until cooldownUntil (one record per cabinet; a new campaign
+ * replaces it), and dropped after it or when the cabinet no longer exists.
+ */
+export interface NeighborhoodCampaign {
+  cabinet: CabinetId;
+  /** Day it was bought (0..state.day). */
+  startDay: number;
+  /** Day its effect has faded to nothing (startDay + CAMPAIGN_DAYS + CAMPAIGN_FADE_DAYS at purchase), > startDay. */
+  endDay: number;
+  /** No new campaign in this area before this day (endDay + CAMPAIGN_COOLDOWN_DAYS at purchase), >= endDay. */
+  cooldownUntil: number;
+  /** What it cost (posted as 'marketing' when bought), whole dollars >= 0. */
+  cost: number;
+  /** Lit units not signed up in the area when bought (what it was sized on), >= 0. */
+  units: number;
+}
+
+/**
+ * Round 4c/4d: what one account's happiness remembers
+ * (CustomersState.memories; only accounts with something to remember have
+ * an entry). customers.ts updates it at each close (outages, price steps)
+ * and at connect (an install wait), and drops an entry once every field has
+ * expired (or its account is gone).
+ */
+export interface CustomerMemory {
+  parcel: ParcelId;
+  /** Days its service was cut off by outages within HAPPINESS_OUTAGE_MEMORY_DAYS of the latest (outageDay), >= 0. */
+  outageDays: number;
+  /** Last day counted in outageDays, or null (outageDays is then 0). */
+  outageDay: number | null;
+  /** Close day its price last stepped up (a lock ending with a rise, a move to a dearer tier), or null. */
+  priceStepDay: number | null;
+  /** Day it connected after waiting for a port or for installs to resume, or null. */
+  waitedDay: number | null;
+}
+
+/** Round 4c/4d: the last day a cabinet turned signups away (CustomersState.waits), for the install-wait happiness factor. */
+export interface CabinetWait {
+  cabinet: CabinetId;
+  /** Last day it was listed in Sales.fullCabinets (0..state.day). */
+  day: number;
+}
+
+/** Round 4c/4d: customer figures accrued over the open month, reset by each close. */
+export interface CustomersMonth {
+  /**
+   * Signups credited to referral credits so far this month, in thousandths
+   * of a unit (each signup adds round(its referral share x 1000), the share
+   * of its street's switching that word of mouth brought while credits were
+   * on). The close credits round(/ 1000) referrals, >= 0.
+   */
+  referralMilli: number;
+  /** Neighborhood campaigns bought so far this month, dollars >= 0. */
+  campaignSpend: number;
+}
+
+/** Round 4c/4d: the customers model's saved state (GameState.customers; customers.newCustomers() for a new game). */
+export interface CustomersState {
+  supportLevel: SupportLevel;
+  /** Referral credits on (setReferrals): REFERRAL_CREDIT off for both sides of each referral signup. */
+  referrals: boolean;
+  /** One per lit segment, ascending segment. */
+  streets: StreetAwareness[];
+  /** Running or cooling down, ascending cabinet, at most one per cabinet. */
+  campaigns: NeighborhoodCampaign[];
+  /** Ascending parcel, at most one per parcel. */
+  memories: CustomerMemory[];
+  /** Cabinets that turned signups away recently, ascending cabinet, at most one per cabinet. */
+  waits: CabinetWait[];
+  /** Last day installs were paused for lack of cash (Sales.installsPaused), or null. */
+  pausedDay: number | null;
+  month: CustomersMonth;
+}
+
 export interface GameState {
   schemaVersion: 4;
   seed: number;
+  /** Round 4b: the player's company: its name and the difficulty it started at. */
+  company: Company;
   day: number;
   rng: RngStreams;
   /** Monotonic id source for spans and cabinets. */
@@ -985,8 +1292,12 @@ export interface GameState {
   /** Credit line, term loans and covenant stage (debt.newDebt() for a new game: nothing borrowed). */
   debt: Debt;
   sales: Sales;
+  /** Round 4c/4d: support level, referral credits, awareness, campaigns and happiness memory (customers.newCustomers() for a new game). */
+  customers: CustomersState;
   /** Round 4: storms and the month's outage totals (weather.newWeather() for a new game). */
   weather: Weather;
+  /** Round 4b: snoozed and recently shown suggestions (advisor.newAdvisorState() for a new game). */
+  advisor: AdvisorState;
   /** Achieved milestones, in the order achieved; each id at most once. */
   milestones: MilestoneRecord[];
   /** The newest NOTICE_LOG_MAX notices, oldest first. */
@@ -1044,7 +1355,38 @@ export type Command =
   /** Borrow a fixed-rate term loan of whole dollars (TERM_LOAN_MIN..capacity). Cost = -amount (cash in). */
   | { type: 'takeTermLoan'; amount: number; termYears: TermYears }
   /** Prepay whole dollars (>= 1, <= balance) of a term loan plus the interest accrued on them. Cost = amount + accrued interest. */
-  | { type: 'prepayLoan'; loan: LoanId; amount: number };
+  | { type: 'prepayLoan'; loan: LoanId; amount: number }
+  /**
+   * Round 4b: answer the incumbent's running promo at `cabinet` with a
+   * retention offer: every subscriber there gets a 'retention' price lock
+   * (RETENTION_PERCENT_OFF off) until the promo ends, which spares them the
+   * promo's extra churn. Free now (the discount is revenue given up). Once
+   * per promo. See incumbent.answerIncumbent / quoteRetention.
+   */
+  | { type: 'answerIncumbent'; cabinet: CabinetId }
+  /**
+   * Round 4b: snooze (dismiss) the suggestion with this Advice.key for
+   * ADVICE_SNOOZE_MONTHS closes (ADVICE_SNOOZE_URGENT_MONTHS for an urgent
+   * one). Free; changes only what the advisor shows. See advisor.snoozeAdvice.
+   */
+  | { type: 'snoozeAdvice'; key: string }
+  /**
+   * Round 4b: the month-end briefing just showed these suggestions
+   * (Advice.key); the UI sends it once per close-time briefing (not when the
+   * menu reopens one). Free; feeds Advice.repeat. See advisor.noteAdviceShown.
+   */
+  | { type: 'noteAdviceShown'; keys: string[] }
+  /**
+   * Round 4c/4d: run a neighborhood campaign in a live, active cabinet's
+   * area (an awareness burst there). Cost = customers.quoteCampaign(...).cost,
+   * posted as 'marketing'. One per area at a time, then a cooldown. See
+   * customers.runCampaign.
+   */
+  | { type: 'runCampaign'; cabinet: CabinetId }
+  /** Round 4c/4d: set the support level (its cost per customer from the next daily accrual). Free now. See customers.setSupport. */
+  | { type: 'setSupport'; level: SupportLevel }
+  /** Round 4c/4d: turn referral credits on or off. Free now; each referral signup costs 2 x REFERRAL_CREDIT at the close. See customers.setReferrals. */
+  | { type: 'setReferrals'; on: boolean };
 
 /**
  * On success `cost` is the net cash spent now: negative for a refund or money
@@ -1126,6 +1468,29 @@ export interface CableQuote {
    * this route face another street". Ascending ids.
    */
   wrongSideParcels: ParcelId[];
+  /**
+   * Round 4b: the storm (and, underground, dig-in) exposure of the new
+   * segments as this method would build them (weather.stormRisk summed, and
+   * the exposure bands of weather.segmentExposure): the aerial quote card's
+   * storm-risk line. Null when there are no new segments.
+   */
+  stormRisk: CableStormRisk | null;
+}
+
+/** Round 4b: how exposed a street is to storms (weather.exposureBand of weather.segmentExposure). */
+export type ExposureBand = 'sheltered' | 'moderate' | 'exposed';
+
+/** Round 4b: a cable quote's storm exposure (CableQuote.stormRisk). Estimates, not rounded. */
+export interface CableStormRisk {
+  method: CableMethod;
+  /** Sums over the new segments of weather.stormRisk(segment, method). */
+  outagesPerYear: number;
+  repairCostPerYear: number;
+  outageDaysPerYear: number;
+  /** The most exposed band among the new segments. */
+  band: ExposureBand;
+  /** Feet of the new segments in the 'exposed' band. */
+  exposedFt: number;
 }
 
 export interface CabinetQuote {
@@ -1480,6 +1845,50 @@ export interface PrepayQuote {
   paysOff: boolean;
   /** Re-amortized level payment over the same months left at the effective rate (0 when it pays off). */
   paymentAfter: number;
+  /**
+   * Round 4c/4d: the covenant figures after the prepayment (today's cash
+   * flows; the loan's balance and payment as they would be), for the Bank's
+   * "its effect on bank health" words. Today's figures when the quote is not ok.
+   */
+  after: CovenantMetrics;
+}
+
+/** Round 4c/4d: what repaying the credit line would do (debt.quoteRepay), for the Bank's emergency-cash preview. */
+export interface RepayQuote {
+  /** repayCredit would accept it: whole dollars, 1..min(balance, cash), game not over. */
+  ok: boolean;
+  reasons: string[];
+  amount: number;
+  /** Covenant figures today and after the repayment (the line's balance less the amount; its year of interest gone from the debt service). */
+  before: CovenantMetrics;
+  after: CovenantMetrics;
+  cashAfter: number;
+}
+
+/**
+ * Round 4c/4d: the Bank's health in plain words (debt.bankHealth). The
+ * level maps to the words the HUD chip, the Bank and the month summary all
+ * use (ui/health.ts): good "Good", watch "Watch", warning "Warning",
+ * penalty "Higher interest", frozen "No more borrowing".
+ */
+export type BankHealthLevel = 'good' | 'watch' | 'warning' | 'penalty' | 'frozen';
+
+export interface BankHealth {
+  level: BankHealthLevel;
+  /** Nothing owed (level 'good'; the checks read as not needed). */
+  noDebt: boolean;
+  /** Compliant stage, but today's figures break a check (level 'watch'): the old "At risk". */
+  failingNow: boolean;
+  /** Compliant stage, both checks pass, but within BANK_WATCH_HEADROOM of a limit (level 'watch'). */
+  nearLimit: boolean;
+  /** Today's covenant figures (debt.covenantMetrics). */
+  metrics: CovenantMetrics;
+  /** PENALTY_STEP_UP_BPS while 'penalty' or 'frozen', else 0. */
+  penaltyBps: number;
+  /** Frozen with debt and not yet called: closes until the bank calls the loans (debt.closesUntilAcceleration), else null. */
+  closesUntilCalled: number | null;
+  /** The bank has called the loans (Debt.acceleration), whatever the stage. */
+  called: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,6 +1915,12 @@ export interface PricingQuote {
   unitsMoving: number;
   /** Expected cancellations from its price steps and tier moves (an estimate, rounded), at the closes they happen. */
   expectedChurn: number;
+  /**
+   * Round 4c (spec C): mrrAfterLocks less what the expected cancellations
+   * (expectedChurn) would have paid, so the drop-tiers preview counts the
+   * cancellations it lists. Whole dollars, <= mrrAfterLocks.
+   */
+  mrrAfterChurn: number;
 }
 
 /** What converting an aerial span to underground would take (network.quoteConvert). */
@@ -1523,6 +1938,122 @@ export interface ConvertQuote {
   poleRentSaved: number;
   /** Expected storm repair cost a year it avoids (weather.stormRisk aerial minus underground), dollars (an estimate). */
   repairsAvoidedPerYear: number;
+  /** Round 4b: the span's street's storm exposure band (weather.exposureBand of weather.segmentExposure). */
+  exposure: ExposureBand;
+}
+
+/**
+ * Round 4b: the households a price lineup wins, by price sensitivity
+ * (balance.DEMAND_SEGMENTS: value seekers who only take a cheap tier,
+ * mainstream, speed seekers). sales.segmentDemand; the pricing panel's
+ * "who signs up" rows.
+ */
+export type DemandSegmentId = 'value' | 'mainstream' | 'speed';
+
+/** One demand segment's response to a lineup (sales.segmentDemand). */
+export interface SegmentDemand {
+  segment: DemandSegmentId;
+  /** Its share of households (DEMAND_SEGMENTS share; the shares sum to 1). */
+  share: number;
+  /** Its target take rate under the lineup, 0..1 (before TAKE_RATE_KIND_FACTOR: a household's). */
+  takeRate: number;
+  /** The tier it would mostly take, or null when no offered tier suits it (it does not sign up). */
+  tier: TierId | null;
+}
+
+/**
+ * Round 4b: what a retention offer answering the incumbent's promo at
+ * `cabinet` would cost and save (incumbent.quoteRetention), for the pricing
+ * panel and the advisor. Estimates rounded to whole dollars / units.
+ */
+export interface RetentionQuote {
+  /** answerIncumbent would accept it: a promo runs there now, not answered yet, with subscribers. */
+  ok: boolean;
+  reasons: string[];
+  cabinet: CabinetId;
+  /** Subscribed units on accounts of that cabinet today. */
+  units: number;
+  /** RETENTION_PERCENT_OFF. */
+  percentOff: number;
+  /** Month closes until the promo ends (the locks' length). */
+  months: number;
+  /** Revenue a month the offer gives up (MRR now less with the locks). */
+  monthlyCost: number;
+  /** monthlyCost x months. */
+  totalCost: number;
+  /** Cancellations the promo is expected to cause there over its remaining months that the offer avoids. */
+  cancellationsAvoided: number;
+  /** What those cancellations would cost (lost margin until replaced, reinstalls), dollars. */
+  valueSaved: number;
+  /** valueSaved > totalCost: the advisor recommends it only then. */
+  pays: boolean;
+}
+
+/**
+ * Round 4b: the best answer to the incumbent's promo at a cabinet
+ * (incumbent.bestIncumbentAnswer): the remedy that pays most, or none when
+ * nothing beats waiting it out. The advisor's incumbentPromo card says this
+ * and only this; the pricing panel shows the same figures.
+ */
+export interface IncumbentAnswer {
+  cabinet: CabinetId;
+  /** retention: answerIncumbent pays; introPromo: setPromo(promo) pays; none: nothing pays (or the promo is answered or over). */
+  kind: 'retention' | 'introPromo' | 'none';
+  /** The retention offer's quote (always computed). */
+  retention: RetentionQuote;
+  /** The intro promo it weighed (kind introPromo: the one to set), else null. */
+  promo: IntroPromo | null;
+  /** What the remedy is worth beyond its cost, dollars (0 for none). */
+  netValue: number;
+  /** One plain-language sentence with the figures; round 4c/4d: for none, one sentence saying ignoring the promo is fine there, and why (empty only when the promo is answered or over). */
+  text: string;
+}
+
+/**
+ * Round 4b: what an intro promo would do (sales.quotePromo), for the pricing
+ * panel ("when it pays") and the advisor. Estimates over PROMO_QUOTE_MONTHS.
+ */
+export interface PromoQuote {
+  /** setPromo would accept it (null: always). */
+  ok: boolean;
+  reasons: string[];
+  promo: IntroPromo | null;
+  /** Units waiting to sign up across lit areas today (target take less subscribed), the gap a promo speeds up. */
+  waitingUnits: number;
+  /** Extra signups the promo brings within PROMO_QUOTE_MONTHS (its signup boost on the waiting gap). */
+  extraSignups: number;
+  /** Revenue given up on the discounted signups within the horizon, dollars. */
+  discountCost: number;
+  /** Margin the extra (and earlier) signups bring within the horizon, dollars. */
+  valueGained: number;
+  /** valueGained > discountCost. */
+  pays: boolean;
+  /** One plain-language sentence on when it pays ("Pays while you light new areas: ..."). */
+  advice: string;
+}
+
+/**
+ * Round 4b: everything a new cabinet at `node` needs to light what it
+ * reaches (coverage.buildOutPlan), as commands a player (or the advisor's
+ * expand suggestion, or a bot following it) can send in order.
+ */
+export interface BuildOutPlan {
+  node: NodeId;
+  /** Uncabled segments joining the node to the planned plant (network.cableRoute from the nearest planned plant node), in route order; empty when already joined. */
+  feeder: SegmentId[];
+  /** Uncabled segments within CABINET_REACH_FT of the node along streets (coveragePreview's build-out), ascending. */
+  reach: SegmentId[];
+  /** Feeder and reach segments by method (weather.preferredMethod per segment), each ascending: one layCable order per non-empty list. */
+  aerial: SegmentId[];
+  underground: SegmentId[];
+  /** placeCabinet (when none stands there), then layCable aerial, then layCable underground. */
+  commands: Command[];
+  /** Cabinet price plus both orders' quoteCable costs, dollars. */
+  cost: number;
+  /** Units on existing parcels the plan would newly pass (not served elsewhere: coveragePreview). */
+  passings: number;
+  /** cost / passings, or null when passings is 0. */
+  cpp: number | null;
 }
 
 /** Expected yearly storm and dig-in exposure of a span of `method` on a segment (weather.stormRisk). */
@@ -1553,13 +2084,17 @@ export type AdviceId =
   | 'incumbentPromo' // the incumbent is running a promo in an area: price / marketing response
   | 'takeRate' // take rate lagging its target: price or marketing
   | 'pricing' // a tier priced far from what the market bears
+  | 'lineup' // round 4c/4d: the cheap tiers are not offered: value seekers do not sign up
+  | 'support' // round 4c/4d: outages or unhappiness drive cancellations: Great support pays (or Basic costs customers)
+  | 'growCustomers' // round 4c/4d: lit areas under-signed: the cheapest way to more customers (marketing, a campaign, referral credits or a new street)
   | 'redCpp' // red-CPP builds are raising the rate on new debt
+  | 'firstBuild' // round 4c/4d: nothing lit yet: a concrete first build sized to the cash
   | 'expand'; // idle cash or safe borrowing room with green-CPP corners nearby: build there
 
 export type AdviceSeverity = 'urgent' | 'important' | 'tip';
 
-/** A panel the UI can open for an advice. */
-export type AdvicePanel = 'pricing' | 'bank' | 'olt';
+/** A panel the UI can open for an advice (round 4c/4d: 'customers', the Customers dashboard). */
+export type AdvicePanel = 'pricing' | 'bank' | 'olt' | 'customers';
 
 /** What "Show me" does: move the camera to a place (and highlight it), or open a panel. */
 export type AdviceAction =
@@ -1572,17 +2107,48 @@ export type AdviceAction =
 export interface Advice {
   id: AdviceId;
   /**
+   * Round 4b: the suggestion's identity for snoozes and repeats: its rule and
+   * subject, e.g. "addSplitter:cabinet:12", "expand:node:345",
+   * "pricing:fiber2g", "cashRunway" (1..ADVICE_KEY_MAX_LENGTH characters, no
+   * whitespace). Two suggestions with the same key are the same advice; a
+   * different subject is a different one (a snooze does not silence it).
+   */
+  key: string;
+  /**
+   * Round 4b: how many month-end briefings in a row before this one showed
+   * this key (AdvisorState.shown); 0 = new. The advisor words a repeat
+   * differently (never word for word); the briefing may compact it.
+   */
+  repeat: number;
+  /**
    * Rank: higher first (ties by AdviceId order above). Bands: urgent 300-399,
    * important 200-299, tip 100-199, so severity and priority always agree.
    */
   priority: number;
   severity: AdviceSeverity;
-  /** Short imperative, e.g. "Add a splitter at Elm St & 3rd Ave". */
+  /**
+   * Short imperative, e.g. "Add a splitter at Elm St & 3rd Ave". Round 4c/4d
+   * (spec B): at most advisor.ADVICE_TITLE_MAX (~45) characters.
+   */
   title: string;
-  /** Plain-language reason built from the game's figures, one or two sentences. */
+  /**
+   * Plain-language reason built from the game's figures. Round 4c/4d (spec
+   * B): ONE sentence of at most advisor.ADVICE_WHY_MAX (~90) characters that
+   * names the cost when there is one ("It's full and 12 homes are waiting.
+   * Costs $1,800."); it leads the month summary's next-step card. Longer
+   * reasoning goes in `detail`.
+   */
   why: string;
+  /**
+   * Round 4c/4d: the longer reasoning (figures, alternatives, how it is
+   * financed), shown only behind the card's own disclosure; '' when the
+   * short `why` says it all.
+   */
+  detail: string;
+  /** Round 4c/4d: what following it costs now, whole dollars (null: no cost, or not a purchase). */
+  cost: number | null;
   action: AdviceAction;
-  /** Button label: "Show me" for a place, "Open Pricing" / "Open Bank" / "Open OLT" for a panel. */
+  /** Button label: "Show me" for a place, "Open Pricing" / "Open Bank" / "Open OLT" / "Open Customers" for a panel. */
   actionLabel: string;
 }
 
@@ -1652,10 +2218,365 @@ export interface Briefing {
     /** Loans called: closes left to repay everything, else null. */
     accelerationClosesLeft: number | null;
   };
-  /** advisor.advise(state): at most ADVICE_MAX, ranked. */
+  /**
+   * advisor.advise(state): at most ADVICE_MAX, ranked (snoozed suggestions
+   * left out). Round 4c/4d: the first is the month summary's "Your next
+   * step"; the rest are its "N more tips".
+   */
   advice: Advice[];
+  /** Round 4b: suggestions that fired but are snoozed (AdvisorState.snoozes), so not in `advice`. */
+  snoozed: number;
   /** Something needs the player: urgent advice, or a period notice of a kind that needs action (advisor.noticeNeedsAttention). */
   needsAttention: boolean;
+  /** Round 4c/4d: the period's story, which picks the month summary's headline (see BriefingStory). */
+  story: BriefingStory;
+  /** Round 4c/4d: the period's money in and out, partitioned for the month summary's two bars (see BriefingMoney). */
+  money: BriefingMoney;
+  /** Round 4c/4d: the cash card's figures (see BriefingCash). */
+  cash: BriefingCash;
+  /** Round 4c/4d: at most advisor.ATTENTION_MAX things that need the player now, most pressing first (empty when nothing does). */
+  attention: AttentionItem[];
+}
+
+/**
+ * Round 4c/4d: which headline the month summary leads with:
+ *   bank       - bank trouble leads: the covenant stage is warning or worse, or the loans are called;
+ *   earned     - money in without borrowing (bills + other) covered money out;
+ *   building   - money out was more, but customer bills covered running costs and loan payments (the shortfall is building);
+ *   billsShort - customer bills did not cover running costs and loan payments.
+ */
+export type BriefingStory = 'bank' | 'earned' | 'building' | 'billsShort';
+
+/** Round 4c/4d: the three groups of money out (the month summary's stacked bar). */
+export type MoneyGroupKey = 'running' | 'building' | 'loans';
+
+/**
+ * Round 4c/4d: one line of the money partition. Money in: bills (revenue),
+ * borrowed (loanProceeds: loan proceeds and credit-line draws), otherIn
+ * (any group or category that netted positive). Running the business:
+ * overheadBase / overheadCustomers / overheadPlant (OpsStats.overhead's
+ * lines, when every report of the period has them) or overhead (the whole
+ * category otherwise), payroll, poleRent, marketing (campaigns and referral
+ * credits included), repair, otherOut. Building fiber: construction,
+ * equipment, install, refund (negative: it nets). Loan payments: interest,
+ * principal.
+ */
+export type MoneyLineKey =
+  | 'bills'
+  | 'borrowed'
+  | 'otherIn'
+  | 'overheadBase'
+  | 'overheadCustomers'
+  | 'overheadPlant'
+  | 'overhead'
+  | 'payroll'
+  | 'poleRent'
+  | 'marketing'
+  | 'campaigns'
+  | 'referrals'
+  | 'repair'
+  | 'otherOut'
+  | 'construction'
+  | 'equipment'
+  | 'install'
+  | 'refund'
+  | 'interest'
+  | 'principal';
+
+export interface MoneyLine {
+  key: MoneyLineKey;
+  /** Whole dollars, as money in (in lines) or money out (group lines): positive, except a refund netting a group (negative). Lines of 0 are left out. */
+  amount: number;
+}
+
+export interface BriefingMoneyGroup {
+  key: MoneyGroupKey;
+  /** Money out of the group over the period, whole dollars >= 0 (a group that netted positive is 0 here and its net is in money in's otherIn). */
+  total: number;
+  /** Its lines, biggest first; they sum to `total` unless the group netted positive. */
+  lines: MoneyLine[];
+}
+
+/**
+ * Round 4c/4d: the period's money (advisor.buildBriefing), from the ledger
+ * totals of its reports only: in - out = cashChange exactly (whole dollars),
+ * the change in cash over the period (the sum of the reports' nets).
+ */
+export interface BriefingMoney {
+  /** Money in, whole dollars >= 0: bills + borrowed + otherIn. */
+  in: number;
+  /** bills, then borrowed and otherIn when non-zero. */
+  inLines: MoneyLine[];
+  /** Money out, whole dollars >= 0: the groups' totals. */
+  out: number;
+  /** running, building, loans, always all three (a group may be 0). */
+  groups: BriefingMoneyGroup[];
+  /** in - out: the period's cash change. */
+  cashChange: number;
+}
+
+/** Round 4c/4d: the month summary's cash card. */
+export interface BriefingCash {
+  /** The period's cash change (= money.cashChange). */
+  change: number;
+  /** Cash at the period's end (report.cashEnd). */
+  end: number;
+  /** round(change / span): "at this pace you add about $X a month". */
+  perMonth: number;
+  /** finance.runwayMonths now (null when not burning): what running the business alone burns (the full books' look ahead). */
+  runwayMonths: number | null;
+  /**
+   * Round 4c/4d: how long the cash at the period's end lasts at the period's
+   * own pace (perMonth, building included) while cash fell: floor(max(0,
+   * end) / -perMonth), 0 when it is gone; null when cash did not fall. The
+   * cash card's "At this pace your cash lasts about N months" (spec G.4).
+   */
+  paceMonths: number | null;
+  /** Building fiber's money out was more than 0 this period. */
+  building: boolean;
+  /** Customer bills less running costs and loan payments over the period ("without building you'd have made $Z" when > 0). */
+  withoutBuilding: number;
+}
+
+/**
+ * Round 4c/4d: kinds of the month summary's "Needs attention" lines:
+ *   bankStage   - the covenant stage stepped up at the close (a warning, higher interest, no more borrowing);
+ *   bankWatch   - compliant with debt, but today's figures fail a check (the old "At risk");
+ *   loansCalled - the bank has called the loans;
+ *   outage      - plant still out of service at the close;
+ *   storm       - a storm hit this period (repaired already);
+ *   cabinetFull - a cabinet is full and turning signups away.
+ */
+export type AttentionKind = 'bankStage' | 'bankWatch' | 'loansCalled' | 'outage' | 'storm' | 'cabinetFull';
+
+export interface AttentionItem {
+  kind: AttentionKind;
+  /** What its button does: open the Bank, or show the place. */
+  action: AdviceAction;
+  /** The place it is about ("Elm St & 3rd Ave"), or null. */
+  place: string | null;
+  /** Its count when it has one (homes waiting at a full cabinet, spans out, storms), else null. */
+  count: number | null;
+  /** bankStage: the stage now; else null. */
+  stage: CovenantStage | null;
+}
+
+// ---------------------------------------------------------------------------
+// Customers queries and quotes (round 4c/4d; customers.ts; derived, never saved)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a lit household has not signed up (one main reason each):
+ *   unaware      - doesn't know you yet (awareness);
+ *   notWorth     - knows you, but your deal is not worth switching for yet (value vs cable for its segment);
+ *   tooExpensive - no offered plan within its segment's reservation price;
+ *   waiting      - wants to switch but waits for an install or a free port (cabinet full, installs paused, its street cut off).
+ */
+export type SwitchReason = 'unaware' | 'notWorth' | 'tooExpensive' | 'waiting';
+
+/** Counts by reason, in units (customers.whyNotSwitched). */
+export interface SwitchReasonCounts {
+  unaware: number;
+  notWorth: number;
+  tooExpensive: number;
+  waiting: number;
+  /** Lit units not signed up: exactly unaware + notWorth + tooExpensive + waiting. */
+  unsigned: number;
+  /** Units passed (on lit streets) and subscribed units there. */
+  passings: number;
+  subscribed: number;
+  /**
+   * Units on existing parcels of cabled streets that are not lit yet (their
+   * cable is still being built, or no cabinet reaches them): not part of
+   * `unsigned`. 0 in a per-area row (no cabinet serves them).
+   */
+  notLit: number;
+}
+
+export interface AreaSwitchReasons extends SwitchReasonCounts {
+  cabinet: CabinetId;
+}
+
+export interface SwitchReasons {
+  overall: SwitchReasonCounts;
+  /** One per active cabinet serving lit streets, ascending cabinet; their counts sum to overall's (notLit aside). */
+  areas: AreaSwitchReasons[];
+}
+
+/** Round 4c/4d: a customer's happiness bucket (balance HAPPY_SCORE_MIN / UNHAPPY_SCORE_MAX). */
+export type HappinessBucket = 'happy' | 'okay' | 'unhappy';
+
+/**
+ * What moves a customer's happiness:
+ *   support       - the support level (Basic lowers it, Great raises it);
+ *   outages       - days without service in the recent past;
+ *   priceVsCable  - pays more than cable's local price for that kind of plan (an incumbent promo);
+ *   priceVsMarket - pays more than the market's price for the tier;
+ *   goodDeal      - pays less than the market's price for the tier;
+ *   priceStep     - its price stepped up recently;
+ *   installWait   - waited to be connected.
+ */
+export type HappinessReason = 'support' | 'outages' | 'priceVsCable' | 'priceVsMarket' | 'goodDeal' | 'priceStep' | 'installWait';
+
+export interface HappinessFactor {
+  reason: HappinessReason;
+  /** Signed score it adds (positive: happier). Never 0. */
+  score: number;
+}
+
+/** One account's happiness (customers.accountHappiness). */
+export interface AccountHappiness {
+  parcel: ParcelId;
+  cabinet: CabinetId;
+  units: number;
+  /** Sum of the factors' scores. */
+  score: number;
+  bucket: HappinessBucket;
+  /** Non-zero factors, most negative first. */
+  factors: HappinessFactor[];
+}
+
+/** One of the top happiness reasons (HappinessReport.reasons). */
+export interface HappinessReasonCount {
+  reason: HappinessReason;
+  /** 'happy' for a reason that raises happiness (goodDeal, Great support), 'unhappy' for one that lowers it. */
+  bucket: 'happy' | 'unhappy';
+  /** Subscribed units in that bucket for whom it is the biggest factor. */
+  units: number;
+  /** The cabinet area holding most of them, or null when no area holds half. */
+  cabinet: CabinetId | null;
+}
+
+/** Round 4c/4d: happiness across the network (customers.happinessReport). */
+export interface HappinessReport {
+  /** Subscribed units by bucket; they sum to every subscribed unit. */
+  happy: number;
+  okay: number;
+  unhappy: number;
+  /** The top reasons, most units first (at most customers.HAPPINESS_REASONS_MAX). */
+  reasons: HappinessReasonCount[];
+  /** Per cabinet with accounts, ascending cabinet. */
+  areas: { cabinet: CabinetId; happy: number; okay: number; unhappy: number }[];
+}
+
+/** Round 4c/4d: one row of the dashboard's Areas list (customers.customerAreas). */
+export interface CustomerArea {
+  cabinet: CabinetId;
+  /** The cabinet's corner. */
+  node: NodeId;
+  /** Units passed on the streets it serves: the homes it can sell to. */
+  passings: number;
+  /** Subscribed units on its accounts. */
+  subscribed: number;
+  /** subscribed / passings, or null with nothing passed. */
+  takeRate: number | null;
+  /** Whole months since the cabinet went live (null while it is not live). */
+  monthsLit: number | null;
+  /** Its subscribed units customers.AREA_TREND_MONTHS closes ago (MonthlyReport.customers.areas), or null when unknown (trend: subscribed - this). */
+  subscribedBefore: number | null;
+  /** Its campaign record (running or cooling down), or null. */
+  campaign: NeighborhoodCampaign | null;
+}
+
+/** Round 4c/4d: what a marketing budget would do (customers.quoteMarketing). Estimates over `months`. */
+export interface MarketingQuote {
+  /** setMarketing would accept the budget (and the game is not over). */
+  ok: boolean;
+  reasons: string[];
+  perMonth: number;
+  /** CUSTOMER_QUOTE_MONTHS. */
+  months: number;
+  /** Expected new customers a month at this budget (gross signups over the horizon / months), not rounded. */
+  signupsPerMonth: number;
+  /** Of those, the ones this budget brings beyond no marketing at all, a month, not rounded (>= 0). */
+  extraPerMonth: number;
+  /** perMonth / extraPerMonth, whole dollars; null when extraPerMonth is about 0 (or the budget is 0). */
+  costPerCustomer: number | null;
+}
+
+/** Round 4c/4d: what a neighborhood campaign would do (customers.quoteCampaign). Estimates over CUSTOMER_QUOTE_MONTHS. */
+export interface CampaignQuote {
+  /** runCampaign would accept it now. */
+  ok: boolean;
+  reasons: string[];
+  cabinet: CabinetId;
+  /** What it costs now: max(CAMPAIGN_COST_MIN, round(unsignedUnits x CAMPAIGN_COST_PER_UNIT)). */
+  cost: number;
+  /** Lit units not signed up in the area today, and of them the ones who don't know you yet. */
+  unsignedUnits: number;
+  unawareUnits: number;
+  /** Expected signups it brings beyond no campaign, within the horizon (not rounded). */
+  extraSignups: number;
+  /** cost / extraSignups, whole dollars; null when extraSignups is about 0. */
+  costPerCustomer: number | null;
+  /** Margin the extra signups bring within the horizon (their bills less per-customer costs; installs left out), dollars. */
+  valueGained: number;
+  /** valueGained > cost. */
+  pays: boolean;
+  /** When the area's cooldown ends (no campaign before it), or null when none holds it back. */
+  availableDay: number | null;
+}
+
+/** Round 4c/4d: what a support level would do against today's (customers.quoteSupport). Estimates over CUSTOMER_QUOTE_MONTHS. */
+export interface SupportQuote {
+  level: SupportLevel;
+  /** setSupport would accept it (always, while the game is not over). */
+  ok: boolean;
+  reasons: string[];
+  /** The support line a month at this level for today's subscribers. */
+  costPerMonth: number;
+  /** costPerMonth less today's level's (positive: dearer). */
+  costChange: number;
+  /** Subscribed units by bucket at this level today. */
+  happy: number;
+  okay: number;
+  unhappy: number;
+  /** Expected cancellations a month at this level (not rounded). */
+  cancellationsPerMonth: number;
+  /** Expected new customers a month at this level (word of mouth moves it; not rounded). */
+  signupsPerMonth: number;
+  /** Value over the horizon against today's level: margin of the customers kept and gained less the extra cost (negative: worse). Dollars. */
+  netValue: number;
+  /** netValue > 0 (false for today's own level). */
+  pays: boolean;
+}
+
+/** Round 4c/4d: what referral credits on or off would do (customers.quoteReferrals). Estimates over CUSTOMER_QUOTE_MONTHS. */
+export interface ReferralQuote {
+  on: boolean;
+  ok: boolean;
+  reasons: string[];
+  /** Expected referral signups a month with credits on (those credited; 0 for off), not rounded. */
+  referralsPerMonth: number;
+  /** referralsPerMonth x 2 x REFERRAL_CREDIT (0 for off). */
+  costPerMonth: number;
+  /** Signups a month credits on bring beyond credits off (>= 0; 0 for off), not rounded. */
+  extraPerMonth: number;
+  /** costPerMonth / extraPerMonth, whole dollars; null when extraPerMonth is about 0. */
+  costPerCustomer: number | null;
+  /** Value over the horizon of this setting against the other (margin of extra customers less credits). Dollars. */
+  netValue: number;
+  pays: boolean;
+}
+
+/** Round 4c/4d: the levers the advisor weighs for more customers (advisor.growthOptions). */
+export type GrowthLever = 'marketing' | 'campaign' | 'referrals' | 'build';
+
+/** One way to more customers, priced per customer (advisor.growthOptions). */
+export interface GrowthOption {
+  lever: GrowthLever;
+  /** Expected extra customers within CUSTOMER_QUOTE_MONTHS (not rounded). */
+  customers: number;
+  /** What it costs over that horizon (marketing: the extra budget x months; campaign: its price; referrals: the credits; build: the build-out plan with its installs), dollars. */
+  cost: number;
+  /** cost / customers, whole dollars; null when customers is about 0. */
+  costPerCustomer: number | null;
+  /** The campaign's area, else null. */
+  cabinet: CabinetId | null;
+  /** The build's corner, else null. */
+  node: NodeId | null;
+  /** What following it sends, in order (setMarketing, runCampaign, setReferrals, or the build-out plan's commands with any financing first). */
+  commands: Command[];
 }
 
 // ---------------------------------------------------------------------------

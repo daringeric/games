@@ -5,8 +5,8 @@
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { ADVICE_PRIORITY, advicePlans, advise, buildBriefing, noticeNeedsAttention, planFor } from './advisor';
-import { COVENANT_CURE_CLOSES, CPP_AMBER_MULTIPLIER, CPP_SPREAD_BPS, CPP_TARGET, MAX_SPLITTERS_PER_CABINET } from './balance';
+import { ADVICE_PRIORITY, advicePlans, advise, buildBriefing, growthOptions, noticeNeedsAttention, planFor } from './advisor';
+import { COVENANT_CURE_CLOSES, CPP_AMBER_MULTIPLIER, CPP_SPREAD_BPS, CPP_TARGET, MARKETING_MAX_PER_MONTH, MAX_SPLITTERS_PER_CABINET } from './balance';
 import { formatMonth, dateOf } from './calendar';
 import {
   closesUntilAcceleration,
@@ -28,6 +28,7 @@ import { accountUnits, retireDestination, TIER_IDS, unitsByTier } from './sales'
 import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
 import { frozenHoarderBot, smartBot } from './tuning/bots';
 import { runBot } from './tuning/harness';
+import type { BotFactory } from './tuning/harness';
 import type { Account, CabinetId, Command, GameState, MonthlyReport, Notice, ParcelId, SegmentId, TierId } from './types';
 import { cutOffOf, outageChurnFor, outageChurnProbability } from './weather';
 
@@ -45,6 +46,37 @@ function tiers(units: number, tier: TierId = 'fiber500'): Record<TierId, number>
 
 function account(parcel: ParcelId, cabinet: CabinetId, units: number, since: number): Account {
   return { parcel, cabinet, tierUnits: tiers(units), since, locks: [] };
+}
+
+/**
+ * The state right after each month close of `makeBot` played on `seed`
+ * (index i: after close i + 1), cached per run. Tests that need a scenario a
+ * bot reaches (a frozen line one close before the call, installs posted on
+ * the 1st...) take the first close that has it, not a fixed month, so a
+ * balance change that moves the bot's path does not lose the scenario.
+ */
+const closesCache = new Map<string, GameState[]>();
+function statesAfterCloses(key: string, seed: number, makeBot: BotFactory, months: number): GameState[] {
+  const cached = closesCache.get(key);
+  if (cached) return cached;
+  const states: GameState[] = [];
+  let closes = 0;
+  runBot(seed, makeBot, months, {
+    afterTick: (s) => {
+      if (s.finance.reports.length === closes) return;
+      closes = s.finance.reports.length;
+      states.push(structuredClone(s));
+    },
+  });
+  closesCache.set(key, states);
+  return states;
+}
+
+/** The first state after a close (from month `from` on) that `has` the scenario; fails the test when the run never reaches it. */
+function firstClose(states: readonly GameState[], from: number, has: (state: GameState) => boolean): GameState {
+  const found = states.slice(from - 1).find(has);
+  expect(found, 'a close with the scenario').toBeDefined();
+  return found!;
 }
 
 /** Put a storm outage on the live span of `segment`, `daysLeft` days to repair. */
@@ -137,9 +169,13 @@ describe('#2 outage churn and subscribers who connected after the repair', () =>
     let units = 0;
     let late = 0;
     let outageChurn = 0;
-    for (let seed = 1; seed <= 120; seed++) {
+    for (let seed = 1; seed <= 200; seed++) {
       const state = makeTestState(makeGridCity({ cols: 3, rows: 2 }), { rngSales: seed });
-      addLivePlant(state, { splitters: 4 });
+      const cabinet = addLivePlant(state, { splitters: 4 })!;
+      // Round 4c/4d: homes switch as they hear of you, so the town gets the strongest push there is (the most marketing
+      // and a neighborhood campaign), over more towns, for enough of them to sign up in a month.
+      expect(applyCommand(state, { type: 'setMarketing', perMonth: MARKETING_MAX_PER_MONTH }).ok).toBe(true);
+      expect(applyCommand(state, { type: 'runCampaign', cabinet }).ok).toBe(true);
       breakSpan(state, 0, 3); // out on days 1-2, before anyone can sign up there
       runDays(state, 30); // Jan 31
       const onSeg0 = state.sales.accounts.filter((a) => state.city.parcels[a.parcel]!.segment === 0);
@@ -305,10 +341,12 @@ describe('#8 the cash projected at the next close from the 1st of the month', ()
   }
 
   it('does not scale one day of installs up to a month, so a healthy operator gets no false payment alarm', () => {
-    const { state } = runBot(12345, smartBot(), 53);
+    // A mature, healthy operator (SMART in its fifth year) at a close where installs landed on the 1st.
+    const installsOnThe1st = (s: GameState) => s.finance.monthToDate.some((e) => e.category === 'install' && e.day === s.day);
+    const state = firstClose(statesAfterCloses('smart:12345', 12345, smartBot(), 60), 48, installsOnThe1st);
     expect(dateOf(state.day).day).toBe(1);
     // The briefing runs right after the close, with the 1st's installs already posted.
-    expect(state.finance.monthToDate.some((e) => e.category === 'install' && e.day === state.day)).toBe(true);
+    expect(installsOnThe1st(state)).toBe(true);
     const projected = estimateCashAtClose(state);
     const actual = cashAtDebtStep(state);
     // Off by less than a month of installs (scaling the 1st's up to the month missed by several months' worth).
@@ -319,7 +357,8 @@ describe('#8 the cash projected at the next close from the 1st of the month', ()
     const briefing = buildBriefing(state)!;
     expect(briefing.advice.map((a) => a.id)).not.toContain('paymentShort');
     expect(briefing.forward.projectedCash).toBeGreaterThan(0);
-  });
+    // Round 4c/4d: the 60-month SMART run behind it takes several seconds with the scaled overhead and the customers model.
+  }, 60_000);
 
   it('counts the month\'s installs when none landed on the 1st', () => {
     const { state } = runBot(1, smartBot(), 21);
@@ -362,10 +401,14 @@ describe('#5 a briefing with a short payment and covenants near their limit', ()
       if (p === short) continue;
       expect(p.commands.some((c) => c.type === 'drawCredit' || c.type === 'takeTermLoan'), p.advice.id).toBe(false);
     }
-    expect(cure.advice.why).toMatch(/Beyond the borrowing suggested above/);
-    expect(cure.advice.why).not.toMatch(/(^|\. )Hold off on new borrowing/);
+    // Round 4c/4d: the card says it in plain words; the reasoning behind it names the exception.
+    expect(cure.advice.why).toMatch(/borrow nothing beyond the payment above/);
+    expect(cure.advice.detail).toMatch(/Beyond the borrowing suggested above/);
+    expect(`${cure.advice.why} ${cure.advice.detail}`).not.toMatch(/(^|\. )Hold off on new borrowing/);
     // On its own (nothing borrowed before it) the warning still says plainly to hold off.
-    expect(planFor(state, 'covenantCure')!.advice.why).toMatch(/Hold off on new borrowing/);
+    const alone = planFor(state, 'covenantCure')!.advice;
+    expect(alone.why).toMatch(/hold off on new borrowing/);
+    expect(alone.detail).toMatch(/Hold off on new borrowing/);
   });
 });
 
@@ -390,8 +433,9 @@ describe('#6 the CPP spread advice', () => {
     expect(state.debt.credit.balance).toBe(0);
     const p = planFor(state, 'redCpp')!;
     expect(p.advice).toMatchObject({ severity: 'tip', priority: ADVICE_PRIORITY.redCpp });
-    expect(p.advice.why).not.toMatch(/today's .* of debt|a year on/);
-    expect(p.advice.why).toMatch(/term loans keep the rates they were taken at/);
+    const said = `${p.advice.why} ${p.advice.detail}`;
+    expect(said).not.toMatch(/today's .* of debt|a year on/);
+    expect(p.advice.detail).toMatch(/term loans keep the rates they were taken at/);
   });
 
   it('prices the spread on the line\'s balance only, important while the line is drawn', () => {
@@ -399,8 +443,8 @@ describe('#6 the CPP spread advice', () => {
     state.debt.credit.balance = 50_000;
     const p = planFor(state, 'redCpp')!;
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.redCppWithDebt });
-    expect(p.advice.why).toContain(formatMoney((50_000 * CPP_SPREAD_BPS.red) / 10_000));
-    expect(p.advice.why).not.toContain(formatMoney(((50_000 + state.debt.loans[0]!.balance) * CPP_SPREAD_BPS.red) / 10_000));
+    expect(p.advice.detail).toContain(formatMoney((50_000 * CPP_SPREAD_BPS.red) / 10_000));
+    expect(`${p.advice.why} ${p.advice.detail}`).not.toContain(formatMoney(((50_000 + state.debt.loans[0]!.balance) * CPP_SPREAD_BPS.red) / 10_000));
   });
 });
 
@@ -442,8 +486,15 @@ describe('#9 covenant cures and the bank\'s call', () => {
     return copy;
   }
 
+  /** FROZEN_HOARDER on 12345, close by close: it freezes, the bank calls its loans, and it runs out of cash to repay them. */
+  const hoarder = () => statesAfterCloses('hoarder:12345', 12345, frozenHoarderBot(), 40);
+
   it('one close before the call, suggests repaying everything (which stops it), not a cure that cannot finish in time', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 18);
+    // Frozen, not yet called, the call due before a cure could lift the freeze, with a prepayment that would pass today's tests.
+    const state = firstClose(hoarder(), 1, (s) => {
+      const left = closesUntilAcceleration(s);
+      return s.debt.covenant.stage === 'frozen' && s.debt.acceleration === null && left !== null && left < COVENANT_CURE_CLOSES && cureOptions(s)[0]?.kind === 'prepayLoan';
+    });
     expect(state.debt.covenant.stage).toBe('frozen');
     expect(closesUntilAcceleration(state)).toBeLessThan(COVENANT_CURE_CLOSES);
     expect(covenantMetrics(state).compliant).toBe(false);
@@ -466,7 +517,7 @@ describe('#9 covenant cures and the bank\'s call', () => {
   });
 
   it('once the loans are called, suggests repaying everything when cash covers it, never a growth target', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 19);
+    const state = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.finance.cash >= totalDebt(s));
     expect(state.debt.acceleration).not.toBeNull();
     expect(cureOptions(state)[0]?.kind).toBe('grow');
     const plans = advicePlans(state);
@@ -474,9 +525,14 @@ describe('#9 covenant cures and the bank\'s call', () => {
     expect(cure.advice.title).toBe(`Repay all ${formatMoney(totalDebt(state))} you owe`);
     expect(plans.some((p) => /Grow operating cash flow/.test(p.advice.title))).toBe(false);
     // Repaying is not borrowing: a later card never calls it "the borrowing suggested above".
-    for (const p of plans) expect(p.advice.why, p.advice.id).not.toMatch(/borrowing suggested above/);
+    for (const p of plans) expect(`${p.advice.why} ${p.advice.detail ?? ''}`, p.advice.id).not.toMatch(/borrowing suggested above/);
     const runway = plans.find((p) => p.advice.id === 'cashRunway');
-    if (runway) expect(runway.advice.why).toMatch(/don't borrow/);
+    if (runway) {
+      // Round 4c/4d: the card's sentence is short and its reasoning is in the detail; it never suggests borrowing.
+      expect(runway.commands.some((c) => c.type === 'drawCredit' || c.type === 'takeTermLoan')).toBe(false);
+      expect(runway.advice.why).not.toMatch(/: borrow|borrowing \$/);
+      expect(`${runway.advice.why} ${runway.advice.detail ?? ''}`).toMatch(/don't borrow|loans won't fix it|cannot carry more debt/);
+    }
     const after = follow(state, cure.commands);
     tickThroughClose(after);
     expect(after.debt.acceleration).toBeNull();
@@ -484,7 +540,11 @@ describe('#9 covenant cures and the bank\'s call', () => {
   });
 
   it('with the loans called and too little cash to repay them, gives no cure card, and one card for a last close that cannot pay', () => {
-    const { state } = runBot(12345, frozenHoarderBot(), 32);
+    // Round 4c/4d: with the scaled overhead the hoarder keeps more cash than it owes once called, so its first called
+    // close is taken with the cash short of the debt (what a worse year would have left).
+    const called = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.gameOver === null);
+    const state = structuredClone(called);
+    state.finance.cash = Math.min(state.finance.cash, totalDebt(state) - 1);
     expect(state.debt.acceleration).not.toBeNull();
     expect(state.finance.cash).toBeLessThan(totalDebt(state));
     expect(cureFor(state)).toBeNull();
@@ -538,13 +598,17 @@ describe('#10 attention for capacity notices', () => {
 // ---------------------------------------------------------------------------
 
 describe('#11 the take-rate tip and capacity wording when cash is short', () => {
-  it('suggests no more marketing while installs are paused or cash is short', () => {
+  it('suggests no more marketing (or other spending on growth) while installs are paused', () => {
     const { state } = runBot(12345, smartBot({ splitterAt: 5, marketingPerPassing: 0.25, borrow: false }), 24);
-    const lagging = planFor(state, 'takeRate');
-    expect(lagging).not.toBeNull();
+    // Round 4c/4d: marketing is growCustomers' to weigh (the take-rate tip is about prices only).
+    expect(planFor(state, 'growCustomers')).not.toBeNull();
     state.sales.installsPaused = true;
+    expect(planFor(state, 'growCustomers')).toBeNull();
     expect(planFor(state, 'takeRate')).toBeNull();
-    expect(advicePlans(state).map((p) => p.advice.id)).not.toContain('takeRate');
+    expect(growthOptions(state)).toEqual([]);
+    const ids = advicePlans(state).map((p) => p.advice.id);
+    expect(ids).not.toContain('growCustomers');
+    expect(ids).not.toContain('takeRate');
   });
 
   it('asks for a cushion, not "the next loan payment", from a company that owes nothing', () => {
@@ -559,8 +623,8 @@ describe('#11 the take-rate tip and capacity wording when cash is short', () => 
     expect(plans.find((q) => q.advice.id === 'cashRunway')?.commands.length).toBeGreaterThan(0);
     const p = plans.find((q) => q.advice.id === 'addSplitter')!;
     expect(p.advice.title).toMatch(/when cash allows/);
-    expect(p.advice.why).not.toMatch(/loan payment/);
-    expect(p.advice.why).toMatch(/a cushion/);
+    expect(`${p.advice.why} ${p.advice.detail}`).not.toMatch(/loan payment/);
+    expect(p.advice.detail).toMatch(/a cushion/);
   });
 });
 
@@ -583,6 +647,6 @@ describe('#12 the grow cure', () => {
     expect(option.text).toContain(`from ${formatMoney(m.annualOperatingCashFlow)} to ${formatMoney(option.after.annualOperatingCashFlow)} a year`);
     expect(option.text).toContain(`the bank counts ${formatMoney(m.underwritingCashFlow)}`);
     const p = planFor(state, 'covenantCure')!;
-    expect(p.advice.title).toMatch(/^Grow operating cash flow to about \$[\d,]+ a year$/);
+    expect(p.advice.title).toMatch(/^Raise cash flow to about \$[\d,]+ a year$/);
   });
 });

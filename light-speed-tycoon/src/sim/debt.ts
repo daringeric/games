@@ -21,7 +21,8 @@
 // 'paymentDue' reminder when due.
 //
 // Month close (finance.closeMonth), in order:
-//   1. pole rent; 2. overhead; 3. sales.closeSalesMonth   (unchanged)
+//   1. pole rent; 2. overhead (base, per plant); 3. sales.closeSalesMonth
+//      (its per-customer overhead line included)
 //   4. debt.closeDebtMonth(state, lastDay): debt service (called loans: what
 //      falls due), then the frozen-line sweep, dated lastDay
 //   5. totals, report (stats), append, clear monthToDate  (unchanged)
@@ -63,8 +64,8 @@ import {
   LATE_FEE_SHARE,
   LEVERAGE_SPREAD_BANDS,
   LEVERAGE_SPREAD_MAX_BPS,
+  BANK_WATCH_HEADROOM,
   LOAN_ROUNDING,
-  OVERHEAD_PER_MONTH,
   PAYMENT_REMINDER_DAYS,
   PENALTY_STEP_UP_BPS,
   TERM_CAPACITY_ARR_MULTIPLE,
@@ -78,7 +79,10 @@ import { estimateCashAtClose, estimateMonthOperatingCashFlow, formatMoney, month
 import { costPerPassing, cppBand, operatingCashFlow, trailingRepairs } from './metrics';
 import { getService } from './network';
 import { postNotice } from './notices';
+import { fixedCostsPerMonth } from './overhead';
 import type {
+  BankHealth,
+  BankHealthLevel,
   Command,
   CommandResult,
   CovenantMetrics,
@@ -93,6 +97,7 @@ import type {
   MonthlyReport,
   PrepayQuote,
   RateBreakdown,
+  RepayQuote,
   RateParts,
   RepricedLoan,
   TermLoan,
@@ -855,10 +860,26 @@ function termProForma(
 }
 
 /**
+ * Round 4b: whether covenant figures `m` pass with `headroom` (a share,
+ * 0..1) to spare: no debt or leverage measurable and at most
+ * COVENANT_MAX_LEVERAGE x (1 - headroom), and nothing scheduled or coverage
+ * at least COVENANT_MIN_COVERAGE x (1 + headroom). With headroom 0 exactly
+ * m.compliant. The advisor's expand suggestion (EXPAND_COVENANT_HEADROOM)
+ * and the Bank's starting loan (BANK_PREFILL_HEADROOM) use it.
+ */
+export function covenantsWithin(m: CovenantMetrics, headroom: number): boolean {
+  const h = Number.isFinite(headroom) && headroom > 0 ? Math.min(headroom, 1) : 0;
+  if (h === 0) return m.compliant;
+  const leverageOk = m.totalDebt === 0 || (m.leverage !== null && m.leverage <= COVENANT_MAX_LEVERAGE * (1 - h));
+  const coverageOk = m.annualDebtService === 0 || (m.coverage !== null && m.coverage >= COVENANT_MIN_COVERAGE * (1 + h));
+  return leverageOk && coverageOk;
+}
+
+/**
  * The largest multiple of LOAN_ROUNDING in TERM_LOAN_MIN..capacity whose
- * termProForma covenants pass (compliance only falls as the amount grows:
- * more debt, a higher payment, a rate no lower), by bisection; 0 when none
- * does. `extra` as termProForma.
+ * termProForma covenants pass with `headroom` to spare (covenantsWithin;
+ * compliance only falls as the amount grows: more debt, a higher payment, a
+ * rate no lower), by bisection; 0 when none does. `extra` as termProForma.
  */
 function safeTermMax(
   state: GameState,
@@ -867,9 +888,10 @@ function safeTermMax(
   termYears: TermYears,
   capacity: number,
   extra?: { debt: number; service: number },
+  headroom = 0,
 ): number {
   if (state.gameOver || capacity < TERM_LOAN_MIN || !TERM_LOAN_YEARS.includes(termYears)) return 0;
-  const safe = (amount: number): boolean => termProForma(state, base, cpp, amount, termYears, true, extra).after.compliant;
+  const safe = (amount: number): boolean => covenantsWithin(termProForma(state, base, cpp, amount, termYears, true, extra).after, headroom);
   let lo = Math.ceil(TERM_LOAN_MIN / LOAN_ROUNDING);
   let hi = Math.floor(capacity / LOAN_ROUNDING);
   if (hi < lo || !safe(lo * LOAN_ROUNDING)) return 0;
@@ -924,7 +946,7 @@ export function quotePrepay(state: GameState, loan: LoanId, amount: number): Pre
   if (!found) {
     reasons.push(`There is no open term loan #${describeValue(loan)}`);
     if (!whole) reasons.push(`A prepayment must be a whole number of dollars, at least $1 (got ${describeValue(amount)})`);
-    return { ok: false, reasons, loan, amount, accruedInterest: 0, total: usable, paysOff: false, paymentAfter: 0 };
+    return { ok: false, reasons, loan, amount, accruedInterest: 0, total: usable, paysOff: false, paymentAfter: 0, after: covenantMetrics(state) };
   }
   const accruedInterest = usable > 0 ? accruedOn(state, found, usable) : 0;
   const total = usable + accruedInterest;
@@ -938,7 +960,39 @@ export function quotePrepay(state: GameState, loan: LoanId, amount: number): Pre
   // Re-amortized at the effective rate, like every level payment (TermLoan.payment).
   const effective = found.rateBps + penaltyBps(state.debt.covenant.stage);
   const paymentAfter = whole && amount < found.balance ? levelPayment(found.balance - amount, effective, found.monthsLeft) : 0;
-  return { ok: reasons.length === 0, reasons, loan, amount, accruedInterest, total, paysOff, paymentAfter };
+  // Round 4c/4d: the covenant figures after it (the loan's balance and payment as they would be), for the Bank's health words.
+  let after = covenantMetrics(state);
+  if (whole && amount <= found.balance) {
+    const rest = found.balance - amount;
+    const others = state.debt.loans.filter((l) => l.id !== found.id);
+    const loans: TermLoan[] = rest > 0 ? [...others, { ...found, balance: rest, payment: paymentAfter }] : others;
+    loans.sort((a, b) => a.id - b.id);
+    after = covenantMetrics(withDebt(state, { ...state.debt, loans }));
+  }
+  return { ok: reasons.length === 0, reasons, loan, amount, accruedInterest, total, paysOff, paymentAfter, after };
+}
+
+/**
+ * Round 4c/4d: what repayCredit(amount) would do now (see RepayQuote), for
+ * the Bank's emergency-cash preview in words. Never throws for bad input:
+ * ok false with repayCredit's reason, `after` then today's figures. The
+ * repayment takes the amount off the line's balance and its year of
+ * interest at the effective rate off the debt service (as annualDebtService
+ * counts the line). Allowed while frozen. Pure.
+ */
+export function quoteRepay(state: GameState, amount: number): RepayQuote {
+  const whole = isWholeDollars(amount);
+  const { credit } = state.debt;
+  const before = covenantMetrics(state);
+  const reasons: string[] = [];
+  if (state.gameOver) reasons.push('The game is over');
+  if (!whole) reasons.push(`A credit line repayment must be a whole number of dollars, at least $1 (got ${describeValue(amount)})`);
+  else if (credit.balance === 0) reasons.push('Nothing is drawn on the credit line');
+  else if (amount > credit.balance) reasons.push(`Only ${formatMoney(credit.balance)} is drawn on the credit line`);
+  else if (state.finance.cash < amount) reasons.push(`Not enough cash: need ${formatMoney(amount)}, have ${formatMoney(state.finance.cash)}`);
+  const usable = whole && amount <= credit.balance ? amount : 0;
+  const after = usable > 0 ? covenantMetrics(withDebt(state, { ...state.debt, credit: { ...credit, balance: credit.balance - usable } })) : before;
+  return { ok: reasons.length === 0, reasons, amount, before, after, cashAfter: state.finance.cash - usable };
 }
 
 /**
@@ -1806,14 +1860,16 @@ export function quoteDraw(state: GameState, amount: number): DrawQuote {
 /**
  * The largest term loan of `termYears` whose pro forma covenants
  * (quoteTermLoan(...).after, same-month re-pricing included) stay
- * compliant: a multiple of LOAN_ROUNDING in TERM_LOAN_MIN..termCapacity,
- * found by bisection (safeTermMax, on the same pro forma as the quote); 0
- * when even TERM_LOAN_MIN would breach, while frozen or called, with no
- * capacity, for a term not on offer, or once the game is over.
+ * compliant, with `headroom` to spare (round 4b, covenantsWithin; default 0:
+ * exactly compliant): a multiple of LOAN_ROUNDING in
+ * TERM_LOAN_MIN..termCapacity, found by bisection (safeTermMax, on the same
+ * pro forma as the quote); 0 when even TERM_LOAN_MIN would breach, while
+ * frozen or called, with no capacity, for a term not on offer, or once the
+ * game is over.
  */
-export function maxSafeTermLoan(state: GameState, termYears: TermYears): number {
+export function maxSafeTermLoan(state: GameState, termYears: TermYears, headroom = 0): number {
   if (!TERM_LOAN_YEARS.includes(termYears)) return 0;
-  return safeTermMax(state, metricsBase(state), pricingCpp(state), termYears, termCapacity(state));
+  return safeTermMax(state, metricsBase(state), pricingCpp(state), termYears, termCapacity(state), undefined, headroom);
 }
 
 /** A credit-line draw's yearly debt service, as quoteDraw counts it: a year of interest at the line's effective rate. */
@@ -1822,9 +1878,9 @@ function drawService(state: GameState, amount: number): number {
   return round((amount * effective) / 10_000);
 }
 
-/** quoteDraw(state, amount).after.compliant, on a base read once. */
-function drawSafe(state: GameState, base: MetricsBase, amount: number): boolean {
-  return metricsOf(base, { addDebt: amount, addAnnualDebtService: drawService(state, amount) }).compliant;
+/** quoteDraw(state, amount).after passes with `headroom` to spare (covenantsWithin; 0: compliant), on a base read once. */
+function drawSafe(state: GameState, base: MetricsBase, amount: number, headroom = 0): boolean {
+  return covenantsWithin(metricsOf(base, { addDebt: amount, addAnnualDebtService: drawService(state, amount) }), headroom);
 }
 
 /**
@@ -1832,25 +1888,30 @@ function drawSafe(state: GameState, base: MetricsBase, amount: number): boolean 
  * is available: a multiple of LOAN_ROUNDING, or everything available when
  * that is safe; 0 when none is. Bisection (compliance only falls as a draw grows).
  */
-function maxSafeDraw(state: GameState, base: MetricsBase): number {
+function maxSafeDraw(state: GameState, base: MetricsBase, headroom = 0): number {
   const available = creditAvailable(state);
   if (available <= 0 || state.gameOver) return 0;
-  if (drawSafe(state, base, available)) return available;
+  if (drawSafe(state, base, available, headroom)) return available;
   let lo = 0;
   let hi = Math.floor(available / LOAN_ROUNDING);
   if (hi >= 1 && hi * LOAN_ROUNDING === available) hi -= 1;
   // Invariant: lo x LOAN_ROUNDING is safe (0 trivially); above hi is not known to be.
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
-    if (drawSafe(state, base, mid * LOAN_ROUNDING)) lo = mid;
+    if (drawSafe(state, base, mid * LOAN_ROUNDING, headroom)) lo = mid;
     else hi = mid - 1;
   }
   return lo * LOAN_ROUNDING;
 }
 
-/** FUNDING_CUSHION_MONTHS of fixed costs: overhead and today's marketing budget. */
+/**
+ * FUNDING_CUSHION_MONTHS of fixed costs: a month of the overhead at
+ * today's size (round 4c/4d: overhead.fixedCostsPerMonth, every line of the
+ * scaled overhead: base, per customer at the support level, per plant) and
+ * today's marketing budget, so the cushion grows with the network.
+ */
 function fixedCostCushion(state: GameState): number {
-  return FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth);
+  return FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state);
 }
 
 /** The smallest multiple of LOAN_ROUNDING at or above `amount` (>= 0). */
@@ -1860,8 +1921,9 @@ function roundUpToLoan(amount: number): number {
 
 /**
  * How to pay for `cost` keeping a cushion (see FundingHint): the cushion is
- * FUNDING_CUSHION_MONTHS x (OVERHEAD_PER_MONTH + marketing) + the next
- * close's estimated debt service; shortfall = max(0, cost + cushion - cash).
+ * FUNDING_CUSHION_MONTHS x overhead.fixedCostsPerMonth (a month of the
+ * scaled overhead at today's size + marketing) + the next close's estimated
+ * debt service; shortfall = max(0, cost + cushion - cash).
  * In order of preference, each verified pro forma at today's figures:
  *   cash        - no shortfall;
  *   draw        - the shortfall rounded up to LOAN_ROUNDING (capped at what is
@@ -1875,9 +1937,12 @@ function roundUpToLoan(amount: number): number {
  *                 draw with the largest term loan safe on top of it (0 when
  *                 below TERM_LOAN_MIN), or the largest safe loan alone when
  *                 that is more.
- * A cost that is not a positive number counts as 0. Pure.
+ * A cost that is not a positive number counts as 0. Round 4b: with
+ * `headroom` (a share, default 0), "covenant-safe" means passing with that
+ * much to spare (covenantsWithin), so the financing lands comfortably
+ * inside the limits. Pure.
  */
-export function fundingHint(state: GameState, cost: number): FundingHint {
+export function fundingHint(state: GameState, cost: number, headroom = 0): FundingHint {
   const price = typeof cost === 'number' && Number.isFinite(cost) && cost > 0 ? cost : 0;
   const termYears = TERM_LOAN_YEARS[TERM_LOAN_YEARS.length - 1] as TermYears;
   const cushion = fixedCostCushion(state) + estimateNextDebtService(state);
@@ -1888,22 +1953,22 @@ export function fundingHint(state: GameState, cost: number): FundingHint {
   const base = metricsBase(state);
   const available = creditAvailable(state);
   const wantDraw = Math.min(available, roundUpToLoan(shortfall));
-  if (wantDraw >= shortfall && drawSafe(state, base, wantDraw)) return hint('draw', wantDraw, 0);
+  if (wantDraw >= shortfall && drawSafe(state, base, wantDraw, headroom)) return hint('draw', wantDraw, 0);
 
   const cpp = pricingCpp(state);
   const capacity = termCapacity(state);
   const wantTerm = Math.max(roundUpToLoan(TERM_LOAN_MIN), roundUpToLoan(shortfall));
-  const safeTerm = safeTermMax(state, base, cpp, termYears, capacity);
+  const safeTerm = safeTermMax(state, base, cpp, termYears, capacity, undefined, headroom);
   if (wantTerm <= safeTerm) return hint('term', 0, wantTerm);
 
-  const draw = maxSafeDraw(state, base);
+  const draw = maxSafeDraw(state, base, headroom);
   const extra = { debt: draw, service: drawService(state, draw) };
   const rest = Math.max(roundUpToLoan(TERM_LOAN_MIN), roundUpToLoan(shortfall - draw));
-  if (draw > 0 && rest <= capacity && termProForma(state, base, cpp, rest, termYears, true, extra).after.compliant) {
+  if (draw > 0 && rest <= capacity && covenantsWithin(termProForma(state, base, cpp, rest, termYears, true, extra).after, headroom)) {
     return hint('drawAndTerm', draw, rest);
   }
   // The most there is: the safe draw with the loan safe on top of it, or the safe loan alone when that is more.
-  const termOnTop = draw > 0 ? safeTermMax(state, base, cpp, termYears, capacity, extra) : safeTerm;
+  const termOnTop = draw > 0 ? safeTermMax(state, base, cpp, termYears, capacity, extra, headroom) : safeTerm;
   return draw + termOnTop >= safeTerm ? hint('short', draw, termOnTop) : hint('short', 0, safeTerm);
 }
 
@@ -2144,4 +2209,54 @@ export function estimateSweep(state: GameState): number {
   if (cashAfterService < 0) return 0;
   const flow = estimateMonthOperatingCashFlow(state);
   return Math.max(0, Math.min(round(FROZEN_SWEEP_SHARE * Math.max(0, flow)), cashAfterService - FROZEN_SWEEP_RESERVE, owed - principal));
+}
+
+// ---------------------------------------------------------------------------
+// Round 4c/4d: bank health in plain words (contract: implemented; the Bank,
+// the HUD chip and the month summary all word it through ui/health.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * The health level for a covenant stage and covenant figures (`owed`: any
+ * debt at all): 'good' with no debt or compliant with both checks more than
+ * BANK_WATCH_HEADROOM inside their limits; 'watch' compliant but failing a
+ * check at these figures or within the headroom of a limit; otherwise the
+ * stage ('warning', 'penalty', 'frozen'). The Bank's borrowing preview
+ * passes a quote's pro forma figures ("If you borrow $50,000: still Good").
+ */
+export function healthLevel(stage: CovenantStage, metrics: CovenantMetrics, owed: boolean): BankHealthLevel {
+  if (stage !== 'compliant') return stage;
+  if (!owed) return 'good';
+  return covenantsWithin(metrics, BANK_WATCH_HEADROOM) ? 'good' : 'watch';
+}
+
+/**
+ * The stage the next close would leave at these covenant figures, if they
+ * held: a breach steps a stage up (compliant -> warning -> penalty ->
+ * frozen; frozen stays), a compliant close leaves it (the cure needs
+ * COVENANT_CURE_CLOSES in a row, which the preview does not count). The
+ * Bank's "you'd get a warning at the next month close".
+ */
+export function stageAfterClose(stage: CovenantStage, compliant: boolean): CovenantStage {
+  if (compliant) return stage;
+  return stage === 'compliant' ? 'warning' : stage === 'warning' ? 'penalty' : 'frozen';
+}
+
+/** The Bank's health today (see BankHealth). Pure read. */
+export function bankHealth(state: GameState): BankHealth {
+  const { stage } = state.debt.covenant;
+  const owed = totalDebt(state);
+  const metrics = covenantMetrics(state);
+  const level = healthLevel(stage, metrics, owed > 0);
+  const compliantStage = stage === 'compliant' && owed > 0;
+  return {
+    level,
+    noDebt: owed === 0,
+    failingNow: compliantStage && !metrics.compliant,
+    nearLimit: compliantStage && metrics.compliant && level === 'watch',
+    metrics,
+    penaltyBps: penaltyBps(stage),
+    closesUntilCalled: closesUntilAcceleration(state),
+    called: state.debt.acceleration !== null && owed > 0,
+  };
 }

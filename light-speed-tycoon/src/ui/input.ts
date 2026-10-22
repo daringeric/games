@@ -57,6 +57,8 @@ export interface InputHandlers {
   dragCancel(): void;
   /** The O key: toggle the $/ft cost overlay. */
   toggleOverlay(): void;
+  /** Round 4b: the E key: toggle the storm-exposure overlay. */
+  toggleExposureOverlay(): void;
 }
 
 interface Press {
@@ -82,6 +84,7 @@ const SPACE_CONTROLS = 'button, [role="menuitem"], a[href], summary, select';
 
 const TOOL_KEYS: Record<string, ToolId> = { i: 'inspect', a: 'aerial', u: 'underground', c: 'cabinet', x: 'remove' };
 const OVERLAY_KEY = 'o';
+const EXPOSURE_KEY = 'e';
 const SPEED_KEYS: Record<string, Speed> = { '1': 1, '2': 2, '3': 4 };
 
 export class Input {
@@ -327,6 +330,7 @@ export class Input {
       this.handlers.pickTool(tool);
     } else if (speed) this.handlers.setSpeed(speed);
     else if (key === OVERLAY_KEY) this.handlers.toggleOverlay();
+    else if (key === EXPOSURE_KEY) this.handlers.toggleExposureOverlay();
     else if (key === '+' || key === '=') this.zoomCenter(KEY_ZOOM);
     else if (key === '-' || key === '_') this.zoomCenter(1 / KEY_ZOOM);
     else if (e.key === 'Escape') {

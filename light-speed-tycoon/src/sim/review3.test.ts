@@ -13,7 +13,6 @@ import {
   COVENANT_MAX_LEVERAGE,
   INSOLVENCY_GRACE_MONTHS,
   LEVERAGE_SPREAD_BANDS,
-  OVERHEAD_PER_MONTH,
   PAYMENT_REMINDER_DAYS,
   PENALTY_STEP_UP_BPS,
 } from './balance';
@@ -38,6 +37,7 @@ import {
 import type { DebtClose } from './debt';
 import { closeMonth, estimateCashAtClose, formatMoney, postEntry } from './finance';
 import { applyCommand, tick } from './game';
+import { fixedCostsPerMonth } from './overhead';
 import { Rng } from './rng';
 import { deserialize } from './save';
 import { closedMonth, makeLoan, makeTradingState } from './testing/fixtures';
@@ -250,8 +250,10 @@ describe('#2 #6 #11 the payment reminder projects cash at the close', () => {
     const state = tenDaysOut('frozen');
     const due = estimateNextDebtService(state);
     expect(due).toBeGreaterThan(0);
-    // More cash than the payment, less than the payment plus the month's overhead.
-    state.finance.cash = due + 5_000;
+    // More cash than the payment, less than the payment plus the running costs the close will post (no billing: no subscribers).
+    const running = state.finance.cash - estimateCashAtClose(state);
+    expect(running).toBeGreaterThan(1);
+    state.finance.cash = due + Math.floor(running / 2);
     const mark = lastNoticeId(state);
     const report = tickThroughClose(state);
     const reminders = noticesSince(state, mark, 'paymentDue');
@@ -270,7 +272,7 @@ describe('#2 #6 #11 the payment reminder projects cash at the close', () => {
     state.finance.cash = due - 1;
     // This month's billing so far: enough for the running costs and the payment.
     const dim = MONTH_LENGTHS[dateOf(state.day).month - 1] as number;
-    state.sales.month.revenueDollarDays += (due + OVERHEAD_PER_MONTH + 2 * state.sales.marketingPerMonth) * dim;
+    state.sales.month.revenueDollarDays += (due + fixedCostsPerMonth(state) + state.sales.marketingPerMonth) * dim;
     expect(estimateCashAtClose(state)).toBeGreaterThanOrEqual(due);
     const mark = lastNoticeId(state);
     const report = tickThroughClose(state);

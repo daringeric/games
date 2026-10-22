@@ -6,20 +6,39 @@
 // migrateV1toV2 -> v2 -> migrateV2toV3 -> v3 -> migrateV3toV4 -> v4. A v2
 // save gets no debt; a v3 save gets no storms, price locks or promos.
 //
-// Owner: the round-4 contract (architect). Workstreams do not change the
+// Round 4b extends schemaVersion 4 in place (round 4 never shipped): the
+// company (name, difficulty), the advisor's snoozes and shown suggestions,
+// the 'retention' lock, IncumbentPromo.triggerTakePct / answered /
+// answeredWithPromo,
+// MonthAccrual.outageCreditDollarDays and OpsStats.outageCredits. A v4 save
+// written before them gets defaults on load (upgradeEarlyV4); v1-v3 saves
+// get them from migrateV3toV4 (difficulty 'seed', company.defaultCompanyName
+// of the town).
+//
+// Round 4c/4d extends schemaVersion 4 in place again (still unreleased):
+// GameState.customers (customers.newCustomers() for saves without it),
+// OpsStats.overhead (null on reports written before it) and the optional
+// MonthlyReport.customers.
+//
+// Owner: the round-4cd contract (architect). Workstreams do not change the
 // saved shape; migration tests run against the frozen v1, v2 and v3
 // fixtures in testing/.
 
 import {
   ACCELERATION_WARNING_CLOSES,
   CABINET_REACH_FT,
+  DEFAULT_DIFFICULTY,
   FROZEN_ACCELERATION_CLOSES,
   FROZEN_SWEEP_SHARE,
+  INCUMBENT_PROMO_TAKE_RATE,
   OLT_MAX_CARDS,
   OLT_PORTS_PER_CARD,
   START_YEAR,
 } from './balance';
+import { isAdviceKey, newAdvisorState } from './advisor';
 import { dateOf, formatMonth } from './calendar';
+import { COMPANY_NAME_MAX, defaultCompanyName, normalizeCompanyName } from './company';
+import { AWARENESS_PPM, newCustomers } from './customers';
 import { formatMoney, groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
@@ -29,16 +48,19 @@ import { otherEnd, segmentsAtNode } from './streets';
 import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX, newSales, retireDestination, unitsByTier } from './sales';
 import type {
   Account,
+  AdviceSeverity,
   BuildStage,
   CableMethod,
   CableSpan,
   CovenantStage,
   Debt,
+  DifficultyId,
   GameOverReason,
   GameState,
   LedgerCategory,
   LedgerEntry,
   MilestoneId,
+  MonthAccrual,
   MonthlyReport,
   MonthlyStats,
   Network,
@@ -48,8 +70,10 @@ import type {
   ParcelKind,
   PonTech,
   PriceLockReason,
+  PriceLockResume,
   Sales,
   StreetClass,
+  SupportLevel,
   TierId,
   Zone,
 } from './types';
@@ -93,6 +117,8 @@ const SANE_CLOSES_MAX = 10_000;
 const SANE_SEVERITY_MAX = 100;
 /** Most days of one month (an outage-days entry counts days in the open month). */
 const MONTH_DAYS_MAX = 31;
+/** Most entries a save's advisor lists may hold (the rule, advisor.ADVISOR_MEMORY_MAX, may change). */
+const SANE_ADVISOR_ENTRIES_MAX = 1_000;
 
 export class SaveError extends Error {
   override name = 'SaveError';
@@ -151,15 +177,81 @@ export function deserialize(json: string): GameState {
 }
 
 /**
- * Bring a schemaVersion 4 save written before outage churn went by each
- * subscriber's own days (Weather.cutOff) up to date: no subscriber has days
- * waiting to be charged (an outage running now counts from today). The
- * input object is changed in place; anything malformed is left for
- * validation to reject.
+ * Bring a schemaVersion 4 save written by an earlier round-4 build up to
+ * date, in place (round 4 never shipped, so v4 grew without a version bump;
+ * keys are inserted where newGame puts them, so the save hashes like a
+ * fresh one). Anything malformed is left for validation to reject.
+ * - Before outage churn went by each subscriber's own days: weather.cutOff
+ *   = [] (no subscriber has days waiting to be charged).
+ * - Before round 4b: company { name: company.defaultCompanyName(the town),
+ *   difficulty: DEFAULT_DIFFICULTY } right after `seed`; a company name an
+ *   earlier round-4b build accepted with invisible characters in it
+ *   (earlyCompanyName) becomes normalizeCompanyName's form of it, or
+ *   defaultCompanyName(the town) when nothing visible is left; advisor =
+ *   advisor.newAdvisorState() right after `weather`;
+ *   sales.month.outageCreditDollarDays = 0; every report's ops.outageCredits
+ *   = 0; every incumbent promo's triggerTakePct = the round-4 trigger
+ *   (round(INCUMBENT_PROMO_TAKE_RATE x 100)), answered = false and
+ *   answeredWithPromo = false.
+ * - Before round 4c/4d: customers = customers.newCustomers() right after
+ *   `sales`; every report's ops.overhead = null (right after outageCredits).
+ *   Reports keep no `customers` (it is optional).
  */
 function upgradeEarlyV4(save: Json): void {
   const weather = save.weather;
   if (isRecord(weather) && !('cutOff' in weather)) weather.cutOff = [];
+  const city = save.city;
+  if (!('company' in save) && isRecord(city) && typeof city.name === 'string') {
+    insertAfter(save, 'seed', 'company', { name: defaultCompanyName(city.name), difficulty: DEFAULT_DIFFICULTY });
+  }
+  const company = save.company;
+  if (isRecord(company) && typeof company.name === 'string' && isRecord(city) && typeof city.name === 'string' && earlyCompanyName(company.name)) {
+    company.name = normalizeCompanyName(company.name) ?? defaultCompanyName(city.name);
+  }
+  if (!('advisor' in save)) insertAfter(save, 'weather', 'advisor', newAdvisorState());
+  const sales = save.sales;
+  if (isRecord(sales)) {
+    if (isRecord(sales.month) && !('outageCreditDollarDays' in sales.month)) insertAfter(sales.month, 'lostService', 'outageCreditDollarDays', 0);
+    if (Array.isArray(sales.incumbentPromos)) {
+      for (const promo of sales.incumbentPromos) {
+        if (!isRecord(promo)) continue;
+        if (!('triggerTakePct' in promo)) insertAfter(promo, 'quietUntil', 'triggerTakePct', Math.round(INCUMBENT_PROMO_TAKE_RATE * 100));
+        if (!('answered' in promo)) insertAfter(promo, 'triggerTakePct', 'answered', false);
+        if (!('answeredWithPromo' in promo)) insertAfter(promo, 'answered', 'answeredWithPromo', false);
+      }
+    }
+  }
+  const finance = save.finance;
+  if (isRecord(finance) && Array.isArray(finance.reports)) {
+    for (const report of finance.reports) {
+      if (isRecord(report) && isRecord(report.ops) && !('outageCredits' in report.ops)) insertAfter(report.ops, 'mrr', 'outageCredits', 0);
+      // Round 4c/4d.
+      if (isRecord(report) && isRecord(report.ops) && !('overhead' in report.ops)) insertAfter(report.ops, 'outageCredits', 'overhead', null);
+    }
+  }
+  if (!('customers' in save) && 'sales' in save) insertAfter(save, 'sales', 'customers', newCustomers());
+}
+
+/**
+ * A company name an earlier round-4b build stored that today's rules refuse
+ * or clean further: it was its own normal form under the old rules (only
+ * whitespace collapsed and C0/C1 controls removed, 1..COMPANY_NAME_MAX code
+ * units) but holds invisible characters normalizeCompanyName now removes or
+ * refuses (a zero-width space, a bidi override). Anything else (already in
+ * today's form, or malformed under the old rules too) is not upgraded.
+ */
+function earlyCompanyName(name: string): boolean {
+  const old = name.replace(/\s+/g, ' ').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').replace(/ {2,}/g, ' ').trim();
+  return old === name && name.length >= 1 && name.length <= COMPANY_NAME_MAX && normalizeCompanyName(name) !== name;
+}
+
+/** Put `key` (absent) into `record` right after `after` (at the end when `after` is absent), keeping the other keys' order. */
+function insertAfter(record: Json, after: string, key: string, value: unknown): void {
+  const entries = Object.entries(record);
+  const at = entries.findIndex(([k]) => k === after);
+  entries.splice(at < 0 ? entries.length : at + 1, 0, [key, value]);
+  for (const k of Object.keys(record)) delete record[k];
+  Object.assign(record, Object.fromEntries(entries));
 }
 
 /** v3 -> v4, validated, and the notices about round-4 rules that take something away from this game. */
@@ -227,13 +319,15 @@ export function fnv1a(text: string): string {
 export type V3Span = Omit<CableSpan, 'outage' | 'conversion'>;
 /** An account as schemaVersion 2 and 3 saved it (no price locks). */
 export type V3Account = Omit<Account, 'locks'>;
-/** A schemaVersion 3 game: the round-3 shape (no weather, locks, promos, frozen counters). */
-export type V3State = Omit<GameState, 'schemaVersion' | 'rng' | 'network' | 'debt' | 'sales' | 'weather'> & {
+/** A month's sales accruals as schemaVersion 2 and 3 saved them (no outage credits). */
+export type V3MonthAccrual = Omit<MonthAccrual, 'outageCreditDollarDays'>;
+/** A schemaVersion 3 game: the round-3 shape (no company, weather, locks, promos, frozen counters or advisor). */
+export type V3State = Omit<GameState, 'schemaVersion' | 'company' | 'rng' | 'network' | 'debt' | 'sales' | 'customers' | 'weather' | 'advisor'> & {
   schemaVersion: 3;
   rng: { events: number; sales: number };
   network: Omit<Network, 'spans'> & { spans: V3Span[] };
   debt: Omit<Debt, 'frozenCloses' | 'acceleration'>;
-  sales: Omit<Sales, 'accounts' | 'promo' | 'incumbentPromos'> & { accounts: V3Account[] };
+  sales: Omit<Sales, 'accounts' | 'promo' | 'incumbentPromos' | 'month'> & { accounts: V3Account[]; month: V3MonthAccrual };
 };
 /** A schemaVersion 2 game: the round-3 shape without debt. */
 export type V2State = Omit<V3State, 'schemaVersion' | 'debt'> & { schemaVersion: 2 };
@@ -289,7 +383,11 @@ function trailingFrozenCloses(reports: readonly MonthlyReport[]): number {
  *   frozen for years still gets its warning closes before the bank calls the
  *   loans), else 0; no acceleration;
  * - weather = weather.newWeather() (no storms yet);
- * - reports keep no `ops` and no new DebtStats fields (the UI shows "-").
+ * - reports keep no `ops` and no new DebtStats fields (the UI shows "-");
+ * - round 4b: company { name: company.defaultCompanyName(the town's name),
+ *   difficulty: DEFAULT_DIFFICULTY }, advisor = advisor.newAdvisorState(),
+ *   sales.month.outageCreditDollarDays = 0.
+ * - round 4c/4d: customers = customers.newCustomers().
  * Keys are written in newGame's order so migrated and fresh saves hash alike.
  */
 export function migrateV3toV4(v3: V3State): GameState {
@@ -301,6 +399,7 @@ export function migrateV3toV4(v3: V3State): GameState {
   return {
     schemaVersion: 4,
     seed: v3.seed,
+    company: { name: defaultCompanyName(v3.city.name), difficulty: DEFAULT_DIFFICULTY },
     day: v3.day,
     rng: { events: v3.rng.events, sales: v3.rng.sales, weather: deriveSeed(v3.seed, 'weather') },
     nextId: v3.nextId,
@@ -342,11 +441,13 @@ export function migrateV3toV4(v3: V3State): GameState {
       connectsTotal: sales.connectsTotal,
       fullCabinets: sales.fullCabinets,
       installsPaused: sales.installsPaused,
-      month: sales.month,
+      month: { ...sales.month, outageCreditDollarDays: 0 },
       promo: null,
       incumbentPromos: [],
     },
+    customers: newCustomers(),
     weather: newWeather(),
+    advisor: newAdvisorState(),
     milestones: v3.milestones,
     notices: v3.notices,
     nextNoticeId: v3.nextNoticeId,
@@ -479,10 +580,11 @@ export function migrateV1toV2(v1: Record<string, unknown>): V2State {
   };
 }
 
-/** newSales() as a round-2/3 save holds it (no promo or incumbent promos yet). */
+/** newSales() as a round-2/3 save holds it (no promo, incumbent promos or outage credits yet). */
 function v2Sales(): V2State['sales'] {
   const { promo: _promo, incumbentPromos: _incumbent, ...sales } = newSales();
-  return sales;
+  const { outageCreditDollarDays: _credits, ...month } = sales.month;
+  return { ...sales, month };
 }
 
 /**
@@ -668,8 +770,12 @@ const LEDGER_CATEGORIES_BY_VERSION: Record<Version, readonly LedgerCategory[]> =
 };
 const OUTAGE_CAUSES = members<OutageCause>({ storm: true, digIn: true });
 const CONVERSION_STAGES: readonly BuildStage[] = ['permitting', 'constructing'];
-const LOCK_REASONS = members<PriceLockReason>({ grandfather: true, notice: true, promo: true });
-const OPS_FIELDS = members<keyof OpsStats>({
+const LOCK_REASONS = members<PriceLockReason>({ grandfather: true, notice: true, promo: true, retention: true });
+const RESUME_REASONS = members<PriceLockResume['reason']>({ grandfather: true, notice: true, promo: true });
+const DIFFICULTY_IDS = members<DifficultyId>({ angel: true, seed: true, bootstrapped: true, shoestring: true });
+const SEVERITIES = members<AdviceSeverity>({ urgent: true, important: true, tip: true });
+/** Every OpsStats field but `overhead` (round 4c/4d: an object or null, checked on its own) is an integer >= 0. */
+const OPS_FIELDS = members<Exclude<keyof OpsStats, 'overhead'>>({
   lastNoticeId: true,
   tierMoves: true,
   priceChurn: true,
@@ -681,8 +787,10 @@ const OPS_FIELDS = members<keyof OpsStats>({
   repairs: true,
   incumbentPromos: true,
   mrr: true,
+  outageCredits: true,
 });
 const COVENANT_STAGES = members<CovenantStage>({ compliant: true, warning: true, penalty: true, frozen: true });
+const SUPPORT_LEVEL_IDS = members<SupportLevel>({ basic: true, good: true, great: true });
 const GAME_OVER_REASONS = members<GameOverReason>({ insolvent: true, default: true });
 const STATS_FIELDS = members<keyof MonthlyStats>({
   subscribers: true,
@@ -817,13 +925,126 @@ function checkState(save: Json, version: Version): void {
   const nextId = int(save.nextId, 'nextId', 1);
   const city = checkCity(obj(save.city, 'city'));
   const ctx: Context = { version, day, nextId, city, nextStormId: 1 };
+  if (version >= 4) checkCompany(obj(save.company, 'company'));
   if (version >= 4) ctx.nextStormId = checkWeather(obj(save.weather, 'weather'), ctx);
+  if (version >= 4) checkAdvisor(obj(save.advisor, 'advisor'), ctx);
   checkNetwork(obj(save.network, 'network'), ctx);
   checkFinance(obj(save.finance, 'finance'), ctx);
   if (version === 1) return;
   if (version >= 3) checkDebt(obj(save.debt, 'debt'), ctx);
   checkSales(obj(save.sales, 'sales'), ctx);
+  if (version >= 4) checkCustomers(obj(save.customers, 'customers'), ctx);
   checkProgress(save, ctx);
+}
+
+/** Null, or an integer in [min, max]. */
+function nullableInt(value: unknown, path: string, min: number, max: number): number | null {
+  return value === null ? null : int(value, path, min, max);
+}
+
+/**
+ * The customers state (v4, round 4c/4d): a known support level, referral
+ * credits on or off, per-street awareness (lit segments: ascending, one
+ * each, 0..AWARENESS_PPM), campaign records (ascending by an issued cabinet
+ * id, start <= today < end <= cooldown), per-account memories (ascending
+ * parcels, days in range), cabinet waits and the month's figures.
+ */
+function checkCustomers(customers: Json, ctx: Context): void {
+  const { city, day, nextId } = ctx;
+  oneOf(customers.supportLevel, 'customers.supportLevel', SUPPORT_LEVEL_IDS);
+  bool(customers.referrals, 'customers.referrals');
+  const segments = list(customers.streets, 'customers.streets').map((value, i) => {
+    const path = `customers.streets[${i}]`;
+    const street = obj(value, path);
+    int(street.litDay, `${path}.litDay`, 0, day);
+    int(street.awareness, `${path}.awareness`, 0, AWARENESS_PPM);
+    return ref(street.segment, `${path}.segment`, city.segments, 'segment');
+  });
+  ascending(segments, 'customers.streets (by segment)');
+  const cabinets = list(customers.campaigns, 'customers.campaigns').map((value, i) => {
+    const path = `customers.campaigns[${i}]`;
+    const campaign = obj(value, path);
+    // A removed cabinet's record lingers until the next step drops it: the id need only have been issued.
+    const cabinet = int(campaign.cabinet, `${path}.cabinet`, 1, nextId - 1);
+    const start = int(campaign.startDay, `${path}.startDay`, 0, day);
+    const end = int(campaign.endDay, `${path}.endDay`, start + 1);
+    int(campaign.cooldownUntil, `${path}.cooldownUntil`, end);
+    int(campaign.cost, `${path}.cost`, 0, SANE_DEBT_MAX);
+    int(campaign.units, `${path}.units`, 0);
+    return cabinet;
+  });
+  ascending(cabinets, 'customers.campaigns (by cabinet)');
+  const parcels = list(customers.memories, 'customers.memories').map((value, i) => {
+    const path = `customers.memories[${i}]`;
+    const memory = obj(value, path);
+    const outageDay = nullableInt(memory.outageDay, `${path}.outageDay`, 0, day);
+    // Days counted within the memory window of the latest outage: none without one.
+    int(memory.outageDays, `${path}.outageDays`, 0, outageDay === null ? 0 : CUT_OFF_DAYS_MAX * 4);
+    nullableInt(memory.priceStepDay, `${path}.priceStepDay`, 0, day);
+    nullableInt(memory.waitedDay, `${path}.waitedDay`, 0, day);
+    return ref(memory.parcel, `${path}.parcel`, city.parcels.length, 'parcel');
+  });
+  ascending(parcels, 'customers.memories (by parcel)');
+  const waits = list(customers.waits, 'customers.waits').map((value, i) => {
+    const path = `customers.waits[${i}]`;
+    const wait = obj(value, path);
+    int(wait.day, `${path}.day`, 0, day);
+    return int(wait.cabinet, `${path}.cabinet`, 1, nextId - 1);
+  });
+  ascending(waits, 'customers.waits (by cabinet)');
+  nullableInt(customers.pausedDay, 'customers.pausedDay', 0, day);
+  const month = obj(customers.month, 'customers.month');
+  int(month.referralMilli, 'customers.month.referralMilli', 0);
+  int(month.campaignSpend, 'customers.month.campaignSpend', 0, SANE_DEBT_MAX);
+}
+
+/** The company (v4, round 4b): a name already in normalizeCompanyName's form, a known difficulty. */
+function checkCompany(company: Json): void {
+  const name = str(company.name, 'company.name');
+  if (normalizeCompanyName(name) !== name) {
+    expected('company.name', `a company name (1-${COMPANY_NAME_MAX} characters, trimmed, single spaces, no control characters)`, name);
+  }
+  oneOf(company.difficulty, 'company.difficulty', DIFFICULTY_IDS);
+}
+
+/** String keys strictly ascending (sorted, no duplicates). */
+function ascendingKeys(keys: readonly string[], path: string): void {
+  for (let i = 1; i < keys.length; i++) {
+    if ((keys[i] as string) <= (keys[i - 1] as string)) {
+      corrupt(`${path}[${i}]`, `should come after the entry before it (${JSON.stringify(keys[i - 1])}), got ${JSON.stringify(keys[i])}`);
+    }
+  }
+}
+
+/** A suggestion key (advisor.isAdviceKey). */
+function adviceKey(value: unknown, path: string): string {
+  if (!isAdviceKey(value)) expected(path, 'a suggestion key (1-64 characters, no spaces)', value);
+  return value;
+}
+
+/** The advisor (v4, round 4b): snoozes and shown suggestions, each list ascending by key. */
+function checkAdvisor(advisor: Json, ctx: Context): void {
+  const snoozes = list(advisor.snoozes, 'advisor.snoozes');
+  if (snoozes.length > SANE_ADVISOR_ENTRIES_MAX) corrupt('advisor.snoozes', `should hold at most ${SANE_ADVISOR_ENTRIES_MAX} entries, got ${snoozes.length}`);
+  const snoozed = snoozes.map((value, i) => {
+    const path = `advisor.snoozes[${i}]`;
+    const snooze = obj(value, path);
+    int(snooze.untilDay, `${path}.untilDay`, 0);
+    oneOf(snooze.severity, `${path}.severity`, SEVERITIES);
+    return adviceKey(snooze.key, `${path}.key`);
+  });
+  ascendingKeys(snoozed, 'advisor.snoozes (by key)');
+  const shown = list(advisor.shown, 'advisor.shown');
+  if (shown.length > SANE_ADVISOR_ENTRIES_MAX) corrupt('advisor.shown', `should hold at most ${SANE_ADVISOR_ENTRIES_MAX} entries, got ${shown.length}`);
+  const keys = shown.map((value, i) => {
+    const path = `advisor.shown[${i}]`;
+    const entry = obj(value, path);
+    const first = int(entry.firstDay, `${path}.firstDay`, 0, ctx.day);
+    int(entry.lastDay, `${path}.lastDay`, first, ctx.day);
+    int(entry.times, `${path}.times`, 1, SANE_CLOSES_MAX);
+    return adviceKey(entry.key, `${path}.key`);
+  });
+  ascendingKeys(keys, 'advisor.shown (by key)');
 }
 
 /** Weather (v4); returns nextStormId. */
@@ -1054,7 +1275,10 @@ function checkFinance(finance: Json, ctx: Context): void {
     if (ctx.version >= 4 && report.ops !== undefined) {
       const ops = obj(report.ops, `${path}.ops`);
       for (const field of OPS_FIELDS) int(ops[field], `${path}.ops.${field}`, 0);
+      // Round 4c/4d: required but nullable (null on reports written before it).
+      if (ops.overhead !== null) checkOverheadLines(obj(ops.overhead, `${path}.ops.overhead`), `${path}.ops.overhead`);
     }
+    if (ctx.version >= 4 && report.customers !== undefined) checkCustomerStats(obj(report.customers, `${path}.customers`), `${path}.customers`, ctx);
   });
 
   if (ctx.version === 1) return;
@@ -1063,6 +1287,27 @@ function checkFinance(finance: Json, ctx: Context): void {
   int(capex.connect, 'finance.capex.connect', 0);
   int(capex.co, 'finance.capex.co', 0);
   int(finance.negativeMonths, 'finance.negativeMonths', 0);
+}
+
+/** Report ops.overhead (round 4c/4d): whole dollars >= 0, support part of perCustomer. */
+function checkOverheadLines(lines: Json, path: string): void {
+  int(lines.base, `${path}.base`, 0, SANE_DEBT_MAX);
+  const perCustomer = int(lines.perCustomer, `${path}.perCustomer`, 0, SANE_DEBT_MAX);
+  int(lines.support, `${path}.support`, 0, perCustomer);
+  int(lines.perPlant, `${path}.perPlant`, 0, SANE_DEBT_MAX);
+}
+
+/** Report customers (round 4c/4d): counts >= 0, areas ascending by an issued cabinet id. */
+function checkCustomerStats(stats: Json, path: string, ctx: Context): void {
+  for (const field of ['happy', 'okay', 'unhappy', 'referralSignups', 'referralCredits', 'campaignSpend'] as const) int(stats[field], `${path}.${field}`, 0);
+  const cabinets = list(stats.areas, `${path}.areas`).map((value, i) => {
+    const areaPath = `${path}.areas[${i}]`;
+    const area = obj(value, areaPath);
+    int(area.passings, `${areaPath}.passings`, 0);
+    int(area.units, `${areaPath}.units`, 0);
+    return int(area.cabinet, `${areaPath}.cabinet`, 1, ctx.nextId - 1);
+  });
+  ascending(cabinets, `${path}.areas (by cabinet)`);
 }
 
 /** Report.debt (round-3 closes; the round-4 fields are optional, checked when present). */
@@ -1181,9 +1426,17 @@ function checkSales(sales: Json, ctx: Context): void {
         const lockPath = `${path}.locks[${k}]`;
         const lock = obj(value, lockPath);
         const tier = oneOf(lock.tier, `${lockPath}.tier`, TIER_IDS);
-        int(lock.price, `${lockPath}.price`, 1, SANE_PRICE_MAX);
-        int(lock.untilDay, `${lockPath}.untilDay`, 0);
-        oneOf(lock.reason, `${lockPath}.reason`, LOCK_REASONS);
+        const price = int(lock.price, `${lockPath}.price`, 1, SANE_PRICE_MAX);
+        const until = int(lock.untilDay, `${lockPath}.untilDay`, 0);
+        const reason = oneOf(lock.reason, `${lockPath}.reason`, LOCK_REASONS);
+        // Round 4b: the longer lock a retention lock gives back when it ends (only on a retention lock).
+        if ('resume' in lock) {
+          if (reason !== 'retention') corrupt(`${lockPath}.resume`, `is only on a retention lock, got one on a ${reason} lock`);
+          const resume = obj(lock.resume, `${lockPath}.resume`);
+          int(resume.price, `${lockPath}.resume.price`, price + 1, SANE_PRICE_MAX);
+          int(resume.untilDay, `${lockPath}.resume.untilDay`, until + 1);
+          oneOf(resume.reason, `${lockPath}.resume.reason`, RESUME_REASONS);
+        }
         return TIER_IDS.indexOf(tier);
       });
       ascending(order, `${path}.locks (by tier)`);
@@ -1209,6 +1462,7 @@ function checkSales(sales: Json, ctx: Context): void {
   }
 
   if (ctx.version < 4) return;
+  int(month.outageCreditDollarDays, 'sales.month.outageCreditDollarDays', 0);
   if (sales.promo !== null) {
     const promo = obj(sales.promo, 'sales.promo');
     int(promo.percentOff, 'sales.promo.percentOff', 1, 100);
@@ -1223,6 +1477,9 @@ function checkSales(sales: Json, ctx: Context): void {
     const end = int(promo.endDay, `${path}.endDay`, start + 1);
     int(promo.price, `${path}.price`, 1, SANE_PRICE_MAX);
     int(promo.quietUntil, `${path}.quietUntil`, end);
+    int(promo.triggerTakePct, `${path}.triggerTakePct`, 0, 100);
+    bool(promo.answered, `${path}.answered`);
+    bool(promo.answeredWithPromo, `${path}.answeredWithPromo`);
     return cabinet;
   });
   ascending(cabinets, 'sales.incumbentPromos (by cabinet)');

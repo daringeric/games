@@ -3,7 +3,7 @@
 // is `cell` world pixels on a side. Colors are CSS hex strings, which Pixi and
 // CSS both accept.
 
-import type { CppBand, StreetClass } from '../sim/types';
+import type { CppBand, ExposureBand, StreetClass } from '../sim/types';
 
 export interface RoofColors {
   roof: string;
@@ -204,6 +204,14 @@ export interface Theme {
   };
   /** The $/ft cost overlay (band colors come from `cpp`). */
   costOverlay: { none: string; alpha: number; width: number };
+  /**
+   * Round 4b: the storm-exposure overlay: every street colored by its
+   * exposure band (weather.exposureBand), light to dark as storms get
+   * likelier there, so it reads in grayscale too. themeCss publishes the
+   * band colors as --exposure-sheltered / --exposure-moderate /
+   * --exposure-exposed (the legend, quote cards and the span panel).
+   */
+  exposureOverlay: { alpha: number; width: number; band: Record<ExposureBand, string> };
   overlay: {
     snapRing: string;
     snapFill: string;
@@ -413,6 +421,8 @@ export const toyTown: Theme = {
     outlineAlpha: 0.38,
   },
   costOverlay: { none: '#C9C2B4', alpha: 1, width: 8 },
+  // Clear sky to storm cloud: a pale blue, a mid blue and a deep storm indigo.
+  exposureOverlay: { alpha: 1, width: 8, band: { sheltered: '#7FB8DE', moderate: '#4F78B8', exposed: '#3F1D73' } },
   overlay: {
     snapRing: '#E8553A',
     snapFill: '#FFFFFF',

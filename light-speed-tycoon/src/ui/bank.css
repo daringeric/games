@@ -1,66 +1,540 @@
-/* Round 4: Bank panel changes: covenant status at the top, the frozen-line sweep and countdown, draw previews, the safe term-loan default (sim-debt workstream).
-   Imported by main.ts after style.css and mapTools.css, so rules here may
-   override theirs; style.css itself is frozen for round 4. Colors and sizes come
-   from the theme variables themeCss.ts publishes (--card, --text, --accent,
-   --danger, --radius, --touch, ...), never literals. */
+/* The Bank, round 4c/4d (spec H, "Bank C: health first"): the health status,
+   the two checks with their bars, Borrow more (amount chips, Other amount,
+   5 or 7 years, the live preview), Pay back and Emergency cash opening in
+   place, "What happens if I slip?" and the bank's messages.
+   Imported by main.ts after style.css, so rules here may override its older
+   .bank-* rules; style.css itself is frozen. Colors and sizes come from the
+   theme variables themeCss.ts publishes (--card, --text, --success, --danger,
+   --cpp-amber, --radius, --touch, ...), never literals. Containers carry
+   is-ok / is-warn / is-danger (not style.css's tone-*, which colors every
+   number inside). */
 
-/* The verified cure under today's covenant tests. */
-.bank-remedy {
+.sheet.bank {
+  width: min(600px, calc(100vw - 24px));
+}
+
+.bank .sheet-head {
+  align-items: center;
+  padding: 14px 14px 4px 24px;
+}
+
+.bank .sheet-title.bank-eyebrow {
+  color: var(--text-2);
+  font: 800 13px / 1.3 var(--font-ui);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.bank .sheet-body {
+  gap: 18px;
+  padding: 6px 24px 22px;
+}
+
+/* The tone colors every container below picks from. */
+.bank .is-ok {
+  --bank-tone: var(--success);
+  --bank-tone-bg: var(--success-bg);
+}
+
+.bank .is-warn {
+  --bank-tone: var(--cpp-amber);
+  --bank-tone-bg: color-mix(in srgb, var(--cpp-amber) 14%, var(--card));
+}
+
+.bank .is-danger {
+  --bank-tone: var(--danger);
+  --bank-tone-bg: var(--danger-bg);
+}
+
+/* 1. Health status ----------------------------------------------------------- */
+
+.bank-health {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.bank-health-icon {
+  flex: none;
+  width: 56px;
+  height: 56px;
+}
+
+.bank-health-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.bank-health-icon .hi-ring {
+  fill: var(--bank-tone-bg, var(--chip));
+}
+
+.bank-health-icon .hi-shape {
+  fill: var(--bank-tone, var(--text-2));
+}
+
+.bank-health-icon .hi-mark {
+  fill: none;
+  stroke: var(--card);
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bank-health-icon .hi-dot {
+  fill: var(--card);
+}
+
+.bank-health-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sheet .bank-health-title {
   margin: 0;
-  padding: 8px 12px;
-  border-left: 3px solid var(--accent);
-  border-radius: 10px;
-  background: var(--chip);
   color: var(--text);
-  font-size: 13.5px;
-  font-weight: 800;
+  font: 600 34px / 1.05 var(--font-display);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.bank-health-sentence {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
   line-height: 1.4;
 }
 
-/* The frozen line: the sweep, the countdown to the call, or the called loans. */
-.bank-frozen {
-  display: grid;
-  gap: 6px;
-  padding: 10px 12px;
+/* The verified cure (or how it steps back), with its button. */
+.bank-cure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 12px 14px;
+  border-left: 4px solid var(--accent);
   border-radius: 14px;
   background: var(--chip);
-  box-shadow: inset 0 0 0 2px var(--card-border);
 }
 
-.bank-frozen.bank-frozen-warn {
-  background: color-mix(in srgb, var(--cpp-amber) 12%, var(--card));
-  box-shadow: inset 0 0 0 2px var(--cpp-amber);
+.bank-cure[hidden] {
+  display: none;
 }
 
-.bank-frozen.bank-frozen-danger {
-  background: var(--danger-bg);
-  box-shadow: inset 0 0 0 2px var(--danger);
-}
-
-.sheet .bank-frozen-title {
+.bank-cure-text {
+  flex: 1 1 240px;
   margin: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.45;
 }
 
-.bank-frozen.bank-frozen-danger .bank-frozen-title {
+.bank .btn.bank-cure-action {
+  flex: none;
+  min-height: 48px;
+  padding: 0 18px;
+  border: 2px solid var(--text);
+  background: var(--card);
+  white-space: normal;
+  line-height: 1.15;
+}
+
+/* The next payment the close won't have the cash for. */
+.bank-attention {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--cpp-amber) 14%, var(--card));
+  box-shadow: inset 0 0 0 2px var(--cpp-amber);
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+/* No more borrowing: the sweep and the countdown, or the called loans. */
+.bank-frozen {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: var(--bank-tone-bg, var(--chip));
+  box-shadow: inset 0 0 0 2px var(--bank-tone, var(--card-border));
+}
+
+.bank-frozen[hidden] {
+  display: none;
+}
+
+.bank-frozen-lines,
+.bank-frozen-due {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0 0 0 20px;
+  color: var(--text);
+  font-size: 14.5px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bank-frozen-due {
+  margin-top: 6px;
+  padding-left: 24px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 2. The two checks ---------------------------------------------------------- */
+
+.bank .bank-checks {
+  display: grid;
+  gap: 22px;
+  margin: 0;
+  padding: 18px 20px;
+  border-radius: 20px;
+  background: var(--chip);
+}
+
+.bank .bank-check {
+  display: grid;
+  align-items: normal;
+  justify-content: normal;
+  gap: 8px;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+}
+
+.bank-check-sentence {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.bank-check-sentence b {
+  font-weight: 800;
+}
+
+.bank-bar {
+  position: relative;
+  display: block;
+  height: 16px;
+  margin-top: 4px;
+  border-radius: var(--pill);
+  background: var(--shadow);
+}
+
+.bank-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: var(--pill);
+  background: var(--success);
+}
+
+.bank-check[data-status='near'] .bank-bar-fill {
+  background: var(--cpp-amber);
+}
+
+.bank-check[data-status='over'] .bank-bar-fill {
+  background: var(--danger);
+}
+
+.bank-bar-marker {
+  position: absolute;
+  top: -6px;
+  width: 4px;
+  height: 28px;
+  margin-left: -2px;
+  border-radius: 2px;
+  background: var(--danger);
+}
+
+.bank-scale {
+  position: relative;
+  display: block;
+  height: 16px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.bank-scale-start {
+  position: absolute;
+  left: 0;
+}
+
+.bank-scale-limit {
+  position: absolute;
+  color: var(--danger);
+  transform: translateX(-50%);
+}
+
+/* The bar's end is in its label for a screen reader; on screen it would crowd the limit. */
+.bank-scale-end {
+  display: none;
+}
+
+.bank-check-status {
+  justify-self: start;
+  padding: 2px 10px;
+  border-radius: var(--pill);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.bank-check[data-status='pass'] .bank-check-status,
+.bank-check[data-status='none'] .bank-check-status {
+  display: none;
+}
+
+.bank-check[data-status='near'] .bank-check-status {
+  background: color-mix(in srgb, var(--cpp-amber) 16%, var(--card));
+  color: color-mix(in srgb, var(--cpp-amber) 60%, var(--text));
+}
+
+.bank-check[data-status='over'] .bank-check-status {
+  background: var(--danger-bg);
   color: var(--danger);
 }
 
-/* The covenant preview under the draw form. */
-.bank-draw-preview {
-  display: grid;
-  gap: 6px;
-  padding: 8px 12px;
-  border-radius: 12px;
-  background: var(--chip);
+/* The quiet disclosures: what the bank counts, how the rate is set, the slip ladder, the messages. */
+.bank-more > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--touch);
+  color: var(--text-2);
+  font-size: 14.5px;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
 }
 
-.bank-draw-preview .bank-subhead {
+.bank-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.bank-more > summary:focus-visible {
+  border-radius: 10px;
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.bank-more-chevron {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: 0 4px 0 2px;
+  border-right: 2.5px solid currentColor;
+  border-bottom: 2.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+.bank-more[open] > summary .bank-more-chevron {
+  transform: rotate(45deg);
+}
+
+.bank-count {
+  margin-top: -10px;
+}
+
+.bank-count .bank-figs {
+  padding-top: 4px;
+}
+
+.bank-count .bank-fig {
+  border-top: 1px dashed var(--card-border);
+}
+
+/* 3. Borrow more ------------------------------------------------------------- */
+
+.bank .bank-borrow {
+  gap: 12px;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.sheet .bank-heading {
   margin: 0;
+  color: var(--text);
+  font: 800 16px / 1.25 var(--font-ui);
+  letter-spacing: 0;
+  text-transform: none;
 }
 
-/* The builder's largest covenant-safe amount. */
-.bank-safe {
+.bank-why {
+  margin: 0;
   color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.bank-builder {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bank-builder[hidden] {
+  display: none;
+}
+
+.bank-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.bank .btn.bank-chip {
+  flex: 1 1 96px;
+  min-height: 48px;
+  padding: 0 10px;
+  border: 2px solid var(--card-border);
+  border-radius: 14px;
+  background: var(--card);
+  color: var(--text);
+  font: 600 18px / 1 var(--font-display);
+  box-shadow: none;
+}
+
+.bank .btn.bank-chip:hover {
+  background: var(--hover);
+}
+
+.bank .btn.bank-chip[aria-pressed='true'] {
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--card);
+  box-shadow: none;
+}
+
+.bank .btn.bank-chip-other {
+  flex: 1 1 120px;
+  font: 700 15px / 1 var(--font-ui);
+}
+
+.bank-other {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.bank-other[hidden] {
+  display: none;
+}
+
+.bank-other .bank-money {
+  flex: 1 1 160px;
+}
+
+.bank-up-to {
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+
+.bank .bank-years {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  background: none;
+}
+
+.bank-years-label {
+  margin-right: 2px;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.bank .btn.bank-year {
+  flex: none;
+  min-height: var(--touch);
+  padding: 0 14px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  font: 700 14px / 1 var(--font-ui);
+  box-shadow: none;
+}
+
+.bank .btn.bank-year[aria-checked='true'] {
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--card);
+  box-shadow: none;
+}
+
+/* The live preview lines (borrowing, emergency cash, paying back, paying off a loan). */
+.bank-preview {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--bank-tone-bg, var(--chip));
+}
+
+.bank-preview[hidden] {
+  display: none;
+}
+
+.bank-preview-mark {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+}
+
+.bank-preview-mark svg {
+  display: block;
+}
+
+.bank-preview-mark .pv-shape {
+  fill: var(--bank-tone, var(--text-2));
+}
+
+.bank-preview-mark .pv-mark {
+  fill: none;
+  stroke: var(--card);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bank-preview-mark .pv-dot {
+  fill: var(--card);
+}
+
+.bank-preview-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.bank-preview.is-danger .bank-preview-text {
+  font-weight: 800;
 }
 
 /* Same-month loans a new loan re-prices. */
@@ -68,11 +542,274 @@
   display: grid;
   gap: 4px;
   margin: 0;
-  padding: 8px 12px 8px 28px;
-  border-radius: 10px;
+  padding: 10px 14px 10px 30px;
+  border-radius: 14px;
   background: color-mix(in srgb, var(--cpp-amber) 12%, var(--card));
   color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bank-repriced[hidden] {
+  display: none;
+}
+
+.bank-rate-details .bank-rate-rows,
+.bank-line-rate .bank-rate-rows {
+  margin-bottom: 8px;
+}
+
+.bank-detail-lines {
+  display: grid;
+  gap: 6px;
+}
+
+.bank-detail-lines p {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+/* 4. The actions and the two panes ----------------------------------------- */
+
+.bank-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: -4px;
+}
+
+.bank .btn.bank-borrow-go {
+  min-height: 52px;
+  padding: 0 26px;
+  font: 600 19px / 1.1 var(--font-display);
+}
+
+.bank .btn.bank-borrow-go[hidden] {
+  display: none;
+}
+
+.bank .btn.bank-toggle {
+  min-height: 48px;
+  padding: 0 18px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  font: 700 15px / 1.1 var(--font-ui);
+}
+
+.bank .btn.bank-toggle[aria-expanded='true'] {
+  border-color: var(--text);
+  background: var(--hover);
+}
+
+.bank-pane {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px 18px;
+  border-radius: 20px;
+  background: var(--chip);
+}
+
+.bank-pane[hidden] {
+  display: none;
+}
+
+.bank-slot:empty {
+  display: none;
+}
+
+.bank-credit-summary,
+.bank-repay-head {
+  margin: 0;
+  color: var(--text);
+  font-size: 15.5px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bank-repay[hidden],
+.bank-form[hidden] {
+  display: none;
+}
+
+.bank-pane .bank-preview {
+  background: var(--bank-tone-bg, var(--card));
+}
+
+.bank .bank-loans {
+  gap: 10px;
+}
+
+.bank .bank-loan {
+  gap: 8px;
+  background: var(--card);
+}
+
+.bank-loan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.bank-loan-line {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.bank-loan-note {
+  margin: 0;
+  color: var(--text-2);
   font-size: 13px;
   font-weight: 700;
   line-height: 1.4;
+}
+
+.bank .btn.bank-prepay-open {
+  min-height: var(--touch);
+  font-size: 14px;
+}
+
+.bank .bank-prepay[hidden] {
+  display: none;
+}
+
+/* 5. What happens if I slip? and 6. the bank's messages ---------------------- */
+
+.bank-slip,
+.bank-messages {
+  padding-top: 10px;
+  border-top: 2px solid var(--card-border);
+}
+
+.bank-messages[hidden] {
+  display: none;
+}
+
+.bank-slip > summary,
+.bank-messages > summary {
+  color: var(--text);
+  font-size: 16px;
+}
+
+.bank-ladder {
+  display: grid;
+  gap: 6px;
+  margin: 4px 0 10px;
+  padding: 0 0 0 24px;
+  color: var(--text-2);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.bank-step strong {
+  color: var(--text);
+}
+
+.bank-step.is-current {
+  margin-left: -8px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--cpp-amber) 16%, var(--card));
+  box-shadow: inset 0 0 0 2px var(--cpp-amber);
+  color: var(--text);
+}
+
+.bank-step[data-step='penalty'].is-current,
+.bank-step[data-step='frozen'].is-current,
+.bank-step[data-step='called'].is-current {
+  background: var(--danger-bg);
+  box-shadow: inset 0 0 0 2px var(--danger);
+}
+
+.bank-here {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: var(--pill);
+  background: var(--text);
+  color: var(--card);
+  font-size: 12px;
+  font-weight: 800;
+  vertical-align: 1px;
+}
+
+.bank-slip .bank-note {
+  font-size: 14px;
+}
+
+.bank-slip .bank-note + .bank-note {
+  margin-top: 6px;
+}
+
+.bank-messages .bank-notice-list {
+  margin-top: 4px;
+}
+
+/* Phones ---------------------------------------------------------------------- */
+
+@media (max-width: 480px) {
+  .bank .sheet-head {
+    padding: 12px 10px 2px 16px;
+  }
+
+  .bank .sheet-body {
+    gap: 16px;
+    padding: 4px 14px 16px;
+  }
+
+  .bank-health {
+    gap: 12px;
+  }
+
+  .bank-health-icon {
+    width: 48px;
+    height: 48px;
+  }
+
+  .sheet .bank-health-title {
+    font-size: 27px;
+  }
+
+  .bank-health-sentence {
+    font-size: 15px;
+  }
+
+  .bank .bank-checks {
+    gap: 18px;
+    padding: 14px 14px;
+  }
+
+  .bank-check-sentence {
+    font-size: 16px;
+  }
+
+  .bank .btn.bank-chip {
+    flex-basis: 84px;
+    font-size: 17px;
+  }
+
+  .bank .btn.bank-chip-other {
+    flex-basis: 100%;
+  }
+
+  .bank-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .bank .btn.bank-borrow-go {
+    flex-basis: 100%;
+  }
+
+  .bank-pane {
+    padding: 14px 12px;
+  }
 }

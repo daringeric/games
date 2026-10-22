@@ -13,7 +13,6 @@ import {
   FROZEN_SWEEP_RESERVE,
   FROZEN_SWEEP_SHARE,
   FUNDING_CUSHION_MONTHS,
-  OVERHEAD_PER_MONTH,
   ARR_TRAILING_MONTHS,
   BASE_RATE_BPS,
   COVENANT_CURE_CLOSES,
@@ -59,6 +58,7 @@ import {
   frozenReason,
   levelPayment,
   maxSafeTermLoan,
+  covenantsWithin,
   leverageSpreadBps,
   newDebt,
   penaltyBps,
@@ -79,6 +79,7 @@ import {
 import { closeMonth, estimateCashAtClose, formatMoney, postEntry } from './finance';
 import { cppBand, operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService } from './network';
+import { fixedCostsPerMonth, fixedOverheadLines } from './overhead';
 import { Rng } from './rng';
 import { addLivePlant, closedMonth, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
 import type { CommandResult, CovenantStage, GameState, MonthlyReport, TermLoan, TermYears } from './types';
@@ -892,6 +893,8 @@ describe('quotePrepay', () => {
         total: amount + accrued,
         paysOff: false,
         paymentAfter: levelPayment(loan.balance - amount, loan.rateBps, loan.monthsLeft),
+        // Round 4c/4d: the covenant figures after it (checked in contract4cd.test.ts).
+        after: q.after,
       });
     });
     expect(quotePrepay(state, 1, amount).accruedInterest).toBeGreaterThan(0);
@@ -1384,6 +1387,8 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
    * the month's operating entries posted as closeMonth steps 1-3 would
    * (revenue 30,000, overhead) plus capex, which the sweep ignores.
    */
+  /** The fake month's running costs: an amount of the test's own (not the game's overhead). */
+  const BOOKED_COSTS = 9_000;
   function frozenBooks(line = 4_000): GameState {
     const state = trading();
     state.finance.cash = 500_000;
@@ -1396,11 +1401,11 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
     state.debt.nextLoanId = 3;
     state.day = nextCloseDay(state) - 1;
     postEntry(state, 'revenue', 30_000, 'Billing');
-    postEntry(state, 'overhead', -OVERHEAD_PER_MONTH, 'Overhead');
+    postEntry(state, 'overhead', -BOOKED_COSTS, 'Overhead');
     postEntry(state, 'install', -7_000, 'Installs');
     return state;
   }
-  const FLOW = 30_000 - OVERHEAD_PER_MONTH;
+  const FLOW = 30_000 - BOOKED_COSTS;
 
   it('sweeps its share of the month\'s operating cash flow after the debt service: the line first, then loans by id, re-amortized', () => {
     const state = frozenBooks();
@@ -1485,9 +1490,11 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
     state.debt.frozenCloses = 1;
     state.debt.credit.balance = 80_000;
     const mark = lastId(state);
+    // The close's running costs: the overhead's fixed lines (no plant, no customers: the base).
+    const fixed = fixedOverheadLines(state);
     const report = closeWith(state, 30_000);
     const sweep = report.debt!.sweep!;
-    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * (30_000 - OVERHEAD_PER_MONTH)));
+    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * (30_000 - fixed.base - fixed.perPlant)));
     expect(report.totals.principal).toBe(-sweep);
     expect(state.debt.credit.balance).toBe(80_000 - sweep);
     const notice = noticesAfter(state, mark, 'debtSwept')[0]!;
@@ -1768,9 +1775,52 @@ describe('maxSafeTermLoan', () => {
   });
 });
 
+describe('covenant headroom (round 4b)', () => {
+  const COSTS = 20_000;
+  const H = 0.15;
+
+  it('covenantsWithin is m.compliant at 0 and tighter with headroom', () => {
+    const state = trading(COSTS);
+    for (const amount of [TERM_LOAN_MIN, maxSafeTermLoan(state, 7), termCapacity(state)]) {
+      const after = quoteTermLoan(state, amount, 7).after;
+      expect(covenantsWithin(after, 0)).toBe(after.compliant);
+      if (covenantsWithin(after, H)) expect(after.compliant).toBe(true);
+    }
+    const none = covenantMetrics(trading());
+    expect(covenantsWithin(none, H)).toBe(true);
+  });
+
+  it('maxSafeTermLoan with headroom stays that far inside both limits, and is no more than without it', () => {
+    const state = trading(COSTS);
+    const plain = maxSafeTermLoan(state, 7);
+    const roomy = maxSafeTermLoan(state, 7, H);
+    expect(roomy).toBeLessThan(plain);
+    expect(roomy % LOAN_ROUNDING).toBe(0);
+    if (roomy >= TERM_LOAN_MIN) {
+      const after = quoteTermLoan(state, roomy, 7).after;
+      expect(after.leverage).not.toBeNull();
+      expect(after.leverage!).toBeLessThanOrEqual(COVENANT_MAX_LEVERAGE * (1 - H));
+      if (after.coverage !== null) expect(after.coverage).toBeGreaterThanOrEqual(COVENANT_MIN_COVERAGE * (1 + H));
+      expect(covenantsWithin(quoteTermLoan(state, roomy + LOAN_ROUNDING, 7).after, H)).toBe(false);
+    }
+    expect(maxSafeTermLoan(state, 7, 0)).toBe(plain);
+  });
+
+  it('fundingHint with headroom only suggests financing that keeps it', () => {
+    const state = trading();
+    state.finance.cash = 50_000;
+    const years = TERM_LOAN_YEARS.at(-1) as TermYears;
+    const cost = 50_000 + creditAvailable(state) * 2;
+    const hint = fundingHint(state, cost, H);
+    if (hint.kind === 'term') expect(covenantsWithin(quoteTermLoan(state, hint.termLoan, years).after, H)).toBe(true);
+    if (hint.kind === 'draw') expect(covenantsWithin(quoteDraw(state, hint.draw).after, H)).toBe(true);
+    expect(fundingHint(state, cost, 0)).toEqual(fundingHint(state, cost));
+  });
+});
+
 describe('fundingHint', () => {
   function cushionOf(state: GameState): number {
-    return FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth) + estimateNextDebtService(state);
+    return FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state) + estimateNextDebtService(state);
   }
 
   it('says cash when cash covers the cost and the cushion', () => {
@@ -1867,7 +1917,7 @@ describe('cureOptions', () => {
   }
 
   function keep(state: GameState): number {
-    return estimateNextDebtService(state) + FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth);
+    return estimateNextDebtService(state) + FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state);
   }
 
   it('is empty with no debt or when the covenants pass', () => {

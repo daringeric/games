@@ -1,4 +1,5 @@
-/* Round 4: pricing panel changes: grandfathering, the intro promo, tier retirement and incumbent promo previews (sim-pricing workstream).
+/* Round 4: pricing panel changes: grandfathering, the intro promo, tier retirement and incumbent promo previews (sim-pricing workstream;
+   round 4b additions at the end: pricing-balance workstream).
    Imported by main.ts after style.css and mapTools.css, so rules here may
    override theirs; style.css itself is frozen for round 4. Colors and sizes come
    from the theme variables themeCss.ts publishes (--card, --text, --accent,
@@ -94,6 +95,69 @@
   display: none;
 }
 
+/* Round 4b (pricing-balance): the intro promo's "when it pays" line, who signs up, and the retention offer. */
+.pricing .promo-advice {
+  text-align: left;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.pricing .promo-advice[hidden] {
+  display: none;
+}
+
+.who-signs-up .segment-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.who-signs-up .segment-list li + li {
+  margin-top: 4px;
+}
+
+/* A segment no plan suits: they will not sign up, so it reads as a warning. */
+.who-signs-up .segment-out {
+  color: var(--danger);
+}
+
+.incumbent-promos .incumbent-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.incumbent-promos .retention-line {
+  color: var(--text-2);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.incumbent-promos .retention-answer,
+.incumbent-promos .retention-answer:hover {
+  min-height: var(--touch);
+  max-width: 100%;
+  margin-top: 2px;
+  background: var(--active);
+  color: var(--active-text);
+  box-shadow: 0 3px 0 var(--active-shadow);
+  white-space: normal;
+  text-align: left;
+}
+
+.incumbent-promos .retention-answer:disabled,
+.incumbent-promos .retention-answer:disabled:hover {
+  border: 2px dashed var(--card-border);
+  background: var(--hover);
+  color: var(--text-2);
+  box-shadow: none;
+  cursor: not-allowed;
+  transform: none;
+}
+
 @media (max-width: 480px) {
   .pricing .promo-fields .field {
     width: 56px;
@@ -102,4 +166,54 @@
   .impact-figure dd {
     font-size: 15px;
   }
+}
+
+/* Round 4c/4d (ui-customers): the marketing budget is read-only here, with a
+   link to the Customers dashboard where it is set; and the note under the
+   impact figures saying the "after" figure counts the expected cancellations. */
+.pricing .pricing-marketing-now {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px 10px;
+}
+
+.pricing .pricing-marketing-value {
+  font: 600 var(--fs-num) / 1.2 var(--font-display);
+}
+
+.pricing .btn.pricing-marketing-link {
+  min-height: var(--touch);
+  padding: 0 16px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  color: var(--success);
+  font: 800 15px / 1.2 var(--font-ui);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.pricing .btn.pricing-marketing-link:hover {
+  background: var(--hover);
+}
+
+.pricing .btn.pricing-marketing-link[hidden] {
+  display: none;
+}
+
+.pricing .pricing-marketing-hint {
+  text-align: left;
+}
+
+.pricing-impact .impact-note {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.pricing-impact .impact-note[hidden] {
+  display: none;
 }

@@ -27,4 +27,6 @@ export const ICONS = {
   warning: svg('<path d="M12 4l9 16H3z"/><path d="M12 10v4.5"/><circle cx="12" cy="17.3" r="0.9" fill="currentColor"/>'),
   // Round 3: the Bank panel and the HUD debt chip.
   bank: svg('<path d="M3.5 9.5L12 4.5l8.5 5"/><path d="M6 10.5v7M10 10.5v7M14 10.5v7M18 10.5v7"/><path d="M3.5 20h17"/>'),
+  // Round 4b: the storm-exposure overlay switch (a cloud with a bolt).
+  storm: svg('<path d="M7.5 16.5h-1a4 4 0 01-.6-7.95A5.5 5.5 0 0116.6 8a3.75 3.75 0 01.9 7.4"/><path d="M13 12l-2.6 4.2h3.2L11.2 21" stroke-width="2"/>'),
 };

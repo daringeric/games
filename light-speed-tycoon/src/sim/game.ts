@@ -1,11 +1,15 @@
 // Game lifecycle: new game, command dispatch and the daily tick.
 
-import { OLT_START_CARDS, OLT_START_PON_PORTS, START_CASH } from './balance';
+import { DEFAULT_DIFFICULTY, OLT_START_CARDS, OLT_START_PON_PORTS } from './balance';
+import { newAdvisorState, noteAdviceShown, snoozeAdvice } from './advisor';
 import { isFirstOfMonth } from './calendar';
 import { generateCity } from './citygen';
 import type { CityGenOptions } from './citygen';
+import { defaultCompanyName, difficultyLevel, isDifficultyId, normalizeCompanyName } from './company';
+import { newCustomers, runCampaign, setReferrals, setSupport, stepCustomers } from './customers';
 import { drawCredit, endDebtDay, newDebt, prepayLoan, repayCredit, takeTermLoan } from './debt';
 import { closeMonth } from './finance';
+import { answerIncumbent, setIntroPromo } from './incumbent';
 import {
   addOltCard,
   addSplitter,
@@ -18,36 +22,62 @@ import {
   removeSpan,
 } from './network';
 import { deriveSeed, withRng } from './rng';
-import { accrueDay, newSales, setMarketing, setPricing, setPromo, stepSales } from './sales';
-import type { CableMethod, City, Command, CommandResult, GameState, IntroPromo, TermYears, TierSetting } from './types';
+import { accrueDay, newSales, setMarketing, setPricing, stepSales } from './sales';
+import type { CableMethod, City, Command, CommandResult, DifficultyId, GameState, IntroPromo, SupportLevel, TermYears, TierSetting } from './types';
 import { newWeather, stepWeather } from './weather';
 
 export interface NewGameOptions {
   /** Use this city instead of generating one (tests, scenarios). */
   city?: City;
   cityOptions?: CityGenOptions;
+  /** Round 4b: the difficulty (DEFAULT_DIFFICULTY when omitted): it sets the starting cash. */
+  difficulty?: DifficultyId;
+  /**
+   * Round 4b: the company's name as typed (company.normalizeCompanyName
+   * applies); omitted: company.defaultCompanyName(the town's name).
+   */
+  companyName?: string;
 }
 
 /**
- * Fresh game: day 0, START_CASH, empty network with an OLT of OLT_START_CARDS
+ * Fresh game: day 0, the difficulty's starting cash
+ * (company.difficultyLevel(opts.difficulty ?? DEFAULT_DIFFICULTY).startCash:
+ * START_CASH for the default Seed round), company { name, difficulty },
+ * empty network with an OLT of OLT_START_CARDS
  * line cards (OLT_START_PON_PORTS GPON ports), rng.events = deriveSeed(seed,
  * 'events'), rng.sales = deriveSeed(seed, 'sales'), rng.weather =
  * deriveSeed(seed, 'weather'), city = opts.city ??
  * generateCity(deriveSeed(seed, 'citygen'), opts.cityOptions), default pricing
  * and marketing, no subscribers, milestones, notices or capex, no debt
- * (debt.newDebt()) and no storms yet (weather.newWeather()).
+ * (debt.newDebt()), no storms yet (weather.newWeather()), an advisor with
+ * nothing snoozed or shown (advisor.newAdvisorState()) and (round 4c/4d)
+ * the customers model at its defaults (customers.newCustomers(): Good
+ * support, referral credits off, nothing known yet). The difficulty and
+ * the company name change nothing else: a seed replays identically at every
+ * level but for the cash. Throws RangeError for an unknown difficulty or a
+ * name normalizeCompanyName rejects (the start screen validates first).
  */
 export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
   // Keep the seed as the uint32 that deriveSeed actually mixes, so it saves and
   // validates as one; every derived stream is unchanged by this.
   const base = seed >>> 0;
+  const difficulty = opts.difficulty ?? DEFAULT_DIFFICULTY;
+  if (!isDifficultyId(difficulty)) throw new RangeError(`newGame: unknown difficulty ${JSON.stringify(difficulty)}`);
+  const city = opts.city ?? generateCity(deriveSeed(base, 'citygen'), opts.cityOptions);
+  let name = defaultCompanyName(city.name);
+  if (opts.companyName !== undefined) {
+    const chosen = normalizeCompanyName(opts.companyName);
+    if (chosen === null) throw new RangeError(`newGame: company name must be 1-32 characters, got ${JSON.stringify(opts.companyName)}`);
+    name = chosen;
+  }
   return {
     schemaVersion: 4,
     seed: base,
+    company: { name, difficulty },
     day: 0,
     rng: { events: deriveSeed(base, 'events'), sales: deriveSeed(base, 'sales'), weather: deriveSeed(base, 'weather') },
     nextId: 1,
-    city: opts.city ?? generateCity(deriveSeed(base, 'citygen'), opts.cityOptions),
+    city,
     network: {
       spans: [],
       cabinets: [],
@@ -55,10 +85,12 @@ export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
       makeReady: [],
       version: 0,
     },
-    finance: { cash: START_CASH, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
+    finance: { cash: difficultyLevel(difficulty).startCash, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
     debt: newDebt(),
     sales: newSales(),
+    customers: newCustomers(),
     weather: newWeather(),
+    advisor: newAdvisorState(),
     milestones: [],
     notices: [],
     nextNoticeId: 1,
@@ -85,6 +117,19 @@ function reject(reason: string): CommandResult {
  * { percentOff: number, months: number } } goes to sales.setPromo;
  * convertSpan { span: number } goes to network.convertSpan with the events
  * stream (its permit draw).
+ *
+ * Round 4b: answerIncumbent { cabinet: number } goes to
+ * incumbent.answerIncumbent; setPromo goes through incumbent.setIntroPromo
+ * (which notes the incumbent promos an intro promo answers) to sales.setPromo; snoozeAdvice { key: string } to
+ * advisor.snoozeAdvice; noteAdviceShown { keys: string[] } to
+ * advisor.noteAdviceShown (each checks values: ranges, lengths, whether
+ * the promo or the suggestion exists).
+ *
+ * Round 4c/4d: runCampaign { cabinet: number } goes to
+ * customers.runCampaign, setSupport { level: string } to
+ * customers.setSupport, setReferrals { on: boolean } to
+ * customers.setReferrals (each checks values: an existing live cabinet, a
+ * known level, cash).
  */
 export function applyCommand(state: GameState, cmd: Command): CommandResult {
   // Commands also come from replays, scripts and the console, so check field
@@ -134,8 +179,8 @@ export function applyCommand(state: GameState, cmd: Command): CommandResult {
     case 'setPromo': {
       const { promo } = fields;
       if (promo !== null && !isPromoShape(promo)) return reject('setPromo needs promo: null or { percentOff, months }');
-      // Out-of-range values are rejected by sales.setPromo.
-      return setPromo(state, promo);
+      // Out-of-range values are rejected by sales.setPromo (round 4b: through incumbent.setIntroPromo, which notes an answered promo).
+      return setIntroPromo(state, promo);
     }
     case 'convertSpan': {
       const { span } = fields;
@@ -160,6 +205,29 @@ export function applyCommand(state: GameState, cmd: Command): CommandResult {
       if (typeof fields.loan !== 'number') return reject('prepayLoan needs a loan id');
       if (typeof fields.amount !== 'number') return reject('prepayLoan needs an amount in dollars');
       return prepayLoan(state, fields.loan, fields.amount);
+    case 'answerIncumbent':
+      if (typeof fields.cabinet !== 'number') return reject('answerIncumbent needs a cabinet id');
+      return answerIncumbent(state, fields.cabinet);
+    case 'snoozeAdvice':
+      if (typeof fields.key !== 'string') return reject('snoozeAdvice needs the suggestion key');
+      return snoozeAdvice(state, fields.key);
+    case 'noteAdviceShown': {
+      const { keys } = fields;
+      if (!Array.isArray(keys) || !keys.every((k): k is string => typeof k === 'string')) {
+        return reject('noteAdviceShown needs a list of suggestion keys');
+      }
+      return noteAdviceShown(state, keys);
+    }
+    case 'runCampaign':
+      if (typeof fields.cabinet !== 'number') return reject('runCampaign needs a cabinet id');
+      return runCampaign(state, fields.cabinet);
+    case 'setSupport':
+      if (typeof fields.level !== 'string') return reject('setSupport needs a support level');
+      // An unknown level is rejected by customers.setSupport naming the levels.
+      return setSupport(state, fields.level as SupportLevel);
+    case 'setReferrals':
+      if (typeof fields.on !== 'boolean') return reject('setReferrals needs on: true or false');
+      return setReferrals(state, fields.on);
     default:
       return reject(`Unknown command: ${describeType(fields.type)}`);
   }
@@ -200,6 +268,9 @@ function describeType(type: unknown): string {
  *     storms, dig-ins and the month's outage accruals. It sees today's
  *     network progress (a span that went live today can be hit), and the
  *     sales step sees its outages the same day (no signups on a cut-off street)
+ *   customers.stepCustomers for the new day (round 4c/4d, no rng): the lit
+ *     streets' awareness, campaign strength, waits and memories, before
+ *     the signups that read them
  *   stepSales for the new day (sales stream)
  * A span that goes live on the 1st, or a lot that appears that day, belongs to
  * the new month. Day 0 never gets a sales step (no signups or churn), only its
@@ -217,6 +288,7 @@ export function tick(state: GameState): void {
   if (state.gameOver) return;
   advanceNetwork(state);
   withRng(state, 'weather', (rng) => stepWeather(state, rng));
+  stepCustomers(state);
   withRng(state, 'sales', (rng) => stepSales(state, rng));
 }
 

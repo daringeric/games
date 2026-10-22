@@ -54,12 +54,47 @@
 //   (network.outageService). Subscribers cut off keep their accounts and are
 //   charged outage churn for their own days without service at each close,
 //   an outage's base churn once (weather.outageChargeOf).
+//
+// Round 4b (pricing-balance workstream; the contract added the types,
+// balance constants, the accrual and ops fields and documented stubs):
+// - Demand segments (balance.DEMAND_SEGMENTS): targetTakeRate and tierMix
+//   sum value seekers, the mainstream and speed seekers, so a lineup
+//   without a cheap tier loses the households who only take one
+//   (segmentDemand shows who signs up).
+// - The intro promo speeds up signups (PROMO_SIGNUP_BOOST) and quotePromo
+//   says when it pays.
+// - A 'retention' lock (incumbent.answerIncumbent) spares its units the
+//   incumbent promo's churn (round 4c/4d: through happiness, the default
+//   offer in full, HAPPINESS_CABLE_PREMIUM_TOLERATED; units on a cheaper lock
+//   kept under an answered promo too) and steps up with RETENTION_STEP_SHARE
+//   (round 4b review: to the longer lock it replaced, PriceLock.resume, which
+//   then takes over until its own end, rather than to the list price).
+// - Not done (optional in the brief): extra cancellations when a retired
+//   cheap tier moves units to a tier their segment does not suit; a unit's
+//   segment is not tracked, so the retirement churn stays round 4's.
+// - Outage days are not billed: accrueDay leaves the units cut off that day
+//   (network.outageService) out of revenueDollarDays and subscriberUnitDays
+//   and adds their rate to outageCreditDollarDays; the close reports it as
+//   SalesClose.outageCredits (MonthlyReport.ops.outageCredits).
+//
+// Round 4c/4d (sim-customers workstream; customers.ts holds the rules):
+// - Signups: switching responds to the deal (customers.dealFactor), with
+//   awareness, word of mouth, campaigns and the intro promo's boost on young
+//   or contested streets (stepSales step 2); referral shares and install
+//   waits are noted as units connect.
+// - Churn: each unit's regular part is its happiness churn
+//   (customers.regularChurnReader); the incumbent part is the share of it
+//   cable's promo price adds; price steps are remembered after the draws.
+// - churnProbability is the price part of that churn alone; promoSignupFactor
+//   stays for readers. Round 4b's marketingBoost is gone (marketing works
+//   through awareness, customers.marketingAwarenessPerDay).
+// - quotePricing.mrrAfterChurn counts the cancellations it lists; quotePromo
+//   plays the round-4c rules forward (customers.forecastCustomers).
 
 import {
-  CHURN_MONTHLY_BASE,
+  DEMAND_RESERVATION_SOFTNESS,
+  DEMAND_SEGMENTS,
   CHURN_TOTAL_MAX,
-  CHURN_MONTHLY_MAX,
-  CHURN_PRICE_SENSITIVITY,
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
   INCUMBENT_UP_MBPS,
@@ -67,8 +102,6 @@ import {
   INSTALL_COST_MDU_UNIT,
   INSTALL_COST_SMB,
   MARKETING_DEFAULT_PER_MONTH,
-  MARKETING_HALF_SAT_PER_PASSING,
-  MARKETING_MAX_BOOST,
   MARKETING_MAX_PER_MONTH,
   MDU_PORTS_PER_BUILDING,
   MDU_ROUTER_COST,
@@ -77,16 +110,19 @@ import {
   GRANDFATHER_STEP_SHARE,
   PRICE_STEP_CHURN_MAX,
   PRICE_STEP_CHURN_PER_RISE,
+  PROMO_BOOST_YOUNG_MONTHS,
   PROMO_HORIZON_MONTHS,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
+  PROMO_QUOTE_MONTHS,
+  PROMO_SIGNUP_BOOST,
   PROMO_STEP_SHARE,
-  SIGNUP_RAMP_PER_DAY,
+  RETENTION_PERCENT_OFF,
+  RETENTION_STEP_SHARE,
   SMB_MULTIPLIER_DEFAULT,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
   SPLIT_RATIO,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
   TAKE_PRICE_WEIGHT,
   TAKE_RATE_BASE,
   TAKE_RATE_KIND_FACTOR,
@@ -105,11 +141,25 @@ import {
   TIER_RETIRE_CHURN_MAX,
   TIER_RETIRE_CHURN_PER_RISE,
 } from './balance';
+import type { DemandSegment } from './balance';
 import { dateOf, dayOf, formatMonth } from './calendar';
+import {
+  churnFromScore,
+  dealFactors,
+  forecastCustomers,
+  noteInstallWaits,
+  notePriceSteps,
+  priceScores,
+  regularChurnReader,
+  switchingDay,
+  waitedOn,
+} from './customers';
 import { formatMoney, groupThousands, postEntry, postEntryOn } from './finance';
-import { activePromos, incumbentChurnFor, incumbentPriceFor } from './incumbent';
+import { activePromos, incumbentPriceFor } from './incumbent';
 import { getService, outageService } from './network';
+import type { OutageService } from './network';
 import { postNotice } from './notices';
+import { perCustomerCost, postCustomerOverhead } from './overhead';
 import type { Rng } from './rng';
 import { cornerName } from './streets';
 import type {
@@ -118,16 +168,20 @@ import type {
   CabinetId,
   City,
   CommandResult,
+  DemandSegmentId,
   GameState,
   IntroPromo,
   MonthAccrual,
   Parcel,
+  ParcelId,
   ParcelKind,
   PriceLock,
   PriceLockReason,
   Pricing,
   PricingQuote,
+  PromoQuote,
   Sales,
+  SegmentDemand,
   ServiceSnapshot,
   Tier,
   TierId,
@@ -159,7 +213,7 @@ export function defaultPricing(): Pricing {
 }
 
 export function emptyMonthAccrual(): MonthAccrual {
-  return { revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0 };
+  return { revenueDollarDays: 0, marketingDollarDays: 0, subscriberUnitDays: 0, grossAdds: 0, lostService: 0, outageCreditDollarDays: 0 };
 }
 
 /** Sales state for a new game (and for saves migrated from schemaVersion 1): no subscribers, default pricing and marketing. */
@@ -194,26 +248,9 @@ export function cabinetPortCapacity(cabinet: Cabinet): number {
 // Take rate, tier mix, prices
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PRICE: Readonly<Record<TierId, number>> = Object.fromEntries(
-  TIER_DEFAULTS.map((t) => [t.id, t.price]),
-) as Record<TierId, number>;
-
 const POPULARITY: Readonly<Record<TierId, number>> = Object.fromEntries(
   TIER_DEFAULTS.map((t) => [t.id, t.popularity]),
 ) as Record<TierId, number>;
-
-/** The incumbent's offer scored by the same value formula: every ratio is 1. */
-const INCUMBENT_VALUE = TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - TAKE_PRICE_WEIGHT;
-
-/**
- * The incumbent's offer at `incumbentPrice` a month (its promo price where it
- * runs one): TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - TAKE_PRICE_WEIGHT x
- * incumbentPrice / INCUMBENT_PRICE (exactly INCUMBENT_VALUE at INCUMBENT_PRICE).
- */
-function incumbentValue(incumbentPrice: number): number {
-  if (incumbentPrice === INCUMBENT_PRICE) return INCUMBENT_VALUE;
-  return TAKE_SPEED_WEIGHT + TAKE_UPLOAD_WEIGHT - (TAKE_PRICE_WEIGHT * incumbentPrice) / INCUMBENT_PRICE;
-}
 
 /**
  * The share of the list price a new signup weighs off for an intro promo:
@@ -223,6 +260,17 @@ function incumbentValue(incumbentPrice: number): number {
 export function promoDiscountShare(promo: IntroPromo | null): number {
   if (promo === null) return 0;
   return ((promo.percentOff / 100) * Math.min(promo.months, PROMO_HORIZON_MONTHS)) / PROMO_HORIZON_MONTHS;
+}
+
+/**
+ * Round 4b: the intro promo's multiplier on the signup ramp (stepSales):
+ * 1 + PROMO_SIGNUP_BOOST x percentOff / 100, 1 without a promo. Households
+ * switch sooner for a deal. Round 4c (spec C): it applies only on young
+ * streets and where the incumbent runs a promo (customers.promoBoost).
+ */
+export function promoSignupFactor(promo: IntroPromo | null): number {
+  if (promo === null) return 1;
+  return 1 + (PROMO_SIGNUP_BOOST * promo.percentOff) / 100;
 }
 
 /**
@@ -237,38 +285,203 @@ function priceFactor(pricing: Pricing, kind: ParcelKind): number {
   return kind === 'smb' ? pricing.smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
 }
 
-/**
- * A tier's value to a customer whose price ratio is `factor` x the household
- * one (balance.ts take-rate model; factor 1 for a household), with an intro
- * promo worth `discount` of the list price (promoDiscountShare).
- */
-function tierValue(tier: Tier, factor = 1, discount = 0): number {
-  const price = tier.price - tier.price * discount;
-  return (
-    TAKE_SPEED_WEIGHT * Math.min(tier.downMbps / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP) +
-    TAKE_UPLOAD_WEIGHT * Math.min(tier.upMbps / INCUMBENT_UP_MBPS, TAKE_UPLOAD_RATIO_CAP) -
-    ((TAKE_PRICE_WEIGHT * price) / INCUMBENT_PRICE) * factor
-  );
-}
-
 function clamp(value: number, min: number, max: number): number {
   return value < min ? min : value > max ? max : value;
 }
 
 /**
- * Target take rate (0..1) for a building kind under the given pricing, from the
- * model documented in balance.ts: the best offered tier's value against the
- * incumbent, clamped to TAKE_RATE_MIN..TAKE_RATE_MAX, times
- * TAKE_RATE_KIND_FACTOR[kind]. Businesses value a tier at the price they pay
- * (see priceFactor), so a higher smbMultiplier lowers their take rate. With no
+ * The incumbent's offer to a demand segment at `incumbentPrice` a month (its
+ * promo price where it runs one), by the same value formula as a tier: speed
+ * up to the segment's maxUsefulMbps, upload, and the price term weighted by
+ * its priceWeight.
+ */
+function incumbentValueFor(segment: DemandSegment, incumbentPrice: number): number {
+  return (
+    TAKE_SPEED_WEIGHT * Math.min(Math.min(INCUMBENT_DOWN_MBPS, segment.maxUsefulMbps) / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP) +
+    TAKE_UPLOAD_WEIGHT * Math.min(1, TAKE_UPLOAD_RATIO_CAP) -
+    (TAKE_PRICE_WEIGHT * segment.priceWeight * incumbentPrice) / INCUMBENT_PRICE
+  );
+}
+
+/**
+ * A tier's value to a demand segment whose price ratio is `factor` x the
+ * household one (factor 1 for a household), with an intro promo worth
+ * `discount` of the list price (promoDiscountShare): speed counts up to the
+ * segment's maxUsefulMbps, the price term is weighted by its priceWeight.
+ */
+function tierValueFor(tier: Tier, segment: DemandSegment, factor: number, discount: number): number {
+  const price = tier.price - tier.price * discount;
+  return (
+    TAKE_SPEED_WEIGHT * Math.min(Math.min(tier.downMbps, segment.maxUsefulMbps) / INCUMBENT_DOWN_MBPS, TAKE_SPEED_RATIO_CAP) +
+    TAKE_UPLOAD_WEIGHT * Math.min(tier.upMbps / INCUMBENT_UP_MBPS, TAKE_UPLOAD_RATIO_CAP) -
+    ((TAKE_PRICE_WEIGHT * segment.priceWeight * price) / INCUMBENT_PRICE) * factor
+  );
+}
+
+/**
+ * Round 4b: the most a demand segment pays for a plan where the incumbent
+ * charges `incumbentPrice`: its maxPriceRatio x incumbentPrice (a household
+ * price; a business compares its price / its multiplier x
+ * SMB_MULTIPLIER_DEFAULT). The pricing panel's "no plan at or under" line.
+ */
+export function reservationPrice(segment: DemandSegmentId, incumbentPrice: number = INCUMBENT_PRICE): number {
+  const found = DEMAND_SEGMENTS.find((s) => s.id === segment);
+  return found ? found.maxPriceRatio * incumbentPrice : 0;
+}
+
+/**
+ * Round 4b: how well a plan whose household-equivalent price is `paid` suits
+ * a segment whose reservation price is `reservation` (reservationPrice): 1
+ * at or under it, else max(0, 1 - s / DEMAND_RESERVATION_SOFTNESS) where s
+ * = (paid - reservation) / reservation is the share above it (no cliff when
+ * prices rise a little).
+ */
+export function reservationSuit(paid: number, reservation: number): number {
+  if (paid <= reservation) return 1;
+  if (!(reservation > 0) || !(DEMAND_RESERVATION_SOFTNESS > 0)) return 0;
+  return Math.max(0, 1 - (paid - reservation) / reservation / DEMAND_RESERVATION_SOFTNESS);
+}
+
+/** One demand segment's response to a lineup (demandOf). */
+interface SegmentView {
+  segment: DemandSegment;
+  /** Its target take rate before the kind factor: the best suit x clamp(base + slope x advantage) over the offered tiers that suit it; 0 when none does. */
+  take: number;
+  /** Its signup tier mix: sums to 1 over the tiers that suit it (all 0 when none does). */
+  mix: Record<TierId, number>;
+  /** Round 4c/4d: the best reservation suit among the offered tiers (0 when none suits: every household of it finds you too expensive). */
+  suit: number;
+  /** Round 4c/4d: the best advantage over the incumbent among the offered tiers that suit it, or null when none does. */
+  advantage: number | null;
+}
+
+/**
+ * The demand-segment model (balance.ts DEMAND_SEGMENTS), per segment in that
+ * order, for a building kind (its price factor: priceFactor) against the
+ * incumbent at `incumbentPrice` with the intro promo `promo` valued:
+ * - a tier suits the segment by reservationSuit of its price (list less the
+ *   promo's discount share, times the kind's price factor) against
+ *   maxPriceRatio x incumbentPrice; one that does not suit at all is ignored;
+ * - advantage = tierValueFor - incumbentValueFor (the segment's own
+ *   maxUsefulMbps and priceWeight on both sides);
+ * - take = max over suiting tiers of suit x clamp(TAKE_RATE_BASE +
+ *   TAKE_RATE_PER_ADVANTAGE x advantage, TAKE_RATE_MIN, TAKE_RATE_MAX), which
+ *   is the documented clamp of the best advantage when every tier suits
+ *   fully (suit 1), and 0 when no offered tier suits: those households do not
+ *   sign up;
+ * - mix weight per suiting tier = popularity x max(0, advantage) x suit,
+ *   normalized; when every weight is 0, the suiting tiers split by suit.
+ */
+function demandOf(pricing: Pricing, kind: ParcelKind, incumbentPrice: number, promo: IntroPromo | null): SegmentView[] {
+  const factor = priceFactor(pricing, kind);
+  const discount = promoDiscountShare(promo);
+  return DEMAND_SEGMENTS.map((segment) => {
+    const incumbent = incumbentValueFor(segment, incumbentPrice);
+    const reservation = segment.maxPriceRatio * incumbentPrice;
+    const mix = zeroTiers();
+    const suits = zeroTiers();
+    let take = 0;
+    let total = 0;
+    let suitTotal = 0;
+    let bestSuit = 0;
+    let bestAdvantage: number | null = null;
+    for (const tier of pricing.tiers) {
+      if (!tier.offered) continue;
+      const suit = reservationSuit((tier.price - tier.price * discount) * factor, reservation);
+      if (suit <= 0) continue;
+      const advantage = tierValueFor(tier, segment, factor, discount) - incumbent;
+      take = Math.max(take, suit * clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * advantage, TAKE_RATE_MIN, TAKE_RATE_MAX));
+      const weight = (POPULARITY[tier.id] ?? 0) * Math.max(0, advantage) * suit;
+      mix[tier.id] = weight;
+      total += weight;
+      suits[tier.id] = suit;
+      suitTotal += suit;
+      bestSuit = Math.max(bestSuit, suit);
+      bestAdvantage = bestAdvantage === null ? advantage : Math.max(bestAdvantage, advantage);
+    }
+    for (const id of TIER_IDS) mix[id] = total > 0 ? mix[id] / total : suitTotal > 0 ? suits[id] / suitTotal : 0;
+    return { segment, take, mix, suit: bestSuit, advantage: bestAdvantage };
+  });
+}
+
+/**
+ * Round 4c/4d: one demand segment's view of a lineup (segmentDeals), for the
+ * customers model: its share, its take (before the kind factor), how well
+ * the best offered tier's price suits it (reservationSuit, 0..1) and its
+ * best advantage over the incumbent among the tiers that suit it (null when
+ * none does).
+ */
+export interface SegmentDeal {
+  segment: DemandSegmentId;
+  share: number;
+  take: number;
+  suit: number;
+  advantage: number | null;
+}
+
+/**
+ * Round 4c/4d: the demand-segment model's per-segment view (demandOf, in
+ * DEMAND_SEGMENTS order) for a building kind against the incumbent at
+ * `incumbentPrice` with the intro promo valued. customers.dealAdvantage
+ * (switching speed) and customers.whyNotSwitched (too expensive) read it.
+ * Pure.
+ */
+export function segmentDeals(
+  pricing: Pricing,
+  kind: ParcelKind = 'home',
+  incumbentPrice: number = INCUMBENT_PRICE,
+  promo: IntroPromo | null = null,
+): SegmentDeal[] {
+  return demandOf(pricing, kind, incumbentPrice, promo).map((view) => ({
+    segment: view.segment.id,
+    share: view.segment.share,
+    take: view.take,
+    suit: view.suit,
+    advantage: view.advantage,
+  }));
+}
+
+/** A building kind's target take rate and signup tier mix from its segments (targetTakeRate, tierMix). */
+function demandFor(pricing: Pricing, kind: ParcelKind, incumbentPrice: number, promo: IntroPromo | null): { take: number; mix: Record<TierId, number> } {
+  const views = demandOf(pricing, kind, incumbentPrice, promo);
+  let take = 0;
+  const mix = zeroTiers();
+  for (const view of views) {
+    const weight = view.segment.share * view.take;
+    take += weight;
+    if (weight <= 0) continue;
+    for (const id of TIER_IDS) mix[id] += weight * view.mix[id];
+  }
+  if (take > 0) {
+    for (const id of TIER_IDS) mix[id] /= take;
+  } else {
+    // Nobody signs up: offered tiers split evenly (the mix is then never drawn from).
+    let offered = 0;
+    for (const tier of pricing.tiers) if (tier.offered) offered++;
+    for (const tier of pricing.tiers) mix[tier.id] = tier.offered ? 1 / offered : 0;
+  }
+  return { take: take * TAKE_RATE_KIND_FACTOR[kind], mix };
+}
+
+/**
+ * Target take rate (0..1) for a building kind under the given pricing.
+ * Round 4b, demand segments (balance.ts DEMAND_SEGMENTS, see demandOf): the
+ * sum over segments of share x the segment's take (the best suiting offered
+ * tier's advantage over the incumbent, clamped to TAKE_RATE_MIN..
+ * TAKE_RATE_MAX, times how well its price suits them; 0 when no offered
+ * tier suits), times TAKE_RATE_KIND_FACTOR[kind]. So a lineup without a
+ * tier near the incumbent's price loses the value seekers, and one priced
+ * far above every segment's reservation signs nobody up (0, below
+ * TAKE_RATE_MIN). Businesses value a tier at the price they pay (see
+ * priceFactor), so a higher smbMultiplier lowers their take rate. With no
  * tier offered (impossible via setPricing) returns 0.
  *
  * Round 4: `incumbentPrice` is the incumbent's price on the streets in
  * question (incumbent.incumbentPriceFor: lower where it runs a promo, which
- * lowers your target there); `promo` is the intro offer new signups get
- * (Sales.promo), valued as promoDiscountShare off each tier's price. The
- * defaults (INCUMBENT_PRICE, no promo) are the round-3 model; stateTakeRate
- * applies the game's own.
+ * lowers your target there, and the segments' reservation prices with it);
+ * `promo` is the intro offer new signups get (Sales.promo), valued as
+ * promoDiscountShare off each tier's price. stateTakeRate applies the
+ * game's own.
  */
 export function targetTakeRate(
   pricing: Pricing,
@@ -276,15 +489,7 @@ export function targetTakeRate(
   incumbentPrice: number = INCUMBENT_PRICE,
   promo: IntroPromo | null = null,
 ): number {
-  const factor = priceFactor(pricing, kind);
-  const discount = promoDiscountShare(promo);
-  const incumbent = incumbentValue(incumbentPrice);
-  let best = -Infinity;
-  for (const tier of pricing.tiers) {
-    if (tier.offered) best = Math.max(best, tierValue(tier, factor, discount) - incumbent);
-  }
-  if (best === -Infinity) return 0;
-  return clamp(TAKE_RATE_BASE + TAKE_RATE_PER_ADVANTAGE * best, TAKE_RATE_MIN, TAKE_RATE_MAX) * TAKE_RATE_KIND_FACTOR[kind];
+  return demandFor(pricing, kind, incumbentPrice, promo).take;
 }
 
 /**
@@ -306,10 +511,11 @@ function zeroTiers(): Record<TierId, number> {
 
 /**
  * Share of new signups of a building kind (default: households) choosing each
- * tier (sums to 1 over offered tiers, 0 for unoffered). Weight per offered
- * tier = popularity_t x max(0, value_t - incumbent value) (see balance.ts),
- * valued at the price that kind pays; if every weight is 0, offered tiers
- * split evenly. Round 4: against the incumbent at `incumbentPrice`, with the
+ * tier (sums to 1 over offered tiers, 0 for unoffered). Round 4b: the
+ * segments' mixes (demandOf: popularity x max(0, advantage) x suit within
+ * each) summed with weight share x the segment's take, so the tiers the
+ * segments that sign up most favour lead; when nobody signs up, offered
+ * tiers split evenly. Against the incumbent at `incumbentPrice`, with the
  * intro promo valued, exactly as targetTakeRate.
  */
 export function tierMix(
@@ -318,24 +524,7 @@ export function tierMix(
   incumbentPrice: number = INCUMBENT_PRICE,
   promo: IntroPromo | null = null,
 ): Record<TierId, number> {
-  const factor = priceFactor(pricing, kind);
-  const discount = promoDiscountShare(promo);
-  const incumbent = incumbentValue(incumbentPrice);
-  const mix = zeroTiers();
-  let total = 0;
-  let offered = 0;
-  for (const tier of pricing.tiers) {
-    if (!tier.offered) continue;
-    offered++;
-    const weight = (POPULARITY[tier.id] ?? 0) * Math.max(0, tierValue(tier, factor, discount) - incumbent);
-    mix[tier.id] = weight;
-    total += weight;
-  }
-  for (const tier of pricing.tiers) {
-    if (!tier.offered) continue;
-    mix[tier.id] = total > 0 ? mix[tier.id] / total : 1 / offered;
-  }
-  return mix;
+  return demandFor(pricing, kind, incumbentPrice, promo).mix;
 }
 
 function tierOf(pricing: Pricing, id: TierId): Tier {
@@ -357,18 +546,10 @@ interface Demand {
 }
 
 function demandModel(pricing: Pricing, incumbentPrice: number, promo: IntroPromo | null): Demand {
-  return {
-    take: {
-      home: targetTakeRate(pricing, 'home', incumbentPrice, promo),
-      mdu: targetTakeRate(pricing, 'mdu', incumbentPrice, promo),
-      smb: targetTakeRate(pricing, 'smb', incumbentPrice, promo),
-    },
-    mixes: {
-      home: tierMix(pricing, 'home', incumbentPrice, promo),
-      mdu: tierMix(pricing, 'mdu', incumbentPrice, promo),
-      smb: tierMix(pricing, 'smb', incumbentPrice, promo),
-    },
-  };
+  const home = demandFor(pricing, 'home', incumbentPrice, promo);
+  const mdu = demandFor(pricing, 'mdu', incumbentPrice, promo);
+  const smb = demandFor(pricing, 'smb', incumbentPrice, promo);
+  return { take: { home: home.take, mdu: mdu.take, smb: smb.take }, mixes: { home: home.mix, mdu: mdu.mix, smb: smb.mix } };
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +588,8 @@ export function lockOn(account: Account, tier: TierId): PriceLock | undefined {
   return undefined;
 }
 
-/** Set `lock` on its tier (replacing any lock there), keeping TIER_IDS order. */
-function putLock(account: Account, lock: PriceLock): void {
+/** Set `lock` on its tier (replacing any lock there), keeping TIER_IDS order. Round 4b: exported for incumbent.answerIncumbent. */
+export function putLock(account: Account, lock: PriceLock): void {
   const order = TIER_IDS.indexOf(lock.tier);
   const locks = account.locks.filter((l) => l.tier !== lock.tier);
   let at = 0;
@@ -430,6 +611,14 @@ export function promoPrice(list: number, percentOff: number): number {
   return Math.max(1, Math.round((list * (100 - percentOff)) / 100));
 }
 
+/**
+ * Round 4b: the household price a retention offer (incumbent.answerIncumbent)
+ * locks on a list price: max(1, round(list x (100 - RETENTION_PERCENT_OFF) / 100)).
+ */
+export function retentionPrice(list: number): number {
+  return Math.max(1, Math.round((list * (100 - RETENTION_PERCENT_OFF)) / 100));
+}
+
 /** The promo lock a signup on `tier` gets on `day`, or null when the promo price would not be below the list price. */
 function promoLock(pricing: Pricing, tier: TierId, promo: IntroPromo, day: number): PriceLock | null {
   const list = tierOf(pricing, tier).price;
@@ -438,9 +627,29 @@ function promoLock(pricing: Pricing, tier: TierId, promo: IntroPromo, day: numbe
   return { tier, price, untilDay: lockEndDay(day, promo.months), reason: 'promo' };
 }
 
-/** Churn share of a price step by why the price was locked (balance.ts PRICE_STEP_CHURN_*). */
+/**
+ * Round 4b: the price a retention lock gives back when it ends at the close
+ * on `day` (PriceLock.resume: the longer lock it replaced, still promised
+ * after that close), or null when it gives back nothing (its units go to
+ * the list price, or to the cheaper of the two when the list was cut below
+ * it: the caller takes the minimum).
+ */
+function resumedPrice(lock: PriceLock, day: number): number | null {
+  return lock.resume && lock.resume.untilDay > day ? lock.resume.price : null;
+}
+
+/** Churn share of a price step by why the price was locked (balance.ts PRICE_STEP_CHURN_*, RETENTION_STEP_SHARE). */
 export function stepShare(reason: PriceLockReason): number {
-  return reason === 'notice' ? 1 : reason === 'grandfather' ? GRANDFATHER_STEP_SHARE : PROMO_STEP_SHARE;
+  switch (reason) {
+    case 'notice':
+      return 1;
+    case 'grandfather':
+      return GRANDFATHER_STEP_SHARE;
+    case 'promo':
+      return PROMO_STEP_SHARE;
+    case 'retention':
+      return RETENTION_STEP_SHARE;
+  }
 }
 
 /**
@@ -546,25 +755,35 @@ function priceTable(pricing: Pricing): PriceTable {
 
 /**
  * Sum over every subscribed unit of its monthly price (accountUnitPrice:
- * price locks included), and the units counted.
+ * price locks included), and the units counted. Round 4b: units on the
+ * parcels in `cutOff` (an outage leaves them without service today:
+ * network.outageService) are left out of both and their rate is `credit`.
  */
-function billableRate(state: GameState): { rate: number; units: number } {
+function billableRate(state: GameState, cutOff?: ReadonlySet<ParcelId>): { rate: number; units: number; credit: number } {
   const prices = priceTable(state.sales.pricing);
   const parcels = state.city.parcels;
+  const outage = cutOff !== undefined && cutOff.size > 0;
   let rate = 0;
   let units = 0;
+  let credit = 0;
   for (const account of state.sales.accounts) {
     const kind = parcels[account.parcel]?.kind ?? 'home';
     const row = prices[kind];
     const locked = account.locks.length > 0;
+    const out = outage && cutOff.has(account.parcel);
     for (const id of TIER_IDS) {
       const n = account.tierUnits[id];
       if (n === 0) continue;
-      rate += n * (locked ? accountUnitPrice(state, account, id) : row[id]);
+      const amount = n * (locked ? accountUnitPrice(state, account, id) : row[id]);
+      if (out) {
+        credit += amount;
+        continue;
+      }
+      rate += amount;
       units += n;
     }
   }
-  return { rate, units };
+  return { rate, units, credit };
 }
 
 /** Subscribed units per tier over every account (TIER_IDS keys). */
@@ -767,16 +986,6 @@ function installMemo(t: InstallTally): string {
 }
 
 /**
- * Marketing boost to the signup ramp, with diminishing returns (balance.ts):
- * MARKETING_MAX_BOOST x m / (m + MARKETING_HALF_SAT_PER_PASSING x max(1, passings)).
- */
-export function marketingBoost(marketingPerMonth: number, passings: number): number {
-  const m = marketingPerMonth;
-  const saturation = m + MARKETING_HALF_SAT_PER_PASSING * Math.max(1, passings);
-  return m > 0 && saturation > 0 ? (MARKETING_MAX_BOOST * m) / saturation : 0;
-}
-
-/**
  * Fixed offset in [0, 1) per (game seed, segment), used to round a segment's
  * target to whole units: ceil(target - offset) is floor(target) plus one with
  * probability frac(target) over segments, never biased up, and never moves as
@@ -825,11 +1034,17 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  *               street settle at its rounded-up target, e.g. a one-home
  *               street near 100% instead of the take rate)
  *      gap    = max(0, target - subscribed units on P)
- *      boost  = MARKETING_MAX_BOOST x m / (m + MARKETING_HALF_SAT_PER_PASSING x max(1, passings))
- *      expect = gap x SIGNUP_RAMP_PER_DAY x (1 + boost)
+ *      expect = gap x min(1, rate), round 4c/4d (customers.ts model 1):
+ *               rate = awareness x SWITCH_BASE_PER_DAY x deal x word of
+ *               mouth x campaign x the intro promo's boost
+ *               (customers.switchingDay for all but the deal; deal = the
+ *               street's kinds' customers.dealFactor at the incumbent's
+ *               price there, weighted by their target units)
  *      n      = floor(expect) + (rng.chance(expect - floor(expect)) ? 1 : 0),
  *               capped at the unsubscribed units on P (skip the draw when gap is 0).
- *    (passings = getService(state).passings; m = marketingPerMonth.)
+ *    (Round 4b's ramp, a fixed share of the gap a day x (1 + a marketing
+ *    boost), is retired: marketing works through awareness,
+ *    customers.stepCustomers.)
  *    Each new unit: pick a parcel on the segment weighted by its unsubscribed
  *    units, pick a tier by tierMix for its kind (rng), and connect it unless C has no free
  *    port (cabinetPortCapacity - ports used; an apartment building that already
@@ -884,6 +1099,25 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  *   one, reason 'promo' } (none when that is not below the list price). An
  *   apartment building's further units on a tier join what the building
  *   pays there (its lock if any).
+ *
+ * Round 4b:
+ * - The target take rate is the demand-segment model's (targetTakeRate).
+ * - While Sales.promo is set, the ramp (expect above) is also multiplied by
+ *   promoSignupFactor(promo) = 1 + PROMO_SIGNUP_BOOST x percentOff / 100.
+ *   Round 4c (spec C): only on young streets (lit within
+ *   PROMO_BOOST_YOUNG_MONTHS) and where the incumbent runs a promo; its
+ *   discount also raises the deal factor everywhere.
+ *
+ * Round 4c/4d (sim-customers):
+ * - Each connected unit adds round(its street's referral share x 1000) to
+ *   customers.month.referralMilli (customers.referralShareOf: the part word
+ *   of mouth brought, while referral credits are on).
+ * - A unit that connects on a cabinet with a recent wait record, or soon
+ *   after installs were paused (customers.waitedOn), is remembered as having
+ *   waited (customers.noteInstallWaits: CustomerMemory.waitedDay = today).
+ * - A full cabinet's waiting demand is held at the street's own rate.
+ * - Step 3 passes today's outage (network.outageService, computed before the
+ *   signups) to accrueDay, so the units it cuts off are not billed today.
  */
 export function stepSales(state: GameState, rng: Rng): void {
   const service = getService(state);
@@ -911,8 +1145,22 @@ export function stepSales(state: GameState, rng: Rng): void {
     }
     return model;
   };
-  const m = sales.marketingPerMonth;
-  const ramp = SIGNUP_RAMP_PER_DAY * (1 + marketingBoost(m, service.passings));
+  // Round 4c/4d: switching responds to the deal (customers.ts model 1): per
+  // incumbent price, each kind's deal factor; per street, awareness, word of
+  // mouth, the area's campaign and the intro promo's boost (young or contested).
+  const deals = new Map<number, Record<ParcelKind, number>>();
+  const dealAt = (incumbentPrice: number): Record<ParcelKind, number> => {
+    let deal = deals.get(incumbentPrice);
+    if (!deal) {
+      deal = dealFactors(pricing, incumbentPrice, promo);
+      deals.set(incumbentPrice, deal);
+    }
+    return deal;
+  };
+  const switching = switchingDay(state);
+  const waited = waitedOn(state);
+  const waitedParcels: ParcelId[] = [];
+  let referralMilli = 0;
 
   const accounts = sales.accounts;
   // Index into `accounts` per parcel (-1: no account).
@@ -962,11 +1210,14 @@ export function stepSales(state: GameState, rng: Rng): void {
       server = working;
       rerouted = true;
     }
-    const { take, mixes } = demandAt(localPrice.get(nearest) ?? INCUMBENT_PRICE);
+    const incumbentPrice = localPrice.get(nearest) ?? INCUMBENT_PRICE;
+    const { take, mixes } = demandAt(incumbentPrice);
+    const deal = dealAt(incumbentPrice);
     const from = index.segStart[seg] as number;
     const to = index.segStart[seg + 1] as number;
 
     let target = 0;
+    let dealWeighted = 0;
     let subscribed = 0;
     let open = 0;
     // Ports the open parcels without an account would take, and the fewest one needs.
@@ -976,7 +1227,9 @@ export function stepSales(state: GameState, rng: Rng): void {
       const parcel = parcels[index.parcelIds[k] as number];
       if (!parcel || parcel.appearsDay > day) continue;
       const sub = subscribedAt(parcel.id);
-      target += take[parcel.kind] * parcel.units;
+      const units = take[parcel.kind] * parcel.units;
+      target += units;
+      dealWeighted += units * deal[parcel.kind];
       subscribed += sub;
       open += Math.max(0, parcel.units - sub);
       if (sub === 0 && parcel.units > 0) {
@@ -985,6 +1238,8 @@ export function stepSales(state: GameState, rng: Rng): void {
         fewestPorts = Math.min(fewestPorts, ports);
       }
     }
+    // The street's deal factor: its kinds' factors weighted by their target units.
+    const streetDeal = target > 0 ? dealWeighted / target : 0;
     // Whole units, rounded with this segment's fixed offset: unbiased, so a
     // one-home street settles near the take rate instead of always signing up.
     target = Math.max(0, Math.ceil(target - segmentOffset(state.seed, seg)));
@@ -993,6 +1248,9 @@ export function stepSales(state: GameState, rng: Rng): void {
     let connectedHere = 0;
     let portsTakenHere = 0;
 
+    const street = switching(seg, nearest, localPrice.has(nearest));
+    const ramp = Math.min(1, street.rate * streetDeal);
+    const referralMilliPerUnit = Math.round(street.referral * 1000);
     const expect = gap * ramp;
     const whole = Math.floor(expect);
     const n = Math.min(open, whole + (rng.chance(expect - whole) ? 1 : 0));
@@ -1066,6 +1324,9 @@ export function stepSales(state: GameState, rng: Rng): void {
       finance.capex.connect += cost;
       sales.connectsTotal += 1;
       sales.month.grossAdds += 1;
+      // Round 4c/4d: referral credits (the part word of mouth brought) and an install wait.
+      referralMilli += referralMilliPerUnit;
+      if (waited(server)) waitedParcels.push(chosen);
     }
 
     // Demand still waiting here that needs new ports on the server (its own, not a stand-in's).
@@ -1079,6 +1340,8 @@ export function stepSales(state: GameState, rng: Rng): void {
   if (addedAccount) accounts.sort((a, b) => a.parcel - b.parcel);
   if (addedRouter) sales.routerParcels = [...routers].sort((a, b) => a - b);
   if (spend > 0) postEntry(state, 'install', -spend, installMemo(tally));
+  if (referralMilli > 0) state.customers.month.referralMilli += referralMilli;
+  if (waitedParcels.length > 0) noteInstallWaits(state, waitedParcels);
 
   if (cashBlockedCost !== null) {
     if (!sales.installsPaused) {
@@ -1095,8 +1358,8 @@ export function stepSales(state: GameState, rng: Rng): void {
     postNotice(state, 'installsResumed', `${INSTALLS_RESUMED_PREFIX}: cash covers installs again, and waiting customers are being connected.`);
   }
 
-  // 3. Accruals, after today's signups.
-  accrueDay(state);
+  // 3. Accruals, after today's signups; units an outage cuts off are not billed today.
+  accrueDay(state, outage);
 
   // 4. Cabinets turning signups away: a cabinet becomes full when it has no
   // room for a waiting new account, and stays full while its waiting demand
@@ -1126,13 +1389,20 @@ export function stepSales(state: GameState, rng: Rng): void {
  * marketingPerMonth, month.subscriberUnitDays += subscribed units. Step 3 of
  * stepSales; tick() also runs it for day 0, which gets no sales step, so the
  * first month bills every one of its days.
+ *
+ * Round 4b: outage days are not billed. The units of the accounts `outage`
+ * cuts off today (network.outageService, which stepSales computes before
+ * its signups; null or omitted: nobody, as on day 0) are left out of
+ * revenueDollarDays and subscriberUnitDays (so no support is charged for
+ * them either), and their monthly rate is added to outageCreditDollarDays.
  */
-export function accrueDay(state: GameState): void {
+export function accrueDay(state: GameState, outage: OutageService | null = null): void {
   const { sales } = state;
-  const { rate, units } = billableRate(state);
+  const { rate, units, credit } = billableRate(state, outage?.cutOff);
   sales.month.revenueDollarDays += rate;
   sales.month.marketingDollarDays += sales.marketingPerMonth;
   sales.month.subscriberUnitDays += units;
+  sales.month.outageCreditDollarDays += credit;
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,7 +1413,10 @@ export function accrueDay(state: GameState): void {
 export interface SalesClose {
   revenue: number;
   marketing: number;
+  /** Round 4c/4d: the support level's part of the per-customer overhead line (overhead.postCustomerOverhead). */
   support: number;
+  /** Round 4c/4d: the per-customer overhead line posted at this close (support included), whole dollars. */
+  perCustomer: number;
   /** Subscriber-days billed in the month (month.subscriberUnitDays before the reset). */
   subscriberDays: number;
   grossAdds: number;
@@ -1160,20 +1433,30 @@ export interface SalesClose {
   priceChurn: number;
   outageChurn: number;
   incumbentChurn: number;
+  /** Round 4b: billing not charged for outage days, round(month.outageCreditDollarDays / daysInMonth), >= 0 (MonthlyReport.ops.outageCredits). */
+  outageCredits: number;
 }
 
 /**
  * Monthly churn probability for a unit of `kind` on `tier` at the price it
- * pays: a household's is the tier price against its default price; a
- * business's is price x smbMultiplier against default price x
- * SMB_MULTIPLIER_DEFAULT (the same as a household's at the default multiplier).
- * Round 4: pass the tier at what the unit pays (its lock price, when lower).
+ * pays, with no other happiness factor (Good support, no outages, price
+ * steps or waits remembered, cable at its standard price): a household's
+ * compares the tier price with its default price; a business's compares
+ * price x smbMultiplier with default price x SMB_MULTIPLIER_DEFAULT (the
+ * same as a household's at the default multiplier). Round 4: pass the tier
+ * at what the unit pays (its lock price, when lower).
+ *
+ * Round 4c/4d: customers.churnFromScore of the unit's price factors
+ * (customers.priceScores: priceVsMarket above the default price, goodDeal
+ * below it), so CHURN_MONTHLY_BASE x (1 + HAPPINESS_PER_PRICE_OVER_MARKET x
+ * the share above the default) up to CHURN_MONTHLY_MAX, as round 4's
+ * price sensitivity did, and less below the default (down to
+ * HAPPY_CHURN_FLOOR of the base). The close charges each unit its full
+ * happiness churn (customers.regularChurnReader).
  */
 export function churnProbability(tier: Tier, kind: ParcelKind = 'home', smbMultiplier: number = SMB_MULTIPLIER_DEFAULT): number {
-  const base = DEFAULT_PRICE[tier.id] ?? tier.price;
-  const factor = kind === 'smb' ? smbMultiplier / SMB_MULTIPLIER_DEFAULT : 1;
-  const over = base > 0 ? Math.max(0, tier.price * factor - base) / base : 0;
-  return Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + CHURN_PRICE_SENSITIVITY * over));
+  const p = priceScores(tier.id, kind, tier.price, smbMultiplier, INCUMBENT_PRICE);
+  return churnFromScore(p.priceVsMarket + p.goodDeal);
 }
 
 /** The pieces of one unit's churn probability at a close (see closeSalesMonth step 6). */
@@ -1216,6 +1499,8 @@ function stepWhy(reasons: ReadonlySet<PriceLockReason>): string {
   if (reasons.size === 1 && reasons.has('grandfather')) return 'whose grandfathered prices ended';
   if (reasons.size === 1 && reasons.has('promo')) return 'whose intro promos ended';
   if (reasons.size === 1 && reasons.has('notice')) return 'whose announced price rise took effect';
+  if (reasons.size === 1 && reasons.has('retention')) return 'whose retention offers ended';
+  if (reasons.has('retention')) return 'whose discounted or grandfathered prices ended';
   return 'whose grandfathered or intro prices ended';
 }
 
@@ -1225,9 +1510,14 @@ function stepWhy(reasons: ReadonlySet<PriceLockReason>): string {
  * days and its last day (the date every entry is posted on). In order:
  * 1. 'revenue' +round(month.revenueDollarDays / daysInMonth) (skip if 0), memo
  *    "Subscriber billing for Mar 2027: 412 subscribers" (billing accrued at
- *    what each unit paid that day: price locks included).
+ *    what each unit paid that day: price locks included; round 4b: outage
+ *    days left out, and the memo adds "($120 not billed for outage days)"
+ *    when round(month.outageCreditDollarDays / daysInMonth) > 0).
  * 2. 'marketing' -round(month.marketingDollarDays / daysInMonth) (skip if 0).
- * 3. 'overhead' -round(SUPPORT_COST_PER_SUB_PER_MONTH x month.subscriberUnitDays / daysInMonth) (skip if 0), memo "Customer support".
+ * 3. Round 4c/4d: overhead.postCustomerOverhead(month.subscriberUnitDays):
+ *    the per-customer overhead line, support at the level included (one
+ *    'overhead' entry, "Customer costs for Mar 2027: 412 customers on Good
+ *    support").
  * 4. Tier retirement (round 4): units on a tier not offered move to
  *    retireDestination (the offered tier nearest in list price, ties to the
  *    cheaper). Accounts ascending, retired tiers in TIER_IDS order, one draw
@@ -1240,27 +1530,45 @@ function stepWhy(reasons: ReadonlySet<PriceLockReason>): string {
  *    count in tierMoves; the cancellations in churned and priceChurn.
  * 5. Churn: every subscribed unit (accounts ascending, tiers in TIER_IDS
  *    order) draws once against the sum of (ChurnParts):
- *      regular   - churnProbability at what it pays (its lock price, when lower)
+ *      regular   - round 4c/4d: the unit's happiness churn at what it pays
+ *                  (its lock price, when lower): customers.regularChurnReader
+ *                  (support, remembered outages, price steps and waits, its
+ *                  price against the market and cable's local price on the
+ *                  ended month's last day), less the incumbent part
  *      price     - when its lock ends at this close (untilDay <= state.day):
- *                  stepChurnProbability(lock price, list price, stepShare(reason))
+ *                  stepChurnProbability(lock price, list price, stepShare(reason));
+ *                  round 4b: to the price of the lock a retention lock gives
+ *                  back (PriceLock.resume), when lower than the list price
  *      outage    - the churn of the account's days cut off since the last
  *                  close (weather.outageChargeOf: outageChurnProbability of
  *                  its days, less what earlier closes charged the same
  *                  outage, so its base churn is charged once), times the
  *                  share of its units that were cut off (units it added
  *                  later were not)
- *      incumbent - incumbent.incumbentChurnFor(its cabinet): a promo ran there
+ *      incumbent - round 4c/4d: the share of the happiness churn its
+ *                  priceVsCable factor adds (the incumbent is folded into
+ *                  happiness, calibrated so a unit at the list price where
+ *                  a promo ran pays INCUMBENT_PROMO_CHURN; the default
+ *                  retention offer answers it in full, a cheaper lock pays
+ *                  less whether answered or not; incumbentChurnFor no
+ *                  longer feeds the close)
  *    capped at CHURN_TOTAL_MAX; a cancellation counts in churned and in the
  *    part its draw falls in (churnCause). Accounts left with 0 units are
  *    removed (routers stay in routerParcels).
  * 6. Locks ending at this close (untilDay <= state.day) are removed (their
- *    units pay the list price from now on), with locks on tiers left with no
- *    units and locks no longer below the list price. When any ended with a
+ *    units pay the list price from now on; round 4b: a retention lock with a
+ *    `resume` becomes that lock instead, { tier, ...resume }), with locks on
+ *    tiers left with no units and locks no longer below the list price. When any ended with a
  *    real rise, one 'priceStep' notice ("Prices stepped up for 312
  *    subscribers whose grandfathered prices ended at the Mar 2028 close: 11
- *    cancelled."; the cancellations are those step 5 put on the price part).
+ *    cancelled."; the cancellations are those step 5 put on the price part;
+ *    round 4b: "whose retention offers ended" for retention locks).
  * 7. Reset `month` to emptyMonthAccrual() and return the figures (subscriber
  *    days, grossAdds and lostService from the accrual before the reset).
+ * Round 4c/4d: after step 6 the accounts whose price stepped up at this
+ * close (a lock ending with a rise, units moved to a dearer tier, and still
+ * subscribed) are remembered (customers.notePriceSteps), so the happiness
+ * factor counts from the next close on, never in this close's draws.
  * Only the sales stream `rng` is drawn from, in the order above.
  */
 export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number, lastDay: number): SalesClose {
@@ -1271,17 +1579,19 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
   const label = formatMonth(ended.year, ended.month);
 
   const revenue = Math.round(month.revenueDollarDays / daysInMonth);
+  const outageCredits = Math.max(0, Math.round(month.outageCreditDollarDays / daysInMonth));
   if (revenue !== 0) {
     const subs = plural(subscriberUnits(state), 'subscriber', 'subscribers');
-    postEntryOn(state, lastDay, 'revenue', revenue, `Subscriber billing for ${label}: ${subs}`);
+    const credited = outageCredits > 0 ? ` (${formatMoney(outageCredits)} not billed for outage days)` : '';
+    postEntryOn(state, lastDay, 'revenue', revenue, `Subscriber billing for ${label}: ${subs}${credited}`);
   }
   const marketing = Math.round(month.marketingDollarDays / daysInMonth);
   if (marketing !== 0) postEntryOn(state, lastDay, 'marketing', -marketing, `Marketing for ${label}`);
-  const support = Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * month.subscriberUnitDays) / daysInMonth);
-  if (support !== 0) postEntryOn(state, lastDay, 'overhead', -support, 'Customer support');
+  // Round 4c/4d: the per-customer overhead line (support at the level) is overhead.ts's to price and post.
+  const customerCost = postCustomerOverhead(state, lastDay, label, month.subscriberUnitDays, daysInMonth);
+  const support = customerCost.support;
 
   const pricing = sales.pricing;
-  const parcels = state.city.parcels;
   const list = zeroTiers();
   for (const id of TIER_IDS) list[id] = tierOf(pricing, id).price;
   let churned = 0;
@@ -1289,6 +1599,9 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
   let outageChurn = 0;
   let incumbentChurn = 0;
   let tierMoves = 0;
+
+  // Round 4c/4d: accounts whose price stepped up at this close (memory written after the draws).
+  const priceSteps = new Set<ParcelId>();
 
   // 4. Tier retirement.
   const destination = new Map<TierId, TierId>();
@@ -1305,11 +1618,15 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
         const n = account.tierUnits[id];
         if (to === undefined || n === 0) continue;
         const lock = lockOn(account, id);
-        const p = retireChurnProbability(lock ? Math.min(lock.price, list[id]) : list[id], list[to]);
+        const paid = lock ? Math.min(lock.price, list[id]) : list[id];
+        const p = retireChurnProbability(paid, list[to]);
         let kept = 0;
         for (let u = 0; u < n; u++) if (!rng.chance(p)) kept++;
         account.tierUnits[id] = 0;
         account.tierUnits[to] += kept;
+        // A move to a dearer tier is a price step (the units joining a cheaper lock there are not).
+        const toLock = lockOn(account, to);
+        if (kept > 0 && (toLock ? Math.min(toLock.price, list[to]) : list[to]) > paid) priceSteps.add(account.parcel);
         if (lock) account.locks = account.locks.filter((l) => l.tier !== id);
         const tally = retired.get(id) ?? { units: 0, cancelled: 0 };
         tally.units += n;
@@ -1336,39 +1653,39 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
   }
 
   // 5. Churn, one draw per unit, attributed to the part it falls in.
-  const regularAtList: Record<ParcelKind, Record<TierId, number>> = { home: zeroTiers(), mdu: zeroTiers(), smb: zeroTiers() };
-  for (const tier of pricing.tiers) {
-    for (const kind of ['home', 'mdu', 'smb'] as const) regularAtList[kind][tier.id] = churnProbability(tier, kind, pricing.smbMultiplier);
-  }
+  // Round 4c/4d: the regular part is the unit's happiness churn (customers.
+  // regularChurnReader: support, remembered outages, price steps and waits,
+  // its price against the market and against cable's local price, the
+  // incumbent's promo price as it stood on the ended month's last day); the
+  // share its priceVsCable factor adds is the incumbent part.
+  const regularOf = regularChurnReader(state, lastDay);
   let stepUnits = 0;
   let stepCancelled = 0;
   const stepReasons = new Set<PriceLockReason>();
   let emptied = false;
   for (const account of sales.accounts) {
-    const parcel = parcels[account.parcel];
-    const kind = parcel?.kind ?? 'home';
     const charge = outageChargeOf(state, account.parcel);
     // Spread over the account's units by the share of them that were cut off: units it added later were not.
     const outage = charge ? charge.probability * Math.min(1, charge.units / Math.max(1, accountUnits(account))) : 0;
-    const incumbent = incumbentChurnFor(state, account.cabinet);
     for (const id of TIER_IDS) {
       const units = account.tierUnits[id];
       if (units === 0) continue;
       const lock = account.locks.length > 0 ? lockOn(account, id) : undefined;
-      let regular = regularAtList[kind][id];
+      const paid = lock ? Math.min(lock.price, list[id]) : list[id];
+      const happiness = regularOf(account, id, paid);
       let price = 0;
       let stepping = false;
       if (lock) {
-        const paid = Math.min(lock.price, list[id]);
-        if (paid < list[id]) regular = churnProbability({ ...tierOf(pricing, id), price: paid }, kind, pricing.smbMultiplier);
-        if (lock.untilDay <= day && list[id] > lock.price) {
-          price = stepChurnProbability(lock.price, list[id], stepShare(lock.reason));
+        // Round 4b: a retention lock that replaced a longer one steps back to that one's price (resumedPrice).
+        const next = Math.min(resumedPrice(lock, day) ?? list[id], list[id]);
+        if (lock.untilDay <= day && next > lock.price) {
+          price = stepChurnProbability(lock.price, next, stepShare(lock.reason));
           stepping = true;
           stepUnits += units;
           stepReasons.add(lock.reason);
         }
       }
-      const parts: ChurnParts = { regular, price, outage, incumbent };
+      const parts: ChurnParts = { regular: happiness.regular, price, outage, incumbent: happiness.cable };
       let left = units;
       for (let u = 0; u < units; u++) {
         const cause = churnCause(parts, rng.next());
@@ -1382,15 +1699,18 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
       }
       churned += units - left;
       account.tierUnits[id] = left;
+      if (stepping && left > 0) priceSteps.add(account.parcel);
     }
     if (accountUnits(account) === 0) emptied = true;
   }
   if (emptied) sales.accounts = sales.accounts.filter((a) => accountUnits(a) > 0);
 
-  // 6. Locks that end here: their units pay the list price from now on.
+  // 6. Locks that end here: their units pay the list price from now on (round 4b: or the lock a retention lock gives back).
   for (const account of sales.accounts) {
     if (account.locks.length === 0) continue;
-    account.locks = account.locks.filter((l) => l.untilDay > day && account.tierUnits[l.tier] > 0 && l.price < list[l.tier]);
+    account.locks = account.locks
+      .map((l): PriceLock => (l.untilDay <= day && l.resume && resumedPrice(l, day) !== null ? { tier: l.tier, price: l.resume.price, untilDay: l.resume.untilDay, reason: l.resume.reason } : l))
+      .filter((l) => l.untilDay > day && account.tierUnits[l.tier] > 0 && l.price < list[l.tier]);
   }
   if (stepUnits > 0) {
     postNotice(
@@ -1399,11 +1719,14 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
       `Prices stepped up for ${plural(stepUnits, 'subscriber', 'subscribers')} ${stepWhy(stepReasons)} at the ${label} close: ${groupThousands(stepCancelled)} cancelled.`,
     );
   }
+  // Round 4c/4d: remember the price steps (after the draws: the happiness factor counts from the next close on).
+  if (priceSteps.size > 0) notePriceSteps(state, [...priceSteps].sort((a, b) => a - b));
 
   const result: SalesClose = {
     revenue,
     marketing,
     support,
+    perCustomer: customerCost.perCustomer,
     subscriberDays: month.subscriberUnitDays,
     grossAdds: month.grossAdds,
     churned,
@@ -1412,6 +1735,7 @@ export function closeSalesMonth(state: GameState, rng: Rng, daysInMonth: number,
     priceChurn,
     outageChurn,
     incumbentChurn,
+    outageCredits,
   };
   sales.month = emptyMonthAccrual();
   return result;
@@ -1612,6 +1936,11 @@ export function setPromo(state: GameState, promo: IntroPromo | null): CommandRes
  *   mrrAfterLocks: the same once the locks it creates have ended and the
  *   moves have happened (moved units at the destination's list price; locks
  *   already held stay held). Neither counts regular churn or cancellations.
+ * - round 4c (spec C): mrrAfterChurn = mrrAfterLocks less what the units
+ *   expected to cancel (each unit's cancellation probability above x what
+ *   it would pay after the locks and moves) would have paid, rounded (at
+ *   least 0): the MRR preview for dropping tiers accounts for the
+ *   cancellations it lists.
  */
 export function quotePricing(
   state: GameState,
@@ -1633,6 +1962,7 @@ export function quotePricing(
       mrrAfterLocks: mrr,
       unitsMoving: 0,
       expectedChurn: 0,
+      mrrAfterChurn: mrr,
     };
   }
   const { settings } = check;
@@ -1656,6 +1986,8 @@ export function quotePricing(
   let mrrNow = 0;
   let mrrAfterLocks = 0;
   let expectedChurn = 0;
+  // Round 4c (spec C): what the expected cancellations would have paid after the locks and moves.
+  let lostMrr = 0;
   let created = false;
   for (const account of state.sales.accounts) {
     const kind = state.city.parcels[account.parcel]?.kind ?? 'home';
@@ -1674,20 +2006,29 @@ export function quotePricing(
       if (destination.has(id)) {
         unitsMoving += n;
         const to = destination.get(id) ?? id;
-        mrrAfterLocks += n * bill(L1[to], kind);
-        expectedChurn += n * retireChurnProbability(payNow, L1[to]);
+        const after = bill(L1[to], kind);
+        const p = retireChurnProbability(payNow, L1[to]);
+        mrrAfterLocks += n * after;
+        expectedChurn += n * p;
+        lostMrr += n * p * after;
         continue;
       }
       if (L1[id] > L0[id]) unitsRising += n;
       if (L1[id] < paidToday) unitsFalling += n;
-      mrrAfterLocks += n * bill(creates ? L1[id] : payNow, kind);
+      const after = bill(creates ? L1[id] : payNow, kind);
+      mrrAfterLocks += n * after;
+      let p = 0;
       if (creates) {
         created = true;
-        expectedChurn += n * stepChurnProbability(L0[id], L1[id], share);
+        p = stepChurnProbability(L0[id], L1[id], share);
       } else if (lock && lockPrice !== null && L1[id] > L0[id]) {
-        const s = stepShare(lock.reason);
-        expectedChurn += n * Math.max(0, stepChurnProbability(lockPrice, L1[id], s) - stepChurnProbability(lockPrice, L0[id], s));
+        // Round 4b: a retention lock giving a longer lock back (PriceLock.resume) reaches the list price from that one.
+        const from = lock.resume ? Math.min(lock.resume.price, L0[id]) : lockPrice;
+        const s = stepShare(lock.resume ? lock.resume.reason : lock.reason);
+        p = Math.max(0, stepChurnProbability(from, L1[id], s) - stepChurnProbability(from, L0[id], s));
       }
+      expectedChurn += n * p;
+      lostMrr += n * p * after;
     }
   }
   return {
@@ -1701,5 +2042,143 @@ export function quotePricing(
     mrrAfterLocks,
     unitsMoving,
     expectedChurn: Math.round(expectedChurn),
+    mrrAfterChurn: Math.max(0, Math.round(mrrAfterLocks - lostMrr)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Round 4b (pricing-balance workstream implements): demand segments, the
+// intro promo's quote
+// ---------------------------------------------------------------------------
+
+/**
+ * Who a lineup wins, by demand segment (balance.DEMAND_SEGMENTS, in that
+ * order): each segment's share, its target take rate (a household's: before
+ * TAKE_RATE_KIND_FACTOR; `kind` sets the price factor as targetTakeRate
+ * does) and the tier it mostly takes (null when no offered tier suits it:
+ * it does not sign up), against the incumbent at `incumbentPrice` with the
+ * intro promo valued (demandOf). Sum over segments of share x takeRate x
+ * TAKE_RATE_KIND_FACTOR[kind] = targetTakeRate(pricing, kind,
+ * incumbentPrice, promo). Pure.
+ */
+export function segmentDemand(
+  pricing: Pricing,
+  kind: ParcelKind = 'home',
+  incumbentPrice: number = INCUMBENT_PRICE,
+  promo: IntroPromo | null = null,
+): SegmentDemand[] {
+  return demandOf(pricing, kind, incumbentPrice, promo).map((view) => {
+    let tier: TierId | null = null;
+    if (view.take > 0) for (const id of TIER_IDS) if (view.mix[id] > 0 && (tier === null || view.mix[id] > view.mix[tier])) tier = id;
+    return { segment: view.segment.id, share: view.segment.share, takeRate: view.take, tier };
+  });
+}
+
+/** Round 4b: the intro promo the pricing panel's controls start at (a suggestion, not a balance value), and the one incumbent.bestIncumbentAnswer weighs. */
+export const SUGGESTED_PROMO: Readonly<IntroPromo> = { percentOff: Math.min(20, PROMO_MAX_PERCENT_OFF), months: Math.min(3, PROMO_MAX_MONTHS) };
+
+/** Days in an average month: the quotes' day <-> month conversions. */
+export const DAYS_PER_MONTH = 365 / 12;
+
+/** "about $4,100": whole hundreds from $1,000, tens below. */
+export function roughMoney(amount: number): string {
+  const step = Math.abs(amount) >= 1_000 ? 100 : 10;
+  return formatMoney(Math.round(amount / step) * step);
+}
+
+/**
+ * What setting `promo` (null: none) would do over the next
+ * PROMO_QUOTE_MONTHS (see PromoQuote), against no intro promo at all. Pure,
+ * no rng. ok/reasons as setPromo would decide (and false once the game is
+ * over); with `cabinet`, only the streets that cabinet serves count (the
+ * incumbent's contested area: bestIncumbentAnswer).
+ * Round 4c (spec C): customers.forecastCustomers plays both cases out day by
+ * day under the round-4c rules: the promo raises each street's target and
+ * its deal factor by its discount share over PROMO_HORIZON_MONTHS (longer
+ * and deeper offers do more, with diminishing returns through the deal
+ * clamp), and its signup boost (promoSignupFactor) applies only on young
+ * streets (lit within PROMO_BOOST_YOUNG_MONTHS) and where the cable company
+ * runs a promo; every new signup is discounted for its promo months (inside
+ * the horizon) and a share of them cancels at the step when it ends
+ * (PROMO_STEP_SHARE).
+ * - waitingUnits: the lit streets' gap today (target less subscribed) with
+ *   the promo valued (without one for null).
+ * - extraSignups = signups with the promo less without; discountCost = the
+ *   discounted subscriber-months x percentOff of the new signups' average
+ *   list price; valueGained = the extra subscriber-months x that price less
+ *   overhead.perCustomerCost (installs left out: they only come sooner);
+ *   pays = valueGained > discountCost. So it pays where many households
+ *   wait on young or contested streets, and not in a mature town, where it
+ *   mostly discounts people who would sign up anyway.
+ * - advice: one sentence on when it pays (promoAdvice).
+ */
+export function quotePromo(state: GameState, promo: IntroPromo | null, cabinet?: CabinetId): PromoQuote {
+  const inRange =
+    promo === null ||
+    (typeof promo === 'object' &&
+      Number.isInteger(promo.percentOff) &&
+      promo.percentOff >= 1 &&
+      promo.percentOff <= PROMO_MAX_PERCENT_OFF &&
+      Number.isInteger(promo.months) &&
+      promo.months >= 1 &&
+      promo.months <= PROMO_MAX_MONTHS);
+  const reasons: string[] = [];
+  if (state.gameOver) reasons.push(`Game over: ${state.gameOver.message}`);
+  if (!inRange) reasons.push(`An intro promo is 1-${PROMO_MAX_PERCENT_OFF}% off for 1-${PROMO_MAX_MONTHS} months`);
+  const quote: PromoQuote = { ok: reasons.length === 0, reasons, promo, waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false, advice: '' };
+  if (!quote.ok) return quote;
+
+  const area = cabinet === undefined ? {} : { cabinet };
+  const base = forecastCustomers(state, { ...area, promo: null, months: PROMO_QUOTE_MONTHS });
+  const offered = promo === null ? base : forecastCustomers(state, { ...area, promo, months: PROMO_QUOTE_MONTHS });
+  const waiting = offered.gap;
+  quote.waitingUnits = Math.round(waiting);
+  if (promo !== null && waiting > 0) {
+    const price = offered.signupPrice;
+    const margin = Math.max(0, price - perCustomerCost(state));
+    const discount = ((offered.promoUnitDays / DAYS_PER_MONTH) * price * promo.percentOff) / 100;
+    const value = ((offered.unitDays - base.unitDays) / DAYS_PER_MONTH) * margin;
+    quote.extraSignups = Math.max(0, Math.round(offered.signups - base.signups));
+    quote.discountCost = Math.round(discount);
+    quote.valueGained = Math.max(0, Math.round(value));
+    quote.pays = value > discount;
+  }
+  quote.advice = promoAdvice(quote, offered.youngGap, offered.contestedGap);
+  return quote;
+}
+
+/**
+ * quotePromo's sentence on when an intro promo pays, from its figures and
+ * how many of the waiting units are on young streets (round 4c: lit within
+ * PROMO_BOOST_YOUNG_MONTHS, where its signup boost applies) and on streets
+ * where the cable company runs a promo (its boost applies there too): pays
+ * or not, and why (newly lit or contested areas vs a mature town). Pure.
+ */
+export function promoAdvice(quote: PromoQuote, young: number, contested: number): string {
+  const waiting = quote.waitingUnits;
+  const households = plural(waiting, 'household', 'households');
+  const year = PROMO_BOOST_YOUNG_MONTHS === 12 ? 'the last year' : `the last ${plural(PROMO_BOOST_YOUNG_MONTHS, 'month', 'months')}`;
+  if (waiting < 1) return 'Nobody is waiting to sign up now: an intro promo pays once you light new areas, where many households have yet to sign up.';
+  if (quote.promo === null) {
+    return (
+      `About ${households} ${waiting === 1 ? 'is' : 'are'} waiting to sign up. An intro promo speeds up signups on streets lit in ${year} ` +
+      "and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway."
+    );
+  }
+  const fresh = young * 2 >= waiting;
+  const fought = contested * 2 >= waiting;
+  if (quote.pays) {
+    const where = fresh ? ' on newly lit streets' : fought ? " where the cable company's promo runs" : '';
+    return (
+      `Pays now: about ${households}${where} ${waiting === 1 ? 'is' : 'are'} waiting to sign up and it brings them in sooner ` +
+      '(in a mature town it would mostly discount people who would sign up anyway).'
+    );
+  }
+  if (fresh || fought || young + contested > 0) {
+    return (
+      `Doesn't pay at this discount: it costs more than bringing the ${households} waiting in sooner is worth; ` +
+      'a smaller or shorter offer may pay while streets are newly lit.'
+    );
+  }
+  return `Doesn't pay now: your streets were lit over ${year === 'the last year' ? 'a year' : year.replace('the last ', '')} ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.`;
 }

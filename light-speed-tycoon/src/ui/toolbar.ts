@@ -1,5 +1,7 @@
 // Tool palette: vertical on the left, a bottom bar at phone width. After the
-// tools comes the $/ft cost overlay toggle (a view switch, not a tool).
+// tools come the view switches (not tools): the $/ft cost overlay and (round
+// 4b) the storm-exposure overlay. MapControls keeps the two overlays apart:
+// switching one on switches the other off.
 
 import { el, icon } from './dom';
 import { ICONS } from './icons';
@@ -21,14 +23,18 @@ export const TOOLS: readonly ToolInfo[] = [
 ];
 
 export const OVERLAY_KEY = 'O';
+/** Round 4b: the storm-exposure overlay's key. */
+export const EXPOSURE_KEY = 'E';
 
 export class Toolbar {
   readonly root: HTMLElement;
   /** The $/ft cost overlay switch. */
   readonly overlayButton: HTMLButtonElement;
+  /** Round 4b: the storm-exposure overlay switch. */
+  readonly exposureButton: HTMLButtonElement;
   private readonly buttons = new Map<ToolId, HTMLButtonElement>();
 
-  constructor(onPick: (tool: ToolId) => void, onToggleOverlay: () => void = () => {}) {
+  constructor(onPick: (tool: ToolId) => void, onToggleOverlay: () => void = () => {}, onToggleExposure: () => void = () => {}) {
     this.root = el('nav', { class: 'toolbar pill-card', attrs: { 'aria-label': 'Tools' } });
     for (const tool of TOOLS) {
       const button = el(
@@ -66,7 +72,23 @@ export class Toolbar {
       },
       [icon(ICONS.layers), el('kbd', { text: OVERLAY_KEY, attrs: { 'aria-hidden': 'true' } })],
     );
-    this.root.append(this.overlayButton);
+    this.exposureButton = el(
+      'button',
+      {
+        class: 'btn tool tool-exposure',
+        attrs: {
+          type: 'button',
+          'aria-label': `Storm exposure overlay (${EXPOSURE_KEY})`,
+          'aria-pressed': 'false',
+          'aria-keyshortcuts': EXPOSURE_KEY,
+          'data-tip': `Storm exposure: color every street by how often storms hit it, sheltered to exposed (${EXPOSURE_KEY})`,
+          'data-testid': 'exposure-overlay-toggle',
+        },
+        on: { click: () => onToggleExposure() },
+      },
+      [icon(ICONS.storm), el('kbd', { text: EXPOSURE_KEY, attrs: { 'aria-hidden': 'true' } })],
+    );
+    this.root.append(this.overlayButton, this.exposureButton);
   }
 
   select(tool: ToolId): void {
@@ -76,5 +98,10 @@ export class Toolbar {
   /** Show the cost overlay switch as on or off. */
   setOverlay(on: boolean): void {
     this.overlayButton.setAttribute('aria-pressed', String(on));
+  }
+
+  /** Show the storm-exposure overlay switch as on or off. */
+  setExposureOverlay(on: boolean): void {
+    this.exposureButton.setAttribute('aria-pressed', String(on));
   }
 }

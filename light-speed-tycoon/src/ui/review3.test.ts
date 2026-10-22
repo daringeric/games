@@ -1,12 +1,15 @@
 // Regressions from the round-3 review of the Bank, the HUD and the toasts:
 // each test reproduces a confirmed finding (numbered as in the review) on
 // real sim state or literal figures, and pins the fix. Money and limits come
-// from balance.ts constants or the sim's own results.
+// from balance.ts constants or the sim's own results. Round 4c/4d: the same
+// findings, pinned on the health-first Bank's view models (loan rows, the
+// borrow preview, the payment warning, the health words, the disclosures).
 
 import { describe, expect, it } from 'vitest';
-import { ARR_TRAILING_MONTHS, COVENANT_MAX_LEVERAGE, INSOLVENCY_GRACE_MONTHS, PENALTY_STEP_UP_BPS } from '../sim/balance';
+import { ARR_TRAILING_MONTHS, COVENANT_MAX_LEVERAGE, INSOLVENCY_GRACE_MONTHS, MARKETING_MAX_PER_MONTH, PENALTY_STEP_UP_BPS } from '../sim/balance';
 import { dateOf, dayOf, formatDate, formatMonth, MONTH_LENGTHS } from '../sim/calendar';
 import {
+  bankHealth,
   closeDebtMonth,
   covenantMetrics,
   creditOffer,
@@ -22,21 +25,27 @@ import { Rng } from '../sim/rng';
 import { closedMonth, makeLoan, makeTradingState } from '../sim/testing/fixtures';
 import type { GameState, MonthlyReport, Notice, TermLoan } from '../sim/types';
 import {
-  AT_RISK_LABEL,
   BANK_NOTICES_SHOWN,
+  bankFigures,
   bankNotices,
+  borrowPreview,
   cashAtCloseFigure,
-  covenantView,
-  creditView,
+  coverageCheck,
+  debtCheck,
+  healthView,
   isBankNotice,
   lastTestFigure,
-  loanView,
+  loanRow,
   nextCloseDay,
   nextPaymentFigure,
   noticeHeadline,
-  termView,
+  paymentWarning,
+  plainRate,
+  rateRows,
+  termDetailLines,
 } from './bankPanel';
-import { formatMoney, formatRatio, plural } from './format';
+import { formatBpsDelta, formatMoney, formatRatio, plural } from './format';
+import { healthSentence } from './health';
 import { covenantStatus, overdraftStatus } from './hud';
 import { TOAST_MAX_MS, TOAST_MS, WARN_TOAST_MS, toastDuration } from './overlays';
 import { monthClosedTone } from './panel';
@@ -77,25 +86,26 @@ describe('#1 the loan row and the quote name the real last payment', () => {
     state.debt.loans = [loan];
     const last = finalPayment(state, loan);
     expect(last).not.toBe(loan.payment);
-    const view = loanView(loan, day, 0, last);
-    expect(view.payment).toBe(`${formatMoney(loan.payment)}/mo`);
-    expect(view.schedule).toBe(`${plural(40, 'payment')} left, the last ${formatMoney(last)}`);
+    const row = loanRow(loan, day, 0, last);
+    expect(row.line).toBe(`Loan 2: ${formatMoney(50_000)} left · ${formatMoney(loan.payment)} a month · ${plural(40, 'month')} left`);
+    expect(row.note).toContain(`The last payment will be ${formatMoney(last)}.`);
     // One payment left: the row shows what it will charge.
     const ending: TermLoan = { ...loan, monthsLeft: 1, balance: 3_210 };
-    expect(loanView(ending, day, 0, finalPayment(state, ending)).payment).toBe(`${formatMoney(finalPayment(state, ending))} (last)`);
-    // The penalty is in the payment while it lasts.
-    expect(loanView(loan, day, PENALTY_STEP_UP_BPS, last).penalty).toMatch(/included in the payment/);
+    expect(loanRow(ending, day, 0, finalPayment(state, ending)).line).toBe(`Loan 2: ${formatMoney(3_210)} left · last payment ${formatMoney(finalPayment(state, ending))}`);
+    // The higher interest is in the payment while it lasts.
+    expect(loanRow(loan, day, PENALTY_STEP_UP_BPS, last).note).toContain(`The payment includes the higher interest (${formatBpsDelta(PENALTY_STEP_UP_BPS)}) while it lasts.`);
   });
 
   it('quotes a loan on the penalty rate with the payment that repays it at that rate, and says so', () => {
     const state = makeTradingState(200_000, 0);
     state.debt.covenant.stage = 'penalty';
     const q = quoteTermLoan(state, 500_000, 7);
-    const view = termView(q, 'penalty');
-    const payment = view.figures.find((f) => f.label === 'Monthly payment')!;
-    expect(payment.value).toBe(formatMoney(levelPayment(500_000, q.rate.effectiveRateBps, 84)));
-    expect(payment.sub).toMatch(/^penalty included while it lasts/);
-    expect(view.figures.find((f) => f.label === 'Total interest')!.sub).toMatch(/penalty lasted the whole term/);
+    expect(q.ok).toBe(true);
+    const preview = borrowPreview(q, 'penalty')!;
+    expect(preview.text).toContain(
+      `${formatMoney(levelPayment(500_000, q.rate.effectiveRateBps, 84))} a month for 7 years at ${plainRate(q.rate.effectiveRateBps)}, with the higher interest while it lasts.`,
+    );
+    expect(termDetailLines(q, 0).join(' ')).toMatch(/Total interest counts the higher interest for the whole loan, as if it lasted\./);
   });
 });
 
@@ -110,11 +120,19 @@ describe('#2 #6 the Bank flags a payment the close will not have the cash for', 
     apply(state, { type: 'takeTermLoan', amount: 100_000, termYears: 5 });
     closeNext(state);
     state.day += 20;
+    // The running costs left this month (a big marketing budget among them) will take more than the cash spare today.
+    apply(state, { type: 'setMarketing', perMonth: MARKETING_MAX_PER_MONTH });
     const estimate = estimateNextDebtService(state);
     expect(estimate).toBeGreaterThan(0);
     state.finance.cash = estimate + 5_000;
     const atClose = estimateCashAtClose(state);
     expect(atClose).toBeLessThan(estimate);
+    // On the first view: one plain warning line.
+    expect(paymentWarning(estimate, atClose, state.day)).toBe(
+      `Your next loan payment, about ${formatMoney(estimate)} on ${formatDate(nextCloseDay(state.day))}, is more than the cash you're expected to have then (about ${formatMoney(atClose)}).`,
+    );
+    expect(paymentWarning(estimate, estimate, state.day)).toBe('');
+    // In "What the bank counts": the figures, toned.
     const figure = nextPaymentFigure(estimate, atClose, state.day);
     expect(figure).toMatchObject({ tone: 'warn' });
     expect(figure.sub).toContain('more than the cash projected then');
@@ -172,24 +190,24 @@ describe('#7 a compliant stage with both covenant tests red', () => {
     const metrics = covenantMetrics(state);
     expect(metrics).toMatchObject({ leverageOk: false, coverageOk: false });
     expect(state.debt.covenant.stage).toBe('compliant');
-    const next = nextCloseDay(state.day);
-    const view = covenantView('compliant', 0, metrics, next);
-    expect(view.stage).toBe(AT_RISK_LABEL);
+    const health = bankHealth(state);
+    expect(health).toMatchObject({ level: 'watch', failingNow: true });
+    const view = healthView(health);
+    expect(view.title).toBe('Bank health: Watch');
     expect(view.tone).toBe('warn');
-    expect(view.meaning).not.toMatch(/good standing\.$/);
-    expect(view.meaning).toContain('the leverage and coverage covenants');
-    expect(view.meaning).toContain(`the ${formatDate(next)} close`);
     // Hedged: the close re-tests on that month's figures.
-    expect(view.meaning).not.toMatch(/will breach/);
-    expect(view.checks.every((c) => !c.ok)).toBe(true);
+    expect(view.sentence).toBe("At today's figures you'd fail a check at the next month close.");
+    expect(view.sentence).not.toMatch(/will breach/);
+    expect(debtCheck(metrics).status).toBe('over');
+    expect(coverageCheck(metrics).status).toBe('over');
 
     const chip = covenantStatus(state)!;
-    expect(chip).toMatchObject({ text: 'Covenant at risk', tone: 'warn' });
-    expect(chip.tip).toContain('the leverage and coverage covenants');
-    // Within the limits: no chip, and the plain compliant wording.
+    expect(chip).toMatchObject({ text: 'Bank: Watch', tone: 'warn' });
+    expect(chip.tip).toContain(healthSentence(health));
+    // Within the limits: no chip, and the plain good-standing words.
     state.debt.loans = [];
     expect(covenantStatus(state)).toBeNull();
-    expect(covenantView('compliant', 0, covenantMetrics(state), next).stage).toBe('Compliant');
+    expect(healthView(bankHealth(state)).title).toBe('Bank health: Good');
   });
 });
 
@@ -209,12 +227,12 @@ describe('#8 the credit-line breakdown is dated', () => {
     expect(offer.rate.leverage).toBe(0);
     const close = formatMonth(report.year, report.month);
     const next = formatDate(nextCloseDay(state.day));
-    const view = creditView(offer, { close, next });
-    const leverage = view.rateRows.find((r) => r.key === 'leverage')!;
+    const rows = rateRows(offer.rate, { kind: 'line' }, { close, next });
+    const leverage = rows.find((r) => r.key === 'leverage')!;
     expect(leverage.note).not.toBe('no debt yet');
     expect(leverage.note).toBe(`no debt at the ${close} close`);
-    expect(view.rateRows.find((r) => r.key === 'cpp')!.note).toContain(`at the ${close} close`);
-    expect(view.rateRows.find((r) => r.key === 'product')!.note).toContain(`next on ${next}`);
+    expect(rows.find((r) => r.key === 'cpp')!.note).toContain(`at the ${close} close`);
+    expect(rows.find((r) => r.key === 'product')!.note).toContain(`next on ${next}`);
   });
 });
 
@@ -319,11 +337,18 @@ describe('#10 the figures the close tested, beside the re-priced ones', () => {
     const now = covenantMetrics(state);
     expect(now.annualDebtService).not.toBe(report.debt!.annualDebtService);
     const label = formatMonth(report.year, report.month);
-    const view = covenantView(state.debt.covenant.stage, 0, now, nextCloseDay(state.day), { close: label, debt: report.debt! });
-    const tested = view.figures.find((f) => f.label === `Tested at the ${label} close`)!;
+    const figures = bankFigures(now, {
+      credit: state.debt.credit.balance,
+      term: now.totalDebt - state.debt.credit.balance,
+      estimate: estimateNextDebtService(state),
+      cashAtClose: estimateCashAtClose(state),
+      day: state.day,
+      last: { close: label, debt: report.debt! },
+    });
+    const tested = figures.find((f) => f.label === `Tested at the ${label} close`)!;
     expect(tested.value).toBe(`${formatRatio(report.debt!.leverageX100! / 100)} · ${formatRatio(report.debt!.coverageX100! / 100)}`);
     expect(tested.sub).toContain(formatMoney(report.debt!.annualDebtService));
-    expect(view.figures.find((f) => f.label === 'Debt service, next 12 months')!.value).toBe(`${formatMoney(now.annualDebtService)}/yr`);
+    expect(figures.find((f) => f.label === 'Loan payments, next 12 months')!.value).toBe(`${formatMoney(now.annualDebtService)} a year`);
     // The notice gives both, so the toast and the Bank agree.
     const notice = state.notices.filter((n) => n.kind === 'covenantPenalty').at(-1)!;
     expect(notice.message).toContain(formatMoney(report.debt!.annualDebtService));

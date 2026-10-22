@@ -51,13 +51,33 @@ export function hasSave(key: string): boolean {
   }
 }
 
+/** A file-name-safe slug: lower case ASCII letters and digits joined by single hyphens, accents dropped ("" when none are left). */
+export function slug(text: string): string {
+  return text
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * The export's file name (round 4b): "<company>-day-<N>.json", by the
+ * town's name when the company's has no letters or digits to use, and
+ * "light-speed-tycoon" when neither has.
+ */
+export function exportFileName(state: GameState): string {
+  const base = slug(state.company.name) || slug(state.city.name) || 'light-speed-tycoon';
+  return `${base}-day-${state.day}.json`;
+}
+
 /** Offer the game as a JSON download. */
 export function exportSave(state: GameState): void {
   const blob = new Blob([serialize(state)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${state.city.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-day-${state.day}.json`;
+  a.download = exportFileName(state);
   document.body.append(a);
   a.click();
   a.remove();

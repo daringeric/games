@@ -94,7 +94,8 @@ function playYear(state: GameState, opts: { reloadAtMonth?: number } = {}): Play
     expect(openingCash + postedTotal(state)).toBe(state.finance.cash);
     // Capex moves with its ledger entries (v1 plant capex was rebuilt from the v1 ledger).
     expect(state.finance.capex.osp + state.finance.capex.co + postedIn(state, ['construction', 'equipment', 'refund'])).toBe(capexBase.plant);
-    expect(state.finance.capex.connect).toBe(-postedIn(state, ['install']));
+    // (As a sum: with no installs yet, -0 and 0 are the same books.)
+    expect(state.finance.capex.connect + postedIn(state, ['install'])).toBe(0);
     // Ports: accounts within each cabinet's splitters, splitters within the OLT.
     const used = cabinetPortsUsed(state);
     for (const cabinet of state.network.cabinets) expect(used.get(cabinet.id) ?? 0).toBeLessThanOrEqual(cabinetPortCapacity(cabinet));
