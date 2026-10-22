@@ -88,12 +88,15 @@ const SESSION_SEEDS = [3, 2027];
 const SESSION_MONTHS = 60;
 /**
  * Closes after which the session injects an incumbent promo at its largest
- * cabinet area (bots.ensureIncumbentPromo, a test-only state edit), so the
- * retention offer (answerIncumbent) is exercised: since round 4b the
- * incumbent only answers take rates above where a careful operator's areas
- * settle, which the mixed bot's random prices rarely reach.
+ * cabinet area with customers (bots.ensureIncumbentPromo, a test-only state
+ * edit), so the retention offer (answerIncumbent) is exercised: since round
+ * 4b the incumbent only answers take rates above where a careful operator's
+ * areas settle, which the mixed bot's random prices rarely reach. Round
+ * 4c/4d: from the first year too, since the mixed bot's random removals can
+ * cut its whole plant off for good (seed 3 loses every customer before
+ * close 24) and a promo where nobody subscribes cannot be answered.
  */
-const PROMO_INJECT_CLOSES: readonly number[] = [24, 42];
+const PROMO_INJECT_CLOSES: readonly number[] = [12, 24, 42];
 // Round 4b review: an injected promo is also answered at the session's next
 // look (the first one that takes; later ones are left to the mixed bot's random
 // answers), so the retention offer runs whatever those answers hit: the bot's

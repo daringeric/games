@@ -100,6 +100,8 @@
 
 import {
   AERIAL_FT_PER_DAY,
+  AWARENESS_ON_LIT,
+  BUILD_METHOD_HORIZON_YEARS,
   CABINET_CONSTRUCT_DAYS,
   CABINET_COST,
   CABINET_REACH_FT,
@@ -110,8 +112,8 @@ import {
   GRANDFATHER_MONTHS_MAX,
   INCUMBENT_PROMO_MONTHS,
   INCUMBENT_PROMO_QUIET_MONTHS,
-  INSTALL_COST_HOME,
   LOAN_ROUNDING,
+  LOST_CUSTOMER_MONTHS,
   MAKE_READY_DAYS_MAX,
   MAKE_READY_DAYS_MIN,
   MAKE_READY_LONG_CHANCE,
@@ -120,19 +122,17 @@ import {
   MARKETING_MAX_PER_MONTH,
   MAX_SPLITTERS_PER_CABINET,
   MDU_ROUTER_COST,
+  METHOD_UPFRONT_WEIGHT,
   OLT_CARD_COST,
   OLT_MAX_CARDS,
-  OVERHEAD_PER_MONTH,
   PERMIT_DAYS_MAX,
   PERMIT_DAYS_MIN,
   POLE_RENT_PER_POLE_PER_MONTH,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
-  SIGNUP_RAMP_PER_DAY,
   SMB_MULTIPLIER_DEFAULT,
   SPLITTER_COST,
   START_CASH,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
   TERM_LOAN_MIN,
   TERM_LOAN_YEARS,
   TIER_DEFAULTS,
@@ -153,7 +153,9 @@ import {
   termCapacity,
   totalDebt,
 } from '../debt';
-import { advicePlans, advise } from '../advisor';
+import { advicePlans, advise, buildTrough } from '../advisor';
+import { awarenessGainPerDay, marketingAwarenessPerDay, switchRate } from '../customers';
+import { estimateMonthlyOverhead, fixedCostsPerMonth, overheadTotal, perCustomerCost } from '../overhead';
 import { difficultyLevel } from '../company';
 import { activePromos, areaTakeRates, bestIncumbentAnswer, incumbentPromoPrice } from '../incumbent';
 import { cppBand, reportKpis } from '../metrics';
@@ -177,10 +179,8 @@ import {
   cabinetPortsUsed,
   installCost,
   installsPaused,
-  marketingBoost,
   monthlyRecurringRevenue,
   quotePromo,
-  subscriberUnits,
   targetTakeRate,
   tierMix,
 } from '../sales';
@@ -205,7 +205,7 @@ import type {
   TermYears,
   TierId,
 } from '../types';
-import { meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
+import { DAYS_PER_BILL, outageChurnProbability, stormRisk } from '../weather';
 import { cheapestMethod, constantPriceBot, cumulativeOperatingCashFlow, runBot, streetTree, treePath } from './harness';
 import type { BotFactory, Send } from './harness';
 
@@ -247,7 +247,7 @@ export interface SmartOptions {
   reserveMonths: number;
   /**
    * Extra reserve months of the part of fixed costs that revenue does not
-   * cover yet (overhead + marketing - (MRR - support)): the runway through the
+   * cover yet (running costs + marketing - MRR): the runway through the
    * ramp before the first homes pay for the office.
    */
   burnMonths: number;
@@ -323,6 +323,12 @@ export interface SmartOptions {
   methods: MethodPolicy;
   /** Years of running costs (pole rent, repairs, outage churn) the lifetime method choice weighs against the up-front difference. */
   horizonYears: number;
+  /**
+   * Round 4c/4d: what a dollar spent up front counts for in the lifetime
+   * method choice against a dollar of running costs (the advisor's
+   * METHOD_UPFRONT_WEIGHT: growth is bound by capital).
+   */
+  upfrontWeight: number;
   /** Weight of the make-ready wait in the lifetime method choice (1: the margin lost while waiting, in full). */
   waitWeight: number;
   /**
@@ -370,6 +376,16 @@ export interface SmartOptions {
   streetOrder: 'distance' | 'density';
   /** Past a covenant warning, cure (debt.cureOptions) or deleverage, and build nothing until compliant. */
   cure: boolean;
+  /**
+   * Round 4c/4d: a project it pays for with its own cash must leave the cash
+   * the advisor's runway arithmetic says its ramp needs (advisor.buildTrough:
+   * the deepest the cash falls over the months after the build, the new
+   * area's installs and running costs against its signups) above the cash
+   * floor; a smaller project is tried when the first does not fit
+   * (TROUGH_BUDGET_SHARES). The lean operator's rule: with a small purse the
+   * months before the first homes pay are what ends a company.
+   */
+  troughCheck: boolean;
   /** RunResult.bot. */
   name: string;
 }
@@ -412,10 +428,11 @@ export const SMART_DEFAULTS: SmartOptions = {
   allowRed: false,
   redOnly: false,
   methods: 'lifetime',
-  horizonYears: 13,
+  horizonYears: BUILD_METHOD_HORIZON_YEARS,
+  upfrontWeight: METHOD_UPFRONT_WEIGHT,
   waitWeight: 1,
   buryGain: 0,
-  stormWeight: 2,
+  stormWeight: 1,
   stormReserveYears: 2,
   convert: true,
   convertHits: 2,
@@ -428,6 +445,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   managePromo: true,
   streetOrder: 'distance',
   cure: true,
+  troughCheck: false,
   name: 'smart',
 };
 
@@ -446,6 +464,8 @@ interface Project {
   /** Install spend its expected signups will take over the reserve's horizon (part of its budget). */
   connect: number;
   newUnits: number;
+  /** The streets with homes it lights (its targets, not the feeder or paths between them). */
+  lit: SegmentId[];
 }
 
 // ---------------------------------------------------------------------------
@@ -454,22 +474,21 @@ interface Project {
 
 /** What one subscriber is worth to the method choice and the rebuild test, at today's prices. */
 export interface SubscriberEconomics {
-  /** Monthly margin of one household subscriber: the signup tier mix's price less support. */
+  /** What one household subscriber pays a month: the signup tier mix's price. */
+  price: number;
+  /** Its monthly margin: price less the running cost per customer (overhead.perCustomerCost, the support level's cost included). */
   margin: number;
-  /** What losing one costs: a new install plus the margin lost while the signup ramp refills its place (capped at the horizon). */
+  /** What losing one costs: LOST_CUSTOMER_MONTHS of its margin (weather.methodYearlyCost's rule, the advisor's per-street method choice). */
   lostValue: number;
 }
 
-export function subscriberEconomics(state: GameState, opts: SmartOptions = SMART_DEFAULTS): SubscriberEconomics {
+export function subscriberEconomics(state: GameState): SubscriberEconomics {
   const { pricing } = state.sales;
   const mix = tierMix(pricing, 'home');
   let price = 0;
   for (const tier of pricing.tiers) price += mix[tier.id] * tier.price;
-  const margin = Math.max(0, price - SUPPORT_COST_PER_SUB_PER_MONTH);
-  const boost = marketingBoost(opts.marketingPerPassing * 1_000, 1_000);
-  const monthlyRamp = SIGNUP_RAMP_PER_DAY * (1 + boost) * 30;
-  const refillMonths = Math.min(12 * opts.horizonYears, monthlyRamp > 0 ? 1 / monthlyRamp : Infinity);
-  return { margin, lostValue: INSTALL_COST_HOME + margin * refillMonths };
+  const margin = Math.max(0, price - perCustomerCost(state));
+  return { price, margin, lostValue: LOST_CUSTOMER_MONTHS * margin };
 }
 
 /** Expected days from order to light for a span of `method` on `segment`: permitting (make-ready's long tail included) plus construction. */
@@ -500,21 +519,31 @@ function riskOf(state: GameState, segment: StreetSegment, method: CableMethod): 
   return risk;
 }
 
-/** Expected yearly cost of the outages on a span of `method` carrying `subscribers`: repairs plus the subscribers they cost. */
+/**
+ * Expected yearly cost of the outages on a span of `method` carrying
+ * `subscribers` (weather.methodYearlyCost's rule, with the bot's own
+ * estimate of the street's subscribers): the expected storm and dig-in
+ * repairs, and per outage (its mean days out, the canopy counted) the
+ * cancellations it causes at SubscriberEconomics.lostValue each and the
+ * days of service not billed.
+ */
 function outageCostPerYear(state: GameState, segment: StreetSegment, method: CableMethod, subscribers: number, econ: SubscriberEconomics): number {
   const risk = riskOf(state, segment, method);
-  const churn = risk.outagesPerYear * subscribers * outageChurnProbability(meanOutageDays(method)) * econ.lostValue;
-  return risk.repairCostPerYear + churn;
+  if (!(risk.outagesPerYear > 0) || !(subscribers > 0)) return risk.repairCostPerYear;
+  const days = risk.outageDaysPerYear / risk.outagesPerYear;
+  const perOutage = outageChurnProbability(days) * econ.lostValue + (days / DAYS_PER_BILL) * econ.price;
+  return risk.repairCostPerYear + risk.outagesPerYear * subscribers * perOutage;
 }
 
 /**
- * What cabling `segment` with `method` costs over opts.horizonYears: its
- * charges (construction, rock, make-ready) and its share of an order's fees,
- * plus the horizon's pole rent and expected outage cost (weather.stormRisk
- * repairs, and the outage churn of its own street's `own` subscribers: the
- * street grid gives the rest of the plant a second path, so an outage cuts
- * off little more than the street itself), plus opts.waitWeight x the margin
- * `waiting` subscribers lose while it waits for permits and make-ready
+ * What cabling `segment` with `method` costs over opts.horizonYears, the
+ * advisor's per-street rule (weather.lifetimeMethodCost) with the bot's
+ * settings: opts.upfrontWeight x its charges (construction, rock,
+ * make-ready) and its share of an order's fees, plus opts.horizonYears x
+ * its running costs (pole rent, and opts.stormWeight x the expected outage
+ * cost: repairs, and the outage churn and unbilled days of its own street's
+ * `own` subscribers), plus opts.waitWeight x the margin `waiting`
+ * subscribers lose while it waits for permits and make-ready
  * (expectedLeadDays: the street lights that much later).
  */
 export function lifetimeCost(
@@ -530,7 +559,7 @@ export function lifetimeCost(
   const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 : 0;
   const yearly = rent + opts.stormWeight * outageCostPerYear(state, segment, method, own, econ);
   const wait = waiting > 0 ? opts.waitWeight * (expectedLeadDays(segment, method) / 30) * waiting * econ.margin : 0;
-  return upfront + opts.horizonYears * yearly + wait;
+  return opts.upfrontWeight * upfront + opts.horizonYears * yearly + wait;
 }
 
 /**
@@ -553,7 +582,7 @@ export function chooseMethod(
   const underground = lifetimeCost(state, segment, 'underground', own, waiting, opts, econ);
   minGain = Math.max(minGain, opts.buryGain);
   if (minGain <= 0) return underground < aerial ? 'underground' : 'aerial';
-  // Only when what it saves over the horizon is at least minGain x what it costs more up front.
+  // Only when what it saves over the horizon is at least minGain x what it costs more up front (beyond its weight).
   const extra = spanCharges(segment, 'underground').total - spanCharges(segment, 'aerial').total;
   return aerial - underground >= minGain * Math.max(1, extra) ? 'underground' : 'aerial';
 }
@@ -614,16 +643,22 @@ function streetSubscribers(state: GameState, segment: SegmentId, rates: Readonly
 }
 
 /**
- * Share of a take-rate gap the signup ramp closes within `days` at a marketing
- * budget of `perPassing` dollars per passing per month (the boost does not
- * depend on the town's size at a fixed spend per passing), at most 1.
+ * Share of a freshly lit street's take-rate gap that switches within `days`
+ * at a marketing budget of `perPassing` dollars per passing per month (the
+ * marketing gain does not depend on the town's size at a fixed spend per
+ * passing), at most 1: the customers model day by day (awareness from
+ * AWARENESS_ON_LIT growing by time and marketing, customers.awarenessGainPerDay;
+ * switching at customers.switchRate at the default deal), without word of
+ * mouth, campaigns or the intro promo.
  */
 export function installShare(days: number, perPassing: number): number {
-  const boost = marketingBoost(perPassing * 1_000, 1_000);
-  // 1 - (1 - r)^days, by repeated multiplication (no Math.pow in the sim).
-  const r = SIGNUP_RAMP_PER_DAY * (1 + boost);
+  const gain = awarenessGainPerDay(marketingAwarenessPerDay(perPassing * 1_000, 1_000), 0, 0, false);
+  let awareness = AWARENESS_ON_LIT;
   let left = 1;
-  for (let d = 0; d < days; d++) left *= 1 - r;
+  for (let d = 0; d < days; d++) {
+    left *= 1 - switchRate(awareness, 1, 1, 1, 1);
+    awareness += (1 - awareness) * Math.min(1, gain);
+  }
   return Math.min(1, 1 - left);
 }
 
@@ -654,8 +689,8 @@ export function daysUntilPlannedLive(state: GameState): number {
  * (expectedInstalls over opts.installDays).
  */
 export function smartReserve(state: GameState, opts: SmartOptions = SMART_DEFAULTS, debtService = 0): number {
-  const fixed = OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
-  const earning = monthlyRecurringRevenue(state) - SUPPORT_COST_PER_SUB_PER_MONTH * subscriberUnits(state);
+  const fixed = fixedCosts(state);
+  const earning = monthlyRecurringRevenue(state);
   const uncovered = Math.max(0, fixed + debtService - earning);
   const burnMonths = opts.burnMonths + daysUntilPlannedLive(state) / 30;
   return (
@@ -944,7 +979,7 @@ function planProject(
   };
   const build = new Set<SegmentId>(feeder);
   let estimate = fixed + costOf(feeder);
-  const accepted: Array<{ segments: SegmentId[]; units: number; connect: number }> = [];
+  const accepted: Array<{ segment: SegmentId; segments: SegmentId[]; units: number; connect: number }> = [];
   let newUnits = 0;
   let connect = 0;
   for (const target of targets) {
@@ -959,7 +994,7 @@ function planProject(
     estimate += addCost;
     newUnits += units;
     connect += addConnect;
-    accepted.push({ segments: adds, units, connect: addConnect });
+    accepted.push({ segment: target.segment, segments: adds, units, connect: addConnect });
   }
 
   // Exact cost from quotes; drop the farthest streets until it fits.
@@ -973,7 +1008,7 @@ function planProject(
     ];
     let cost = fixed;
     for (const order of orders) cost += quoteCable(state, order.segments, order.method).cost;
-    if (cost + connect <= budget) return { node, oltCard, orders, cost, connect, newUnits };
+    if (cost + connect <= budget) return { node, oltCard, orders, cost, connect, newUnits, lit: accepted.map((a) => a.segment) };
     const last = accepted.pop();
     if (!last) return null;
     for (const id of last.segments) build.delete(id);
@@ -1059,7 +1094,7 @@ function chooseProject(
     subscribed: new Map(state.sales.accounts.map((a) => [a.parcel, accountUnits(a)])),
     installShare: installShare(opts.installDays, opts.marketingPerPassing),
     rates: takeRates(state),
-    econ: subscriberEconomics(state, opts),
+    econ: subscriberEconomics(state),
   };
   const reach = streetReach(city);
   const buildCost = segmentBuildCosts(city, opts.methods);
@@ -1141,7 +1176,7 @@ function fundCapacity(state: GameState, send: Send, opts: SmartOptions, cost: nu
 function addCapacity(state: GameState, send: Send, opts: SmartOptions): void {
   const used = cabinetPortsUsed(state);
   const full = new Set(state.sales.fullCabinets);
-  const cushion = OVERHEAD_PER_MONTH;
+  const cushion = overheadTotal(estimateMonthlyOverhead(state));
   for (const cabinet of [...state.network.cabinets]) {
     if (cabinet.splitters >= MAX_SPLITTERS_PER_CABINET) continue;
     const ports = used.get(cabinet.id) ?? 0;
@@ -1195,9 +1230,9 @@ function largestOk(max: number, step: number, ok: (amount: number) => boolean): 
   return lo * step;
 }
 
-/** Overhead + this month's marketing. */
+/** A month of running costs at today's size (overhead.fixedCostsPerMonth: base, per customer with support, per plant) + this month's marketing. */
 function fixedCosts(state: GameState): number {
-  return OVERHEAD_PER_MONTH + state.sales.marketingPerMonth;
+  return fixedCostsPerMonth(state);
 }
 
 /**
@@ -1492,7 +1527,7 @@ function convertHitSpans(state: GameState, send: Send, opts: SmartOptions): void
     .filter((s) => s.stage === 'live' && s.method === 'aerial' && s.conversion === null && (hits.get(s.id) ?? 0) >= opts.convertHits)
     .sort((a, b) => (hits.get(b.id) ?? 0) - (hits.get(a.id) ?? 0) || a.id - b.id);
   if (candidates.length === 0) return;
-  const econ = subscriberEconomics(state, opts);
+  const econ = subscriberEconomics(state);
   for (const span of candidates) {
     const quote = quoteConvert(state, span.id);
     if (!quote.ok) continue;
@@ -1512,6 +1547,34 @@ export interface SmartMemo {
 
 export function newSmartMemo(): SmartMemo {
   return { idleKey: null, promo: newPromoMemo() };
+}
+
+/** Budget shares a trough-checked operator tries, largest first, until a project leaves its ramp's cash (SmartOptions.troughCheck). */
+export const TROUGH_BUDGET_SHARES: readonly number[] = [1, 0.8, 0.65, 0.5, 0.4, 0.3, 0.2];
+
+/**
+ * The cash `project` needs to come through its ramp (advisor.buildTrough on
+ * the project as a build plan: its cabinet, its cable by method, the units
+ * and streets it lights).
+ */
+export function projectTrough(state: GameState, project: Project): number {
+  const aerial: SegmentId[] = [];
+  const underground: SegmentId[] = [];
+  for (const order of project.orders) (order.method === 'aerial' ? aerial : underground).push(...order.segments);
+  const here = state.network.cabinets.some((c) => c.node === project.node);
+  const commands: Command[] = here ? [] : [{ type: 'placeCabinet', node: project.node }];
+  return buildTrough(state, {
+    node: project.node,
+    feeder: [],
+    reach: [],
+    aerial,
+    underground,
+    commands,
+    cost: project.cost,
+    passings: project.newUnits,
+    cpp: project.newUnits > 0 ? projectCpp(project) : null,
+    lit: project.lit,
+  });
 }
 
 /** One weekly look by the careful operator (shared by SMART, RURAL, MIXED and the round-4 variants). */
@@ -1541,7 +1604,17 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
     const lifetimeOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.loanLifetimeCpp;
     const ownOk = (p: Project) => opts.allowRed || opts.redOnly || projectedLifetimeCpp(state, p) <= opts.ownLifetimeCpp;
     let project = room > 0 ? chooseProject(state, Math.max(0, own) + room, opts, loanBand(opts), true, lifetimeOk) : null;
-    if (!project && own > 0) project = chooseProject(state, own, opts, defaultBand(opts), false, ownOk);
+    if (!project && own > 0) {
+      if (opts.troughCheck) {
+        // The lean operator: the largest project whose ramp its cash comes through.
+        const spare = state.finance.cash - cashFloor(state, opts);
+        const fits = (p: Project) => ownOk(p) && p.cost + projectTrough(state, p) <= spare;
+        for (const share of TROUGH_BUDGET_SHARES) {
+          project = chooseProject(state, own * share, opts, defaultBand(opts), false, fits);
+          if (project) break;
+        }
+      } else project = chooseProject(state, own, opts, defaultBand(opts), false, ownOk);
+    }
     if (!project) {
       memo.idleKey = key;
       break;
@@ -1568,6 +1641,7 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
  * used up (bridgeMonths).
  */
 export const LEAN_OPTIONS: Partial<SmartOptions> = {
+  troughCheck: true,
   burnMonths: 2,
   installDays: 180,
   buryGain: 3,
@@ -2150,7 +2224,9 @@ function copyState(state: GameState): GameState {
 
 /**
  * Test-only state edit: an incumbent promo at the cabinet area with the most
- * passings, starting today with the rule's length, price and quiet months
+ * passings among those with customers (round 4c/4d: the incumbent answers a
+ * take rate, so a promo where nobody has signed up yet tests nothing; any
+ * area when none has customers), starting today with the rule's length, price and quiet months
  * (incumbent.reviewIncumbent's record), unless one already runs (then the
  * running one with the most passings). Returns its cabinet and whether it
  * was injected.
@@ -2160,7 +2236,8 @@ export function ensureIncumbentPromo(state: GameState): { cabinet: number; injec
   const passingsOf = (cabinet: number) => areas.find((a) => a.cabinet === cabinet)?.passings ?? 0;
   const running = activePromos(state).sort((a, b) => passingsOf(b.cabinet) - passingsOf(a.cabinet) || a.cabinet - b.cabinet);
   if (running[0]) return { cabinet: running[0].cabinet, injected: false };
-  const area = [...areas].sort((a, b) => b.passings - a.passings || a.cabinet - b.cabinet)[0];
+  const signed = (a: { takeRate: number }) => (a.takeRate > 0 ? 1 : 0);
+  const area = [...areas].sort((a, b) => signed(b) - signed(a) || b.passings - a.passings || a.cabinet - b.cabinet)[0];
   if (!area) throw new Error('ensureIncumbentPromo: no cabinet area');
   const endDay = closeDayAfter(state.day, INCUMBENT_PROMO_MONTHS);
   const promo: IncumbentPromo = {

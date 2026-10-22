@@ -12,16 +12,16 @@ import {
   INCUMBENT_PROMO_QUIET_MONTHS,
   INCUMBENT_PROMO_RETRIGGER_POINTS,
   INCUMBENT_PROMO_TAKE_RATE,
+  CUSTOMER_QUOTE_MONTHS,
   INSTALL_COST_HOME,
-  MARKETING_MAX_PER_MONTH,
-  RETENTION_CHURN_CUT,
   RETENTION_PERCENT_OFF,
   RETENTION_STEP_SHARE,
-  SIGNUP_RAMP_PER_DAY,
+  SMB_MULTIPLIER_DEFAULT,
   START_CASH,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
+  SUPPORT_LEVELS,
 } from './balance';
 import { dayOf, formatDate } from './calendar';
+import { AWARENESS_PPM, areaSwitchRate, churnFromScore, lostMonthsPerCancellation, priceScores } from './customers';
 import { applyCommand, runDays } from './game';
 import {
   answerIncumbent,
@@ -38,6 +38,7 @@ import {
   reviewIncumbent,
 } from './incumbent';
 import { getService } from './network';
+import { perCustomerCost } from './overhead';
 import { closeDayAfter, DAYS_PER_MONTH, monthlyRecurringRevenue, quotePromo, retentionPrice, roughMoney, stepChurnProbability, SUGGESTED_PROMO } from './sales';
 import { cornerName } from './streets';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
@@ -313,12 +314,25 @@ describe('the incumbent in play', () => {
 describe('the retention offer (round 4b)', () => {
   const list1g = (state: GameState) => state.sales.pricing.tiers.find((t) => t.id === 'fiber1g')!.price;
 
-  /** Every home of TOWN subscribed on 1 Gig, and the incumbent's promo just started there (JUN1). */
-  function contested(marketing = 0): Area & { promo: IncumbentPromo } {
+  /** Every home of TOWN subscribed on 1 Gig, and the incumbent's promo just started there (JUN1); everybody there knows you when `aware`. */
+  function contested(marketing = 0, aware = false): Area & { promo: IncumbentPromo } {
     const made = area({ take: 1 });
     made.state.sales.marketingPerMonth = marketing;
+    if (aware) made.state.customers.streets = [...getService(made.state).litSegments].sort((a, b) => a - b).map((segment) => ({ segment, litDay: 0, awareness: AWARENESS_PPM }));
     reviewIncumbent(made.state);
     return { ...made, promo: made.state.sales.incumbentPromos[0]! };
+  }
+
+  /** Round 4c/4d: a home's monthly churn on 1 Gig paying `paid` where cable runs its promo (customers' happiness churn at Good support). */
+  function churnAt(paid: number): number {
+    const p = priceScores('fiber1g', 'home', paid, SMB_MULTIPLIER_DEFAULT, incumbentPromoPrice());
+    return churnFromScore(SUPPORT_LEVELS.good.happiness + p.priceVsCable + p.priceVsMarket + p.goodDeal);
+  }
+
+  /** What one cancellation at `cabinet` costs in the quote: margin until replaced within CUSTOMER_QUOTE_MONTHS (plus `wait` months), and the reinstall for the share replaced. */
+  function perCancellation(state: GameState, cabinet: CabinetId, list: number, wait: number): number {
+    const lost = lostMonthsPerCancellation(areaSwitchRate(state, cabinet), Math.round(CUSTOMER_QUOTE_MONTHS * DAYS_PER_MONTH));
+    return (list - perCustomerCost(state)) * (lost.months + wait) + INSTALL_COST_HOME * lost.replaced;
   }
 
   it('is not possible where the incumbent runs no promo, and the command says why without touching the game', () => {
@@ -350,22 +364,35 @@ describe('the retention offer (round 4b)', () => {
       monthlyCost: passings * (list - offer),
       totalCost: passings * (list - offer) * INCUMBENT_PROMO_MONTHS,
     });
-    const avoided =
-      passings * INCUMBENT_PROMO_CHURN * Math.min(1, RETENTION_CHURN_CUT) * INCUMBENT_PROMO_MONTHS - passings * stepChurnProbability(offer, list, RETENTION_STEP_SHARE);
+    // Round 4c/4d: the promo's churn is folded into happiness (calibrated to INCUMBENT_PROMO_CHURN at the list price, none at
+    // the default retention offer); each month the offer covers saves the difference, less the step back up at its end.
+    expect(churnAt(list) - churnAt(offer)).toBeGreaterThanOrEqual(INCUMBENT_PROMO_CHURN);
+    const avoided = passings * INCUMBENT_PROMO_MONTHS * (churnAt(list) - churnAt(offer)) - passings * stepChurnProbability(offer, list, RETENTION_STEP_SHARE);
     expect(q.cancellationsAvoided).toBe(Math.max(0, Math.round(avoided)));
-    // No marketing and no intro promo: a lost subscriber's gap refills at the bare ramp, after the promo (its
-    // target there is below today's subscribers, so nobody signs up meanwhile), and costs a reinstall.
-    const refill = 1 / (SIGNUP_RAMP_PER_DAY * DAYS_PER_MONTH);
+    // A lost subscriber's gap is signed up again at the area's switching rate today, after the promo (its target there is below
+    // today's subscribers, so nobody signs up meanwhile), and costs a reinstall.
     const wait = (INCUMBENT_PROMO_MONTHS - 1) / 2;
-    expect(q.valueSaved).toBe(Math.max(0, Math.round(avoided * ((list - SUPPORT_COST_PER_SUB_PER_MONTH) * (refill + wait) + INSTALL_COST_HOME))));
+    expect(q.valueSaved).toBe(Math.max(0, Math.round(avoided * perCancellation(state, cabinet, list, wait))));
     expect(q.pays).toBe(q.valueSaved > q.totalCost);
     expect(promo.answered).toBe(false);
   });
 
-  it('is worth less where marketing refills a lost subscriber sooner, and with fewer months left', () => {
+  it('loses less margin per cancellation where a lost subscriber is replaced sooner (everybody knows you), and is worth less with fewer months left', () => {
     const quiet = quoteRetention(contested(0).state, contested(0).cabinet);
-    const loud = contested(MARKETING_MAX_PER_MONTH);
-    expect(quoteRetention(loud.state, loud.cabinet).valueSaved).toBeLessThan(quiet.valueSaved);
+    const known = contested(0, true);
+    const days = Math.round(CUSTOMER_QUOTE_MONTHS * DAYS_PER_MONTH);
+    const slow = areaSwitchRate(contested(0).state, contested(0).cabinet);
+    const fast = areaSwitchRate(known.state, known.cabinet);
+    expect(fast).toBeGreaterThan(slow);
+    // Replaced sooner: fewer months of margin lost, a larger share replaced (and reinstalled) within the horizon.
+    expect(lostMonthsPerCancellation(fast, days).months).toBeLessThan(lostMonthsPerCancellation(slow, days).months);
+    expect(lostMonthsPerCancellation(fast, days).replaced).toBeGreaterThan(lostMonthsPerCancellation(slow, days).replaced);
+    expect(lostMonthsPerCancellation(0, days)).toEqual({ months: days / DAYS_PER_MONTH, replaced: 0 });
+    const sooner = quoteRetention(known.state, known.cabinet);
+    expect(sooner.cancellationsAvoided).toBe(quiet.cancellationsAvoided);
+    const list = list1g(known.state);
+    const avoided = known.passings * INCUMBENT_PROMO_MONTHS * (churnAt(list) - churnAt(retentionPrice(list))) - known.passings * stepChurnProbability(retentionPrice(list), list, RETENTION_STEP_SHARE);
+    expect(sooner.valueSaved).toBe(Math.max(0, Math.round(avoided * perCancellation(known.state, known.cabinet, list, (INCUMBENT_PROMO_MONTHS - 1) / 2))));
     const late = contested(0);
     late.state.day = late.promo.endDay - 1;
     const q = quoteRetention(late.state, late.cabinet);
@@ -430,7 +457,7 @@ describe('the retention offer (round 4b)', () => {
     for (const account of state.sales.accounts) account.locks = [{ tier: 'fiber1g', price: kept, untilDay: grandfatherEnd, reason: 'grandfather' }];
     const q = quoteRetention(state, cabinet);
     // The step at the promo's end goes back to the grandfathered price, not to the list price.
-    const avoided = passings * INCUMBENT_PROMO_CHURN * Math.min(1, RETENTION_CHURN_CUT) * INCUMBENT_PROMO_MONTHS - passings * stepChurnProbability(offer, kept, RETENTION_STEP_SHARE);
+    const avoided = passings * INCUMBENT_PROMO_MONTHS * (churnAt(kept) - churnAt(offer)) - passings * stepChurnProbability(offer, kept, RETENTION_STEP_SHARE);
     expect(q).toMatchObject({ ok: true, monthlyCost: passings * (kept - offer), totalCost: passings * (kept - offer) * INCUMBENT_PROMO_MONTHS });
     expect(q.cancellationsAvoided).toBe(Math.max(0, Math.round(avoided)));
     expect(applyCommand(state, { type: 'answerIncumbent', cabinet }).ok).toBe(true);
@@ -498,12 +525,27 @@ describe('the best answer to a promo (round 4b)', () => {
     expect(bestIncumbentAnswer(state, cabinet)).toMatchObject({ kind: 'none', netValue: 0, text: '' });
   });
 
-  it('is none when nothing pays: one close left, the step back up costs more than the month saves', () => {
+  it('is none when nothing pays: one close left, the step back up costs more than the month saves, and says ignoring it is fine (round 4c)', () => {
     const { state, cabinet } = area({ take: 1 });
     reviewIncumbent(state);
-    state.day = state.sales.incumbentPromos[0]!.endDay - 1;
-    expect(quoteRetention(state, cabinet).pays).toBe(false);
-    expect(bestIncumbentAnswer(state, cabinet)).toMatchObject({ kind: 'none', promo: null, netValue: 0, text: '' });
+    const promo = state.sales.incumbentPromos[0]!;
+    state.day = promo.endDay - 1;
+    const quote = quoteRetention(state, cabinet);
+    expect(quote.pays).toBe(false);
+    const place = cornerName(state.city, state.network.cabinets[0]!.node);
+    expect(bestIncumbentAnswer(state, cabinet)).toMatchObject({
+      kind: 'none',
+      promo: null,
+      netValue: 0,
+      text:
+        `Ignoring the cable company's promo around ${place} is fine: a retention offer would cost about ${roughMoney(quote.totalCost)} ` +
+        `to keep customers worth about ${roughMoney(quote.valueSaved)}, and the promo ends on ${formatDate(promo.endDay)}.`,
+    });
+    // With nobody subscribed there yet (and an intro promo already set, so that is not the answer) it says so.
+    state.sales.accounts = [];
+    state.sales.promo = { ...SUGGESTED_PROMO };
+    expect(bestIncumbentAnswer(state, cabinet).kind).toBe('none');
+    expect(bestIncumbentAnswer(state, cabinet).text).toBe(`Ignoring the cable company's promo around ${place} is fine: you have no customers there yet, and it ends on ${formatDate(promo.endDay)}.`);
   });
 
   it('is an intro promo when one pays town-wide and brings signups where the promo runs', () => {

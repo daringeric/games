@@ -1,14 +1,20 @@
-// Pricing and marketing: the three tiers (price, offered), the business price
-// multiplier, how long a price rise is grandfathered for today's subscribers,
-// the intro promo for new signups and the monthly marketing budget, with a
-// live preview of what the edited values would do: target take rate per
-// building kind, tier mix and business prices, what today's subscribers pay
-// and until when (sales.quotePricing: who keeps what, MRR now and after the
-// step, expected cancellations, retired tiers' moves), the promo's prices,
-// the marketing boost, and the incumbent's running promos (where, its price,
-// until when, your target take rate there vs elsewhere). Apply sends
-// setPricing (with grandfatherMonths), then setPromo if it changed, then
-// setMarketing; the sim validates each and its reason is shown on a rejection.
+// Pricing: the three tiers (price, offered), the business price multiplier,
+// how long a price rise is grandfathered for today's subscribers and the
+// intro promo for new signups, with a live preview of what the edited values
+// would do: target take rate per building kind, tier mix and business
+// prices, what today's subscribers pay and until when (sales.quotePricing:
+// who keeps what, their monthly bills now and once the step and the expected
+// cancellations it lists have happened, retired tiers' moves), the promo's
+// prices, and the incumbent's running promos (where, its price, until when,
+// your target take rate there vs elsewhere). Apply sends setPricing (with
+// grandfatherMonths), then setPromo if it changed; the sim validates each and
+// its reason is shown on a rejection.
+//
+// Round 4c/4d (ui-customers, spec I.5): the marketing budget moved to the
+// Customers dashboard, where it has a forecast. This panel shows it read-only
+// with a "Change marketing" link (PricingLinks.marketing, wired by main.ts)
+// and Apply no longer sends setMarketing. Spec C: the "after" figure is
+// quotePricing's mrrAfterChurn, after the expected cancellations it lists.
 //
 // Round 4b (pricing-balance): "Who signs up" (sales.segmentDemand: each
 // demand segment's take rate and favourite tier, and a warning when no plan
@@ -16,14 +22,13 @@
 // for each running incumbent promo the retention offer's figures
 // (incumbent.quoteRetention) with a button that sends answerIncumbent.
 //
-// Owner: pricing-balance workstream (round 4b; sim-pricing in round 4, ui-economy before).
+// Owner: ui-customers workstream (round 4c/4d; pricing-balance in round 4b, sim-pricing in round 4, ui-economy before).
 
 import {
   GRANDFATHER_MONTHS_DEFAULT,
   GRANDFATHER_MONTHS_MAX,
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
-  MARKETING_MAX_PER_MONTH,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
   PROMO_QUOTE_MONTHS,
@@ -35,10 +40,8 @@ import {
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { activePromos, quoteRetention } from '../sim/incumbent';
-import { getService } from '../sim/network';
 import {
   lockOn,
-  marketingBoost,
   promoDiscountShare,
   promoPrice,
   quotePricing,
@@ -85,7 +88,6 @@ export interface PromoDraft {
 export interface PricingDraft {
   tiers: TierSetting[];
   smbMultiplier: number;
-  marketingPerMonth: number;
   /** Month closes a price rise waits before reaching today's subscribers (setPricing grandfatherMonths). */
   grandfatherMonths: number;
   promo: PromoDraft;
@@ -107,8 +109,6 @@ export interface PricingPreview {
   smbPrices: Record<TierId, number> | null;
   /** Household price on the intro promo per tier; null without a valid promo (or valid tiers). */
   promoPrices: Record<TierId, number> | null;
-  /** Marketing boost to the signup ramp at `passings` (0.45 = signups 45% faster); null when the budget is invalid. */
-  boost: number | null;
 }
 
 /** "The incumbent cable company: 300 Mbps for $75/mo" in the panel's words. */
@@ -116,12 +116,11 @@ export function incumbentOffer(): string {
   return `Incumbent cable: ${formatNumber(INCUMBENT_DOWN_MBPS)} Mbps for ${formatMoney(INCUMBENT_PRICE)}/mo`;
 }
 
-/** The draft matching the game's current pricing, budget and intro promo; grandfathering starts at the default. */
-export function draftFrom(pricing: Pricing, marketingPerMonth: number, promo: IntroPromo | null = null): PricingDraft {
+/** The draft matching the game's current pricing and intro promo; grandfathering starts at the default. */
+export function draftFrom(pricing: Pricing, promo: IntroPromo | null = null): PricingDraft {
   return {
     tiers: pricing.tiers.map((t) => ({ id: t.id, price: t.price, offered: t.offered })),
     smbMultiplier: pricing.smbMultiplier,
-    marketingPerMonth,
     grandfatherMonths: GRANDFATHER_MONTHS_DEFAULT,
     promo: promo ? { enabled: true, percentOff: promo.percentOff, months: promo.months } : { enabled: false, ...PROMO_DRAFT_START },
   };
@@ -181,12 +180,13 @@ export function promoOk(promo: PromoDraft): boolean {
 }
 
 /**
- * Check a draft the way setPricing/setPromo/setMarketing will, and preview its
- * effect: target take rates (with the intro promo valued) and tier mix from
- * sales.ts for the edited prices (names and speeds from `base`), business and
- * promo prices, and the marketing boost at `passings`.
+ * Check a draft the way setPricing/setPromo will, and preview its effect:
+ * target take rates (with the intro promo valued) and tier mix from sales.ts
+ * for the edited prices (names and speeds from `base`), business and promo
+ * prices. (The marketing budget lives on the Customers dashboard:
+ * customersPanel.marketingProblem / marketingForecast.)
  */
-export function pricingPreview(base: Pricing, draft: PricingDraft, passings: number): PricingPreview {
+export function pricingPreview(base: Pricing, draft: PricingDraft): PricingPreview {
   const tierProblems = tierProblemsOf(base, draft);
   const problems = [...tierProblems];
   const smb = draft.smbMultiplier;
@@ -198,13 +198,8 @@ export function pricingPreview(base: Pricing, draft: PricingDraft, passings: num
     if (!inRange(draft.promo.percentOff, 1, PROMO_MAX_PERCENT_OFF)) problems.push(`Intro promo must be a whole percent off from 1% to ${PROMO_MAX_PERCENT_OFF}%`);
     if (!inRange(draft.promo.months, 1, PROMO_MAX_MONTHS)) problems.push(`Intro promo must last a whole number of months from 1 to ${PROMO_MAX_MONTHS}`);
   }
-  const m = draft.marketingPerMonth;
-  const marketingOk = inRange(m, 0, MARKETING_MAX_PER_MONTH);
-  if (!marketingOk) problems.push(`Marketing must be a whole number from $0 to ${formatMoney(MARKETING_MAX_PER_MONTH)} a month`);
-
-  const boost = marketingOk ? marketingBoost(m, passings) : null;
   // Take rates and the mix need valid tiers (the business take rate also follows the multiplier).
-  if (tierProblems.length > 0) return { valid: false, problems, takeRate: null, mix: null, smbPrices: null, promoPrices: null, boost };
+  if (tierProblems.length > 0) return { valid: false, problems, takeRate: null, mix: null, smbPrices: null, promoPrices: null };
 
   const pricing = pricingFrom(base, draft, smbOk);
   const promo = promoValid ? draftPromo(draft) : null;
@@ -230,16 +225,39 @@ export function pricingPreview(base: Pricing, draft: PricingDraft, passings: num
     mix: tierMix(pricing, 'home', INCUMBENT_PRICE, promo),
     smbPrices,
     promoPrices,
-    boost,
   };
 }
 
-/** The line under the marketing budget: what it does for signups at today's passings. */
-export function boostHint(boost: number | null, marketingPerMonth: number, passings: number): string {
-  if (boost === null) return '';
-  if (marketingPerMonth <= 0) return 'No marketing: signups come at their natural pace.';
-  if (passings <= 0) return 'No homes passed yet: marketing has nobody to sell to, but it is still billed.';
-  return `Signups come ${formatPercent(boost)} faster at today's ${formatNumber(passings)} passings.`;
+/** The read-only marketing line (round 4c/4d: the budget is set on the Customers dashboard). */
+export function marketingLine(marketingPerMonth: number): string {
+  return marketingPerMonth > 0 ? `${formatMoney(marketingPerMonth)} a month` : 'None';
+}
+
+/** What the impact figures say (pricingImpact's quote), in the panel's plain words; dashes while the draft is invalid. */
+export interface ImpactFigures {
+  /** "$12,400/mo": what today's subscribers pay a month right after the change (grandfathered prices held). */
+  now: string;
+  /** "$12,900/mo": the same once the step has happened, less what the expected cancellations paid (quotePricing.mrrAfterChurn). */
+  after: string;
+  /** "~4": the expected cancellations. */
+  cancels: string;
+  /** The line under the figures: what "after" counts. */
+  note: string;
+}
+
+/** The three impact figures and the note under them (spec C: the after figure counts the cancellations it lists). Pure. */
+export function impactFigures(quote: PricingQuote | null): ImpactFigures {
+  if (!quote) return { now: '–', after: '–', cancels: '–', note: '' };
+  const n = quote.expectedChurn;
+  return {
+    now: `${formatMoney(quote.mrrNow)}/mo`,
+    after: `${formatMoney(quote.mrrAfterChurn)}/mo`,
+    cancels: `~${formatNumber(n)}`,
+    note:
+      n > 0
+        ? `"After the step" is what today's subscribers pay once raised prices reach them and retired tiers move, after the ~${plural(n, 'cancellation')} expected.`
+        : `"After the step" is what today's subscribers pay once raised prices reach them and retired tiers move.`,
+  };
 }
 
 /** The line under the grandfathering control. */
@@ -503,6 +521,16 @@ interface TierInputs {
   smb: HTMLElement;
 }
 
+/**
+ * Round 4c/4d: where the pricing panel links to (main.ts wires it): the
+ * Customers dashboard's marketing lever (spec I.5: Pricing keeps prices,
+ * tiers and the promo, and links to the marketing lever there).
+ */
+export interface PricingLinks {
+  /** Open the Customers dashboard at its marketing lever. */
+  marketing?: () => void;
+}
+
 /** Open the pricing panel over the game; at most one at a time. */
 export class PricingPanel {
   private sheet: Sheet | null = null;
@@ -510,6 +538,8 @@ export class PricingPanel {
   constructor(
     private readonly session: GameSession,
     private readonly toasts: Toasts,
+    /** Round 4c/4d (contract): links out of the panel; ui-customers uses them. */
+    protected readonly links: PricingLinks = {},
   ) {}
 
   get isOpen(): boolean {
@@ -549,9 +579,9 @@ export class PricingPanel {
     if (this.sheet?.isOpen) return;
     const state = this.session.state;
     const base = state.sales.pricing;
-    const draft = draftFrom(base, state.sales.marketingPerMonth, state.sales.promo);
+    const draft = draftFrom(base, state.sales.promo);
     const sheet = openSheet({
-      title: 'Pricing & marketing',
+      title: 'Pricing',
       subtitle: incumbentOffer(),
       className: 'pricing',
       onClose: () => {
@@ -638,15 +668,18 @@ export class PricingPanel {
     });
     const promoLine = el('p', { class: 'field-hint promo-hint' });
     const promoAdvice = el('p', { class: 'field-hint promo-advice', attrs: { 'aria-live': 'polite' } });
-    const marketingInput = numberInput(draft.marketingPerMonth, {
-      min: '0',
-      max: String(MARKETING_MAX_PER_MONTH),
-      step: '100',
-      inputmode: 'numeric',
-      'aria-label': 'Marketing budget per month',
-      id: 'pricing-marketing',
+    // Marketing: read-only here; the Customers dashboard sets it, with a forecast.
+    const marketingValue = el('span', { class: 'pricing-marketing-value', text: marketingLine(state.sales.marketingPerMonth), attrs: { 'data-testid': 'pricing-marketing' } });
+    const marketingLink = el('button', {
+      class: 'btn pricing-marketing-link',
+      text: 'Change marketing',
+      attrs: { type: 'button', 'aria-label': 'Change marketing on the Customers dashboard' },
     });
-    const boostLine = el('p', { class: 'field-hint boost-hint' });
+    marketingLink.addEventListener('click', () => {
+      sheet.close();
+      this.links.marketing?.();
+    });
+    marketingLink.hidden = this.links.marketing === undefined;
     const takeRates = new Map<ParcelKind, HTMLElement>();
     const preview = el('dl', { class: 'take-rates' });
     for (const [kind, label] of KIND_NAMES) {
@@ -664,16 +697,18 @@ export class PricingPanel {
     const mrrNow = el('span', { class: 'num', attrs: { 'data-testid': 'pricing-mrr-now' } });
     const mrrAfter = el('span', { class: 'num', attrs: { 'data-testid': 'pricing-mrr-after' } });
     const cancels = el('span', { class: 'num', attrs: { 'data-testid': 'pricing-cancels' } });
+    const impactNote = el('p', { class: 'impact-note' });
     const figure = (label: string, value: HTMLElement, title: string) =>
       el('div', { class: 'impact-figure', attrs: { title } }, [el('dt', { text: label }), el('dd', {}, [value])]);
     const impact = el('section', { class: 'preview pricing-impact', attrs: { 'aria-label': "Today's subscribers" } }, [
       el('h3', { text: "Today's subscribers" }),
       impactLines,
       el('dl', { class: 'impact-figures' }, [
-        figure('MRR now', mrrNow, 'What today\'s subscribers pay a month right after the change, grandfathered prices held'),
-        figure('After the step', mrrAfter, 'The same once the grandfathered prices end and retired tiers have moved'),
+        figure('Bills now', mrrNow, 'What today\'s subscribers pay a month right after the change, grandfathered prices held'),
+        figure('After the step', mrrAfter, 'The same once the grandfathered prices end and retired tiers have moved, after the expected cancellations'),
         figure('May cancel', cancels, 'Expected cancellations when prices step up and retired tiers move'),
       ]),
+      impactNote,
     ]);
 
     // The incumbent's running promos.
@@ -709,11 +744,11 @@ export class PricingPanel {
       ]),
       promoLine,
       promoAdvice,
-      el('div', { class: 'field-row' }, [
-        el('label', { class: 'field-label', text: 'Marketing', attrs: { for: 'pricing-marketing' } }),
-        el('span', { class: 'money-field' }, [el('span', { text: '$', attrs: { 'aria-hidden': 'true' } }), marketingInput, el('span', { class: 'per', text: '/mo' })]),
+      el('div', { class: 'field-row pricing-marketing-row' }, [
+        el('span', { class: 'field-label', text: 'Marketing' }),
+        el('span', { class: 'pricing-marketing-now' }, [marketingValue, marketingLink]),
       ]),
-      boostLine,
+      el('p', { class: 'field-hint pricing-marketing-hint', text: 'Set it on the Customers dashboard, with what it would bring.' }),
       el('section', { class: 'preview', attrs: { 'aria-label': 'Target take rate' } }, [el('h3', { text: 'Target take rate' }), preview]),
       segments,
       impact,
@@ -722,18 +757,16 @@ export class PricingPanel {
       error,
     );
 
-    const passings = getService(state).passings;
     const read = (): PricingDraft => ({
       tiers: rows.map((r) => ({ id: r.id, price: parseNumberField(r.price.value), offered: r.offered.checked })),
       smbMultiplier: parseNumberField(smbInput.value),
-      marketingPerMonth: parseNumberField(marketingInput.value),
       grandfatherMonths: parseNumberField(grandfatherInput.value),
       promo: { enabled: promoToggle.checked, percentOff: parseNumberField(promoPercent.value), months: parseNumberField(promoMonths.value) },
     });
     const refresh = () => {
       const now = read();
       const game = this.session.state;
-      const p = pricingPreview(base, now, passings);
+      const p = pricingPreview(base, now);
       for (const row of rows) {
         const setting = now.tiers.find((t) => t.id === row.id) as TierSetting;
         row.price.setAttribute('aria-invalid', String(!inRange(setting.price, TIER_PRICE_MIN, TIER_PRICE_MAX)));
@@ -746,7 +779,6 @@ export class PricingPanel {
       promoMonths.disabled = !now.promo.enabled;
       promoPercent.setAttribute('aria-invalid', String(now.promo.enabled && !inRange(now.promo.percentOff, 1, PROMO_MAX_PERCENT_OFF)));
       promoMonths.setAttribute('aria-invalid', String(now.promo.enabled && !inRange(now.promo.months, 1, PROMO_MAX_MONTHS)));
-      marketingInput.setAttribute('aria-invalid', String(p.boost === null));
       for (const [kind, value] of takeRates) setText(value, p.takeRate ? formatPercent(p.takeRate[kind]) : '–');
       setText(grandfatherLine, grandfatherHint(now.grandfatherMonths));
       setText(promoLine, promoHint(base, now, p));
@@ -759,13 +791,16 @@ export class PricingPanel {
           el('li', { class: row.warning ? 'segment-row segment-out' : 'segment-row', text: row.text, attrs: { 'data-segment': row.segment } }),
         ),
       );
-      setText(boostLine, boostHint(p.boost, now.marketingPerMonth, passings));
 
       const effect = pricingImpact(game, now);
       impactLines.replaceChildren(...effect.lines.map((line) => el('li', { text: line })));
-      setText(mrrNow, effect.quote ? `${formatMoney(effect.quote.mrrNow)}/mo` : '–');
-      setText(mrrAfter, effect.quote ? `${formatMoney(effect.quote.mrrAfterLocks)}/mo` : '–');
-      setText(cancels, effect.quote ? `~${formatNumber(effect.quote.expectedChurn)}` : '–');
+      const figures = impactFigures(effect.quote);
+      setText(mrrNow, figures.now);
+      setText(mrrAfter, figures.after);
+      setText(cancels, figures.cancels);
+      setText(impactNote, figures.note);
+      impactNote.hidden = figures.note === '';
+      setText(marketingValue, marketingLine(game.sales.marketingPerMonth));
 
       const rivals = incumbentRows(game, now);
       incumbent.hidden = rivals.length === 0;
@@ -812,14 +847,9 @@ export class PricingPanel {
           return;
         }
       }
-      const marketed = this.session.dispatch({ type: 'setMarketing', perMonth: now.marketingPerMonth });
-      if (!marketed.ok) {
-        fail(`Prices updated, but the marketing budget was not: ${marketed.reason}`);
-        return;
-      }
       sheet.close();
       const promoNote = !promoChanged ? '' : promo ? `; intro promo ${promo.percentOff}% off for ${plural(promo.months, 'month')}` : '; intro promo off';
-      this.toasts.show(`Pricing updated; marketing ${formatMoney(now.marketingPerMonth)}/mo${promoNote}`, true);
+      this.toasts.show(`Pricing updated${promoNote}`, true);
     });
     // Enter in a field applies, as in a form.
     sheet.body.addEventListener('keydown', (e) => {

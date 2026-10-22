@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CABINET_COST, CABINET_REACH_FT, CABINET_START_SPLITTERS, SPLIT_RATIO, SPLITTER_COST } from './balance';
-import { buildOutPlan, coveragePreview, segmentsWithinReach } from './coverage';
+import { buildOutPlan, coveragePreview, segmentsWithinReach, smallerBuildPlan } from './coverage';
 import { applyCommand, newGame, runDays } from './game';
 import { cppBand } from './metrics';
 import { getService, orderFees, quoteCable, spanCharges } from './network';
@@ -371,5 +371,68 @@ describe('buildOutPlan (round 4b)', () => {
     expect(plan.feeder).toEqual([]);
     expect(plan.commands.some((c) => c.type === 'placeCabinet')).toBe(false);
     expect(buildOutPlan(state, -1)).toMatchObject({ feeder: [], reach: [], commands: [], cost: 0, passings: 0, cpp: null });
+  });
+});
+
+describe('smallerBuildPlan (round 4c/4d, spec B)', () => {
+  /** A generated town and the corner whose whole build-out passes the most homes. */
+  function town(): { state: GameState; node: number; full: ReturnType<typeof buildOutPlan> } {
+    const state = newGame(424242, { difficulty: 'shoestring' });
+    let best = { node: -1, full: buildOutPlan(state, -1) };
+    for (const n of state.city.nodes) {
+      const full = buildOutPlan(state, n.id);
+      if (full.reach.length >= 4 && full.passings > best.full.passings) best = { node: n.id, full };
+    }
+    return { state, ...best };
+  }
+
+  it('is the whole build-out when it fits, with the streets it newly lights', () => {
+    const { state, node, full } = town();
+    const plan = smallerBuildPlan(state, node, full.cost)!;
+    expect({ ...plan, lit: undefined }).toEqual({ ...full, lit: undefined });
+    const preview = coveragePreview(state, node);
+    expect(plan.lit).toEqual(preview.segments.filter((s) => s.servedBy === null).map((s) => s.segment));
+  });
+
+  it('fits a smaller budget with the cabinet, its feeder and the densest streets, priced and counted as built', () => {
+    const { state, node, full } = town();
+    const maxCost = Math.round(full.cost / 2);
+    const plan = smallerBuildPlan(state, node, maxCost)!;
+    expect(plan).not.toBeNull();
+    expect(plan.cost).toBeLessThanOrEqual(maxCost);
+    expect(plan.feeder).toEqual(full.feeder);
+    for (const id of plan.reach) expect(full.reach).toContain(id);
+    expect(plan.reach.length).toBeLessThan(full.reach.length);
+    expect(plan.passings).toBeGreaterThan(0);
+    expect(plan.cpp).toBe(plan.cost / plan.passings);
+    // Each street is built as buildOutPlan builds it.
+    for (const id of plan.aerial) expect(full.aerial).toContain(id);
+    for (const id of plan.underground) expect(full.underground).toContain(id);
+    expect(plan.commands[0]).toEqual({ type: 'placeCabinet', node });
+    // Sending it spends exactly its cost, and once built the cabinet lights exactly the streets it said, passing what it said.
+    state.finance.cash = plan.cost + 1_000_000;
+    const before = state.finance.cash;
+    for (const cmd of plan.commands) expect(applyCommand(state, cmd), JSON.stringify(cmd)).toMatchObject({ ok: true });
+    expect(before - state.finance.cash).toBe(plan.cost);
+    const day = state.day;
+    runDays(state, 200);
+    const service = getService(state);
+    const cabinet = state.network.cabinets.find((c) => c.node === node)!;
+    expect(service.cabinetCoverage.get(cabinet.id)!.segments).toEqual(plan.lit);
+    let units = 0;
+    for (const segment of plan.lit) {
+      for (const id of parcelsServedBy(state.city, segment)) {
+        const parcel = state.city.parcels[id]!;
+        if (parcel.appearsDay <= day) units += parcel.units;
+      }
+    }
+    expect(units).toBe(plan.passings);
+  });
+
+  it('is null when not even the cabinet and its feeder fit, or for a bad node', () => {
+    const { state, node, full } = town();
+    expect(smallerBuildPlan(state, node, CABINET_PRICE - 1)).toBeNull();
+    expect(full.cost).toBeGreaterThan(CABINET_PRICE);
+    expect(smallerBuildPlan(state, -1, 1_000_000)).toBeNull();
   });
 });

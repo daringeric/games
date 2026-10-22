@@ -13,7 +13,6 @@ import {
   FROZEN_SWEEP_RESERVE,
   FROZEN_SWEEP_SHARE,
   FUNDING_CUSHION_MONTHS,
-  OVERHEAD_PER_MONTH,
   ARR_TRAILING_MONTHS,
   BASE_RATE_BPS,
   COVENANT_CURE_CLOSES,
@@ -80,6 +79,7 @@ import {
 import { closeMonth, estimateCashAtClose, formatMoney, postEntry } from './finance';
 import { cppBand, operatingCashFlow, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService } from './network';
+import { fixedCostsPerMonth, fixedOverheadLines } from './overhead';
 import { Rng } from './rng';
 import { addLivePlant, closedMonth, makeLoan, makeTestState, makeTradingState } from './testing/fixtures';
 import type { CommandResult, CovenantStage, GameState, MonthlyReport, TermLoan, TermYears } from './types';
@@ -893,6 +893,8 @@ describe('quotePrepay', () => {
         total: amount + accrued,
         paysOff: false,
         paymentAfter: levelPayment(loan.balance - amount, loan.rateBps, loan.monthsLeft),
+        // Round 4c/4d: the covenant figures after it (checked in contract4cd.test.ts).
+        after: q.after,
       });
     });
     expect(quotePrepay(state, 1, amount).accruedInterest).toBeGreaterThan(0);
@@ -1385,6 +1387,8 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
    * the month's operating entries posted as closeMonth steps 1-3 would
    * (revenue 30,000, overhead) plus capex, which the sweep ignores.
    */
+  /** The fake month's running costs: an amount of the test's own (not the game's overhead). */
+  const BOOKED_COSTS = 9_000;
   function frozenBooks(line = 4_000): GameState {
     const state = trading();
     state.finance.cash = 500_000;
@@ -1397,11 +1401,11 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
     state.debt.nextLoanId = 3;
     state.day = nextCloseDay(state) - 1;
     postEntry(state, 'revenue', 30_000, 'Billing');
-    postEntry(state, 'overhead', -OVERHEAD_PER_MONTH, 'Overhead');
+    postEntry(state, 'overhead', -BOOKED_COSTS, 'Overhead');
     postEntry(state, 'install', -7_000, 'Installs');
     return state;
   }
-  const FLOW = 30_000 - OVERHEAD_PER_MONTH;
+  const FLOW = 30_000 - BOOKED_COSTS;
 
   it('sweeps its share of the month\'s operating cash flow after the debt service: the line first, then loans by id, re-amortized', () => {
     const state = frozenBooks();
@@ -1486,9 +1490,11 @@ describe('the frozen-line sweep (closeDebtMonth)', () => {
     state.debt.frozenCloses = 1;
     state.debt.credit.balance = 80_000;
     const mark = lastId(state);
+    // The close's running costs: the overhead's fixed lines (no plant, no customers: the base).
+    const fixed = fixedOverheadLines(state);
     const report = closeWith(state, 30_000);
     const sweep = report.debt!.sweep!;
-    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * (30_000 - OVERHEAD_PER_MONTH)));
+    expect(sweep).toBe(Math.round(FROZEN_SWEEP_SHARE * (30_000 - fixed.base - fixed.perPlant)));
     expect(report.totals.principal).toBe(-sweep);
     expect(state.debt.credit.balance).toBe(80_000 - sweep);
     const notice = noticesAfter(state, mark, 'debtSwept')[0]!;
@@ -1814,7 +1820,7 @@ describe('covenant headroom (round 4b)', () => {
 
 describe('fundingHint', () => {
   function cushionOf(state: GameState): number {
-    return FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth) + estimateNextDebtService(state);
+    return FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state) + estimateNextDebtService(state);
   }
 
   it('says cash when cash covers the cost and the cushion', () => {
@@ -1911,7 +1917,7 @@ describe('cureOptions', () => {
   }
 
   function keep(state: GameState): number {
-    return estimateNextDebtService(state) + FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + state.sales.marketingPerMonth);
+    return estimateNextDebtService(state) + FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state);
   }
 
   it('is empty with no debt or when the covenants pass', () => {

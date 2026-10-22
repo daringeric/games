@@ -1,13 +1,15 @@
 // Cash, ledger and monthly close.
 
-import { INSOLVENCY_GRACE_MONTHS, OVERHEAD_PER_MONTH, POLE_RENT_PER_POLE_PER_MONTH, SUPPORT_COST_PER_SUB_PER_MONTH } from './balance';
+import { INSOLVENCY_GRACE_MONTHS, POLE_RENT_PER_POLE_PER_MONTH } from './balance';
 import { dateOf, formatMonth, MONTH_LENGTHS } from './calendar';
+import { closeCustomersMonth, referralCreditsDue } from './customers';
 import { closeDebtMonth, estimateNextDebtService, reviewDebt, totalDebt } from './debt';
 import { promosRunningBetween, reviewIncumbent } from './incumbent';
 import { CAPEX_CATEGORIES, FINANCING_CATEGORIES, operatingCashFlow, REPAIR_TRAILING_MONTHS, trailingRepairs } from './metrics';
 import { checkMilestones } from './milestones';
 import { ponPortsUsed } from './network';
 import { postNotice } from './notices';
+import { closeOverhead, fixedOverheadLines, overheadLinesOf, perCustomerCost } from './overhead';
 import type { Rng } from './rng';
 import { closeSalesMonth, monthlyRecurringRevenue, subscriberUnits } from './sales';
 import { polesOnSegment } from './streets';
@@ -91,10 +93,24 @@ export function monthlyPoleRent(state: GameState): number {
 interface CloseFlows {
   /** Billing: revenue accrued so far plus today's subscribers at today's prices for the days left. */
   revenue: number;
-  /** Marketing and support: accrued so far plus today's rates for the days left (positive = money out). */
+  /**
+   * Marketing: accrued so far plus today's budget for the days left, plus
+   * (round 4c/4d) the referral credits accrued so far, which the close posts
+   * as 'marketing' (customers.referralCreditsDue; positive = money out).
+   */
   marketing: number;
-  support: number;
-  /** OVERHEAD_PER_MONTH and pole rent for today's live aerial spans (positive = money out). */
+  /**
+   * The per-customer overhead line (overhead.postCustomerOverhead): the
+   * subscriber-days accrued so far plus today's subscribed units for the days
+   * left, at today's per-customer rate (overhead.perCustomerCost, the support
+   * level's cost included), over the month's days (positive = money out).
+   */
+  perCustomer: number;
+  /**
+   * The fixed overhead lines (overhead.fixedOverheadLines: base, and per
+   * plant for the plant as it stands today) and pole rent for today's live
+   * aerial spans (positive = money out).
+   */
   overhead: number;
   poleRent: number;
   /**
@@ -119,11 +135,12 @@ function estimateCloseFlows(state: GameState): CloseFlows {
   const last = finance.reports.at(-1);
   const lastInstalls = last ? (last.totals.install ?? 0) : 0;
   const lastDays = last ? (MONTH_LENGTHS[last.month - 1] as number) : 0;
+  const fixed = fixedOverheadLines(state);
   return {
     revenue: Math.round((month.revenueDollarDays + monthlyRecurringRevenue(state) * left) / daysInMonth),
-    marketing: Math.round((month.marketingDollarDays + sales.marketingPerMonth * left) / daysInMonth),
-    support: Math.round((SUPPORT_COST_PER_SUB_PER_MONTH * (month.subscriberUnitDays + subscriberUnits(state) * left)) / daysInMonth),
-    overhead: OVERHEAD_PER_MONTH,
+    marketing: Math.round((month.marketingDollarDays + sales.marketingPerMonth * left) / daysInMonth) + referralCreditsDue(state).credits,
+    perCustomer: Math.round((perCustomerCost(state) * (month.subscriberUnitDays + subscriberUnits(state) * left)) / daysInMonth),
+    overhead: fixed.base + fixed.perPlant,
     poleRent: monthlyPoleRent(state),
     installsLeft: Math.round(((installs + lastInstalls) * left) / (date.day + lastDays)),
   };
@@ -133,22 +150,26 @@ function estimateCloseFlows(state: GameState): CloseFlows {
  * Cash the next month close will have at its debt step (closeMonth steps 1-3
  * done): today's cash, plus the billing it will post (revenue accrued so far,
  * plus today's subscribers at today's prices for the days of the month not
- * yet accrued), less pole rent for today's live aerial spans, the overhead,
- * marketing and support (accrued so far plus today's rates for the days
- * left), and installs for the days left at the pace of this month so far and
- * the last closed month together (CloseFlows.installsLeft). Exact on
+ * yet accrued), less pole rent for today's live aerial spans, the overhead
+ * (round 4c/4d, overhead.ts: the base and per-plant lines for today's plant,
+ * and the per-customer line from the subscriber-days accrued so far plus
+ * today's subscribers for the days left at today's rate), marketing
+ * (accrued so far plus today's budget for the days left, and the referral
+ * credits accrued so far), and installs
+ * for the days left at the pace of this month so far and the last closed
+ * month together (CloseFlows.installsLeft). Exact on
  * the month's last day, when nothing is left to accrue; before that an
  * estimate (signups, churn and commands change it). The payment reminder
  * (debt.endDebtDay) and the Bank's next payment compare it with
  * debt.estimateNextDebtService. Pure read, O(accounts + ledger entries).
- * Round 4b: the billing and support accrued so far are already net of
- * outage days (sales.accrueDay); the days left are estimated at today's MRR
+ * Round 4b: the billing and subscriber-days accrued so far are already net
+ * of outage days (sales.accrueDay); the days left are estimated at today's MRR
  * and subscribers, so an outage under way counts as repaired by then (it
  * lasts days, and the estimate errs by the few days' credit at most).
  */
 export function estimateCashAtClose(state: GameState): number {
   const f = estimateCloseFlows(state);
-  return state.finance.cash + f.revenue - f.marketing - f.support - f.overhead - f.poleRent + f.installsLeft;
+  return state.finance.cash + f.revenue - f.marketing - f.perCustomer - f.overhead - f.poleRent + f.installsLeft;
 }
 
 /**
@@ -161,7 +182,7 @@ export function estimateCashAtClose(state: GameState): number {
  */
 export function estimateMonthOperatingCashFlow(state: GameState): number {
   const f = estimateCloseFlows(state);
-  return monthOperatingCashFlow(state) + f.revenue - f.marketing - f.support - f.overhead - f.poleRent;
+  return monthOperatingCashFlow(state) + f.revenue - f.marketing - f.perCustomer - f.overhead - f.poleRent;
 }
 
 /**
@@ -187,9 +208,16 @@ export function monthOperatingCashFlow(state: GameState): number {
  *
  * In order, every ledger entry dated the ended month's last day:
  *   1. pole rent for live aerial spans;
- *   2. 'overhead' -OVERHEAD_PER_MONTH ("Overhead for Mar 2027");
- *   3. sales.closeSalesMonth: revenue, marketing, support, churn, accrual
- *      reset (round 4: tier moves, price steps, outage and incumbent churn);
+ *   2. overhead.closeOverhead: the fixed overhead lines (round 4c/4d: the
+ *      base, "Overhead for Mar 2027: office and systems", and per plant for
+ *      the plant on the ended month's last day, "Plant upkeep for Mar 2027:
+ *      6 cabinets, 7.4 miles of cable"; round 4b posted a flat overhead);
+ *   3. sales.closeSalesMonth: revenue, marketing, the per-customer overhead
+ *      line (overhead.postCustomerOverhead, support at the game's level),
+ *      churn, accrual reset (round 4: tier moves, price steps, outage and
+ *      incumbent churn);
+ *      round 4c/4d: customers.closeCustomersMonth (referral credits,
+ *      happiness memory, the month's customer figures: report.customers);
  *      then weather.closeWeatherMonth (the month's outage totals, reset);
  *   4. debt.closeDebtMonth: the month's debt service (credit-line interest,
  *      term-loan payments; round 4: the frozen sweep and accelerated
@@ -207,7 +235,8 @@ export function monthOperatingCashFlow(state: GameState): number {
  *      skipped once a default has ended the game);
  *   8. checkInsolvency(state) (nothing once a default has ended the game);
  *   9. report.ops (round 4) with lastNoticeId = nextNoticeId - 1, after
- *      every notice of the close.
+ *      every notice of the close; round 4c/4d: ops.overhead, the month's
+ *      overhead by line (base + perCustomer + perPlant = -totals.overhead).
  * Returns the report. Every report it writes has `stats`, `debt` (zeros
  * with no debt) and `ops`.
  */
@@ -226,11 +255,12 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
       memo: `Pole rent for ${label}: ${groupThousands(poles)} poles x ${formatMoney(POLE_RENT_PER_POLE_PER_MONTH)}`,
     });
   }
-  if (OVERHEAD_PER_MONTH > 0) {
-    record(state, { day: lastDay, category: 'overhead', amount: -OVERHEAD_PER_MONTH, memo: `Overhead for ${label}` });
-  }
+  // Round 4c/4d: overhead.closeOverhead posts the fixed lines (base, per plant).
+  const fixedOverhead = closeOverhead(state, lastDay, label);
 
   const sales = closeSalesMonth(state, rng, MONTH_LENGTHS[ended.month - 1] as number, lastDay);
+  // Round 4c/4d: referral credits, happiness memory, the month's customer figures (before weather resets the month's outages).
+  const customers = closeCustomersMonth(state, lastDay);
   const weather = closeWeatherMonth(state);
   const debtClose = closeDebtMonth(state, lastDay);
 
@@ -269,6 +299,7 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
     cashEnd: state.finance.cash,
     passings,
     stats,
+    customers,
   };
   state.finance.reports.push(report);
   state.finance.monthToDate = [];
@@ -291,6 +322,8 @@ export function closeMonth(state: GameState, passings: number, rng: Rng): Monthl
     incumbentPromos,
     mrr: monthlyRecurringRevenue(state),
     outageCredits: sales.outageCredits,
+    // Round 4c/4d: the overhead by line (overhead.closeOverhead's fixed lines, sales' per-customer line).
+    overhead: overheadLinesOf(fixedOverhead, sales.perCustomer, sales.support),
   };
   return report;
 }

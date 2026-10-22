@@ -18,6 +18,7 @@ import {
 import { dateOf, MONTH_LENGTHS } from './calendar';
 import { newAdvisorState } from './advisor';
 import { defaultCompanyName } from './company';
+import { newCustomers } from './customers';
 import { closesUntilAcceleration, creditAvailable, newDebt, termCapacity, totalDebt, trailingArr } from './debt';
 import { applyCommand, newGame, runDays, tick } from './game';
 import { getService } from './network';
@@ -39,10 +40,13 @@ const MIXED_LOTS: GridCityOptions['parcelKinds'] = (p) =>
 
 /**
  * A game mid-flight and mid-month (Mar 25): live and permitting spans, a live
- * cabinet, closed months, open month-to-date entries, subscribers on homes,
+ * cabinet, closed months, open month-to-date entries, subscribers on
  * businesses and apartment buildings (with building routers), a half-accrued
- * month, a milestone and its notice. Default grid: horizontal segments 0..8,
- * vertical 9..16, CO at node 0.
+ * month, a milestone and its notice, and (round 4c/4d) a neighborhood
+ * campaign bought the day the cabinet lit its first streets: a lit street
+ * now switches over years, not weeks (customers.ts), and the campaign is what
+ * signs the first customers within the month. Default grid: horizontal
+ * segments 0..8, vertical 9..16, CO at node 0.
  */
 function playedGame(cityOpts: GridCityOptions = {}): GameState {
   const state = newGame(7, { city: makeGridCity({ parcelKinds: MIXED_LOTS, ...cityOpts }) });
@@ -50,7 +54,10 @@ function playedGame(cityOpts: GridCityOptions = {}): GameState {
   applyCommand(state, { type: 'placeCabinet', node: 0 });
   applyCommand(state, { type: 'layCable', segments: [0], method: 'underground' });
   applyCommand(state, { type: 'layCable', segments: [2], method: 'aerial' });
-  runDays(state, 80);
+  let day = 0;
+  for (; day < 80 && getService(state).passings === 0; day++) runDays(state, 1);
+  expect(applyCommand(state, { type: 'runCampaign', cabinet: state.network.cabinets[0]!.id }).ok).toBe(true);
+  runDays(state, 80 - day);
   applyCommand(state, { type: 'layCable', segments: [1], method: 'underground' });
   runDays(state, 3);
   return state;
@@ -1016,6 +1023,9 @@ function withoutRound4(state: GameState): Save {
   delete copy.company;
   delete copy.advisor;
   delete copy.sales.month.outageCreditDollarDays;
+  // Round 4c/4d: the customers model at its defaults.
+  expect(copy.customers).toEqual(newCustomers());
+  delete copy.customers;
   return copy;
 }
 

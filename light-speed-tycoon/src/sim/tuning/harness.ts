@@ -25,7 +25,7 @@ import { reportKpis } from '../metrics';
 import type { ReportKpis } from '../metrics';
 import { orderFees, quoteCable, spanCharges } from '../network';
 import { otherEnd, parcelsServedBy, polesOnSegment, segmentsAtNode, segmentsWithin } from '../streets';
-import { cityExposure, exposureBand, meanOutageDays, outageChurnProbability, stormRisk } from '../weather';
+import { cityExposure, exposureBand, meanOutageDays, outageChurnProbability, stormRisk, streetCanopy } from '../weather';
 import type {
   CabinetId,
   CableMethod,
@@ -465,7 +465,7 @@ export function stormExposure(result: RunResult): StormExposure {
     const subs = subscribers.get(span.segment) ?? 0;
     exposure.repairs += risk.repairCostPerYear;
     exposure.subscriberDaysOut += risk.outageDaysPerYear * subs;
-    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method));
+    exposure.outageChurn += risk.outagesPerYear * subs * outageChurnProbability(meanOutageDays(span.method, streetCanopy(state.city, segment)));
   }
   return exposure;
 }

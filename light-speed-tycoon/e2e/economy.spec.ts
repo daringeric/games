@@ -1,8 +1,10 @@
-// The economy UI end to end: subscribers in the HUD and report, insolvency
-// and game over, milestones, the rate card, importing a schemaVersion 1 save,
-// and the debug-hook gate. (Round 4b: the pricing panel's tests moved to
+// The economy UI end to end: subscribers in the HUD and report (round 4c/4d:
+// the overhead and its base / per-customer / plant lines), insolvency and game
+// over, milestones, the rate card (round 4c/4d: running costs that grow with
+// the company), importing a schemaVersion 1 save, and the debug-hook gate. (Round 4b: the pricing panel's tests moved to
 // pricing.spec.ts.)
 //
+// Round 4c/4d's overhead rows and rate card: ui-summary workstream.
 // Owner: start-screen workstream (round 4b: game over and a new game go
 // through the start screen; the HUD shows the company); sim-pricing (round
 // 4) and ui-economy before.
@@ -92,6 +94,18 @@ test('lit homes sign up: subscribers and revenue in the HUD, the report and the 
   await expect(panel.locator('.stat-takeRate dd')).toHaveText(/^[1-9]\d*%$/);
   await expect(panel.locator('.stat-subscribers dd')).toHaveText(/^[1-9][\d,]*$/);
   await expect(panel.getByTestId('mtd-spend')).toHaveText(/^\$[\d,]+$/);
+  // Round 4c/4d: the overhead, and its lines that add up to it.
+  const overhead = await page.evaluate(() => {
+    const last = window.__lst!.getState().finance.reports.at(-1)!;
+    return { total: -(last.totals.overhead ?? 0), lines: last.ops?.overhead ?? null };
+  });
+  expect(overhead.lines).not.toBeNull();
+  const money = (n: number) => `$${n.toLocaleString('en-US')}`;
+  await expect(panel.locator('.row-overhead dd .num')).toHaveText(money(overhead.total));
+  await expect(panel.locator('.row-overheadBase dd .num')).toHaveText(money(overhead.lines!.base));
+  await expect(panel.locator('.row-overheadCustomers dd .num')).toHaveText(money(overhead.lines!.perCustomer));
+  await expect(panel.locator('.row-overheadPlant dd .num')).toHaveText(money(overhead.lines!.perPlant));
+  expect(overhead.lines!.base + overhead.lines!.perCustomer + overhead.lines!.perPlant).toBe(overhead.total);
 
   // Milestones: first light is dated, the rest say how far there is to go.
   await page.getByRole('button', { name: 'Milestones' }).click();
@@ -235,9 +249,22 @@ test('the rate card opens from the menu and Esc closes it', async ({ page }) => 
   await page.getByRole('menuitem', { name: /Rate card/ }).click();
   const card = page.getByRole('dialog', { name: 'Rate card' });
   await expect(card).toBeVisible();
-  for (const label of ['Underground bore', 'Make-ready', 'Engineering', 'Cabinet', 'OLT line card', 'Home install', 'Overhead', 'Pole rent']) {
+  for (const label of ['Underground bore', 'Make-ready', 'Engineering', 'Cabinet', 'OLT line card', 'Home install', 'Base overhead', 'Pole rent']) {
     await expect(card.getByText(label, { exact: true }).first()).toBeVisible();
   }
+  // Round 4c/4d: running costs grow with the company: per customer (each support level), per cabinet, per mile of cable.
+  const running = card.locator('.rate-section').filter({ has: page.getByRole('heading', { name: 'Running costs' }) });
+  await expect(running.locator('.rate-row dt > span:not(.band-swatch)')).toHaveText([
+    'Base overhead',
+    'Per customer',
+    'Basic support',
+    'Good support',
+    'Great support',
+    'Per cabinet',
+    'Per mile of cable',
+    'Pole rent',
+  ]);
+  for (const value of await running.locator('.rate-row dd').allTextContents()) expect(value).toMatch(/^\$[\d,]+(\.\d\d)?\/mo$/);
   await page.keyboard.press('Escape');
   await expect(card).toBeHidden();
   await expect(page.getByRole('button', { name: 'Menu' })).toBeFocused();

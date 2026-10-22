@@ -3,7 +3,8 @@
 // Money is checked against balance.ts constants and sim results.
 
 import { describe, expect, it } from 'vitest';
-import { FUNDING_CUSHION_MONTHS, LOAN_ROUNDING, OVERHEAD_PER_MONTH, TERM_LOAN_YEARS } from '../sim/balance';
+import { FUNDING_CUSHION_MONTHS, LOAN_ROUNDING, TERM_LOAN_YEARS } from '../sim/balance';
+import { fixedCostsPerMonth } from '../sim/overhead';
 import { creditAvailable, creditLimit, estimateNextDebtService, fundingHint, termCapacity } from '../sim/debt';
 import { applyCommand, newGame } from '../sim/game';
 import { quoteCabinet, quoteCable, quoteSplitter } from '../sim/network';
@@ -120,7 +121,7 @@ describe('cash after an order, and the credit line when cash is short', () => {
   it('keeps a cushion: says so when cash covers the cost but not a month of costs and the next payment', () => {
     const state = withRevenue(game(), 100 * LOAN_ROUNDING);
     state.sales.marketingPerMonth = 2_000;
-    const cushion = FUNDING_CUSHION_MONTHS * (OVERHEAD_PER_MONTH + 2_000) + estimateNextDebtService(state);
+    const cushion = FUNDING_CUSHION_MONTHS * fixedCostsPerMonth(state) + estimateNextDebtService(state);
     const cost = 20 * LOAN_ROUNDING;
     state.finance.cash = cost + cushion - 1;
     const hint = fundingHint(state, cost);

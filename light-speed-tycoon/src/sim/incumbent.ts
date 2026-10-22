@@ -11,8 +11,11 @@
 // Where the rules plug in:
 //   sales.stepSales     - the take rate and tier mix on a street compare your
 //                         tiers with incumbentPriceFor(its serving cabinet)
-//   sales.closeSalesMonth - incumbentChurnFor(account.cabinet) joins each
-//                         unit's churn at the close
+//   sales.closeSalesMonth - round 4c/4d: the promo price at a unit's cabinet
+//                         folds into its happiness (customers.priceScores'
+//                         priceVsCable, calibrated to INCUMBENT_PROMO_CHURN at
+//                         the list price; the default retention offer answers
+//                         it in full); incumbentChurnFor stays for readers
 //   finance.closeMonth  - reviewIncumbent after debt.reviewDebt: promos end
 //                         and start, with their notices
 //
@@ -23,6 +26,13 @@
 // answer a running promo with a retention offer (answerIncumbent,
 // quoteRetention) that pays where the promo would otherwise cost
 // subscribers.
+//
+// Round 4c (spec C, sim-customers workstream): quoteRetention values the
+// offer under the round-4c/4d churn (happiness) and switching (a lost
+// customer is replaced at the area's switching rate today), margins from
+// overhead.perCustomerCost; bestIncumbentAnswer's 'none' says plainly that
+// ignoring the promo is fine there; switching is slower where a promo runs
+// (customers.dealFactor at the promo price).
 
 import {
   INCUMBENT_PRICE,
@@ -33,26 +43,24 @@ import {
   INCUMBENT_PROMO_QUIET_MONTHS,
   INCUMBENT_PROMO_RETRIGGER_POINTS,
   INCUMBENT_PROMO_TAKE_RATE,
+  CUSTOMER_QUOTE_MONTHS,
   PROMO_QUOTE_MONTHS,
-  RETENTION_CHURN_CUT,
   RETENTION_PERCENT_OFF,
   RETENTION_STEP_SHARE,
-  SIGNUP_RAMP_PER_DAY,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
   TIER_DEFAULTS,
 } from './balance';
 import { formatDate } from './calendar';
+import { areaSwitchRate, lostMonthsPerCancellation, regularChurnReader } from './customers';
 import { formatMoney } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
+import { perCustomerCost } from './overhead';
 import {
   accountUnits,
   closeDayAfter,
   DAYS_PER_MONTH,
   installCost,
   lockOn,
-  marketingBoost,
-  promoSignupFactor,
   putLock,
   quotePromo,
   retentionPrice,
@@ -219,8 +227,9 @@ export function reviewIncumbent(state: GameState): void {
 /**
  * Round 4b: whether the promo running at `cabinet` on `day` (default
  * yesterday, as incumbentChurnFor) was answered with a retention offer
- * (IncumbentPromo.answered). sales.closeSalesMonth spares the units it
- * covers RETENTION_CHURN_CUT of the promo's churn.
+ * (IncumbentPromo.answered). Round 4c/4d: the close no longer reads it (a
+ * retention lock answers the promo through happiness: what its units pay
+ * against cable's promo price, balance HAPPINESS_CABLE_PREMIUM_TOLERATED).
  */
 export function answeredPromoAt(state: GameState, cabinet: CabinetId, day: number = state.day - 1): boolean {
   for (const promo of state.sales.incumbentPromos) {
@@ -269,24 +278,29 @@ function retentionRefusal(state: GameState, cabinet: CabinetId, promo: Incumbent
  * cost and save (see RetentionQuote). Pure, no rng. Per subscribed unit on
  * accounts of that cabinet (L = its tier's list price, R =
  * sales.retentionPrice(L), RETENTION_PERCENT_OFF off):
- * - one already locked at or below R keeps its lock (no cost) and is covered
- *   while that lock lasts (closes until the earlier of its untilDay and the
- *   promo's endDay); any other gets a 'retention' lock at R until endDay:
- *   monthlyCost adds what it pays now less what it would pay (a business
- *   at its multiplier), and it is covered for `months` (closes until
- *   endDay), then steps back up (stepChurnProbability(R, back,
- *   RETENTION_STEP_SHARE)), `back` being L, or the dearer lock's price when
- *   that lock was promised past endDay (answerIncumbent gives it back then);
- * - cancellationsAvoided = covered unit-months x INCUMBENT_PROMO_CHURN x
- *   RETENTION_CHURN_CUT less the step's cancellations (at least 0);
- * - one cancellation costs the reinstall (installCost, router already in)
- *   plus its margin (list price less SUPPORT_COST_PER_SUB_PER_MONTH) until
- *   the gap is signed up again: 1 / today's ramp days (SIGNUP_RAMP_PER_DAY x
- *   (1 + marketing boost) x the intro promo's factor), plus, while the
- *   promo's target take rate there (stateTakeRate at its price, over the
- *   area's passings) is at or below the units already subscribed (nobody
- *   signs up there until it ends), the wait for its end: (months - 1) / 2
- *   on average over the closes left;
+ * - one already locked at or below R keeps its lock (no cost) and pays the
+ *   same either way, so the offer changes nothing for it; any other gets a
+ *   'retention' lock at R until endDay: monthlyCost adds what it pays now
+ *   less what it would pay (a business at its multiplier), and for each of
+ *   the `months` closes left (closes until endDay) it cancels less: round
+ *   4c/4d, the incumbent is folded into happiness (customers.priceScores'
+ *   priceVsCable), so its churn at the close (customers.regularChurnReader
+ *   with cable's promo price) at what it pays now less that at R; then it
+ *   steps back up (stepChurnProbability(R, back, RETENTION_STEP_SHARE)),
+ *   `back` being L, or the dearer lock's price when that lock was promised
+ *   past endDay (answerIncumbent gives it back then);
+ * - cancellationsAvoided = those covered unit-months' churn saved less the
+ *   step's cancellations (at least 0);
+ * - one cancellation costs, within CUSTOMER_QUOTE_MONTHS, its margin (list
+ *   price less overhead.perCustomerCost) until the gap it reopens is signed
+ *   up again at the area's switching rate today (customers.areaSwitchRate:
+ *   awareness, the deal against cable's promo price, word of mouth,
+ *   campaigns; customers.lostMonthsPerCancellation) plus the reinstall
+ *   (installCost, router already in) for the share replaced by then, plus,
+ *   while the promo's target take rate there (stateTakeRate at its price,
+ *   over the area's passings) is at or below the units already subscribed
+ *   (nobody signs up there until it ends), the wait for its end: (months -
+ *   1) / 2 months of margin on average over the closes left;
  * - totalCost = monthlyCost x months; pays = valueSaved > totalCost.
  * ok false (with the reason) when the game is over, the cabinet is gone, no
  * promo runs there, it is already answered or nobody subscribes there.
@@ -317,8 +331,10 @@ export function quoteRetention(state: GameState, cabinet: CabinetId): RetentionQ
 
   const pricing = state.sales.pricing;
   const routers = new Set(state.sales.routerParcels);
+  const perCustomer = perCustomerCost(state);
+  const churnOf = regularChurnReader(state, state.day);
   let monthlyCost = 0;
-  let coveredUnitMonths = 0;
+  let saved = 0;
   let stepCancels = 0;
   let margin = 0;
   let reinstall = 0;
@@ -331,39 +347,35 @@ export function quoteRetention(state: GameState, cabinet: CabinetId): RetentionQ
       const offer = retentionPrice(list);
       const lock = lockOn(account, tier.id);
       const paid = lock ? Math.min(lock.price, list) : list;
-      margin += n * (unitPrice(pricing, tier.id, kind) - SUPPORT_COST_PER_SUB_PER_MONTH);
+      margin += n * Math.max(0, unitPrice(pricing, tier.id, kind) - perCustomer);
       reinstall += n * installCost(kind, kind !== 'mdu' || routers.has(account.parcel));
-      if (lock && paid <= offer) {
-        coveredUnitMonths += n * closesUntil(state.day, Math.min(lock.untilDay, promo.endDay));
-        continue;
-      }
-      if (offer >= list) continue;
+      if ((lock && paid <= offer) || offer >= list) continue;
       const bill = (household: number) => (kind === 'smb' ? Math.round(household * pricing.smbMultiplier) : household);
       monthlyCost += n * (bill(paid) - bill(offer));
-      coveredUnitMonths += n * months;
+      const ignored = churnOf(account, tier.id, paid);
+      const answered = churnOf(account, tier.id, offer);
+      saved += n * months * Math.max(0, ignored.regular + ignored.cable - (answered.regular + answered.cable));
       // The step at the promo's end: back to a longer lock it would replace (answerIncumbent resumes it), else to the list price.
       const resume = resumeOf(lock, promo.endDay);
       stepCancels += n * stepChurnProbability(offer, resume ? Math.min(resume.price, list) : list, RETENTION_STEP_SHARE);
     }
   }
-  const avoided = coveredUnitMonths * INCUMBENT_PROMO_CHURN * Math.min(1, Math.max(0, RETENTION_CHURN_CUT)) - stepCancels;
+  const avoided = saved - stepCancels;
 
   // What one cancellation costs there.
-  const service = getService(state);
-  const ramp = SIGNUP_RAMP_PER_DAY * (1 + marketingBoost(state.sales.marketingPerMonth, service.passings)) * promoSignupFactor(state.sales.promo);
-  const refillMonths = ramp > 0 ? 1 / (ramp * DAYS_PER_MONTH) : 0;
+  const lost = lostMonthsPerCancellation(areaSwitchRate(state, cabinet), Math.round(CUSTOMER_QUOTE_MONTHS * DAYS_PER_MONTH));
   const kinds = areaPassings(state, cabinet);
   let promoTarget = 0;
   for (const kind of ['home', 'mdu', 'smb'] as const) promoTarget += kinds[kind] * stateTakeRate(state, kind, cabinet);
   const waitMonths = promoTarget <= units ? (months - 1) / 2 : 0;
-  const perCancel = (margin / units) * (refillMonths + waitMonths) + reinstall / units;
-  const saved = avoided * perCancel;
+  const perCancel = (margin / units) * (lost.months + waitMonths) + (reinstall / units) * lost.replaced;
+  const value = avoided * perCancel;
 
   quote.monthlyCost = monthlyCost;
   quote.totalCost = monthlyCost * months;
   quote.cancellationsAvoided = Math.max(0, Math.round(avoided));
-  quote.valueSaved = Math.max(0, Math.round(saved));
-  quote.pays = saved > quote.totalCost;
+  quote.valueSaved = Math.max(0, Math.round(value));
+  quote.pays = value > quote.totalCost;
   return quote;
 }
 
@@ -392,8 +404,9 @@ function areaPassings(state: GameState, cabinet: CabinetId): Record<'home' | 'md
  * becomes true, and returns
  * { ok: true, cost: 0 } (the discount bills from the next daily accrual).
  * While the promo runs, a unit on a retention lock, or on a cheaper lock it
- * kept, is spared RETENTION_CHURN_CUT of the promo's extra churn
- * (sales.closeSalesMonth); when a retention lock ends its price steps back
+ * kept, pays little enough against cable's promo price that it is spared the
+ * promo's extra churn (round 4c/4d: through happiness, the default offer in
+ * full, balance HAPPINESS_CABLE_PREMIUM_TOLERATED); when a retention lock ends its price steps back
  * up with churn share RETENTION_STEP_SHARE (sales.stepShare).
  */
 export function answerIncumbent(state: GameState, cabinet: CabinetId): CommandResult {
@@ -444,7 +457,10 @@ function resumeOf(lock: PriceLock | undefined, endDay: number): PriceLockResume 
  * none when neither pays. `text` names the remedy, its cost and what it
  * saves, e.g. "A retention offer (15% off until Jun 1, 2029) costs about
  * $1,800 and keeps about 9 subscribers worth $4,100: answer it in Pricing."
- * The advisor renders it verbatim.
+ * The advisor renders it verbatim. Round 4c (spec C): kind 'none' for a
+ * running, unanswered promo says plainly that ignoring it is fine there and
+ * why (rideOutText); empty when no promo runs, it is answered, or the game
+ * is over.
  */
 export function bestIncumbentAnswer(state: GameState, cabinet: CabinetId): IncumbentAnswer {
   const retention = quoteRetention(state, cabinet);
@@ -487,7 +503,22 @@ export function bestIncumbentAnswer(state: GameState, cabinet: CabinetId): Incum
       };
     }
   }
+  if (best.kind === 'none') best = { ...best, text: rideOutText(state, cabinet, running, retention) };
   return best;
+}
+
+/**
+ * Round 4c (spec C): what bestIncumbentAnswer says when nothing pays: that
+ * ignoring the promo is fine there, and why, in one plain sentence.
+ */
+function rideOutText(state: GameState, cabinet: CabinetId, running: IncumbentPromo, retention: RetentionQuote): string {
+  const place = cabinetCorner(state, cabinet);
+  const ends = formatDate(running.endDay);
+  if (retention.units <= 0) return `Ignoring the cable company's promo around ${place} is fine: you have no customers there yet, and it ends on ${ends}.`;
+  return (
+    `Ignoring the cable company's promo around ${place} is fine: a retention offer would cost about ${roughMoney(retention.totalCost)} ` +
+    `to keep customers worth about ${roughMoney(retention.valueSaved)}, and the promo ends on ${ends}.`
+  );
 }
 
 /**

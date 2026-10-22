@@ -1,0 +1,127 @@
+/* Round 4c/4d: HUD additions (ui-bank workstream: the bank chip's plain
+   health words, spec E's phone company name). Imported by main.ts after
+   style.css, so rules here may override it; style.css itself stays frozen.
+   Theme variables only, never literals. */
+
+/* Spec E: the company label is a button (a tap shows the whole name). It keeps
+   style.css's look: no button chrome, the accent dot, one line cut short. */
+.hud-when {
+  position: relative;
+}
+
+button.hud-company {
+  position: relative;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+/* A taller hit area than the line of text, without moving anything (none
+   sideways, so the label never counts as wider than it is). */
+button.hud-company::after {
+  content: '';
+  position: absolute;
+  inset: -8px 0 -4px;
+}
+
+button.hud-company:focus-visible {
+  border-radius: 6px;
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* The whole name, in a bubble under the label (the tooltip's look). */
+.hud-company-full {
+  position: absolute;
+  z-index: 31;
+  top: calc(100% + 8px);
+  left: 50%;
+  display: grid;
+  gap: 3px;
+  width: max-content;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--text);
+  color: var(--card);
+  font: 700 13px / 1.3 var(--font-ui);
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  transform: translateX(-50%);
+  box-shadow: 0 3px 0 var(--shadow);
+}
+
+.hud-company-full[hidden] {
+  display: none;
+}
+
+.hud-company-full-name {
+  font-size: 14.5px;
+  font-weight: 800;
+}
+
+.hud-company-full-tip {
+  font-weight: 600;
+  opacity: 0.9;
+}
+
+.hud-previewing .hud-company-full {
+  display: none;
+}
+
+/* Phones: a long company name takes a second line before it is cut short
+   (the date column has room for two lines beside the speed buttons). */
+@media (max-width: 600px) {
+  button.hud-company {
+    display: -webkit-box;
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 12px;
+    line-height: 1.12;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  /* The accent dot would sit alone on the first line of a wrapped name. */
+  button.hud-company::before {
+    display: none;
+  }
+
+  /* The whole name opens under the HUD, across its width, never off screen. */
+  .hud-when {
+    position: static;
+  }
+
+  .hud-company-full {
+    top: calc(100% + 8px);
+    right: 4px;
+    left: 4px;
+    width: auto;
+    max-width: none;
+    transform: none;
+  }
+}
+
+/* The bank chip: a long countdown ("Bank: No more borrowing: 4 months to
+   call") drops its "Bank: " where the chips are squeezed (style.css drops the
+   chip labels there too), so it keeps to the chips' row on a landscape phone. */
+@media (max-width: 1100px) {
+  .chip-covenant.is-countdown .chip-bank-prefix {
+    display: none;
+  }
+}

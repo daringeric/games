@@ -2,8 +2,10 @@
 // New game and the game-over dialog's "Start a new town" all pass through it;
 // Start makes the company chosen there, Esc or Back returns to where it was
 // opened from. Debug pages skip the first-launch screen unless ?start=1.
+// Round 4c/4d (spec E): on a phone a long company name takes a second line in
+// the HUD, and a tap on it shows the whole name.
 //
-// Owner: start-screen workstream.
+// Owner: start-screen workstream; ui-bank (round 4c/4d).
 
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
@@ -266,6 +268,51 @@ test('a fresh ?seed link offers that town alone, and never touches the main auto
 
 test.describe('on a phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+  test('a long company name takes a second line in the HUD, and a tap shows it whole', async ({ page }) => {
+    const errors = watchErrors(page);
+    await openWithStart(page, '/');
+    const name = 'Wolverine Prairie Fiber and Wire';
+    expect(name.length).toBeLessThanOrEqual(COMPANY_NAME_MAX);
+    await startCompany(page, { name });
+    await page.evaluate(() => document.fonts.ready);
+    const label = page.getByTestId('hud-company');
+    await expect(label).toHaveText(name);
+    await expect(label).toHaveAccessibleName(name);
+    // More than one line before it is cut short, and never wider than its column.
+    const shape = await label.evaluate((el) => {
+      const lineHeight = parseFloat(getComputedStyle(el).lineHeight);
+      return { lines: el.getBoundingClientRect().height / lineHeight, scrollW: el.scrollWidth, clientW: el.clientWidth };
+    });
+    expect(shape.lines).toBeGreaterThan(1.5);
+    expect(shape.scrollW).toBeLessThanOrEqual(shape.clientW);
+
+    // A tap shows the whole name on screen; a tap elsewhere hides it.
+    const full = page.getByTestId('hud-company-full');
+    await expect(full).toBeHidden();
+    await label.tap();
+    await expect(full).toBeVisible();
+    await expect(label).toHaveAttribute('aria-expanded', 'true');
+    await expect(full.locator('.hud-company-full-name')).toHaveText(name);
+    await expect(full).toBeInViewport({ ratio: 1 });
+    const box = (await full.boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(390);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+    await page.touchscreen.tap(195, 600);
+    await expect(full).toBeHidden();
+    await expect(label).toHaveAttribute('aria-expanded', 'false');
+    // Again, and Escape hides it; a second tap on the name toggles it off too.
+    await label.tap();
+    await expect(full).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(full).toBeHidden();
+    await label.tap();
+    await expect(full).toBeVisible();
+    await label.tap();
+    await expect(full).toBeHidden();
+    expect(errors).toEqual([]);
+  });
 
   test('the start screen fits without sideways scrolling, and Start is in view and reachable by keyboard', async ({ page }) => {
     const errors = watchErrors(page);

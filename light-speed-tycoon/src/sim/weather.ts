@@ -35,27 +35,47 @@
 // dig-ins, come from sub-streams derived from those seeds, the storm id or
 // the day, and the street (stormSubSeed, digInSubSeed): two plants on one
 // seed see the same storms, and a street cabled in both gets the same rolls.
+//
+// Round 4c/4d (sim-economy, spec D: storm economics): exposure varies
+// inside the town. Old residential neighborhoods are tree-lined
+// (streetCanopy, from terrain.canopyAt: the grove field, drawn independently
+// of the lots), and on a tree-lined street aerial cable takes up to
+// 1 + STORM_EXPOSURE_CANOPY times the storm damage of an open street, a
+// repair costs up to 1 + REPAIR_CANOPY_SHARE times as much and an outage
+// lasts longer (its days drawn from the top of the usual range: more
+// cancellations, more days not billed). The method choice (methodYearlyCost, lifetimeMethodCost,
+// buryPayback, preferredMethod) weighs pole rent, those repairs and the
+// outage cost of the street's customers against the extra cost of a bore,
+// counting up-front money METHOD_UPFRONT_WEIGHT times (growth is bound by
+// capital): burying a tree-lined block pays back within a few years, while
+// open and sheltered blocks stay aerial.
 
 import {
   BUILD_METHOD_HORIZON_YEARS,
   DIG_INS_PER_MILE_PER_YEAR,
+  LOST_CUSTOMER_MONTHS,
+  METHOD_UPFRONT_WEIGHT,
   OUTAGE_CHURN_BASE,
   OUTAGE_CHURN_MAX,
   OUTAGE_CHURN_PER_DAY,
   OUTAGE_DAYS_AERIAL_MAX,
   OUTAGE_DAYS_AERIAL_MIN,
+  OUTAGE_DAYS_CANOPY,
   OUTAGE_DAYS_UNDERGROUND_MAX,
   OUTAGE_DAYS_UNDERGROUND_MIN,
   POLE_RENT_PER_POLE_PER_MONTH,
   REPAIR_BASE_AERIAL,
   REPAIR_BASE_UNDERGROUND,
+  REPAIR_CANOPY_SHARE,
   REPAIR_PER_FT_AERIAL,
   REPAIR_PER_FT_UNDERGROUND,
   STORM_AERIAL_DAMAGE_CHANCE,
+  STORM_CANOPY_ZONE,
   STORM_CENTER_EXPOSURE_WEIGHT,
   STORM_CENTER_OPEN_FT,
   STORM_CENTER_REACH_CELLS,
   STORM_CHANCE_PER_DAY,
+  STORM_EXPOSURE_CANOPY,
   STORM_EXPOSURE_EDGE,
   STORM_EXPOSURE_EDGE_CELLS,
   STORM_EXPOSURE_EXPOSED,
@@ -73,9 +93,10 @@ import { formatMoney, groupThousands, postEntry } from './finance';
 import { getService, outageService, spanCharges } from './network';
 import { postNotice } from './notices';
 import { Rng, deriveSeed } from './rng';
-import { accountUnits } from './sales';
+import { perCustomerCost } from './overhead';
+import { accountUnits, stateTakeRate, tierMix, unitPrice } from './sales';
 import { cornerName, polesOnSegment } from './streets';
-import { woodedAt } from './terrain';
+import { canopyAt, woodedAt } from './terrain';
 import type {
   AccountOutage,
   CableMethod,
@@ -85,6 +106,7 @@ import type {
   GameState,
   NodeId,
   ParcelId,
+  ParcelKind,
   SegmentId,
   ServiceSnapshot,
   Storm,
@@ -96,6 +118,8 @@ import type {
 
 const FT_PER_MILE = 5_280;
 const DAYS_PER_YEAR = 365;
+/** Days in the month the method choice prices an outage day's unbilled service at (a bill covers about this many days). */
+export const DAYS_PER_BILL = 30;
 /**
  * Most days one WeatherMonth.segmentOutageDays entry can hold (the longest
  * month). Normal play never reaches it, since every close resets the month;
@@ -336,19 +360,37 @@ export function outageChurnProbability(days: number): number {
 
 /**
  * Repair cost of a damaged span of `method` on `segment`, whole dollars:
- * round(REPAIR_BASE_<method> + REPAIR_PER_FT_<method> x lengthFt).
+ * round(REPAIR_BASE_<method> + REPAIR_PER_FT_<method> x lengthFt). Round
+ * 4c/4d: given the street's `city`, an aerial repair also pays for the
+ * trees, x (1 + REPAIR_CANOPY_SHARE x streetCanopy) (rounded once); without
+ * it (or underground) the plain figure, as round 4b.
  */
-export function repairCost(segment: StreetSegment, method: CableMethod): number {
-  return method === 'aerial'
-    ? Math.round(REPAIR_BASE_AERIAL + REPAIR_PER_FT_AERIAL * segment.lengthFt)
-    : Math.round(REPAIR_BASE_UNDERGROUND + REPAIR_PER_FT_UNDERGROUND * segment.lengthFt);
+export function repairCost(segment: StreetSegment, method: CableMethod, city?: City): number {
+  if (method !== 'aerial') return Math.round(REPAIR_BASE_UNDERGROUND + REPAIR_PER_FT_UNDERGROUND * segment.lengthFt);
+  const canopy = city ? streetCanopy(city, segment) : 0;
+  return Math.round((REPAIR_BASE_AERIAL + REPAIR_PER_FT_AERIAL * segment.lengthFt) * (1 + REPAIR_CANOPY_SHARE * canopy));
 }
 
-/** Mean days out of service of one outage on `method` plant (the uniform draw's mean). */
-export function meanOutageDays(method: CableMethod): number {
-  return method === 'aerial'
-    ? (OUTAGE_DAYS_AERIAL_MIN + OUTAGE_DAYS_AERIAL_MAX) / 2
-    : (OUTAGE_DAYS_UNDERGROUND_MIN + OUTAGE_DAYS_UNDERGROUND_MAX) / 2;
+/**
+ * The range one outage's days out are drawn from (uniform, whole days):
+ * OUTAGE_DAYS_<method>_MIN..MAX; round 4c/4d: an aerial outage under
+ * `canopy` (0..1) starts at OUTAGE_DAYS_AERIAL_MIN + round(OUTAGE_DAYS_CANOPY
+ * x canopy), at most OUTAGE_DAYS_AERIAL_MAX.
+ */
+export function outageDaysRange(method: CableMethod, canopy = 0): { min: number; max: number } {
+  if (method !== 'aerial') return { min: OUTAGE_DAYS_UNDERGROUND_MIN, max: OUTAGE_DAYS_UNDERGROUND_MAX };
+  const shift = Math.round(OUTAGE_DAYS_CANOPY * Math.max(0, Math.min(1, canopy)));
+  return { min: Math.min(OUTAGE_DAYS_AERIAL_MAX, OUTAGE_DAYS_AERIAL_MIN + shift), max: OUTAGE_DAYS_AERIAL_MAX };
+}
+
+/**
+ * Mean days out of service of one outage on `method` plant (the uniform
+ * draw's mean, outageDaysRange); round 4c/4d: an aerial outage under
+ * `canopy` (streetCanopy; default 0, an open street) lasts longer.
+ */
+export function meanOutageDays(method: CableMethod, canopy = 0): number {
+  const { min, max } = outageDaysRange(method, canopy);
+  return (min + max) / 2;
 }
 
 /** A storm's damage chance per unit of severity on `method` plant. */
@@ -587,8 +629,8 @@ export function cityStormCoverage(city: City, mx2: number, my2: number): number 
  * the segment's midpoint, cityStormCoverage (centers weighted by exposure),
  * x stormDamageChance for the street's exposure (segmentExposure) averaged
  * over the severities, plus lengthFt / 5,280 x DIG_INS_PER_MILE_PER_YEAR
- * dig-ins for underground), their repair cost (repairCost each) and days out
- * (meanOutageDays each). Used by quote cards ("about $X a year in storm
+ * dig-ins for underground), their repair cost (repairCost each, the street's
+ * canopy counted) and days out (meanOutageDays each, likewise). Used by quote cards ("about $X a year in storm
  * repairs"), quoteConvert, preferredMethod, the advisor and the tuning bots.
  * Pure, no rng; an estimate (not rounded).
  */
@@ -603,8 +645,8 @@ export function stormRisk(state: GameState, segment: StreetSegment, method: Cabl
   if (method === 'underground') outages += (segment.lengthFt / FT_PER_MILE) * DIG_INS_PER_MILE_PER_YEAR;
   return {
     outagesPerYear: outages,
-    repairCostPerYear: outages * repairCost(segment, method),
-    outageDaysPerYear: outages * meanOutageDays(method),
+    repairCostPerYear: outages * repairCost(segment, method, city),
+    outageDaysPerYear: outages * meanOutageDays(method, streetCanopy(city, segment)),
   };
 }
 
@@ -644,7 +686,8 @@ function exposureOf(city: City, seg: StreetSegment): number {
   const reach = STORM_EXPOSURE_EDGE_CELLS > 0 ? STORM_EXPOSURE_EDGE_CELLS : 1;
   const edge = Math.max(0, 1 - toEdge / reach);
   const zone = STORM_EXPOSURE_ZONE[seg.zone] ?? 1;
-  return Math.max(0, zone * (1 + STORM_EXPOSURE_WOODED * wooded) * (1 + STORM_EXPOSURE_EDGE * edge));
+  const canopy = canopyOf(city, seg);
+  return Math.max(0, zone * (1 + STORM_EXPOSURE_WOODED * wooded) * (1 + STORM_EXPOSURE_EDGE * edge) * (1 + STORM_EXPOSURE_CANOPY * canopy));
 }
 
 const exposureCache = new WeakMap<City, readonly number[]>();
@@ -676,6 +719,40 @@ export function cityExposure(city: City): readonly number[] {
   return values;
 }
 
+/** The canopy a street counts (STORM_CANOPY_ZONE[zone] x terrain.canopyAt its midpoint), 0 for a street whose ends are unknown. */
+function canopyOf(city: City, seg: StreetSegment): number {
+  const share = STORM_CANOPY_ZONE[seg.zone] ?? 0;
+  if (!(share > 0)) return 0;
+  const a = city.nodes[seg.a];
+  const b = city.nodes[seg.b];
+  if (!a || !b) return 0;
+  return Math.max(0, Math.min(1, share * canopyAt(city, (a.x + b.x) / 2, (a.y + b.y) / 2)));
+}
+
+const canopyCache = new WeakMap<City, readonly number[]>();
+
+/**
+ * Round 4c/4d (spec D): how much of street `segment` (an id of `city`, or a
+ * segment) runs under mature trees, 0 (open) .. 1 (tree-lined):
+ * terrain.canopyAt its midpoint on the zones STORM_CANOPY_ZONE counts
+ * (residential), 0 elsewhere. It raises the street's storm exposure
+ * (segmentExposure: x (1 + STORM_EXPOSURE_CANOPY x canopy)), what an aerial
+ * repair there costs (repairCost) and how long an aerial outage lasts
+ * (meanOutageDays). Deterministic from the city, memoized per city.
+ */
+export function streetCanopy(city: City, segment: SegmentId | StreetSegment): number {
+  const id = typeof segment === 'number' ? segment : segment.id;
+  const seg = city.segments[id];
+  if (typeof segment !== 'number' && seg !== segment) return canopyOf(city, segment);
+  if (!seg) return 0;
+  let values = canopyCache.get(city);
+  if (!values) {
+    values = city.segments.map((s) => canopyOf(city, s));
+    canopyCache.set(city, values);
+  }
+  return values[id] ?? 0;
+}
+
 /** The band of an exposure: 'exposed' from STORM_EXPOSURE_EXPOSED, 'moderate' from STORM_EXPOSURE_MODERATE, else 'sheltered'. */
 export function exposureBand(exposure: number): ExposureBand {
   if (exposure >= STORM_EXPOSURE_EXPOSED) return 'exposed';
@@ -683,29 +760,140 @@ export function exposureBand(exposure: number): ExposureBand {
   return 'sheltered';
 }
 
+/** Parcels fronting each street of a city (ids ascending), memoized per city: what a street's customers would be. */
+const parcelsByStreet = new WeakMap<City, readonly (readonly ParcelId[])[]>();
+
+function streetParcels(city: City, segment: SegmentId): readonly ParcelId[] {
+  let lists = parcelsByStreet.get(city);
+  if (!lists) {
+    const built: ParcelId[][] = city.segments.map(() => []);
+    for (const parcel of city.parcels) built[parcel.segment]?.push(parcel.id);
+    lists = built;
+    parcelsByStreet.set(city, lists);
+  }
+  return lists[segment] ?? [];
+}
+
 /**
- * What owning a span of `method` on `segment` costs over
- * BUILD_METHOD_HORIZON_YEARS: construction (network.spanCharges, make-ready
- * and rock included; per-order fees left out) + pole rent (aerial) +
- * stormRisk repairs (the exposure model's, exact). Dollars, not rounded.
+ * The customers a street would have once its signups settle: the units of
+ * the buildings on it that stand today, each kind at its target take rate
+ * at today's prices (sales.stateTakeRate). The method choice's estimate.
+ */
+function expectedCustomersOn(state: GameState, segment: StreetSegment): number {
+  const { city } = state;
+  if (city.segments[segment.id] !== segment) return 0;
+  const units: Record<ParcelKind, number> = { home: 0, mdu: 0, smb: 0 };
+  for (const id of streetParcels(city, segment.id)) {
+    const parcel = city.parcels[id];
+    if (parcel && parcel.appearsDay <= state.day) units[parcel.kind] += parcel.units;
+  }
+  let customers = 0;
+  for (const kind of ['home', 'mdu', 'smb'] as const) if (units[kind] > 0) customers += units[kind] * stateTakeRate(state, kind);
+  return customers;
+}
+
+/** What one household customer pays a month at today's prices: the signup tier mix's price (sales.tierMix, sales.unitPrice). */
+function householdPrice(state: GameState): number {
+  const { pricing } = state.sales;
+  const mix = tierMix(pricing, 'home');
+  let price = 0;
+  for (const tier of pricing.tiers) price += (mix[tier.id] ?? 0) * unitPrice(pricing, tier.id, 'home');
+  return price;
+}
+
+/**
+ * Round 4c/4d (spec D): what a span of `method` on `segment` costs a year to
+ * own, dollars (not rounded): pole rent (aerial), the expected storm and
+ * dig-in repairs (stormRisk, exact for the storm model), and what its
+ * outages cost the street's customers would-be or real (expectedCustomersOn):
+ * per outage, the cancellations it causes (outageChurnProbability of the
+ * mean days out, the canopy counted) at LOST_CUSTOMER_MONTHS of a
+ * customer's margin each, and the days of service not billed (mean days out
+ * / DAYS_PER_BILL of the price). An exposed aerial street (storm exposure
+ * from canopy, woods and the map's edge) costs far more a year than the same
+ * street underground or a sheltered one. Pure.
+ */
+export function methodYearlyCost(state: GameState, segment: StreetSegment, method: CableMethod): number {
+  return yearlyCostWith(state, segment, method, streetCustomers(state, segment));
+}
+
+/** The street's would-be customers and what one pays a month and earns over its running cost (for yearlyCostWith). */
+interface StreetCustomers {
+  customers: number;
+  price: number;
+  margin: number;
+}
+
+function streetCustomers(state: GameState, segment: StreetSegment): StreetCustomers {
+  const customers = expectedCustomersOn(state, segment);
+  if (!(customers > 0)) return { customers: 0, price: 0, margin: 0 };
+  const price = householdPrice(state);
+  return { customers, price, margin: Math.max(0, price - perCustomerCost(state)) };
+}
+
+/** methodYearlyCost with the street's customers worked out once (preferredMethod prices both methods with them). */
+function yearlyCostWith(state: GameState, segment: StreetSegment, method: CableMethod, who: StreetCustomers): number {
+  const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 : 0;
+  const risk = stormRisk(state, segment, method);
+  let outages = 0;
+  if (risk.outagesPerYear > 0 && who.customers > 0) {
+    const days = risk.outageDaysPerYear / risk.outagesPerYear;
+    const perOutage = outageChurnProbability(days) * LOST_CUSTOMER_MONTHS * who.margin + (days / DAYS_PER_BILL) * who.price;
+    outages = risk.outagesPerYear * who.customers * perOutage;
+  }
+  return rent + risk.repairCostPerYear + outages;
+}
+
+/** lifetimeMethodCost with the street's customers worked out once. */
+function lifetimeCostWith(state: GameState, segment: StreetSegment, method: CableMethod, who: StreetCustomers): number {
+  return METHOD_UPFRONT_WEIGHT * spanCharges(segment, method).total + BUILD_METHOD_HORIZON_YEARS * yearlyCostWith(state, segment, method, who);
+}
+
+/**
+ * What the method choice weighs for a span of `method` on `segment`
+ * (dollars, not rounded): METHOD_UPFRONT_WEIGHT x its construction charges
+ * (network.spanCharges: cable, rock, make-ready; per-order fees left out)
+ * plus BUILD_METHOD_HORIZON_YEARS x methodYearlyCost (pole rent, expected
+ * storm repairs, the outage cost of the street's customers). The up-front
+ * weight is what money spent now is worth in a game where growth is bound by
+ * capital, so burying wins only where it pays its extra cost back within
+ * BUILD_METHOD_HORIZON_YEARS / METHOD_UPFRONT_WEIGHT years: a tree-lined
+ * (exposed) block, not a sheltered or open one.
  */
 export function lifetimeMethodCost(state: GameState, segment: StreetSegment, method: CableMethod): number {
-  const years = BUILD_METHOD_HORIZON_YEARS;
-  const rent = method === 'aerial' ? polesOnSegment(segment) * POLE_RENT_PER_POLE_PER_MONTH * 12 * years : 0;
-  return spanCharges(segment, method).total + rent + stormRisk(state, segment, method).repairCostPerYear * years;
+  return lifetimeCostWith(state, segment, method, streetCustomers(state, segment));
+}
+
+/**
+ * Round 4c/4d (spec D): burying `segment` instead of stringing it, for a new
+ * build: what it costs more up front (spanCharges underground less aerial;
+ * per-order fees left out), what it saves a year (methodYearlyCost aerial
+ * less underground), and the years it takes to pay back (extra / saved;
+ * null when it saves nothing, 0 when it costs no more). null for a street
+ * without poles (it can only be buried). For the quote cards, the advisor
+ * and the tests. Pure.
+ */
+export function buryPayback(state: GameState, segment: StreetSegment): { extraCost: number; savedPerYear: number; years: number | null } | null {
+  if (!segment.hasPoles) return null;
+  const extraCost = spanCharges(segment, 'underground').total - spanCharges(segment, 'aerial').total;
+  const who = streetCustomers(state, segment);
+  const savedPerYear = yearlyCostWith(state, segment, 'aerial', who) - yearlyCostWith(state, segment, 'underground', who);
+  const years = extraCost <= 0 ? 0 : savedPerYear > 0 ? extraCost / savedPerYear : null;
+  return { extraCost, savedPerYear, years };
 }
 
 /**
  * The method a careful builder would choose for `segment`: the lower
  * lifetimeMethodCost (ties: aerial), or 'underground' when the street has no
- * poles. The advisor's expand plan (coverage.buildOutPlan) builds with it,
- * so once storms favour exposed streets (segmentExposure) its suggestion is
- * the mixed build (aerial in sheltered blocks, underground where exposed).
- * Pure. Implemented by the contract.
+ * poles. The advisor's expand plan (coverage.buildOutPlan) builds with it:
+ * the mixed build, aerial on open and sheltered blocks, underground on
+ * tree-lined and other exposed ones where burying pays back (buryPayback
+ * within BUILD_METHOD_HORIZON_YEARS / METHOD_UPFRONT_WEIGHT years). Pure.
  */
 export function preferredMethod(state: GameState, segment: StreetSegment): CableMethod {
   if (!segment.hasPoles) return 'underground';
-  return lifetimeMethodCost(state, segment, 'aerial') <= lifetimeMethodCost(state, segment, 'underground') ? 'aerial' : 'underground';
+  const who = streetCustomers(state, segment);
+  return lifetimeCostWith(state, segment, 'aerial', who) <= lifetimeCostWith(state, segment, 'underground', who) ? 'aerial' : 'underground';
 }
 
 /** Spans out of service today, in network.spans order (the map and the briefing). Implemented by the contract. */
@@ -844,12 +1032,10 @@ interface Damage {
   repairCost: number;
 }
 
-function drawOutageDays(method: CableMethod, rng: Rng): number {
-  const days =
-    method === 'aerial'
-      ? rng.int(OUTAGE_DAYS_AERIAL_MIN, OUTAGE_DAYS_AERIAL_MAX)
-      : rng.int(OUTAGE_DAYS_UNDERGROUND_MIN, OUTAGE_DAYS_UNDERGROUND_MAX);
-  return Math.max(1, days);
+/** Days out for one damaged span: one uniform draw from `rng` over outageDaysRange(method, the street's canopy). */
+function drawOutageDays(method: CableMethod, rng: Rng, canopy = 0): number {
+  const { min, max } = outageDaysRange(method, canopy);
+  return Math.max(1, rng.int(min, max));
 }
 
 /** Step 2: a storm hits. Its center, radius, severity and seed come from `rng`; each street's damage roll and days out from its own sub-stream. */
@@ -876,7 +1062,8 @@ function stormHits(state: GameState, rng: Rng, subStream: SubStream): void {
     if (dx * dx + dy * dy > reach2) continue;
     const roll = subStream(streetSeed(stormSeed, segment.id));
     if (!roll.chance(stormDamageChance(span.method, severity, exposure[segment.id] ?? 1))) continue;
-    damage.push({ span, daysLeft: drawOutageDays(span.method, roll), repairCost: repairCost(segment, span.method) });
+    const canopy = streetCanopy(city, segment);
+    damage.push({ span, daysLeft: drawOutageDays(span.method, roll, canopy), repairCost: repairCost(segment, span.method, city) });
   }
 
   let total = 0;
@@ -932,7 +1119,7 @@ function digIns(state: GameState, seed: number, subStream: SubStream): void {
     daySeed ??= digInSeedOf(seed, state.day);
     const roll = subStream(streetSeed(daySeed, segment.id));
     if (!roll.chance(segment.lengthFt * perFtPerDay)) continue;
-    cuts.push({ span, daysLeft: drawOutageDays('underground', roll), repairCost: repairCost(segment, 'underground') });
+    cuts.push({ span, daysLeft: drawOutageDays('underground', roll), repairCost: repairCost(segment, 'underground', city) });
   }
   for (const cut of cuts) {
     const before = cutOffOn(state, getService(state));

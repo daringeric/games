@@ -1,13 +1,15 @@
-// The Bank end to end: no credit in a fresh town, drawing from the credit line,
-// the term-loan builder on a phone, prepaying, the financing rows of the
-// monthly report, covenants stepping up to a frozen line and a default that
-// ends the game, and the quote cards' cash-after and credit hints. Round 4:
-// the Bank leads with covenant status, the builder starts at the largest
-// covenant-safe amount, a draw previews its covenants, and a frozen line
-// shows the sweep and the countdown to the bank calling the loans (then what
-// falls due once it has). Round 4b: the builder starts BANK_PREFILL_HEADROOM
-// inside the covenant limits (the exact largest safe amount stays a line
-// under it), and the header names the borrower (the company).
+// The Bank end to end, round 4c/4d (spec H, "Bank C: health first"): the
+// bank's health in one word and sentence, the two checks with their bars,
+// Borrow more (amount chips, Other amount, the 5 or 7-year choice and a
+// live preview in words), Pay back and Emergency cash opening in place,
+// "What happens if I slip?" and the bank's messages. Every action stays
+// covered: borrowing from a chip and from Other amount, the 7-year choice,
+// taking and paying back emergency cash, paying a loan off early, the
+// verified cure's button, the health stepping up to No more borrowing and a
+// missed payment ending the game, the frozen line's sweep and countdown and
+// then the called loans, the financing rows of the monthly report, the
+// quote cards' cash-after and credit hints, and a phone-width pass with no
+// sideways scrolling and comfortable touch targets.
 //
 // Conditions are set up through window.__lst the way economy.spec.ts does:
 // closed months with revenue pushed into finance.reports give the town
@@ -19,12 +21,13 @@
 import { expect, test } from '@playwright/test';
 import type { Locator, Page } from '@playwright/test';
 import { ACCELERATION_CLOSES, BANK_PREFILL_HEADROOM, FROZEN_ACCELERATION_CLOSES, LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
-import { closesUntilAcceleration, covenantsWithin, creditLimit, maxSafeTermLoan, quoteDraw, quoteTermLoan, termCapacity } from '../src/sim/debt';
+import { formatMonth } from '../src/sim/calendar';
+import { closesUntilAcceleration, creditLimit, maxSafeTermLoan, quoteDraw, quoteTermLoan, termCapacity } from '../src/sim/debt';
 import type { GameState } from '../src/sim/types';
-import { formatRatio } from '../src/ui/format';
 import { nodeOnScreen, open, routeFromCo, watchErrors } from './helpers';
 
 const money = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(Math.round(n)).toLocaleString('en-US')}`;
+const round = (n: number) => Math.floor(n / LOAN_ROUNDING) * LOAN_ROUNDING;
 
 interface ToastRecord {
   text: string;
@@ -83,7 +86,7 @@ async function tickToNextClose(page: Page): Promise<void> {
 }
 
 const bankButton = (page: Page) => page.getByRole('button', { name: 'Bank', exact: true });
-const bankDialog = (page: Page) => page.getByRole('dialog', { name: 'Bank' });
+const bankDialog = (page: Page) => page.getByRole('dialog', { name: 'Bank', exact: true });
 
 async function openReportDetails(page: Page): Promise<Locator> {
   const panel = page.getByRole('region', { name: 'Monthly report' });
@@ -92,29 +95,56 @@ async function openReportDetails(page: Page): Promise<Locator> {
   return panel;
 }
 
-test('a fresh town has no credit: the Bank says why and the builder is disabled', async ({ page }) => {
+/** Open a disclosure (a <details>) by its summary, if it is closed. */
+async function disclose(details: Locator): Promise<void> {
+  if (!(await details.evaluate((d) => (d as HTMLDetailsElement).open))) await details.locator('summary').click();
+  await expect(details).toHaveAttribute('open', '');
+}
+
+/** The chip amounts the builder offers for a largest safe amount (spec H.4: about a third, two thirds, all; rounded down; none under the minimum; no repeats). */
+function chipAmounts(safe: number): number[] {
+  const out: number[] = [];
+  for (const amount of [round(safe / 3), round((safe * 2) / 3), round(safe)]) if (amount >= TERM_LOAN_MIN && !out.includes(amount)) out.push(amount);
+  return out;
+}
+
+test('a fresh town has no credit: the Bank says why in plain words and offers no amounts', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
   await expect(page.getByTestId('hud-debt')).toBeHidden();
   await expect(page.getByTestId('hud-covenant')).toBeHidden();
+  const company = (await state(page)).company.name;
 
   await bankButton(page).click();
   const bank = bankDialog(page);
   await expect(bank).toBeVisible();
-  await expect(bank.getByTestId('bank-stage')).toHaveText('Compliant');
-  const credit = bank.getByTestId('bank-credit');
-  await expect(credit).toContainText(/no credit line yet/i);
-  await expect(credit.getByTestId('bank-credit-limit')).toHaveText('$0');
-  await expect(bank.getByTestId('bank-draw')).toBeDisabled();
-  await expect(bank.getByLabel('Amount to draw')).toBeDisabled();
-  // The builder: nothing to borrow, every control off, the sim's reason shown.
-  const term = bank.getByTestId('bank-term');
-  await expect(term.getByLabel('Term loan amount')).toBeDisabled();
-  await expect(term.getByRole('radio', { name: '7 years' })).toBeDisabled();
-  await expect(bank.getByTestId('bank-borrow')).toBeDisabled();
-  await expect(term.locator('.bank-reasons')).toContainText(/no term loans yet/i);
-  await expect(bank.getByTestId('bank-loan-list')).toBeHidden();
-  await expect(bank.getByTestId('bank-loans')).toContainText('No term loans');
+  await expect(bank.locator('.sheet-title')).toHaveText(`The Bank · ${company}`);
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: Good');
+  await expect(bank.getByTestId('bank-health-sentence')).toHaveText('No loans yet.');
+  await expect(bank.getByTestId('bank-health')).toHaveAttribute('data-level', 'good');
+  // With no debt the checks read as passed / not needed.
+  await expect(bank.getByTestId('bank-check-debt')).toContainText('You owe nothing, so this check passes.');
+  await expect(bank.getByTestId('bank-check-coverage')).toContainText('No loan payments yet.');
+  await expect(bank.getByTestId('bank-cure')).toBeHidden();
+  // Borrow more: one plain sentence instead of chips, and no borrow button.
+  await expect(bank.getByTestId('bank-borrow-why')).toHaveText('The bank lends once customers are paying you: sign up customers first.');
+  await expect(bank.getByTestId('bank-chip-0')).toBeHidden();
+  await expect(bank.getByTestId('bank-chip-other')).toBeHidden();
+  await expect(bank.getByTestId('bank-borrow')).toBeHidden();
+  // Emergency cash opens in place, says why there is none, and offers nothing to take.
+  await bank.getByTestId('bank-credit-toggle').click();
+  await expect(bank.getByTestId('bank-credit-toggle')).toHaveAttribute('aria-expanded', 'true');
+  await expect(bank.getByTestId('bank-credit-why')).toContainText('No emergency cash yet');
+  await expect(bank.getByLabel('Amount to take')).toBeHidden();
+  // One section open at a time: Pay back replaces it.
+  await bank.getByTestId('bank-payback-toggle').click();
+  await expect(bank.getByTestId('bank-credit')).toBeHidden();
+  await expect(bank.getByTestId('bank-payback')).toContainText('No loans to pay back.');
+  // Good standing: the slip ladder stays shut, nothing marked; no messages yet.
+  const slip = bank.getByTestId('bank-slip');
+  await expect(slip).not.toHaveAttribute('open', '');
+  await expect(slip.locator('[aria-current="step"]')).toHaveCount(0);
+  await expect(bank.getByTestId('bank-messages')).toBeHidden();
 
   await page.keyboard.press('Escape');
   await expect(bank).toBeHidden();
@@ -122,7 +152,7 @@ test('a fresh town has no credit: the Bank says why and the builder is disabled'
   expect(errors).toEqual([]);
 });
 
-test('draws from the credit line in the Bank: the debt chip appears, cash goes up, the report shows it at the close', async ({ page }) => {
+test('takes and pays back emergency cash with previews in words; the debt chip appears and the report shows it at the close', async ({ page }) => {
   test.setTimeout(90_000);
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
@@ -133,43 +163,68 @@ test('draws from the credit line in the Bank: the debt chip appears, cash goes u
 
   await bankButton(page).click();
   const bank = bankDialog(page);
-  await expect(bank.getByTestId('bank-credit-limit')).toHaveText(money(limit));
-  await expect(bank.getByTestId('bank-credit-available')).toHaveText(money(limit));
+  await bank.getByTestId('bank-credit-toggle').click();
+  const credit = bank.getByTestId('bank-credit');
+  await expect(credit.getByTestId('bank-credit-summary')).toHaveText(`Borrow and repay any time, up to ${money(limit)}. Using now: $0.`);
+  await expect(credit.getByTestId('bank-credit-rate')).toHaveText(/^It costs [\d.]+% a year on what you use, charged at each month close\.$/);
 
-  // More than the line allows: refused with the sim's reason, inline and as a toast.
-  const amount = bank.getByLabel('Amount to draw');
+  // More than it allows: the preview says so plainly and the button stays off.
+  const amount = credit.getByLabel('Amount to take');
   await amount.fill(String(limit + 1));
-  await bank.getByTestId('bank-draw').click();
-  await expect(bank.getByTestId('bank-credit').getByRole('alert')).toContainText('Nothing drawn:');
-  await expect.poll(toasts).toContainEqual(toast('err', 'Nothing drawn:'));
+  await expect(credit.getByTestId('bank-draw-preview')).toHaveText(`You can take up to ${money(limit)} now.`);
+  await expect(credit.getByTestId('bank-draw')).toBeDisabled();
   expect((await state(page)).debt.credit.balance).toBe(0);
 
-  // Half the line, from the preset.
+  // Half of it, from the preset: the preview words what it does to the bank's health.
   const half = Math.floor(limit / 2);
-  const cash = (await state(page)).finance.cash;
-  await bank.getByTestId('bank-credit').getByRole('button', { name: 'Half' }).first().click();
+  const before = await state(page);
+  const quote = quoteDraw(before, half);
+  await credit.getByRole('button', { name: 'Half', exact: true }).click();
   await expect(amount).toHaveValue(String(half));
-  await bank.getByTestId('bank-draw').click();
-  await expect.poll(toasts).toContainEqual(toast('ok', `Drew ${money(half)} from the credit line`));
-  await expect(bank.getByTestId('bank-credit-drawn')).toHaveText(money(half));
-  const after = await state(page);
+  const preview = credit.getByTestId('bank-draw-preview');
+  await expect(preview).toContainText(`If you take ${money(half)}: still Good.`);
+  await expect(preview).toContainText('Debt becomes');
+  await expect(preview).toContainText(`About ${money(quote.interestToClose)} of interest if you keep it to the month end.`);
+  await expect(preview).toHaveClass(/is-ok/);
+  await expect(credit.getByTestId('bank-draw')).toHaveText(`Take ${money(half)}`);
+  await credit.getByTestId('bank-draw').click();
+  await expect.poll(toasts).toContainEqual(toast('ok', `Took ${money(half)} of emergency cash`));
+  let after = await state(page);
   expect(after.debt.credit.balance).toBe(half);
-  expect(after.finance.cash).toBe(cash + half);
-  await expect(bank.getByTestId('bank-summary-debt')).toHaveText(money(half));
+  expect(after.finance.cash).toBe(before.finance.cash + half);
+  await expect(credit.getByTestId('bank-credit-summary')).toHaveText(`Borrow and repay any time, up to ${money(limit)}. Using now: ${money(half)}.`);
+  await expect(bank.getByTestId('bank-check-coverage')).toContainText('for every $1 of loan payments');
+
+  // Pay part of it back from the same section, with its own preview.
+  const back = LOAN_ROUNDING;
+  await expect(credit.getByTestId('bank-repay-head')).toHaveText(`You're using ${money(half)} of emergency cash.`);
+  await credit.getByLabel('Amount to repay').fill(String(back));
+  await expect(credit.getByTestId('bank-repay-preview')).toContainText(`If you pay back ${money(back)}: still Good.`);
+  await credit.getByTestId('bank-repay').click();
+  await expect.poll(toasts).toContainEqual(toast('ok', `Paid back ${money(back)} of emergency cash`));
+  after = await state(page);
+  expect(after.debt.credit.balance).toBe(half - back);
+  // The pay-back form follows to Pay back, which lists the emergency cash used.
+  await bank.getByTestId('bank-payback-toggle').click();
+  await expect(bank.getByTestId('bank-payback').getByTestId('bank-repay-head')).toHaveText(`You're using ${money(half - back)} of emergency cash.`);
 
   // The clock runs behind the sheet: figures refresh in place, a typed amount and focus survive.
-  const termAmount = bank.getByLabel('Term loan amount');
+  await bank.getByTestId('bank-chip-other').click();
+  const termAmount = bank.getByLabel('Amount to borrow');
+  await expect(termAmount).toBeFocused();
   await termAmount.fill(String(TERM_LOAN_MIN));
   await page.evaluate(() => window.__lst!.setSpeed(4));
   await expect.poll(async () => (await state(page)).day, { timeout: 10_000 }).toBeGreaterThan(after.day + 2);
   await page.evaluate(() => window.__lst!.setSpeed(0));
   await expect(termAmount).toBeFocused();
   await expect(termAmount).toHaveValue(String(TERM_LOAN_MIN));
+  await expect(bank.getByTestId('bank-chip-other')).toHaveAttribute('aria-pressed', 'true');
 
   await page.keyboard.press('Escape');
   await expect(bank).toBeHidden();
   const chip = page.getByTestId('hud-debt');
-  await expect(chip).toHaveText(`Debt ${money(half)}`);
+  await expect(chip).toHaveText(`Debt ${money(half - back)}`);
+  await expect(chip).toHaveAttribute('title', /emergency cash/);
   await expect(page.getByTestId('hud-cash')).toHaveText(money((await state(page)).finance.cash));
   // The chip opens the Bank too.
   await chip.click();
@@ -184,7 +239,7 @@ test('draws from the credit line in the Bank: the debt chip appears, cash goes u
   const panel = await openReportDetails(page);
   await expect(panel.locator('.row-interest dd .num')).toHaveText(money(-(report.totals.interest ?? 0)));
   await expect(panel.locator('.row-proceeds dd .num')).toHaveText(money(half));
-  await expect(panel.locator('.row-principal dd .num')).toHaveText('$0');
+  await expect(panel.locator('.row-principal dd .num')).toHaveText(money(back));
   await expect(panel.locator('.row-debt dd .num')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
   await expect(panel.locator('.row-leverage dd')).toContainText('limit');
   await expect(panel.locator('.row-coverage dd')).toContainText('min');
@@ -194,77 +249,130 @@ test('draws from the credit line in the Bank: the debt chip appears, cash goes u
 test.describe('on a phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
-  test('takes a 7-year term loan with the builder, prepays part of it, and sees it in the report', async ({ page }) => {
+  /** Nothing in the open Bank is wider than the screen: no sideways scrolling anywhere. */
+  async function fits(page: Page): Promise<void> {
+    const fit = await page.evaluate(() => {
+      const body = document.querySelector<HTMLElement>('dialog.bank .sheet-body')!;
+      const dialog = document.querySelector<HTMLElement>('dialog.bank')!.getBoundingClientRect();
+      let widest = 0;
+      for (const el of body.querySelectorAll<HTMLElement>('*')) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0) widest = Math.max(widest, r.right);
+      }
+      return {
+        scrollW: body.scrollWidth,
+        clientW: body.clientWidth,
+        page: document.documentElement.scrollWidth - window.innerWidth,
+        left: dialog.left,
+        right: dialog.right,
+        widest,
+      };
+    });
+    expect(fit.scrollW).toBeLessThanOrEqual(fit.clientW);
+    expect(fit.page).toBeLessThanOrEqual(0);
+    expect(fit.left).toBeGreaterThanOrEqual(0);
+    expect(fit.right).toBeLessThanOrEqual(390);
+    expect(fit.widest).toBeLessThanOrEqual(fit.right + 0.5);
+  }
+
+  test('borrows over 7 years from a chip, pays part off early, and sees it in the report, all without sideways scrolling', async ({ page }) => {
     test.setTimeout(90_000);
     const errors = watchErrors(page);
     await open(page, '/?seed=12345');
     const toasts = await recordToasts(page);
     await page.getByRole('button', { name: 'Got it' }).tap();
     await giveRevenue(page, 40_000, 20_000);
-    const capacity = termCapacity(await state(page));
-    expect(capacity).toBeGreaterThanOrEqual(4 * TERM_LOAN_MIN);
+    const s = await state(page);
+    const chips7 = chipAmounts(maxSafeTermLoan(s, 7, BANK_PREFILL_HEADROOM));
+    expect(chips7.length).toBe(3);
 
     await bankButton(page).tap();
     const bank = bankDialog(page);
     await expect(bank).toBeVisible();
-    // One column, nothing wider than the screen, the body scrolls.
-    const fit = await page.evaluate(() => {
+    await fits(page);
+    const scroll = await page.evaluate(() => {
       const body = document.querySelector<HTMLElement>('dialog.bank .sheet-body')!;
-      const dialog = document.querySelector<HTMLElement>('dialog.bank')!.getBoundingClientRect();
-      return { scrollW: body.scrollWidth, clientW: body.clientWidth, scrollH: body.scrollHeight, clientH: body.clientHeight, right: dialog.right, left: dialog.left };
+      return { scrollH: body.scrollHeight, clientH: body.clientHeight };
     });
-    expect(fit.scrollW).toBeLessThanOrEqual(fit.clientW);
-    expect(fit.scrollH).toBeGreaterThan(fit.clientH);
-    expect(fit.left).toBeGreaterThanOrEqual(0);
-    expect(fit.right).toBeLessThanOrEqual(390);
+    expect(scroll.scrollH).toBeGreaterThan(scroll.clientH);
 
+    // The 7-year choice: the chips follow its amounts.
     const term = bank.getByTestId('bank-term');
     const seven = term.getByRole('radio', { name: '7 years' });
     await seven.scrollIntoViewIfNeeded();
     await seven.tap();
     await expect(seven).toHaveAttribute('aria-checked', 'true');
     await expect(term.getByRole('radio', { name: '5 years' })).toHaveAttribute('aria-checked', 'false');
-    // A quarter of what the bank will lend.
-    const quarter = Math.floor((capacity * 0.25) / LOAN_ROUNDING) * LOAN_ROUNDING;
-    await term.getByRole('button', { name: /^25% of what you can borrow/ }).tap();
-    await expect(term.getByLabel('Term loan amount')).toHaveValue(String(quarter));
+    for (const [i, amount] of chips7.entries()) await expect(bank.getByTestId(`bank-chip-${i}`)).toHaveText(money(amount));
+    // The largest safe chip is where the builder starts.
+    await expect(bank.getByTestId('bank-chip-2')).toHaveAttribute('aria-pressed', 'true');
+    // The chips wrap inside the screen.
+    for (const id of ['bank-chip-0', 'bank-chip-1', 'bank-chip-2', 'bank-chip-other']) {
+      const box = (await bank.getByTestId(id).boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(390);
+    }
+
+    // About a third: the preview and the button follow.
+    const third = chips7[0]!;
+    const chip = bank.getByTestId('bank-chip-0');
+    await chip.tap();
+    await expect(chip).toHaveAttribute('aria-pressed', 'true');
+    await expect(bank.getByTestId('bank-chip-2')).toHaveAttribute('aria-pressed', 'false');
     const borrow = bank.getByTestId('bank-borrow');
-    await expect(borrow).toHaveText(`Borrow ${money(quarter)} over 7 years`);
-    await expect(term.getByTestId('bank-term-monthly-payment')).toHaveText(/^\$[1-9][\d,]*$/);
-    await expect(term.locator('[data-check="leverage"]')).toContainText('→');
+    await expect(borrow).toHaveText(`Borrow ${money(third)}`);
+    const preview = bank.getByTestId('bank-term-preview');
+    await expect(preview).toContainText(`If you borrow ${money(third)}: still Good.`);
+    await expect(preview).toContainText(`${money(quoteTermLoan(s, third, 7).payment)} a month for 7 years at`);
 
     // Every control is a comfortable touch target.
-    for (const control of [seven, borrow, term.getByLabel('Term loan amount'), term.getByRole('button', { name: /^50% of/ }), bank.getByTestId('bank-draw')]) {
+    for (const control of [seven, borrow, chip, bank.getByTestId('bank-chip-other'), bank.getByTestId('bank-payback-toggle'), bank.getByTestId('bank-credit-toggle')]) {
       const box = await control.boundingBox();
       expect(box!.height).toBeGreaterThanOrEqual(44);
     }
 
-    const cash = (await state(page)).finance.cash;
+    const cash = s.finance.cash;
     await borrow.scrollIntoViewIfNeeded();
     await borrow.tap();
-    await expect.poll(toasts).toContainEqual(toast('ok', `Borrowed ${money(quarter)} over 7 years`));
-    let s = await state(page);
-    expect(s.debt.loans).toHaveLength(1);
-    const loan = s.debt.loans[0]!;
-    expect(loan).toMatchObject({ principal: quarter, balance: quarter, termMonths: 84 });
-    expect(s.finance.cash).toBe(cash + quarter);
-    const row = bank.locator(`[data-loan="${loan.id}"]`);
-    await expect(row).toContainText(`#${loan.id} · 7 years at`);
-    await expect(row).toContainText('first payment: interest only');
-    await expect(bank.getByTestId(`bank-loan-${loan.id}-balance`)).toHaveText(money(quarter));
+    await expect.poll(toasts).toContainEqual(toast('ok', `Borrowed ${money(third)} over 7 years`));
+    let now = await state(page);
+    expect(now.debt.loans).toHaveLength(1);
+    const loan = now.debt.loans[0]!;
+    expect(loan).toMatchObject({ principal: third, balance: third, termMonths: 84 });
+    expect(now.finance.cash).toBe(cash + third);
 
-    // Prepay part of it: the quote shows the accrued interest and the cash it takes.
+    // Pay back: the loan as one row.
+    await bank.getByTestId('bank-payback-toggle').tap();
+    const row = bank.locator(`[data-loan="${loan.id}"]`);
+    await expect(row.getByTestId(`bank-loan-${loan.id}`)).toHaveText(new RegExp(`^Loan ${loan.id}: \\${money(third)} left · \\$[\\d,]+ a month · 84 months left$`));
+    await expect(row).toContainText('7-year loan at');
+    await expect(row).toContainText("This month's payment is interest only");
+    await expect(bank.getByTestId(`bank-loan-${loan.id}-balance`)).toHaveText(money(third));
+
+    // A few days on (interest builds), pay part of it off early: the preview says what it takes and does.
+    await page.evaluate(() => window.__lst!.tick(3));
+    await row.getByTestId(`bank-prepay-open-${loan.id}`).tap();
+    const prepayAmount = row.getByLabel(`Amount to pay off loan ${loan.id}`);
+    await expect(prepayAmount).toHaveValue(String(third));
+    await expect(row.getByTestId(`bank-prepay-preview-${loan.id}`)).toContainText('If you pay it off:');
+    await expect(row.getByTestId(`bank-prepay-${loan.id}`)).toHaveText(/^Pay off for \$[\d,]+$/);
+    await fits(page);
     const part = TERM_LOAN_MIN;
-    const prepayAmount = row.getByLabel(`Amount to prepay on loan #${loan.id}`);
-    await prepayAmount.scrollIntoViewIfNeeded();
     await prepayAmount.fill(String(part));
-    await expect(row.locator('.bank-prepay-quote')).toContainText('Accrued interest');
-    await bank.getByTestId(`bank-prepay-${loan.id}`).tap();
-    await expect.poll(toasts).toContainEqual(toast('ok', `Prepaid ${money(part)} of loan #${loan.id}`));
-    s = await state(page);
-    expect(s.debt.loans[0]!.balance).toBe(quarter - part);
-    await expect(bank.getByTestId(`bank-loan-${loan.id}-balance`)).toHaveText(money(quarter - part));
-    await expect(page.getByTestId('hud-debt')).toHaveText(`Debt ${money(quarter - part)}`);
+    await expect(row.getByTestId(`bank-prepay-preview-${loan.id}`)).toContainText(`If you pay ${money(part)} off early: still Good.`);
+    await expect(row.getByTestId(`bank-prepay-preview-${loan.id}`)).toContainText('of interest so far');
+    await row.getByTestId(`bank-prepay-${loan.id}`).tap();
+    await expect.poll(toasts).toContainEqual(toast('ok', `Paid ${money(part)} off loan ${loan.id}`));
+    now = await state(page);
+    expect(now.debt.loans[0]!.balance).toBe(third - part);
+    await expect(bank.getByTestId(`bank-loan-${loan.id}-balance`)).toHaveText(money(third - part));
+    await expect(page.getByTestId('hud-debt')).toHaveText(`Debt ${money(third - part)}`);
+
+    // Emergency cash and the slip ladder fit too.
+    await bank.getByTestId('bank-credit-toggle').tap();
+    await disclose(bank.getByTestId('bank-slip'));
+    await disclose(bank.getByTestId('bank-figures'));
+    await fits(page);
 
     // The month close: interest (the loan's first, interest-only payment), the prepaid principal, debt at month end.
     await page.keyboard.press('Escape');
@@ -276,21 +384,82 @@ test.describe('on a phone', () => {
     const panel = await openReportDetails(page);
     await expect(panel.locator('.row-interest dd .num')).toHaveText(money(-(report.totals.interest ?? 0)));
     await expect(panel.locator('.row-principal dd .num')).toHaveText(money(part));
-    await expect(panel.locator('.row-proceeds dd .num')).toHaveText(money(quarter));
+    await expect(panel.locator('.row-proceeds dd .num')).toHaveText(money(third));
     await expect(panel.locator('.row-debt dd .num')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
+    expect(errors).toEqual([]);
+  });
+
+  test('a frozen line fits a phone too', async ({ page }) => {
+    const errors = watchErrors(page);
+    await open(page, '/?seed=12345');
+    await giveRevenue(page, 40_000, 20_000);
+    await page.evaluate(() => {
+      const s = window.__lst!.getState();
+      s.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+      s.debt.credit.balance = 150_000;
+      s.debt.frozenCloses = 2;
+      window.__lst!.tick(1);
+    });
+    await page.getByTestId('hud-covenant').tap();
+    const bank = bankDialog(page);
+    await expect(bank.getByTestId('bank-frozen')).toBeVisible();
+    await expect(bank.getByTestId('bank-slip')).toHaveAttribute('open', '');
+    await bank.getByTestId('bank-credit-toggle').tap();
+    await fits(page);
     expect(errors).toEqual([]);
   });
 });
 
-test('covenant breaches step the stage up to a frozen line, and a payment missed while frozen is a default', async ({ page }) => {
+test('the verified cure leads when a check fails, and its button cures it', async ({ page }) => {
+  const errors = watchErrors(page);
+  await open(page, '/?seed=12345');
+  const toasts = await recordToasts(page);
+  await giveRevenue(page, 40_000, 20_000);
+  // A loan, then (test-only) a cash-flow history that cannot carry it: failing both checks while in good standing.
+  await page.evaluate(
+    ({ min }) => {
+      const lst = window.__lst!;
+      lst.dispatch({ type: 'takeTermLoan', amount: min * 2, termYears: 5 });
+      for (const report of lst.getState().finance.reports) {
+        report.totals = { revenue: 100, overhead: -30_000 };
+        report.net = 100 - 30_000;
+      }
+      lst.tick(1);
+    },
+    { min: TERM_LOAN_MIN },
+  );
+  const chip = page.getByTestId('hud-covenant');
+  await expect(chip).toHaveText('Bank: Watch');
+  await chip.click();
+  const bank = bankDialog(page);
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: Watch');
+  await expect(bank.getByTestId('bank-health-sentence')).toHaveText("At today's figures you'd fail a check at the next month close.");
+  await expect(bank.getByTestId('bank-check-debt')).toHaveAttribute('data-status', 'over');
+  await expect(bank.getByTestId('bank-check-debt-status')).toHaveText("Over the bank's limit");
+  // Not Good: the slip ladder opens by itself.
+  await expect(bank.getByTestId('bank-slip')).toHaveAttribute('open', '');
+  const cure = bank.getByTestId('bank-cure');
+  await expect(cure).toBeVisible();
+  await expect(cure.getByTestId('bank-cure-text')).toHaveText(/^To pass both checks again, /);
+  const action = cure.getByTestId('bank-cure-action');
+  const label = (await action.textContent()) ?? '';
+  expect(label).toMatch(/^Pay /);
+  await action.click();
+  await expect.poll(toasts).toContainEqual(toast('ok', label.replace(/^Pay back /, 'Paid back ').replace(/^Pay /, 'Paid ')));
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: Good');
+  await expect(cure).toBeHidden();
+  await expect(chip).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
+test('the health steps up from Watch to Warning, Higher interest and No more borrowing, and a payment missed then ends the game', async ({ page }) => {
   test.setTimeout(90_000);
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
   const toasts = await recordToasts(page);
   const company = (await state(page)).company.name;
   await giveRevenue(page, 40_000, 20_000);
-  // Borrow most of what the bank allows, then (test-only) rewrite the months it lent against
-  // into a cash-flow history that cannot carry the debt.
+  // Borrow, then (test-only) rewrite the months it lent against into a cash-flow history that cannot carry the debt.
   const result = await page.evaluate(
     ({ min }) => {
       const lst = window.__lst!;
@@ -304,10 +473,11 @@ test('covenant breaches step the stage up to a frozen line, and a payment missed
     { min: TERM_LOAN_MIN },
   );
   expect(result.ok).toBe(true);
-  // Still compliant, but at today's figures the debt breaks the covenants: the HUD warns ahead of the close.
+  // Still in good standing, but at today's figures it fails the checks: the HUD warns ahead of the close, in the Bank's words.
   const chip = page.getByTestId('hud-covenant');
-  await expect(chip).toHaveText('Covenant at risk');
+  await expect(chip).toHaveText('Bank: Watch');
   await expect(chip).toHaveClass(/chip-warn/);
+  await expect(chip).toHaveAttribute('title', /^Bank health: Watch\. /);
   expect((await state(page)).debt.covenant.stage).toBe('compliant');
 
   const notice = async (kind: string) => {
@@ -317,35 +487,52 @@ test('covenant breaches step the stage up to a frozen line, and a payment missed
   };
 
   await tickToNextClose(page);
-  await expect(chip).toHaveText('Covenant warning');
+  await expect(chip).toHaveText('Bank: Warning');
   await expect(chip).toHaveClass(/chip-warn/);
   expect((await state(page)).debt.covenant.stage).toBe('warning');
   await expect.poll(toasts).toContainEqual(toast('warn', await notice('covenantWarning')));
 
   await tickToNextClose(page);
-  await expect(chip).toHaveText('Penalty rate');
-  await expect(chip).toHaveClass(/chip-warn/);
+  await expect(chip).toHaveText('Bank: Higher interest');
+  await expect(chip).toHaveClass(/chip-danger/);
   await expect.poll(toasts).toContainEqual(toast('warn', await notice('covenantPenalty')));
 
   await tickToNextClose(page);
-  // Frozen: the chip counts the frozen closes left before the bank calls the loans.
-  await expect(chip).toHaveText(`Credit frozen: ${FROZEN_ACCELERATION_CLOSES - 1} closes to call`);
+  // No more borrowing: the chip counts the months left before the bank asks for every loan back.
+  await expect(chip).toHaveText(`Bank: No more borrowing: ${FROZEN_ACCELERATION_CLOSES - 1} months to call`);
   await expect(chip).toHaveClass(/chip-danger/);
   expect((await state(page)).debt.covenant.stage).toBe('frozen');
   await expect.poll(toasts).toContainEqual(toast('err', await notice('creditFrozen')));
 
-  // The chip opens the Bank: frozen, nothing to draw or borrow, and a missed payment now ends the game.
+  // The chip opens the Bank: its health in the same words, nothing to borrow or take, the ladder at its step.
   await chip.click();
   const bank = bankDialog(page);
-  await expect(bank.getByTestId('bank-covenant-stage')).toHaveText('Frozen');
-  await expect(bank.getByTestId('bank-covenant-next')).toContainText('default');
-  await expect(bank.getByTestId('bank-draw')).toBeDisabled();
-  await expect(bank.getByTestId('bank-borrow')).toBeDisabled();
-  await expect(bank.locator('.rate-penalty').first()).toBeVisible();
-  // The long debt notices can be reread in the Bank, newest first; the next payment is set against the cash projected at the close.
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: No more borrowing');
+  await expect(bank.getByTestId('bank-health-sentence')).toContainText(`asks for every loan back in ${FROZEN_ACCELERATION_CLOSES - 1} months`);
+  await expect(bank.getByTestId('bank-health')).toHaveAttribute('data-level', 'frozen');
+  const slip = bank.getByTestId('bank-slip');
+  await expect(slip).toHaveAttribute('open', '');
+  await expect(slip.locator('[aria-current="step"]')).toHaveAttribute('data-step', 'frozen');
+  await expect(slip.getByTestId('bank-missed-rule')).toHaveText("If you can't make a payment, borrowing stops at once and you pay a late fee.");
+  await expect(bank.getByTestId('bank-borrow-why')).toContainText('No more borrowing for now');
+  await expect(bank.getByTestId('bank-borrow')).toBeHidden();
+  await bank.getByTestId('bank-credit-toggle').click();
+  await expect(bank.getByTestId('bank-credit-why')).toContainText('No emergency cash while the bank has stopped lending');
+  await expect(bank.getByLabel('Amount to take')).toBeHidden();
+  // The higher interest is one tap away, in how the rate is set.
+  const lineRate = bank.getByTestId('bank-credit-rate-details');
+  await disclose(lineRate);
+  await expect(lineRate.locator('.rate-penalty')).toBeVisible();
+  // The bank's messages, newest first, collapsed until asked for.
+  const messages = bank.getByTestId('bank-messages');
+  await expect(messages).not.toHaveAttribute('open', '');
+  await expect(messages.locator('summary')).toHaveText(/^Bank messages \(\d+\)$/);
+  await disclose(messages);
   await expect(bank.getByTestId('bank-notice-list').locator('li').first()).toContainText(await notice('creditFrozen'));
   await expect(bank.getByTestId('bank-notice-list')).toContainText(await notice('covenantWarning'));
-  await expect(bank.getByTestId('bank-summary-cash-at-the-close')).toHaveText(/^≈ -?\$[\d,]+$/);
+  // What the bank counts: the cash projected at the close beside the next payment.
+  await disclose(bank.getByTestId('bank-figures'));
+  await expect(bank.getByTestId('bank-fig-cash-at-the-close')).toHaveText(/^≈ -?\$[\d,]+$/);
 
   // Test-only: no cash for the next payment. The close defaults; the Bank closes for the game-over dialog.
   await page.evaluate(() => {
@@ -389,70 +576,108 @@ test('a quote card shows the cash an order leaves, and the credit line when cash
   expect(errors).toEqual([]);
 });
 
-test('the Bank leads with covenant status, names the borrower, starts the builder inside the covenant headroom and previews a draw\'s covenants', async ({ page }) => {
+test('the Bank leads with health, starts at the largest safe chip, and previews borrowing from Other amount, over the limit included', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
-  // Thin cash flow on healthy revenue: the bank lends a lot, but not all of it keeps the covenants.
+  const toasts = await recordToasts(page);
+  // Thin cash flow on healthy revenue: the bank lends a lot, but not all of it keeps the checks.
   await giveRevenue(page, 40_000, 36_000);
   const s = await state(page);
-  const safe = maxSafeTermLoan(s, 5);
-  expect(safe).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
-  expect(safe).toBeLessThan(termCapacity(s));
+  const safe5 = maxSafeTermLoan(s, 5);
+  const capacity = termCapacity(s);
+  expect(safe5).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
+  expect(safe5).toBeLessThan(capacity);
 
   await bankButton(page).click();
   const bank = bankDialog(page);
-  // Covenant status comes first, right under the summary.
-  const sections = bank.locator('.bank-section');
-  await expect(sections.first()).toHaveAttribute('data-testid', 'bank-covenant');
-  await expect(sections.first()).toContainText('Covenant status');
-  await expect(bank.getByTestId('bank-covenant-checks')).toContainText('Leverage');
-  await expect(bank.getByTestId('bank-cov-lending-arr')).toHaveText(/^\$[\d,]+\/yr$/);
+  await expect(bank.locator('.sheet-title')).toHaveText(`The Bank · ${s.company.name}`);
+  // Health first, then the two checks, then Borrow more.
+  const top = async (id: string) => (await bank.getByTestId(id).boundingBox())!.y;
+  expect(await top('bank-health')).toBeLessThan(await top('bank-checks'));
+  expect(await top('bank-checks')).toBeLessThan(await top('bank-term'));
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: Good');
+  await expect(bank.getByTestId('bank-check-debt')).toContainText("You owe nothing");
+  // The first view carries no jargon.
+  for (const id of ['bank-health', 'bank-checks', 'bank-term']) {
+    const text = await bank.getByTestId(id).evaluate((el) => {
+      const clone = el.cloneNode(true) as HTMLElement;
+      for (const d of clone.querySelectorAll('details')) d.remove();
+      return clone.innerText;
+    });
+    expect(text).not.toMatch(/leverage|covenant|DSCR|ARR|×/i);
+  }
 
-  // The borrower is named in the header.
-  await expect(bank.locator('.sheet-subtitle')).toHaveText(`Borrower: ${s.company.name}`);
+  // The builder starts at the largest chip: BANK_PREFILL_HEADROOM inside the limits.
+  const start = (years: 5 | 7) => maxSafeTermLoan(s, years, BANK_PREFILL_HEADROOM);
+  const chips5 = chipAmounts(start(5));
+  expect(chips5.at(-1)).toBe(start(5));
+  const safeChip = bank.getByTestId(`bank-chip-${chips5.length - 1}`);
+  await expect(safeChip).toHaveText(money(start(5)));
+  await expect(safeChip).toHaveAttribute('aria-pressed', 'true');
+  await expect(bank.getByLabel('Amount to borrow')).toBeHidden();
+  await expect(bank.getByTestId('bank-term-preview')).toContainText(`If you borrow ${money(start(5))}: still Good.`);
+  await expect(bank.getByTestId('bank-borrow')).toHaveText(`Borrow ${money(start(5))}`);
+  // The exact largest safe amount and the rate's parts are one tap away.
+  const rate = bank.getByTestId('bank-rate-details');
+  await disclose(rate);
+  await expect(bank.getByTestId('bank-term-details')).toContainText(`The most you can borrow over 5 years and still pass both checks: ${money(safe5)}.`);
+  await expect(rate.locator('[data-rate="base"]')).toBeVisible();
 
-  // The builder starts inside the covenant headroom, not on the limits; the exact largest safe amount stays a line.
-  const term = bank.getByTestId('bank-term');
-  const amountField = term.getByLabel('Term loan amount');
-  const start = (years: 5 | 7) => {
-    const inside = maxSafeTermLoan(s, years, BANK_PREFILL_HEADROOM);
-    return inside >= TERM_LOAN_MIN ? inside : TERM_LOAN_MIN;
-  };
-  const start5 = start(5);
-  expect(start5).toBeLessThan(safe);
-  expect(covenantsWithin(quoteTermLoan(s, start5, 5).after, BANK_PREFILL_HEADROOM)).toBe(true);
-  await expect(amountField).toHaveValue(String(start5));
-  await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe)} over 5 years.`);
-  await expect(bank.getByTestId('bank-term-prefill')).toHaveText(
-    `The amount starts at ${money(start5)}, leaving the covenants ${Math.round(BANK_PREFILL_HEADROOM * 100)}% inside their limits.`,
-  );
-  await expect(bank.getByTestId('bank-term-warning')).toBeHidden();
-  // The 7-year term has its own amounts, and the builder follows them until the player picks one.
-  const safe7 = maxSafeTermLoan(s, 7);
-  expect(safe7).toBeGreaterThanOrEqual(TERM_LOAN_MIN);
-  await term.getByRole('radio', { name: '7 years' }).click();
-  await expect(amountField).toHaveValue(String(start(7)));
-  await expect(bank.getByTestId('bank-term-safe')).toHaveText(`Largest covenant-safe amount: ${money(safe7)} over 7 years.`);
-  // The presets still reach the whole capacity: the reckless path is one tap away, with the breach warning.
-  await term.getByRole('button', { name: /^100% of what you can borrow/ }).click();
-  await expect(amountField).toHaveValue(String(termCapacity(s)));
-  await expect(bank.getByTestId('bank-term-warning')).toBeVisible();
+  // The 7-year term has its own amounts; the builder follows them until the player picks one.
+  await bank.getByRole('radio', { name: '7 years' }).click();
+  const chips7 = chipAmounts(start(7));
+  await expect(bank.getByTestId(`bank-chip-${chips7.length - 1}`)).toHaveText(money(start(7)));
+  await expect(bank.getByTestId(`bank-chip-${chips7.length - 1}`)).toHaveAttribute('aria-pressed', 'true');
+  await expect(bank.getByTestId('bank-term-details')).toContainText(`over 7 years and still pass both checks: ${money(maxSafeTermLoan(s, 7))}`);
 
-  // A draw previews its covenants before it is made.
-  const amount = Math.floor(creditLimit(s) / 2);
-  await bank.getByLabel('Amount to draw').fill(String(amount));
-  const preview = bank.getByTestId('bank-draw-preview');
-  await expect(preview).toBeVisible();
-  const quote = quoteDraw(await state(page), amount);
-  await expect(preview.locator('[data-check="leverage"]')).toContainText('→');
-  await expect(preview.locator('[data-check="leverage"]')).toContainText(`→ ${quote.after.leverage === null ? 'not measurable' : formatRatio(quote.after.leverage)}`);
-  await expect(bank.getByTestId('bank-draw-warning')).toBeHidden();
-  await bank.getByLabel('Amount to draw').fill('');
-  await expect(preview).toBeHidden();
+  // Other amount: all the bank will lend is one tap away, with the over-the-limit words.
+  await bank.getByTestId('bank-chip-other').click();
+  const amount = bank.getByLabel('Amount to borrow');
+  await expect(amount).toBeVisible();
+  await expect(amount).toBeFocused();
+  await expect(amount).toHaveAttribute('max', String(capacity));
+  await amount.fill(String(capacity));
+  const preview = bank.getByTestId('bank-term-preview');
+  await expect(preview).toHaveClass(/is-danger/);
+  await expect(preview).toContainText(`If you borrow ${money(capacity)}: this would put you over the bank's limit: you'd get a warning at the next month close.`);
+  await expect(bank.getByTestId('bank-borrow')).toBeEnabled();
+  // More than the bank lends: said plainly, and the button is off.
+  await amount.fill(String(capacity + LOAN_ROUNDING));
+  await expect(preview).toHaveText(`The most the bank will lend now is ${money(capacity)}.`);
+  await expect(bank.getByTestId('bank-borrow')).toBeDisabled();
+
+  // Borrow a typed amount over 7 years.
+  const typed = 2 * TERM_LOAN_MIN;
+  await amount.fill(String(typed));
+  await expect(preview).toContainText(`If you borrow ${money(typed)}: still Good.`);
+  await bank.getByTestId('bank-borrow').click();
+  await expect.poll(toasts).toContainEqual(toast('ok', `Borrowed ${money(typed)} over 7 years`));
+  const after = await state(page);
+  expect(after.debt.loans.at(-1)).toMatchObject({ principal: typed, termMonths: 84 });
+  // The builder starts again at the largest chip, and names same-month re-pricing only when it applies.
+  const next7 = chipAmounts(start(7) === 0 ? 0 : maxSafeTermLoan(after, 7, BANK_PREFILL_HEADROOM));
+  if (next7.length > 0) {
+    await expect(bank.getByTestId(`bank-chip-${next7.length - 1}`)).toHaveAttribute('aria-pressed', 'true');
+    const repriced = quoteTermLoan(after, next7.at(-1)!, 7).repriced.length > 0;
+    const lines = bank.getByTestId('bank-term-repriced');
+    if (repriced) await expect(lines).toContainText(/^Loan \d+, taken this month, would go from/);
+    else await expect(lines).toBeHidden();
+  }
+
+  // Emergency cash previews its effect before anything is taken.
+  await bank.getByTestId('bank-credit-toggle').click();
+  const take = Math.floor(creditLimit(after) / 2);
+  await bank.getByLabel('Amount to take').fill(String(take));
+  const drawPreview = bank.getByTestId('bank-draw-preview');
+  await expect(drawPreview).toBeVisible();
+  await expect(drawPreview).toContainText(`If you take ${money(take)}:`);
+  await expect(drawPreview).toContainText('Debt becomes');
+  await bank.getByLabel('Amount to take').fill('');
+  await expect(drawPreview).toBeHidden();
   expect(errors).toEqual([]);
 });
 
-test('a frozen line shows the sweep and the countdown, then what falls due once the bank calls the loans', async ({ page }) => {
+test('a frozen line shows the sweep and the countdown, then what falls due once the bank asks for every loan back', async ({ page }) => {
   test.setTimeout(90_000);
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
@@ -468,27 +693,28 @@ test('a frozen line shows the sweep and the countdown, then what falls due once 
   });
   await tickToNextClose(page);
   let s = await state(page);
-  const sweep = s.finance.reports.at(-1)!.debt!.sweep!;
+  const last = s.finance.reports.at(-1)!;
+  const sweep = last.debt!.sweep!;
   expect(sweep).toBeGreaterThan(0);
   expect(s.notices.some((n) => n.kind === 'debtSwept')).toBe(true);
   const left = closesUntilAcceleration(s)!;
   expect(left).toBe(FROZEN_ACCELERATION_CLOSES - 2);
   const chip = page.getByTestId('hud-covenant');
-  await expect(chip).toHaveText(`Credit frozen: ${left} closes to call`);
+  await expect(chip).toHaveText(`Bank: No more borrowing: ${left} months to call`);
 
   await chip.click();
   const bank = bankDialog(page);
   const frozen = bank.getByTestId('bank-frozen');
   await expect(frozen).toBeVisible();
-  await expect(frozen).toContainText('the sweep and the countdown');
-  await expect(bank.getByTestId('bank-frozen-last-sweep')).toHaveText(money(sweep));
-  await expect(bank.getByTestId('bank-frozen-before-the-bank-calls-the-loans')).toHaveText(`${left} frozen closes`);
-  await expect(bank.getByTestId('bank-frozen-next-sweep')).toHaveText(/^(≈ \$[\d,]+|None expected)$/);
-  // The sweep notice can be reread in the Bank.
+  await expect(bank.getByTestId('bank-frozen-last')).toHaveText(`Last time it took ${money(sweep)}, at the ${formatMonth(last.year, last.month)} close.`);
+  await expect(bank.getByTestId('bank-frozen-countdown')).toContainText(`the bank asks for every loan back in ${left} months`);
+  await expect(bank.getByTestId('bank-frozen-sweep')).toHaveText(/the bank takes about \$[\d,]+ of your spare cash to pay down what you owe\.$|none is expected at the next close\.$/);
+  // The sweep notice can be reread in the Bank's messages.
+  await disclose(bank.getByTestId('bank-messages'));
   await expect(bank.getByTestId('bank-notice-list')).toContainText('The bank swept');
   await page.keyboard.press('Escape');
 
-  // Test-only: one frozen close short of the call (and no compliant close toward a cure). The next close calls the loans.
+  // Test-only: one frozen close short of the call (and no good close toward stepping back). The next close calls the loans.
   await page.evaluate((n) => {
     const debt = window.__lst!.getState().debt;
     debt.frozenCloses = n;
@@ -499,9 +725,16 @@ test('a frozen line shows the sweep and the countdown, then what falls due once 
   expect(s.debt.acceleration?.closesLeft).toBe(ACCELERATION_CLOSES);
   await expect(chip).toHaveText(`Loans called: ${ACCELERATION_CLOSES} closes left`);
   await chip.click();
-  await expect(frozen).toContainText('Loans called');
-  await expect(frozen.locator('.bank-fig').filter({ hasText: /^Due at the/ })).toHaveCount(ACCELERATION_CLOSES);
-  await expect(bank.getByTestId('bank-draw')).toBeDisabled();
-  await expect(bank.getByTestId('bank-borrow')).toBeDisabled();
+  // Round 4c/4d: the Bank's title names the step the HUD chip and the month summary name.
+  await expect(bank.getByTestId('bank-health-title')).toHaveText('Bank health: Loans called');
+  await expect(bank.getByTestId('bank-health-sentence')).toHaveText("The bank has asked for every loan back. You can't borrow until it's all repaid.");
+  await expect(bank.getByTestId('bank-frozen-called')).toContainText('The bank has asked for every loan back');
+  await expect(bank.getByTestId('bank-frozen-called').locator('li')).toHaveCount(ACCELERATION_CLOSES);
+  await expect(bank.getByTestId('bank-frozen-end')).toContainText('the game ends');
+  await expect(bank.getByTestId('bank-slip').locator('[aria-current="step"]')).toHaveAttribute('data-step', 'called');
+  await expect(bank.getByTestId('bank-borrow')).toBeHidden();
+  await expect(bank.getByTestId('bank-borrow-why')).toContainText('asked for every loan back');
+  await bank.getByTestId('bank-credit-toggle').click();
+  await expect(bank.getByLabel('Amount to take')).toBeHidden();
   expect(errors).toEqual([]);
 });

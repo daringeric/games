@@ -27,7 +27,10 @@ src/
     network.ts    cable/cabinet/splitter/OLT orders, build pipeline, service (what's lit)
     coverage.ts   cabinet reach and the placement preview
     sales.ts      subscribers: signups, installs, ports, billing accruals, churn, pricing
+    customers.ts  switching by deal value, awareness, why homes haven't switched, happiness, and the growth
+                  levers (neighborhood campaigns, support level, referral credits) with their forecasts
     finance.ts    ledger, monthly close, insolvency
+    overhead.ts   overhead that scales with the company: base, per customer (with the support level), per unit of plant
     debt.ts       credit line, term loans, underwriting, pricing, covenants, default,
                   the frozen-line sweep and loan acceleration
     weather.ts    storms, dig-ins, span outages and repairs, storm exposure
@@ -39,7 +42,7 @@ src/
     milestones.ts scorecard milestones
     notices.ts    player-facing notices raised by the sim
     game.ts       newGame / applyCommand / tick
-    save.ts       serialize / deserialize, v1 -> v2 -> v3 -> v4 migration (v4 extended in place in round 4b)
+    save.ts       serialize / deserialize, v1 -> v2 -> v3 -> v4 migration (v4 extended in place in rounds 4b and 4c/4d)
     testing/      fixtures for unit tests (incl. frozen schemaVersion 1, 2 and 3 saves)
     tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes

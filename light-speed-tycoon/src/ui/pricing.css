@@ -167,3 +167,53 @@
     font-size: 15px;
   }
 }
+
+/* Round 4c/4d (ui-customers): the marketing budget is read-only here, with a
+   link to the Customers dashboard where it is set; and the note under the
+   impact figures saying the "after" figure counts the expected cancellations. */
+.pricing .pricing-marketing-now {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px 10px;
+}
+
+.pricing .pricing-marketing-value {
+  font: 600 var(--fs-num) / 1.2 var(--font-display);
+}
+
+.pricing .btn.pricing-marketing-link {
+  min-height: var(--touch);
+  padding: 0 16px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  color: var(--success);
+  font: 800 15px / 1.2 var(--font-ui);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.pricing .btn.pricing-marketing-link:hover {
+  background: var(--hover);
+}
+
+.pricing .btn.pricing-marketing-link[hidden] {
+  display: none;
+}
+
+.pricing .pricing-marketing-hint {
+  text-align: left;
+}
+
+.pricing-impact .impact-note {
+  margin: 8px 0 0;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.pricing-impact .impact-note[hidden] {
+  display: none;
+}

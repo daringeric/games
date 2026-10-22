@@ -15,7 +15,12 @@
 // get them from migrateV3toV4 (difficulty 'seed', company.defaultCompanyName
 // of the town).
 //
-// Owner: the round-4b contract (architect). Workstreams do not change the
+// Round 4c/4d extends schemaVersion 4 in place again (still unreleased):
+// GameState.customers (customers.newCustomers() for saves without it),
+// OpsStats.overhead (null on reports written before it) and the optional
+// MonthlyReport.customers.
+//
+// Owner: the round-4cd contract (architect). Workstreams do not change the
 // saved shape; migration tests run against the frozen v1, v2 and v3
 // fixtures in testing/.
 
@@ -33,6 +38,7 @@ import {
 import { isAdviceKey, newAdvisorState } from './advisor';
 import { dateOf, formatMonth } from './calendar';
 import { COMPANY_NAME_MAX, defaultCompanyName, normalizeCompanyName } from './company';
+import { AWARENESS_PPM, newCustomers } from './customers';
 import { formatMoney, groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
@@ -67,6 +73,7 @@ import type {
   PriceLockResume,
   Sales,
   StreetClass,
+  SupportLevel,
   TierId,
   Zone,
 } from './types';
@@ -186,6 +193,9 @@ export function deserialize(json: string): GameState {
  *   = 0; every incumbent promo's triggerTakePct = the round-4 trigger
  *   (round(INCUMBENT_PROMO_TAKE_RATE x 100)), answered = false and
  *   answeredWithPromo = false.
+ * - Before round 4c/4d: customers = customers.newCustomers() right after
+ *   `sales`; every report's ops.overhead = null (right after outageCredits).
+ *   Reports keep no `customers` (it is optional).
  */
 function upgradeEarlyV4(save: Json): void {
   const weather = save.weather;
@@ -215,8 +225,11 @@ function upgradeEarlyV4(save: Json): void {
   if (isRecord(finance) && Array.isArray(finance.reports)) {
     for (const report of finance.reports) {
       if (isRecord(report) && isRecord(report.ops) && !('outageCredits' in report.ops)) insertAfter(report.ops, 'mrr', 'outageCredits', 0);
+      // Round 4c/4d.
+      if (isRecord(report) && isRecord(report.ops) && !('overhead' in report.ops)) insertAfter(report.ops, 'outageCredits', 'overhead', null);
     }
   }
+  if (!('customers' in save) && 'sales' in save) insertAfter(save, 'sales', 'customers', newCustomers());
 }
 
 /**
@@ -309,7 +322,7 @@ export type V3Account = Omit<Account, 'locks'>;
 /** A month's sales accruals as schemaVersion 2 and 3 saved them (no outage credits). */
 export type V3MonthAccrual = Omit<MonthAccrual, 'outageCreditDollarDays'>;
 /** A schemaVersion 3 game: the round-3 shape (no company, weather, locks, promos, frozen counters or advisor). */
-export type V3State = Omit<GameState, 'schemaVersion' | 'company' | 'rng' | 'network' | 'debt' | 'sales' | 'weather' | 'advisor'> & {
+export type V3State = Omit<GameState, 'schemaVersion' | 'company' | 'rng' | 'network' | 'debt' | 'sales' | 'customers' | 'weather' | 'advisor'> & {
   schemaVersion: 3;
   rng: { events: number; sales: number };
   network: Omit<Network, 'spans'> & { spans: V3Span[] };
@@ -374,6 +387,7 @@ function trailingFrozenCloses(reports: readonly MonthlyReport[]): number {
  * - round 4b: company { name: company.defaultCompanyName(the town's name),
  *   difficulty: DEFAULT_DIFFICULTY }, advisor = advisor.newAdvisorState(),
  *   sales.month.outageCreditDollarDays = 0.
+ * - round 4c/4d: customers = customers.newCustomers().
  * Keys are written in newGame's order so migrated and fresh saves hash alike.
  */
 export function migrateV3toV4(v3: V3State): GameState {
@@ -431,6 +445,7 @@ export function migrateV3toV4(v3: V3State): GameState {
       promo: null,
       incumbentPromos: [],
     },
+    customers: newCustomers(),
     weather: newWeather(),
     advisor: newAdvisorState(),
     milestones: v3.milestones,
@@ -759,7 +774,8 @@ const LOCK_REASONS = members<PriceLockReason>({ grandfather: true, notice: true,
 const RESUME_REASONS = members<PriceLockResume['reason']>({ grandfather: true, notice: true, promo: true });
 const DIFFICULTY_IDS = members<DifficultyId>({ angel: true, seed: true, bootstrapped: true, shoestring: true });
 const SEVERITIES = members<AdviceSeverity>({ urgent: true, important: true, tip: true });
-const OPS_FIELDS = members<keyof OpsStats>({
+/** Every OpsStats field but `overhead` (round 4c/4d: an object or null, checked on its own) is an integer >= 0. */
+const OPS_FIELDS = members<Exclude<keyof OpsStats, 'overhead'>>({
   lastNoticeId: true,
   tierMoves: true,
   priceChurn: true,
@@ -774,6 +790,7 @@ const OPS_FIELDS = members<keyof OpsStats>({
   outageCredits: true,
 });
 const COVENANT_STAGES = members<CovenantStage>({ compliant: true, warning: true, penalty: true, frozen: true });
+const SUPPORT_LEVEL_IDS = members<SupportLevel>({ basic: true, good: true, great: true });
 const GAME_OVER_REASONS = members<GameOverReason>({ insolvent: true, default: true });
 const STATS_FIELDS = members<keyof MonthlyStats>({
   subscribers: true,
@@ -916,7 +933,69 @@ function checkState(save: Json, version: Version): void {
   if (version === 1) return;
   if (version >= 3) checkDebt(obj(save.debt, 'debt'), ctx);
   checkSales(obj(save.sales, 'sales'), ctx);
+  if (version >= 4) checkCustomers(obj(save.customers, 'customers'), ctx);
   checkProgress(save, ctx);
+}
+
+/** Null, or an integer in [min, max]. */
+function nullableInt(value: unknown, path: string, min: number, max: number): number | null {
+  return value === null ? null : int(value, path, min, max);
+}
+
+/**
+ * The customers state (v4, round 4c/4d): a known support level, referral
+ * credits on or off, per-street awareness (lit segments: ascending, one
+ * each, 0..AWARENESS_PPM), campaign records (ascending by an issued cabinet
+ * id, start <= today < end <= cooldown), per-account memories (ascending
+ * parcels, days in range), cabinet waits and the month's figures.
+ */
+function checkCustomers(customers: Json, ctx: Context): void {
+  const { city, day, nextId } = ctx;
+  oneOf(customers.supportLevel, 'customers.supportLevel', SUPPORT_LEVEL_IDS);
+  bool(customers.referrals, 'customers.referrals');
+  const segments = list(customers.streets, 'customers.streets').map((value, i) => {
+    const path = `customers.streets[${i}]`;
+    const street = obj(value, path);
+    int(street.litDay, `${path}.litDay`, 0, day);
+    int(street.awareness, `${path}.awareness`, 0, AWARENESS_PPM);
+    return ref(street.segment, `${path}.segment`, city.segments, 'segment');
+  });
+  ascending(segments, 'customers.streets (by segment)');
+  const cabinets = list(customers.campaigns, 'customers.campaigns').map((value, i) => {
+    const path = `customers.campaigns[${i}]`;
+    const campaign = obj(value, path);
+    // A removed cabinet's record lingers until the next step drops it: the id need only have been issued.
+    const cabinet = int(campaign.cabinet, `${path}.cabinet`, 1, nextId - 1);
+    const start = int(campaign.startDay, `${path}.startDay`, 0, day);
+    const end = int(campaign.endDay, `${path}.endDay`, start + 1);
+    int(campaign.cooldownUntil, `${path}.cooldownUntil`, end);
+    int(campaign.cost, `${path}.cost`, 0, SANE_DEBT_MAX);
+    int(campaign.units, `${path}.units`, 0);
+    return cabinet;
+  });
+  ascending(cabinets, 'customers.campaigns (by cabinet)');
+  const parcels = list(customers.memories, 'customers.memories').map((value, i) => {
+    const path = `customers.memories[${i}]`;
+    const memory = obj(value, path);
+    const outageDay = nullableInt(memory.outageDay, `${path}.outageDay`, 0, day);
+    // Days counted within the memory window of the latest outage: none without one.
+    int(memory.outageDays, `${path}.outageDays`, 0, outageDay === null ? 0 : CUT_OFF_DAYS_MAX * 4);
+    nullableInt(memory.priceStepDay, `${path}.priceStepDay`, 0, day);
+    nullableInt(memory.waitedDay, `${path}.waitedDay`, 0, day);
+    return ref(memory.parcel, `${path}.parcel`, city.parcels.length, 'parcel');
+  });
+  ascending(parcels, 'customers.memories (by parcel)');
+  const waits = list(customers.waits, 'customers.waits').map((value, i) => {
+    const path = `customers.waits[${i}]`;
+    const wait = obj(value, path);
+    int(wait.day, `${path}.day`, 0, day);
+    return int(wait.cabinet, `${path}.cabinet`, 1, nextId - 1);
+  });
+  ascending(waits, 'customers.waits (by cabinet)');
+  nullableInt(customers.pausedDay, 'customers.pausedDay', 0, day);
+  const month = obj(customers.month, 'customers.month');
+  int(month.referralMilli, 'customers.month.referralMilli', 0);
+  int(month.campaignSpend, 'customers.month.campaignSpend', 0, SANE_DEBT_MAX);
 }
 
 /** The company (v4, round 4b): a name already in normalizeCompanyName's form, a known difficulty. */
@@ -1196,7 +1275,10 @@ function checkFinance(finance: Json, ctx: Context): void {
     if (ctx.version >= 4 && report.ops !== undefined) {
       const ops = obj(report.ops, `${path}.ops`);
       for (const field of OPS_FIELDS) int(ops[field], `${path}.ops.${field}`, 0);
+      // Round 4c/4d: required but nullable (null on reports written before it).
+      if (ops.overhead !== null) checkOverheadLines(obj(ops.overhead, `${path}.ops.overhead`), `${path}.ops.overhead`);
     }
+    if (ctx.version >= 4 && report.customers !== undefined) checkCustomerStats(obj(report.customers, `${path}.customers`), `${path}.customers`, ctx);
   });
 
   if (ctx.version === 1) return;
@@ -1205,6 +1287,27 @@ function checkFinance(finance: Json, ctx: Context): void {
   int(capex.connect, 'finance.capex.connect', 0);
   int(capex.co, 'finance.capex.co', 0);
   int(finance.negativeMonths, 'finance.negativeMonths', 0);
+}
+
+/** Report ops.overhead (round 4c/4d): whole dollars >= 0, support part of perCustomer. */
+function checkOverheadLines(lines: Json, path: string): void {
+  int(lines.base, `${path}.base`, 0, SANE_DEBT_MAX);
+  const perCustomer = int(lines.perCustomer, `${path}.perCustomer`, 0, SANE_DEBT_MAX);
+  int(lines.support, `${path}.support`, 0, perCustomer);
+  int(lines.perPlant, `${path}.perPlant`, 0, SANE_DEBT_MAX);
+}
+
+/** Report customers (round 4c/4d): counts >= 0, areas ascending by an issued cabinet id. */
+function checkCustomerStats(stats: Json, path: string, ctx: Context): void {
+  for (const field of ['happy', 'okay', 'unhappy', 'referralSignups', 'referralCredits', 'campaignSpend'] as const) int(stats[field], `${path}.${field}`, 0);
+  const cabinets = list(stats.areas, `${path}.areas`).map((value, i) => {
+    const areaPath = `${path}.areas[${i}]`;
+    const area = obj(value, areaPath);
+    int(area.passings, `${areaPath}.passings`, 0);
+    int(area.units, `${areaPath}.units`, 0);
+    return int(area.cabinet, `${areaPath}.cabinet`, 1, ctx.nextId - 1);
+  });
+  ascending(cabinets, `${path}.areas (by cabinet)`);
 }
 
 /** Report.debt (round-3 closes; the round-4 fields are optional, checked when present). */

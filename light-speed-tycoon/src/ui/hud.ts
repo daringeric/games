@@ -1,36 +1,34 @@
 // Top bar: speed controls, the company (round 4b) over the date with the town
 // beside it as a secondary label, cash (with an overdraft warning), the
-// pricing, milestones and bank buttons, the menu, and a row of chips:
+// pricing, customers (round 4c/4d), milestones and bank buttons, the menu, and a row of chips:
 // passings, cost per passing, subscribers, MRR (the monthly run-rate: what
 // subscribers pay per month today; never called ARR, which is the Bank's
 // smoothed lending figure), OLT PON ports, the build queue, and (round 3)
-// total debt and the covenant stage while they matter (round 4: with the
-// frozen line's countdown to the call, and the closes left once called). The
-// debt and covenant chips open the Bank panel.
+// total debt and the bank's health while they matter. The debt and bank
+// chips open the Bank panel.
 //
-// Owner: ui-economy workstream; debt and covenant chips: ui-bank workstream (round 4: sim-debt);
-// the company label: start-screen workstream (round 4b).
+// Round 4c/4d (spec H.8): the bank chip says the same plain words as the
+// Bank and the month summary (ui/health.ts: "Bank: Watch", "Bank: Higher
+// interest", "Bank: No more borrowing: 4 months to call", "Loans called: 2
+// closes left"), shown while the bank's health isn't Good, with a plain
+// tooltip. Spec E: on a phone a long company name gets a second line, and a
+// tap on it shows the whole name.
+//
+// Owner: ui-bank workstream (round 4c/4d; the contract added the Customers button).
 
-import {
-  ACCELERATION_CLOSES,
-  ACCELERATION_WARNING_CLOSES,
-  CPP_AMBER_MULTIPLIER,
-  CPP_TARGET,
-  FROZEN_ACCELERATION_CLOSES,
-  FROZEN_SWEEP_SHARE,
-  INSOLVENCY_GRACE_MONTHS,
-} from '../sim/balance';
+import { ACCELERATION_WARNING_CLOSES, CPP_AMBER_MULTIPLIER, CPP_TARGET, INSOLVENCY_GRACE_MONTHS } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { difficultyLevel, isDifficultyId } from '../sim/company';
-import { acceleratedSchedule, closesUntilAcceleration, covenantMetrics, cureOptions, totalDebt } from '../sim/debt';
+import { acceleratedSchedule, bankHealth, cureFor, estimateSweep, totalDebt } from '../sim/debt';
 import { runwayMonths } from '../sim/finance';
 import { costPerPassing, cppBand } from '../sim/metrics';
 import { getService, ponPortsUsed } from '../sim/network';
 import { monthlyRecurringRevenue, subscriberUnits } from '../sim/sales';
 import type { CppBand, GameOverReason, GameState } from '../sim/types';
-import { STAGE_TONE, brokenCovenants, covenantLimits, cureAdvice, cureText, stageMeaning, stageNext } from './bankPanel';
+import { cureAdvice } from './bankPanel';
 import { el, icon, setText } from './dom';
-import { formatMoney, formatNumber, formatPercent, plural } from './format';
+import { formatMoney, formatNumber, plural } from './format';
+import { CALLED_WORD, HEALTH_TONE, HEALTH_WORD, healthSentence } from './health';
 import { ICONS } from './icons';
 import { SPEEDS } from './session';
 import type { GameSession, Speed } from './session';
@@ -110,7 +108,7 @@ export interface DebtStatus {
   /** "Debt $412,000" */
   text: string;
   total: number;
-  /** "Credit line $12,000 · Term loans $400,000 (2)" and where to see more. */
+  /** What it is made of, in plain words, and where to see more. */
   tip: string;
 }
 
@@ -121,98 +119,76 @@ export function debtStatus(state: GameState): DebtStatus | null {
   const line = state.debt.credit.balance;
   const loans = state.debt.loans;
   const term = total - line;
-  const parts = [`Credit line ${formatMoney(line)}`, `term loans ${formatMoney(term)}${loans.length > 0 ? ` (${plural(loans.length, 'loan')})` : ''}`];
+  const count = loans.length > 0 ? ` (${plural(loans.length, 'loan')})` : '';
   return {
     text: `Debt ${formatMoney(total)}`,
     total,
-    tip: `Debt: ${parts.join(', ')}. Open the Bank for rates, payments and covenants.`,
+    tip: `You owe ${formatMoney(total)}: ${formatMoney(line)} of emergency cash and ${formatMoney(term)} in loans${count}. Open the Bank to borrow or pay back.`,
   };
 }
 
 export interface CovenantStatus {
   /**
-   * "Covenant warning" / "Penalty rate" / "Credit frozen: 4 closes to call",
-   * "Loans called: 2 closes left", or "Covenant at risk" while compliant with
-   * today's figures in breach.
+   * The bank's health in the Bank's own words while it isn't Good: "Bank:
+   * Watch", "Bank: Warning", "Bank: Higher interest", "Bank: No more
+   * borrowing: 4 months to call"; once the bank has asked for every loan
+   * back, "Loans called: 2 closes left".
    */
   text: string;
   tone: 'warn' | 'danger';
-  /** What it means, what comes next and how to cure it (a verified cure, debt.cureOptions). */
+  /** What it means, in plain words, and the verified cure when there is one. */
   tip: string;
 }
 
-const COVENANT_CHIP_TEXT = { warning: 'Covenant warning', penalty: 'Penalty rate', frozen: 'Credit frozen' } as const;
+/** What the bank chip's words start with. */
+const BANK_PREFIX = 'Bank: ';
 
-/** "Credit frozen: 4 closes to call" (frozen with debt, not yet called), or "Credit frozen" otherwise. */
+/** "Bank: No more borrowing: 4 months to call" (frozen with debt, not yet called), or "Bank: No more borrowing" otherwise. */
 export function frozenChipText(closesUntilCall: number | null): string {
-  if (closesUntilCall === null) return COVENANT_CHIP_TEXT.frozen;
-  if (closesUntilCall <= 0) return `${COVENANT_CHIP_TEXT.frozen}: call at the next close`;
-  return `${COVENANT_CHIP_TEXT.frozen}: ${plural(closesUntilCall, 'close')} to call`;
+  const base = `${BANK_PREFIX}${HEALTH_WORD.frozen}`;
+  if (closesUntilCall === null) return base;
+  if (closesUntilCall <= 0) return `${base}: call at the next close`;
+  return `${base}: ${plural(closesUntilCall, 'month')} to call`;
 }
 
 /** "Loans called: 2 closes left" */
 export function calledChipText(closesLeft: number): string {
-  return `Loans called: ${plural(Math.max(1, closesLeft), 'close')} left`;
-}
-
-/** " To cure it now: ..." with the first verified cure, or ''. */
-function remedyTip(state: GameState): string {
-  const advice = cureAdvice(cureOptions(state)[0]);
-  return advice === '' ? '' : ` To cure it now: ${advice}`;
+  return `${CALLED_WORD}: ${plural(Math.max(1, closesLeft), 'close')} left`;
 }
 
 /**
- * The HUD's covenant chip, or null while the loans are in good standing
- * (compliant) and today's figures keep the covenants. Compliant with today's
- * figures in breach, it warns ahead of the close ("Covenant at risk"),
- * hedged: the close tests that month's figures, which can still pass. Frozen
- * with debt it counts the frozen closes left before the bank calls the loans
- * (debt.closesUntilAcceleration); once called, whatever the stage, the closes
- * left to repay everything, both danger.
+ * The HUD's bank chip (debt.bankHealth, worded by ui/health.ts like the Bank
+ * and the month summary), or null while the bank's health is Good. Once the
+ * bank has asked for every loan back, whatever the stage: the closes left to
+ * repay everything, danger. Frozen with debt it counts the months left
+ * before that call (debt.closesUntilAcceleration).
  */
 export function covenantStatus(state: GameState): CovenantStatus | null {
-  const { stage, compliantCloses } = state.debt.covenant;
   const owed = totalDebt(state);
   const call = state.debt.acceleration;
   if (call !== null && owed > 0) {
-    const schedule = acceleratedSchedule(state);
-    const next = schedule[0] ?? 0;
+    const next = acceleratedSchedule(state)[0] ?? 0;
     return {
       text: calledChipText(call.closesLeft),
       tone: 'danger',
       tip:
-        `Loans called: after ${FROZEN_ACCELERATION_CLOSES} frozen closes in a row the bank wants everything you owe (${formatMoney(owed)}) ` +
-        `within ${plural(Math.max(1, call.closesLeft), 'close')}: about ${formatMoney(next)} at the next close. ` +
-        'A close that cannot pay what falls due is a default that ends the game. Open the Bank for each payment.',
+        `The bank has asked for every loan back: ${formatMoney(owed)} in all, about ${formatMoney(next)} at the next month close. ` +
+        "If a month close can't pay what's due, the game ends. Open the Bank to see each payment.",
     };
   }
-  if (stage === 'compliant') {
-    if (owed <= 0) return null;
-    const metrics = covenantMetrics(state);
-    if (metrics.compliant) return null;
-    return {
-      text: 'Covenant at risk',
-      tone: 'warn',
-      tip:
-        `Covenant at risk: at today's figures your debt breaks ${brokenCovenants(metrics)} (the bank requires ${covenantLimits()} at each month close). ` +
-        `The next close tests that month's figures: a breach then brings a warning first.${remedyTip(state)} Open the Bank for the figures.`,
-    };
-  }
-  const tone = STAGE_TONE[stage] === 'danger' ? 'danger' : 'warn';
-  const left = stage === 'frozen' ? closesUntilAcceleration(state) : null;
-  const text = stage === 'frozen' ? frozenChipText(left) : COVENANT_CHIP_TEXT[stage];
-  const countdown =
-    left === null
-      ? ''
-      : ` While frozen, the bank takes ${formatPercent(FROZEN_SWEEP_SHARE)} of each month's positive operating cash flow to repay what you owe, ` +
-        `and ${left <= 0 ? 'the next close' : `after ${plural(left, 'more frozen close')}`} it calls the loans: everything falls due within ${plural(ACCELERATION_CLOSES, 'close')}.` +
-        (left <= ACCELERATION_WARNING_CLOSES ? ' The call is close.' : '');
+  const health = bankHealth(state);
+  if (health.level === 'good') return null;
+  const word = HEALTH_WORD[health.level];
+  const text = health.level === 'frozen' ? frozenChipText(health.closesUntilCalled) : `${BANK_PREFIX}${word}`;
+  const sweep = health.level === 'frozen' && owed > 0 ? estimateSweep(state) : 0;
+  const sweepText = sweep > 0 ? ` At the next month close it takes about ${formatMoney(sweep)} of your spare cash.` : '';
+  const soon =
+    health.closesUntilCalled !== null && health.closesUntilCalled <= ACCELERATION_WARNING_CLOSES ? ' That call is close.' : '';
+  const cure = health.metrics.compliant ? '' : cureAdvice(cureFor(state));
   return {
     text,
-    tone,
-    tip:
-      `${COVENANT_CHIP_TEXT[stage]}: the bank requires ${covenantLimits()} at each month close. ` +
-      `${stageMeaning(stage)} ${stageNext(stage)}${countdown} To step back down: ${cureText(stage, compliantCloses)}${remedyTip(state)}`,
+    tone: HEALTH_TONE[health.level] === 'danger' ? 'danger' : 'warn',
+    tip: `Bank health: ${word}. ${healthSentence(health)}${sweepText}${soon}${cure ? ` ${cure}` : ''} Open the Bank for the details.`,
   };
 }
 
@@ -286,17 +262,33 @@ export interface HudActions {
   milestones(): void;
   /** Open the Bank panel (the bank button, the debt and covenant chips). */
   bank(): void;
+  /** Round 4c/4d: open the Customers dashboard (the Customers button). */
+  customers(): void;
 }
 
 export class Hud {
   readonly root: HTMLElement;
   readonly menuButton: HTMLButtonElement;
   readonly pricingButton: HTMLButtonElement;
+  /** Round 4c/4d: opens the Customers dashboard (data-testid hud-customers). */
+  readonly customersButton: HTMLButtonElement;
   readonly milestonesButton: HTMLButtonElement;
   readonly bankButton: HTMLButtonElement;
   private readonly speedButtons = new Map<Speed, HTMLButtonElement>();
   private readonly when: HTMLElement;
-  private readonly company: HTMLElement;
+  /** Round 4c/4d (spec E): a button; a tap shows the whole name (a phone cuts a long one short). */
+  private readonly company: HTMLButtonElement;
+  private readonly companyFull: HTMLElement;
+  private readonly companyFullName: HTMLElement;
+  private readonly companyFullTip: HTMLElement;
+  private nameTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly closeNameOutside = (e: Event) => {
+    if (e.target instanceof Node && (this.company.contains(e.target) || this.companyFull.contains(e.target))) return;
+    this.showName(false);
+  };
+  private readonly closeNameKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') this.showName(false);
+  };
   private readonly town: HTMLElement;
   private readonly date: HTMLElement;
   private readonly cash: HTMLElement;
@@ -314,6 +306,8 @@ export class Hud {
   private readonly debt: HTMLElement;
   private readonly debtChip: HTMLButtonElement;
   private readonly covenant: HTMLElement;
+  /** "Bank: ", its own span so a narrow HUD can drop it from a long countdown (hud.css). */
+  private readonly covenantPrefix: HTMLElement;
   private readonly covenantChip: HTMLButtonElement;
   /** Session revision and state the subscriber figures were last computed for. */
   private seen: { revision: number; state: GameState | null } = { revision: -1, state: null };
@@ -335,11 +329,21 @@ export class Hud {
       speeds.append(button);
     }
 
-    this.company = el('span', { class: 'hud-company', attrs: { 'data-testid': 'hud-company' } });
+    this.company = el('button', {
+      class: 'hud-company',
+      attrs: { type: 'button', 'data-testid': 'hud-company', 'aria-expanded': 'false', 'aria-controls': 'hud-company-full' },
+      on: { click: () => this.showName(this.companyFull.hidden) },
+    });
+    this.companyFullName = el('strong', { class: 'hud-company-full-name' });
+    this.companyFullTip = el('span', { class: 'hud-company-full-tip' });
+    this.companyFull = el('span', { class: 'hud-company-full', attrs: { id: 'hud-company-full', 'data-testid': 'hud-company-full', hidden: '' } }, [
+      this.companyFullName,
+      this.companyFullTip,
+    ]);
     this.town = el('span', { class: 'hud-town', attrs: { 'data-testid': 'hud-town' } });
     this.date = el('span', { class: 'hud-date num', attrs: { 'data-testid': 'hud-date' } });
     // The company on top; the date with the town beside it (the town gives way first when there is no room).
-    this.when = el('div', { class: 'hud-when' }, [this.company, el('span', { class: 'hud-when-line' }, [this.date, this.town])]);
+    this.when = el('div', { class: 'hud-when' }, [this.company, this.companyFull, el('span', { class: 'hud-when-line' }, [this.date, this.town])]);
     this.cash = el('span', { class: 'hud-cash num', attrs: { 'data-testid': 'hud-cash' } });
     this.alertText = el('span');
     this.alert = el('span', { class: 'chip chip-alert hud-alert', attrs: { 'data-testid': 'hud-insolvency', role: 'status' } }, [
@@ -355,7 +359,9 @@ export class Hud {
         html: svg,
         on: { click: run },
       });
-    this.pricingButton = action('Pricing', 'Pricing and marketing', ICONS.tag, actions.pricing);
+    this.pricingButton = action('Pricing', 'Pricing: plans and prices', ICONS.tag, actions.pricing);
+    this.customersButton = action('Customers', 'Customers: growth, happiness and marketing', ICONS.users, actions.customers);
+    this.customersButton.setAttribute('data-testid', 'hud-customers');
     this.milestonesButton = action('Milestones', 'Milestones', ICONS.trophy, actions.milestones);
     this.bankButton = action('Bank', 'Bank: credit line and loans', ICONS.bank, actions.bank);
     this.menuButton = el('button', {
@@ -391,6 +397,7 @@ export class Hud {
       [icon(ICONS.bank), this.debt],
     );
     this.covenant = el('span');
+    this.covenantPrefix = el('span', { class: 'chip-bank-prefix' });
     this.covenantChip = el(
       'button',
       {
@@ -398,7 +405,7 @@ export class Hud {
         attrs: { type: 'button', 'data-testid': 'hud-covenant', 'aria-haspopup': 'dialog', hidden: '' },
         on: { click: actions.bank },
       },
-      [icon(ICONS.warning), this.covenant],
+      [icon(ICONS.warning), el('span', {}, [this.covenantPrefix, this.covenant])],
     );
     const stats = el('div', { class: 'hud-stats' }, [
       el('span', { class: 'chip chip-passings', attrs: { title: 'Homes and businesses your lit network passes' } }, [
@@ -424,7 +431,7 @@ export class Hud {
       this.when,
       this.cash,
       this.alert,
-      el('div', { class: 'hud-actions' }, [this.pricingButton, this.milestonesButton, this.bankButton]),
+      el('div', { class: 'hud-actions' }, [this.pricingButton, this.customersButton, this.milestonesButton, this.bankButton]),
       this.menuButton,
       stats,
     ]);
@@ -443,6 +450,8 @@ export class Hud {
       // Names only change with the game in play.
       const who = hudIdentity(state);
       setText(this.company, who.company);
+      setText(this.companyFullName, who.company);
+      setText(this.companyFullTip, who.tip.startsWith(who.company) ? who.tip.slice(who.company.length).replace(/^,\s*/, '').replace(/^./, (c) => c.toUpperCase()) : who.tip);
       setText(this.town, who.town);
       if (this.when.title !== who.tip) this.when.title = who.tip;
     }
@@ -492,7 +501,11 @@ export class Hud {
       // Narrower screens drop the chip labels to make room for these two (see style.css).
       this.root.classList.toggle('has-debt', debt !== null || covenant !== null);
       if (covenant) {
-        setText(this.covenant, covenant.text);
+        const prefix = covenant.text.startsWith(BANK_PREFIX) ? BANK_PREFIX : '';
+        setText(this.covenantPrefix, prefix);
+        setText(this.covenant, covenant.text.slice(prefix.length));
+        // A countdown is long: a narrow HUD drops its "Bank: " (the words still say it; the tooltip has it all).
+        this.covenantChip.classList.toggle('is-countdown', / to call$/.test(covenant.text));
         this.covenantChip.classList.toggle('chip-warn', covenant.tone === 'warn');
         this.covenantChip.classList.toggle('chip-danger', covenant.tone === 'danger');
         if (this.covenantChip.title !== covenant.tip) this.covenantChip.title = covenant.tip;
@@ -510,7 +523,32 @@ export class Hud {
     const tip = `${formatNumber(permitting)} permitting, ${formatNumber(constructing)} with crews on site`;
     if (this.buildingChip.title !== tip) this.buildingChip.title = tip;
   }
+
+  /**
+   * Show or hide the whole company name under the label (spec E): a tap on
+   * the name toggles it; a tap elsewhere, Escape or a few seconds hide it.
+   */
+  showName(show: boolean): void {
+    if (this.nameTimer !== null) {
+      clearTimeout(this.nameTimer);
+      this.nameTimer = null;
+    }
+    this.companyFull.hidden = !show;
+    this.company.setAttribute('aria-expanded', String(show));
+    this.when.classList.toggle('name-open', show);
+    if (show) {
+      document.addEventListener('pointerdown', this.closeNameOutside, true);
+      document.addEventListener('keydown', this.closeNameKey);
+      this.nameTimer = setTimeout(() => this.showName(false), NAME_SHOWN_MS);
+    } else {
+      document.removeEventListener('pointerdown', this.closeNameOutside, true);
+      document.removeEventListener('keydown', this.closeNameKey);
+    }
+  }
 }
+
+/** How long a tap shows the whole company name. */
+export const NAME_SHOWN_MS = 6_000;
 
 function setLabel(node: HTMLElement, label: string): void {
   if (node.getAttribute('aria-label') !== label) node.setAttribute('aria-label', label);

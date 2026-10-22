@@ -6,6 +6,7 @@ import { isFirstOfMonth } from './calendar';
 import { generateCity } from './citygen';
 import type { CityGenOptions } from './citygen';
 import { defaultCompanyName, difficultyLevel, isDifficultyId, normalizeCompanyName } from './company';
+import { newCustomers, runCampaign, setReferrals, setSupport, stepCustomers } from './customers';
 import { drawCredit, endDebtDay, newDebt, prepayLoan, repayCredit, takeTermLoan } from './debt';
 import { closeMonth } from './finance';
 import { answerIncumbent, setIntroPromo } from './incumbent';
@@ -22,7 +23,7 @@ import {
 } from './network';
 import { deriveSeed, withRng } from './rng';
 import { accrueDay, newSales, setMarketing, setPricing, stepSales } from './sales';
-import type { CableMethod, City, Command, CommandResult, DifficultyId, GameState, IntroPromo, TermYears, TierSetting } from './types';
+import type { CableMethod, City, Command, CommandResult, DifficultyId, GameState, IntroPromo, SupportLevel, TermYears, TierSetting } from './types';
 import { newWeather, stepWeather } from './weather';
 
 export interface NewGameOptions {
@@ -48,8 +49,10 @@ export interface NewGameOptions {
  * deriveSeed(seed, 'weather'), city = opts.city ??
  * generateCity(deriveSeed(seed, 'citygen'), opts.cityOptions), default pricing
  * and marketing, no subscribers, milestones, notices or capex, no debt
- * (debt.newDebt()), no storms yet (weather.newWeather()) and an advisor with
- * nothing snoozed or shown (advisor.newAdvisorState()). The difficulty and
+ * (debt.newDebt()), no storms yet (weather.newWeather()), an advisor with
+ * nothing snoozed or shown (advisor.newAdvisorState()) and (round 4c/4d)
+ * the customers model at its defaults (customers.newCustomers(): Good
+ * support, referral credits off, nothing known yet). The difficulty and
  * the company name change nothing else: a seed replays identically at every
  * level but for the cash. Throws RangeError for an unknown difficulty or a
  * name normalizeCompanyName rejects (the start screen validates first).
@@ -85,6 +88,7 @@ export function newGame(seed: number, opts: NewGameOptions = {}): GameState {
     finance: { cash: difficultyLevel(difficulty).startCash, monthToDate: [], reports: [], capex: { osp: 0, connect: 0, co: 0 }, negativeMonths: 0 },
     debt: newDebt(),
     sales: newSales(),
+    customers: newCustomers(),
     weather: newWeather(),
     advisor: newAdvisorState(),
     milestones: [],
@@ -120,6 +124,12 @@ function reject(reason: string): CommandResult {
  * advisor.snoozeAdvice; noteAdviceShown { keys: string[] } to
  * advisor.noteAdviceShown (each checks values: ranges, lengths, whether
  * the promo or the suggestion exists).
+ *
+ * Round 4c/4d: runCampaign { cabinet: number } goes to
+ * customers.runCampaign, setSupport { level: string } to
+ * customers.setSupport, setReferrals { on: boolean } to
+ * customers.setReferrals (each checks values: an existing live cabinet, a
+ * known level, cash).
  */
 export function applyCommand(state: GameState, cmd: Command): CommandResult {
   // Commands also come from replays, scripts and the console, so check field
@@ -208,6 +218,16 @@ export function applyCommand(state: GameState, cmd: Command): CommandResult {
       }
       return noteAdviceShown(state, keys);
     }
+    case 'runCampaign':
+      if (typeof fields.cabinet !== 'number') return reject('runCampaign needs a cabinet id');
+      return runCampaign(state, fields.cabinet);
+    case 'setSupport':
+      if (typeof fields.level !== 'string') return reject('setSupport needs a support level');
+      // An unknown level is rejected by customers.setSupport naming the levels.
+      return setSupport(state, fields.level as SupportLevel);
+    case 'setReferrals':
+      if (typeof fields.on !== 'boolean') return reject('setReferrals needs on: true or false');
+      return setReferrals(state, fields.on);
     default:
       return reject(`Unknown command: ${describeType(fields.type)}`);
   }
@@ -248,6 +268,9 @@ function describeType(type: unknown): string {
  *     storms, dig-ins and the month's outage accruals. It sees today's
  *     network progress (a span that went live today can be hit), and the
  *     sales step sees its outages the same day (no signups on a cut-off street)
+ *   customers.stepCustomers for the new day (round 4c/4d, no rng): the lit
+ *     streets' awareness, campaign strength, waits and memories, before
+ *     the signups that read them
  *   stepSales for the new day (sales stream)
  * A span that goes live on the 1st, or a lot that appears that day, belongs to
  * the new month. Day 0 never gets a sales step (no signups or churn), only its
@@ -265,6 +288,7 @@ export function tick(state: GameState): void {
   if (state.gameOver) return;
   advanceNetwork(state);
   withRng(state, 'weather', (rng) => stepWeather(state, rng));
+  stepCustomers(state);
   withRng(state, 'sales', (rng) => stepSales(state, rng));
 }
 

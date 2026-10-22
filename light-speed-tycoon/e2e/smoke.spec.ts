@@ -172,9 +172,10 @@ for (const layout of LAYOUTS) {
           }
           return out;
         }, selector);
-      const controls = '.speed, .menu-button, .hud-action, .tool, .hint-close, .panel-toggle';
+      // Round 4c/4d: the company label is a button too (a tap shows the whole name).
+      const controls = '.speed, .menu-button, .hud-action, .hud-company, .tool, .hint-close, .panel-toggle';
       expect(await problems(controls)).toEqual([]);
-      // The busiest HUD: debt, a covenant stage and an overdraft all showing (test-only state).
+      // The busiest HUD: debt, the bank's health and an overdraft all showing (test-only state).
       await page.evaluate(() => {
         const s = window.__lst!.getState();
         s.debt.credit.balance = 412_000;
@@ -185,6 +186,9 @@ for (const layout of LAYOUTS) {
       await expect(page.getByTestId('hud-debt')).toBeVisible();
       await expect(page.getByTestId('hud-covenant')).toBeVisible();
       await expect(page.getByTestId('hud-insolvency')).toBeVisible();
+      // The bank chip says the Bank's own plain words, with a plain tooltip.
+      await expect(page.getByTestId('hud-covenant')).toHaveText(/^Bank: No more borrowing: \d+ months? to call$/);
+      await expect(page.getByTestId('hud-covenant')).toHaveAttribute('title', /^Bank health: No more borrowing\. /);
       expect(await problems(`${controls}, .chip-debt, .chip-covenant, .hud-alert`)).toEqual([]);
       // The menu opens fully on screen too.
       await page.getByRole('button', { name: 'Menu' }).click();

@@ -1,10 +1,14 @@
-// The pricing panel end to end: previewing and applying prices and
-// marketing, a rejection, grandfathering a rise, the intro promo (moved here
-// from economy.spec.ts in round 4b). Round 4b: who signs up (dropping the
-// cheap tier warns that price-sensitive households won't), answering the
-// cable company's promo with a retention offer, and when an intro promo pays.
+// The pricing panel end to end: previewing and applying prices, a
+// rejection, grandfathering a rise, the intro promo (moved here from
+// economy.spec.ts in round 4b). Round 4b: who signs up (dropping the cheap
+// tier warns that price-sensitive households won't), answering the cable
+// company's promo with a retention offer, and when an intro promo pays.
+// Round 4c/4d: the dialog is "Pricing"; the marketing budget is read-only
+// here with a "Change marketing" link to the Customers dashboard (setting it
+// and its forecast moved to customers.spec.ts), and the "after the step"
+// bills count the expected cancellations.
 //
-// Owner: pricing-balance workstream (round 4b).
+// Owner: ui-customers workstream (round 4c/4d; pricing-balance in round 4b).
 
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
@@ -69,14 +73,15 @@ async function tickToNextClose(page: Page): Promise<void> {
   });
 }
 
-test('the pricing panel previews and applies prices and marketing, and shows a rejection', async ({ page }) => {
+test('the pricing panel previews and applies prices, shows a rejection, and links to the marketing budget', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
   const toasts = await recordToasts(page);
   await page.evaluate(() => window.__lst!.setSpeed(0));
+  const startMarketing = await page.evaluate(() => window.__lst!.getState().sales.marketingPerMonth);
   const pricingButton = page.getByRole('button', { name: 'Pricing' });
   await pricingButton.click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
+  const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   await expect(dialog).toBeVisible();
   await expect(dialog).toContainText(`Incumbent cable: ${INCUMBENT_DOWN_MBPS} Mbps for ${money(INCUMBENT_PRICE)}/mo`);
   for (const tier of TIER_DEFAULTS) await expect(dialog.getByLabel(`${tier.name} price per month`)).toHaveValue(String(tier.price));
@@ -90,20 +95,27 @@ test('the pricing panel previews and applies prices and marketing, and shows a r
   await expect(homes).not.toHaveText(before!);
 
   // Typing in a field never reaches the map's shortcuts ("2" is the 2x speed key).
-  const marketing = dialog.getByLabel('Marketing budget per month');
-  await marketing.fill('');
-  await marketing.pressSequentially('2500');
+  const smb = dialog.getByLabel('Business price multiplier');
+  const smbValue = await smb.inputValue();
+  await smb.fill('');
+  await smb.pressSequentially('2');
   expect(await speedOf(page)).toBe('0');
-  await expect(dialog.locator('.boost-hint')).not.toBeEmpty();
+  await smb.fill(smbValue);
+
+  // The marketing budget is shown read-only (the Customers dashboard sets it).
+  await expect(dialog.getByTestId('pricing-marketing')).toHaveText(startMarketing > 0 ? `${money(startMarketing)} a month` : 'None');
+  await expect(dialog.getByLabel('Marketing budget per month')).toHaveCount(0);
 
   await dialog.getByRole('button', { name: 'Apply' }).click();
   await expect(dialog).toBeHidden();
   await expect.poll(toasts).toContainEqual(toast('ok', 'Pricing updated'));
+  expect((await toasts()).some((t) => /marketing/i.test(t.text))).toBe(false);
   const sales = await page.evaluate((id) => {
     const s = window.__lst!.getState().sales;
     return { price: s.pricing.tiers.find((t) => t.id === id)!.price, marketing: s.marketingPerMonth };
   }, top.id);
-  expect(sales).toEqual({ price: newPrice, marketing: 2500 });
+  // Apply sends prices only: the marketing budget is untouched.
+  expect(sales).toEqual({ price: newPrice, marketing: startMarketing });
 
   // An out-of-range price is refused with the sim's reason, and nothing changes.
   await pricingButton.click();
@@ -121,6 +133,19 @@ test('the pricing panel previews and applies prices and marketing, and shows a r
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   await expect(pricingButton).toBeFocused();
+
+  // "Change marketing" closes Pricing and opens the Customers dashboard at its marketing budget, ready to type.
+  await pricingButton.click();
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: /Change marketing/ }).click();
+  await expect(dialog).toBeHidden();
+  const customers = page.getByRole('dialog', { name: 'Customers' });
+  await expect(customers).toBeVisible();
+  const budget = customers.getByLabel('Marketing budget per month');
+  await expect(budget).toBeFocused();
+  await expect(budget).toHaveValue(String(startMarketing));
+  await expect(budget).toBeInViewport();
+  expect(await page.evaluate(() => window.__lst!.customersOpen())).toBe(true);
   expect(errors).toEqual([]);
 });
 
@@ -159,7 +184,7 @@ test('a price rise is grandfathered: the preview says who keeps what until when,
   expect(before.on1g, `subscribers on ${before.name}`).toBeGreaterThan(0);
 
   await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
+  const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   await expect(dialog).toBeVisible();
   const months = dialog.getByLabel('Grandfathering months');
   await expect(months).toHaveValue(String(GRANDFATHER_MONTHS_DEFAULT));
@@ -181,6 +206,10 @@ test('a price rise is grandfathered: the preview says who keeps what until when,
   const after = await impact.getByTestId('pricing-mrr-after').textContent();
   const dollars = (t: string | null) => Number((t ?? '').replace(/[^\d]/g, ''));
   expect(dollars(after)).toBeGreaterThan(dollars(mrr));
+  // Spec C: "after the step" counts the cancellations the preview lists, and says so.
+  const cancelled = dollars(await impact.getByTestId('pricing-cancels').textContent());
+  if (cancelled > 0) await expect(impact.locator('.impact-note')).toContainText(`after the ~${cancelled} cancellation`);
+  else await expect(impact.locator('.impact-note')).not.toContainText('cancellation');
 
   await dialog.getByRole('button', { name: 'Apply' }).click();
   await expect(dialog).toBeHidden();
@@ -230,7 +259,7 @@ test('an intro promo is set from the pricing panel and new signups get it', asyn
   await litTownWithSubscribers(page, 30);
 
   await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
+  const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   await expect(dialog).toBeVisible();
   // Fits a phone: one column, nothing wider than the screen.
   const fits = () =>
@@ -298,7 +327,7 @@ test('dropping the cheap tier warns that price-sensitive households won\'t sign 
   await open(page, '/?seed=12345');
   await page.evaluate(() => window.__lst!.setSpeed(0));
   await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
+  const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   await expect(dialog).toBeVisible();
   const who = dialog.getByRole('region', { name: 'Who signs up' });
   await expect(who).toBeVisible();
@@ -345,7 +374,7 @@ test('the cable company\'s promo is answered with a retention offer: its subscri
   expect(injected.accounts).toBeGreaterThan(0);
 
   await page.getByRole('button', { name: 'Pricing' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Pricing & marketing' });
+  const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   // With the area lit for months and households still waiting, the intro promo line quotes the typed offer.
   await expect(dialog.locator('.promo-advice')).toHaveText(new RegExp(`over the next ${PROMO_QUOTE_MONTHS} months: (about \\d+ more signups?|less than one more signup), \\$[\\d,]+ of margin against \\$[\\d,]+ of discounts\\.$`));
   await expect(dialog.locator('.promo-advice')).toHaveText(/pays/i);

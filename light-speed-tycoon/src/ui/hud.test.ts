@@ -1,5 +1,6 @@
-// The HUD chips (hud.ts): PON ports, cost per passing, debt, covenant and
-// overdraft status, the runway hint. Moved out of economy.test.ts by the
+// The HUD chips (hud.ts): PON ports, cost per passing, debt, the bank's
+// health (round 4c/4d: the Bank's own plain words) and overdraft status, the
+// runway hint, the company label. Moved out of economy.test.ts by the
 // round-4 contract. Money is checked against balance.ts constants and sim
 // results, never literal dollar amounts.
 
@@ -11,14 +12,11 @@ import {
   INSOLVENCY_GRACE_MONTHS,
   OLT_START_PON_PORTS,
   BASE_RATE_BPS,
-  COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
-  COVENANT_MIN_COVERAGE,
   FROZEN_ACCELERATION_CLOSES,
-  FROZEN_SWEEP_SHARE,
   PENALTY_STEP_UP_BPS,
 } from '../sim/balance';
-import { acceleratedSchedule, cureOptions, totalDebt } from '../sim/debt';
+import { acceleratedSchedule, bankHealth, covenantMetrics, cureFor, estimateSweep, totalDebt } from '../sim/debt';
 import { defaultCompanyName } from '../sim/company';
 import { newGame, runDays } from '../sim/game';
 import { cppBand, operatingCashFlow, reportKpis } from '../sim/metrics';
@@ -26,8 +24,12 @@ import { getService } from '../sim/network';
 import { addLivePlant, makeGridCity, makeTestState, makeTradingState } from '../sim/testing/fixtures';
 import type { GameState, TermLoan } from '../sim/types';
 import { cureAdvice } from './bankPanel';
-import { formatBpsDelta, formatMoney, formatPercent, formatRatio, plural } from './format';
+import { formatMoney, formatPercentFine, plural } from './format';
+import { HEALTH_WORD, healthSentence } from './health';
 import { MRR_TIP, calledChipText, covenantStatus, cppStatus, debtStatus, frozenChipText, hudIdentity, overdraftStatus, ponStatus, runwayHint } from './hud';
+
+/** Words the HUD's bank tooltips leave to the Bank's disclosures. */
+const JARGON = /leverage|covenant|DSCR|ARR|OCF|bps|×/i;
 
 /** A grid town fully lit from the CO with plenty of ports, run long enough to have subscribers and closed months. */
 function litGame(days = 120): GameState {
@@ -84,7 +86,7 @@ describe('HUD chips', () => {
     originatedDay: 0,
   });
 
-  it('shows total debt only while something is owed, splitting line and loans in the tooltip', () => {
+  it('shows total debt only while something is owed, splitting emergency cash and loans in the tooltip', () => {
     const state = makeTestState();
     expect(debtStatus(state)).toBeNull();
     state.debt.credit.balance = 12_000;
@@ -92,29 +94,41 @@ describe('HUD chips', () => {
     state.debt.loans = [loan(1, 150_000), loan(2, 250_000)];
     const status = debtStatus(state)!;
     expect(status.text).toBe(`Debt ${formatMoney(412_000)}`);
-    expect(status.tip).toContain(`Credit line ${formatMoney(12_000)}`);
-    expect(status.tip).toContain(`term loans ${formatMoney(400_000)} (2 loans)`);
+    expect(status.tip).toContain(`${formatMoney(12_000)} of emergency cash`);
+    expect(status.tip).toContain(`${formatMoney(400_000)} in loans (2 loans)`);
+    expect(status.tip).not.toMatch(JARGON);
     state.debt.credit.balance = 0;
-    expect(debtStatus(state)!.tip).toContain(`Credit line ${formatMoney(0)}`);
+    expect(debtStatus(state)!.tip).toContain(`${formatMoney(0)} of emergency cash`);
   });
 
-  it('shows the covenant stage only when not compliant, warn then danger, with what it means and how to cure', () => {
+  it('shows the bank chip only while the health is not Good, in the Bank’s own words, warn then danger', () => {
     const state = makeTestState();
     expect(covenantStatus(state)).toBeNull();
+    state.debt.credit.balance = 10_000;
     state.debt.covenant = { stage: 'warning', compliantCloses: 0 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Covenant warning', tone: 'warn' });
-    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MAX_LEVERAGE));
-    expect(covenantStatus(state)!.tip).toContain(formatRatio(COVENANT_MIN_COVERAGE));
-    expect(covenantStatus(state)!.tip).toContain(plural(COVENANT_CURE_CLOSES, 'compliant month close'));
+    expect(covenantStatus(state)).toMatchObject({ text: `Bank: ${HEALTH_WORD.warning}`, tone: 'warn' });
+    expect(covenantStatus(state)!.tip).toContain(`Bank health: ${HEALTH_WORD.warning}. ${healthSentence(bankHealth(state))}`);
     state.debt.covenant = { stage: 'penalty', compliantCloses: 1 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Penalty rate', tone: 'warn' });
-    expect(covenantStatus(state)!.tip).toContain(formatBpsDelta(PENALTY_STEP_UP_BPS));
-    expect(covenantStatus(state)!.tip).toContain(`1 of ${COVENANT_CURE_CLOSES} so far`);
+    expect(covenantStatus(state)).toMatchObject({ text: 'Bank: Higher interest', tone: 'danger' });
+    expect(covenantStatus(state)!.tip).toContain(`${formatPercentFine(PENALTY_STEP_UP_BPS / 10_000)} more`);
     state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
-    expect(covenantStatus(state)).toMatchObject({ text: 'Credit frozen', tone: 'danger' });
-    expect(covenantStatus(state)!.tip).toContain('default');
+    expect(covenantStatus(state)).toMatchObject({ text: `Bank: No more borrowing: ${plural(FROZEN_ACCELERATION_CLOSES, 'month')} to call`, tone: 'danger' });
+    for (const stage of ['warning', 'penalty', 'frozen'] as const) {
+      state.debt.covenant = { stage, compliantCloses: 0 };
+      expect(covenantStatus(state)!.tip).not.toMatch(JARGON);
+    }
   });
 
+  it('warns on Watch: close to a limit, or failing a check at today’s figures', () => {
+    const state = makeTradingState(25_000, 0);
+    const uw = covenantMetrics(state).underwritingCashFlow;
+    // Within the watch headroom of the leverage limit, still passing.
+    state.debt.loans = [{ ...loan(1, Math.floor(uw * COVENANT_MAX_LEVERAGE * 0.95)), monthsLeft: 600 }];
+    expect(bankHealth(state)).toMatchObject({ level: 'watch', nearLimit: true });
+    expect(covenantStatus(state)).toMatchObject({ text: 'Bank: Watch', tone: 'warn' });
+    expect(covenantStatus(state)!.tip).toContain("you're close to a limit");
+    expect(covenantStatus(state)!.tip).not.toContain('To pass both checks again');
+  });
   it('shows the live cost per passing by the same formula as the report, banded against the target', () => {
     const state = makeTestState();
     expect(cppStatus(state)).toBeNull();
@@ -146,21 +160,34 @@ describe('HUD chips', () => {
 });
 
 describe('HUD chips, round 4', () => {
-  it('counts the frozen closes left before the bank calls the loans', () => {
+  it('counts the months left before the bank asks for every loan back', () => {
     const state = makeTestState();
     state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
     // Frozen with nothing owed: the next close lifts it, nothing to count.
-    expect(covenantStatus(state)!.text).toBe('Credit frozen');
+    expect(covenantStatus(state)!.text).toBe('Bank: No more borrowing');
     state.debt.credit.balance = 50_000;
     state.debt.frozenCloses = 2;
     const status = covenantStatus(state)!;
-    expect(status).toMatchObject({ text: `Credit frozen: ${plural(FROZEN_ACCELERATION_CLOSES - 2, 'close')} to call`, tone: 'danger' });
-    expect(status.tip).toContain(formatPercent(FROZEN_SWEEP_SHARE));
-    expect(status.tip).toContain(`after ${plural(FROZEN_ACCELERATION_CLOSES - 2, 'more frozen close')} it calls the loans`);
+    expect(status).toMatchObject({ text: `Bank: No more borrowing: ${plural(FROZEN_ACCELERATION_CLOSES - 2, 'month')} to call`, tone: 'danger' });
+    expect(status.tip).toContain(`asks for every loan back in ${plural(FROZEN_ACCELERATION_CLOSES - 2, 'month')}`);
     state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES - 1;
-    expect(covenantStatus(state)!.text).toBe('Credit frozen: 1 close to call');
-    expect(frozenChipText(null)).toBe('Credit frozen');
-    expect(frozenChipText(4)).toBe('Credit frozen: 4 closes to call');
+    expect(covenantStatus(state)!.text).toBe('Bank: No more borrowing: 1 month to call');
+    expect(covenantStatus(state)!.tip).toContain('That call is close.');
+    expect(frozenChipText(null)).toBe('Bank: No more borrowing');
+    expect(frozenChipText(4)).toBe('Bank: No more borrowing: 4 months to call');
+    expect(frozenChipText(0)).toBe('Bank: No more borrowing: call at the next close');
+  });
+
+  it('names the sweep in the tip when the next close takes spare cash', () => {
+    const state = makeTradingState(40_000, 20_000);
+    state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
+    state.debt.credit.balance = 150_000;
+    state.debt.frozenCloses = 1;
+    state.finance.cash = 400_000;
+    state.sales.month.revenueDollarDays = 60_000 * 31;
+    const sweep = estimateSweep(state);
+    expect(sweep).toBeGreaterThan(0);
+    expect(covenantStatus(state)!.tip).toContain(`takes about ${formatMoney(sweep)} of your spare cash`);
   });
 
   it('shows the closes left once the loans are called, whatever the stage', () => {
@@ -173,7 +200,8 @@ describe('HUD chips, round 4', () => {
     expect(status).toMatchObject({ text: 'Loans called: 2 closes left', tone: 'danger' });
     expect(status.tip).toContain(formatMoney(totalDebt(state)));
     expect(status.tip).toContain(formatMoney(acceleratedSchedule(state)[0]!));
-    expect(status.tip).toMatch(/default/);
+    expect(status.tip).toMatch(/the game ends/);
+    expect(status.tip).not.toMatch(JARGON);
     // A cure steps the freeze down; the call stays.
     state.debt.covenant = { stage: 'penalty', compliantCloses: 0 };
     state.debt.acceleration.closesLeft = 1;
@@ -185,22 +213,23 @@ describe('HUD chips, round 4', () => {
     expect(overdraftStatus(state)!.tip).toMatch(/called your loans/);
   });
 
-  it('puts the verified cure in the covenant tip', () => {
+  it('puts the verified cure in the tip, in plain words', () => {
     const state = makeTradingState(25_000, 20_000);
     state.finance.cash = 2_000_000;
     state.debt.covenant = { stage: 'warning', compliantCloses: 0 };
     state.debt.credit.balance = 2_000_000;
-    const cure = cureOptions(state)[0]!;
-    expect(cure).toBeDefined();
-    expect(covenantStatus(state)!.tip).toContain(`To cure it now: ${cureAdvice(cure)}`);
-    // At risk while compliant: the same verified cure.
+    const cure = cureFor(state)!;
+    expect(cure).not.toBeNull();
+    expect(covenantStatus(state)!.tip).toContain(cureAdvice(cure));
+    expect(cureAdvice(cure)).not.toMatch(JARGON);
+    // Failing today while in good standing (Watch): the same verified cure.
     state.debt.covenant = { stage: 'compliant', compliantCloses: 0 };
-    expect(covenantStatus(state)!.tip).toContain(`To cure it now: ${cureAdvice(cure)}`);
-    expect(covenantStatus(state)!.tip).not.toContain('The call stands');
-    // Once the loans are called the tip is about the payments, not a cure (a cure lifts the freeze, not the call).
+    expect(covenantStatus(state)).toMatchObject({ text: 'Bank: Watch', tone: 'warn' });
+    expect(covenantStatus(state)!.tip).toContain(cureAdvice(cure));
+    // Once the loans are called the tip is about the payments.
     state.debt.covenant = { stage: 'frozen', compliantCloses: 0 };
     state.debt.acceleration = { day: state.day, closesLeft: 2 };
-    expect(covenantStatus(state)!.tip).not.toContain('To cure it now');
+    expect(covenantStatus(state)!.tip).not.toContain('To pass both checks again');
   });
 
   it('calls the run-rate MRR, distinct from the Bank\'s lending ARR', () => {

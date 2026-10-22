@@ -1,10 +1,13 @@
 // Terrain (round 4b): the grove field shared by the map's trees
 // (render/decor) and storm exposure (weather.segmentExposure's wooded term).
+// Round 4c/4d: street canopy from the same field (tree-lined neighborhoods
+// inside the town, weather.segmentExposure's canopy term).
 
 import { describe, expect, it } from 'vitest';
 import { generateCity } from './citygen';
 import { Rng, deriveSeed } from './rng';
-import { cityGroveField, drawGroveField, GROVE_NOISE_CELLS, groveAt, groveNoise, woodedAt } from './terrain';
+import { CANOPY_LOW, CANOPY_SPAN } from './balance';
+import { canopyAt, cityGroveField, drawGroveField, GROVE_NOISE_CELLS, groveAt, groveNoise, woodedAt } from './terrain';
 import { makeGridCity } from './testing/fixtures';
 import type { City } from './types';
 
@@ -71,5 +74,60 @@ describe('woodedAt', () => {
     let sum = 0;
     for (let cy = 6; cy < 10; cy++) for (let cx = 6; cx < 10; cx++) sum += groveAt(field, cx, cy);
     expect(woodedAt(open, 8, 8)).toBeCloseTo(sum / 16, 12);
+  });
+});
+
+describe('canopyAt (round 4c/4d)', () => {
+  it('maps the grove noise to 0..1 between CANOPY_LOW and CANOPY_LOW + CANOPY_SPAN', () => {
+    const city = generateCity(2027);
+    const field = cityGroveField(city);
+    let open = 0;
+    let lined = 0;
+    for (let y = 0; y <= city.height; y += 2) {
+      for (let x = 0; x <= city.width; x += 2) {
+        const noise = groveNoise(field, x, y);
+        const canopy = canopyAt(city, x, y);
+        expect(canopy).toBeCloseTo(Math.max(0, Math.min(1, (noise - CANOPY_LOW) / CANOPY_SPAN)), 12);
+        expect(canopy).toBeGreaterThanOrEqual(0);
+        expect(canopy).toBeLessThanOrEqual(1);
+        if (noise <= CANOPY_LOW) expect(canopy).toBe(0);
+        if (noise >= CANOPY_LOW + CANOPY_SPAN) expect(canopy).toBe(1);
+        if (canopy === 0) open++;
+        if (canopy === 1) lined++;
+      }
+    }
+    // Most of the map is open; some of it is fully tree-lined.
+    expect(open).toBeGreaterThan(lined);
+    expect(lined).toBeGreaterThan(0);
+  });
+
+  it('is drawn independently of the lots: building on a block never changes its canopy', () => {
+    const city = generateCity(99);
+    const cleared: City = { ...city, parcels: [] };
+    for (let y = 0; y <= city.height; y += 3) for (let x = 0; x <= city.width; x += 3) expect(canopyAt(cleared, x, y)).toBe(canopyAt(city, x, y));
+  });
+
+  it('comes in neighborhoods: the canopy varies block by block inside the town, deterministically per seed', () => {
+    const a = generateCity(424242);
+    const b = generateCity(424242);
+    const values: number[] = [];
+    for (let y = 0; y <= a.height; y++) {
+      for (let x = 0; x <= a.width; x++) {
+        expect(canopyAt(b, x, y)).toBe(canopyAt(a, x, y));
+        values.push(canopyAt(a, x, y));
+      }
+    }
+    // Neighbouring points (a cell apart) differ far less than the field does overall.
+    let step = 0;
+    let n = 0;
+    for (let y = 0; y <= a.height; y++) {
+      for (let x = 0; x < a.width; x++) {
+        step += Math.abs(canopyAt(a, x + 1, y) - canopyAt(a, x, y));
+        n++;
+      }
+    }
+    const mean = values.reduce((t, v) => t + v, 0) / values.length;
+    const spread = values.reduce((t, v) => t + Math.abs(v - mean), 0) / values.length;
+    expect(step / n).toBeLessThan(spread / 2);
   });
 });

@@ -69,8 +69,8 @@ import {
 import { Rng } from './rng';
 import { polesOnSegment, shortestPath } from './streets';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import type { BuildStage, CableMethod, City, CommandResult, GameState, SegmentId, StreetSegment } from './types';
-import { exposureBand, segmentExposure, stormRisk } from './weather';
+import type { BuildStage, CableMethod, City, CommandResult, ConvertQuote, GameState, SegmentId, StreetSegment } from './types';
+import { exposureBand, repairCost, segmentExposure, stormRisk, streetCanopy } from './weather';
 
 // Default grid: 3x2 blocks of 4x2 cells. Node (i, j) = j * 4 + i.
 // Horizontal segment (i, j) = j * 3 + i (240 ft, "1st St".."3rd St");
@@ -1784,6 +1784,31 @@ describe('quoteConvert', () => {
     // No rock under the street: no rock line.
     const soil = makeState();
     expect(quoteConvert(soil, addSpan(soil, H(0, 0))).lines.map((l) => l.kind)).toEqual(['cable', 'engineering', 'permit']);
+  });
+
+  it('quotes the repairs a tree-lined street really costs (round 4c/4d): canopy repairs included, far more than an open street', () => {
+    const state = newGame(2027);
+    state.finance.cash = 10_000_000;
+    const residential = state.city.segments.filter((s) => s.hasPoles && s.zone === 'residential' && s.lengthFt >= 180 && s.lengthFt <= 480);
+    const lined = residential.find((s) => streetCanopy(state.city, s.id) === 1)!;
+    const open = residential.find((s) => streetCanopy(state.city, s.id) === 0 && Math.abs(s.lengthFt - lined.lengthFt) < 1)!;
+    expect(lined).toBeDefined();
+    expect(open).toBeDefined();
+    const quotes = [lined, open].map((street) => {
+      const quote = quoteConvert(state, addSpan(state, street.id));
+      const aerial = stormRisk(state, street, 'aerial');
+      // Honest: exactly the storm model's expected repairs avoided, each repair at what a storm there posts.
+      expect(quote.repairsAvoidedPerYear).toBe(Math.round(aerial.repairCostPerYear - stormRisk(state, street, 'underground').repairCostPerYear));
+      expect(aerial.repairCostPerYear).toBeCloseTo(aerial.outagesPerYear * repairCost(street, 'aerial', state.city), 8);
+      return quote;
+    });
+    const [linedQuote, openQuote] = quotes as [ConvertQuote, ConvertQuote];
+    expect(linedQuote.exposure).toBe('exposed');
+    expect(linedQuote.repairsAvoidedPerYear).toBeGreaterThan(4 * openQuote.repairsAvoidedPerYear);
+    // Same length, same bore: the rebuild of the tree-lined street pays back several times sooner.
+    expect(linedQuote.cost).toBe(openQuote.cost);
+    const payback = (q: ConvertQuote) => q.cost / (q.repairsAvoidedPerYear + 12 * q.poleRentSaved);
+    expect(payback(linedQuote)).toBeLessThan(payback(openQuote) / 2);
   });
 
   it('is allowed while the span is out of service', () => {

@@ -1,8 +1,10 @@
 // Rate card: what everything costs, straight from balance.ts, so the player
 // can plan a build before quoting it, (round 3) what borrowing costs, and
-// (round 4) the rules of storms, pricing and a frozen credit line.
+// (round 4) the rules of storms, pricing and a frozen credit line, and
+// (round 4c/4d) the running costs that grow with the company: the base, per
+// customer (each support level's cost), per cabinet and per mile of cable.
 //
-// Owner: ui-economy workstream.
+// Owner: ui-economy workstream; round 4c/4d's running costs: ui-summary workstream.
 
 import {
   ACCELERATION_CLOSES,
@@ -72,7 +74,10 @@ import {
   MDU_ROUTER_COST,
   OLT_CARD_COST,
   OLT_PORTS_PER_CARD,
-  OVERHEAD_PER_MONTH,
+  OVERHEAD_BASE_PER_MONTH,
+  OVERHEAD_PER_CABINET_PER_MONTH,
+  OVERHEAD_PER_CUSTOMER_PER_MONTH,
+  OVERHEAD_PER_MILE_PER_MONTH,
   PERMIT_FEE_AERIAL,
   PENALTY_STEP_UP_BPS,
   PERMIT_FEE_UNDERGROUND,
@@ -80,7 +85,7 @@ import {
   POLE_SPACING_FT,
   SPLIT_RATIO,
   SPLITTER_COST,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
+  SUPPORT_LEVELS,
   TERM_CAPACITY_ARR_MULTIPLE,
   TERM_EXTRA_BPS,
   TERM_LOAN_MIN,
@@ -88,8 +93,20 @@ import {
   UNDERGROUND_COST_PER_FT,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
   UNDERWRITING_MIN_MARGIN,
+  STORM_EXPOSURE_CANOPY,
+  REPAIR_CANOPY_SHARE,
+  OUTAGE_DAYS_CANOPY,
+  CAMPAIGN_COST_PER_UNIT,
+  CAMPAIGN_COST_MIN,
+  CAMPAIGN_DAYS,
+  CAMPAIGN_FADE_DAYS,
+  CAMPAIGN_COOLDOWN_DAYS,
+  REFERRAL_CREDIT,
+  REFERRAL_WOM_MULTIPLIER,
+  PROMO_BOOST_YOUNG_MONTHS,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
+import type { SupportLevel } from '../sim/types';
 import { openSheet } from './confirm';
 import type { Sheet } from './confirm';
 import { el } from './dom';
@@ -175,14 +192,8 @@ export function rateCardSections(): RateSection[] {
         },
       ],
     },
-    {
-      title: 'Running costs',
-      rows: [
-        { label: 'Overhead', value: `${formatMoney(OVERHEAD_PER_MONTH)}/mo`, note: 'Network operations, billing, office' },
-        { label: 'Customer support', value: `${formatMoney(SUPPORT_COST_PER_SUB_PER_MONTH)}/mo`, note: 'Per subscriber' },
-        { label: 'Pole rent', value: `${formatMoney(POLE_RENT_PER_POLE_PER_MONTH)}/mo`, note: 'Per pole carrying your cable' },
-      ],
-    },
+    runningCostsSection(),
+    customersSection(),
     {
       title: 'Cost per passing',
       rows: [
@@ -197,6 +208,91 @@ export function rateCardSections(): RateSection[] {
     stormSection(),
     pricingSection(),
   ];
+}
+
+/** The default support level (the one a new company starts with). */
+const DEFAULT_SUPPORT: SupportLevel = 'good';
+
+/** Support levels in the order the Customers dashboard lists them. */
+const SUPPORT_ORDER: readonly SupportLevel[] = ['basic', 'good', 'great'];
+
+/** "$100/mo", keeping cents when a rate has them ("$12.50/mo"). */
+function perMonth(amount: number): string {
+  const whole = Math.round(amount) === amount;
+  return whole ? `${formatMoney(amount)}/mo` : `$${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/mo`;
+}
+
+/**
+ * Round 4c/4d: what running the company costs each month, from balance.ts:
+ * a small base, then costs that grow with it (per customer, with each
+ * support level's cost on top; per live cabinet; per mile of live cable),
+ * and pole rent.
+ */
+export function runningCostsSection(): RateSection {
+  return {
+    title: 'Running costs',
+    rows: [
+      { label: 'Base overhead', value: perMonth(OVERHEAD_BASE_PER_MONTH), note: 'Office, billing system and network operations, at any size' },
+      {
+        label: 'Per customer',
+        value: perMonth(OVERHEAD_PER_CUSTOMER_PER_MONTH),
+        note: 'Billing and accounts for each subscriber, plus the support level below',
+      },
+      ...SUPPORT_ORDER.map((id) => {
+        const level = SUPPORT_LEVELS[id];
+        return {
+          label: `${level.name} support`,
+          value: perMonth(level.costPerSub),
+          note: `Per subscriber${id === DEFAULT_SUPPORT ? ' (where every company starts)' : ''}; set it on the Customers dashboard`,
+        };
+      }),
+      { label: 'Per cabinet', value: perMonth(OVERHEAD_PER_CABINET_PER_MONTH), note: 'Each live cabinet: power, cooling and inspections' },
+      {
+        label: 'Per mile of cable',
+        value: perMonth(OVERHEAD_PER_MILE_PER_MONTH),
+        note: 'Each route-mile of live cable (5,280 ft): locates, patrols and plant records',
+      },
+      { label: 'Pole rent', value: perMonth(POLE_RENT_PER_POLE_PER_MONTH), note: 'Per pole carrying your cable' },
+    ],
+  };
+}
+
+/** "about 2 months" for a number of days (the customers section's campaign lengths). */
+function aboutMonths(days: number): string {
+  return `about ${plural(Math.max(1, Math.round(days / 30.4)), 'month')}`;
+}
+
+/**
+ * Round 4c/4d: the customer levers' prices and rules, from balance.ts:
+ * neighborhood campaigns, referral credits and the intro promo's reach
+ * (the support levels are in Running costs).
+ */
+export function customersSection(): RateSection {
+  return {
+    title: 'Customers',
+    rows: [
+      {
+        label: 'Neighborhood campaign',
+        value: `${formatMoney(CAMPAIGN_COST_PER_UNIT)} a home`,
+        note: `Per home not signed up in a cabinet's area, at least ${formatMoney(CAMPAIGN_COST_MIN)}; set it on the Customers dashboard`,
+      },
+      {
+        label: 'Campaign length',
+        value: aboutMonths(CAMPAIGN_DAYS),
+        note: `At full strength, then it fades over ${aboutMonths(CAMPAIGN_FADE_DAYS)}; the area then rests ${aboutMonths(CAMPAIGN_COOLDOWN_DAYS)} before the next one`,
+      },
+      {
+        label: 'Referral credit',
+        value: `${formatMoney(REFERRAL_CREDIT)} off, both sides`,
+        note: `For the customer who refers and the neighbor who joins; word of mouth works ${formatNumber(REFERRAL_WOM_MULTIPLIER)} times as hard while it's on`,
+      },
+      {
+        label: 'Intro promo reach',
+        value: `streets lit within ${plural(PROMO_BOOST_YOUNG_MONTHS, 'month')}`,
+        note: "It speeds up switching there and where the cable company runs a promo; elsewhere it mostly discounts people who'd join anyway",
+      },
+    ],
+  };
 }
 
 /** A price rise of this share is how the rate card quotes per-rise churn ("4% per 10% rise"). */
@@ -225,6 +321,13 @@ export function stormSection(): RateSection {
         note: 'An excavator cuts live underground cable (5,280 ft to the mile)',
       },
       { label: 'Aerial outage', value: formatDayRange(OUTAGE_DAYS_AERIAL_MIN, OUTAGE_DAYS_AERIAL_MAX), note: 'A damaged aerial span is out this long' },
+      {
+        label: 'Tree-lined streets',
+        value: `up to ${formatNumber(1 + STORM_EXPOSURE_CANOPY)} times the storm damage`,
+        note:
+          `Aerial cable under old street trees: falling limbs do most storm damage, repairs cost up to ${formatNumber(1 + REPAIR_CANOPY_SHARE)} times as much, ` +
+          `and outages last ${formatDayRange(Math.min(OUTAGE_DAYS_AERIAL_MAX, OUTAGE_DAYS_AERIAL_MIN + OUTAGE_DAYS_CANOPY), OUTAGE_DAYS_AERIAL_MAX)}. Buried cable there pays back`,
+      },
       {
         label: 'Underground outage',
         value: formatDayRange(OUTAGE_DAYS_UNDERGROUND_MIN, OUTAGE_DAYS_UNDERGROUND_MAX),

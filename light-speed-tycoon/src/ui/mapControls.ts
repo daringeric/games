@@ -52,7 +52,7 @@ export interface MenuLike {
 export const EXPOSURE_LEGEND: Record<ExposureBand, string> = {
   sheltered: 'sheltered · fewer storms',
   moderate: 'moderate',
-  exposed: 'exposed · rural, wooded, edge',
+  exposed: 'exposed · tree-lined, rural, wooded, edge',
 };
 
 const MODE_LABEL: Record<CostOverlayMode, string> = {

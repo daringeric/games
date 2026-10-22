@@ -7,21 +7,30 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  BUILD_METHOD_HORIZON_YEARS,
   DIG_INS_PER_MILE_PER_YEAR,
+  METHOD_UPFRONT_WEIGHT,
   OUTAGE_CHURN_BASE,
   OUTAGE_CHURN_MAX,
   OUTAGE_CHURN_PER_DAY,
   OUTAGE_DAYS_AERIAL_MAX,
   OUTAGE_DAYS_AERIAL_MIN,
+  OUTAGE_DAYS_CANOPY,
   OUTAGE_DAYS_UNDERGROUND_MAX,
   OUTAGE_DAYS_UNDERGROUND_MIN,
+  POLE_RENT_PER_POLE_PER_MONTH,
   REPAIR_BASE_AERIAL,
   REPAIR_BASE_UNDERGROUND,
+  REPAIR_CANOPY_SHARE,
   REPAIR_PER_FT_AERIAL,
   REPAIR_PER_FT_UNDERGROUND,
   STORM_AERIAL_DAMAGE_CHANCE,
+  STORM_CANOPY_ZONE,
   STORM_CENTER_EXPOSURE_WEIGHT,
+  STORM_CENTER_OPEN_FT,
+  STORM_CENTER_REACH_CELLS,
   STORM_CHANCE_PER_DAY,
+  STORM_EXPOSURE_CANOPY,
   STORM_EXPOSURE_EDGE,
   STORM_EXPOSURE_EDGE_CELLS,
   STORM_EXPOSURE_EXPOSED,
@@ -34,18 +43,17 @@ import {
   STORM_SEVERITY_MAX,
   STORM_START_DAY,
   STORM_UNDERGROUND_DAMAGE_CHANCE,
-  STORM_CENTER_OPEN_FT,
-  STORM_CENTER_REACH_CELLS,
 } from './balance';
 import { dayOf } from './calendar';
 import { generateCity } from './citygen';
 import { formatMoney } from './finance';
 import { applyCommand, newGame, runDays, tick } from './game';
-import { getService } from './network';
+import { getService, spanCharges } from './network';
 import { Rng, deriveSeed, withRng } from './rng';
 import { hashState } from './save';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import { woodedAt } from './terrain';
+import { polesOnSegment } from './streets';
+import { canopyAt, woodedAt } from './terrain';
 import type { CableMethod, City, Command, GameState, Storm, Zone } from './types';
 import {
   cityExposure,
@@ -73,6 +81,10 @@ import {
   stormDamageChance,
   stormRisk,
   stormSubSeed,
+  streetCanopy,
+  buryPayback,
+  methodYearlyCost,
+  outageDaysRange,
 } from './weather';
 
 // Default grid: 12 x 4 cells, CO at node 0. Horizontal segments 0..8 are
@@ -308,8 +320,9 @@ describe('repairCost and stormRisk', () => {
       [aerial, 'aerial'],
       [underground, 'underground'],
     ] as const) {
-      expect(risk.repairCostPerYear).toBeCloseTo(risk.outagesPerYear * repairCost(street, method), 8);
-      expect(risk.outageDaysPerYear).toBeCloseTo(risk.outagesPerYear * meanOutageDays(method), 8);
+      // Round 4c/4d: the repair and the days out count the street's canopy.
+      expect(risk.repairCostPerYear).toBeCloseTo(risk.outagesPerYear * repairCost(street, method, city), 8);
+      expect(risk.outageDaysPerYear).toBeCloseTo(risk.outagesPerYear * meanOutageDays(method, streetCanopy(city, street)), 8);
     }
     expect(meanOutageDays('aerial')).toBe((OUTAGE_DAYS_AERIAL_MIN + OUTAGE_DAYS_AERIAL_MAX) / 2);
     expect(meanOutageDays('underground')).toBe((OUTAGE_DAYS_UNDERGROUND_MIN + OUTAGE_DAYS_UNDERGROUND_MAX) / 2);
@@ -334,7 +347,12 @@ describe('storms', () => {
     weatherDay(state, rng, sub);
 
     const spans = state.network.spans;
-    const expectedCost = spans.reduce((sum, s) => sum + repairCost(state.city.segments[s.segment]!, 'aerial'), 0);
+    // Round 4c/4d: a span under canopy costs more to repair and stays down longer (the grid's top streets are tree-lined).
+    const expectedCost = spans.reduce((sum, s) => sum + repairCost(state.city.segments[s.segment]!, 'aerial', state.city), 0);
+    // Each street's sub-stream draws 3 days, within its range (the range starts later under canopy).
+    const daysOut = (segment: number) => Math.max(3, outageDaysRange('aerial', streetCanopy(state.city, segment)).min);
+    const days = spans.map((s) => daysOut(s.segment));
+    expect(Math.max(...days)).toBeGreaterThan(3);
     expect(state.weather.storms).toEqual<Storm[]>([
       { id: 1, day: state.day, x: 6, y: 2, radius: STORM_RADIUS_MAX, severity: 1, spans: spans.map((s) => s.id), repairCost: expectedCost },
     ]);
@@ -344,8 +362,8 @@ describe('storms', () => {
         cause: 'storm',
         storm: 1,
         startDay: state.day,
-        daysLeft: 3,
-        repairCost: repairCost(state.city.segments[span.segment]!, 'aerial'),
+        daysLeft: daysOut(span.segment),
+        repairCost: repairCost(state.city.segments[span.segment]!, 'aerial', state.city),
       });
     }
     // The storm sequence asks only the storm's own chance; each street's sub-stream asks its
@@ -370,7 +388,7 @@ describe('storms', () => {
     expect(notice.message).toContain(`${spans.length} spans down`);
     expect(notice.message).toContain('2 subscribers cut off');
     expect(notice.message).toContain(formatMoney(expectedCost));
-    expect(notice.message).toContain('3 days');
+    expect(notice.message).toContain(`3 to ${Math.max(...days)} days`);
   });
 
   it('uses the underground damage chance on underground plant, and scales both by severity', () => {
@@ -736,9 +754,10 @@ class StormEveryDay extends Rng {
 }
 
 describe('round 4b: storm exposure', () => {
-  it('is zone x (1 + wooded) x (1 + edge), wooded from the grove field at the midpoint', () => {
+  it('is zone x (1 + wooded) x (1 + edge) x (1 + canopy), wooded and canopy from the grove field at the midpoint', () => {
     for (const seed of [2027, 99]) {
       const city = town(seed);
+      let canopied = 0;
       for (const seg of city.segments) {
         const { mx2, my2 } = mid2(city, seg.id);
         const wooded = woodedAt(city, mx2 / 2, my2 / 2);
@@ -746,9 +765,15 @@ describe('round 4b: storm exposure', () => {
         expect(wooded).toBeLessThanOrEqual(1);
         const toEdge = Math.min(mx2, my2, 2 * city.width - mx2, 2 * city.height - my2) / 2;
         const edge = Math.max(0, 1 - toEdge / STORM_EXPOSURE_EDGE_CELLS);
-        const expected = STORM_EXPOSURE_ZONE[seg.zone] * (1 + STORM_EXPOSURE_WOODED * wooded) * (1 + STORM_EXPOSURE_EDGE * edge);
+        // Round 4c/4d: the street's canopy, on the zones that count it (residential).
+        const canopy = STORM_CANOPY_ZONE[seg.zone] * canopyAt(city, mx2 / 2, my2 / 2);
+        expect(streetCanopy(city, seg.id)).toBeCloseTo(canopy, 12);
+        if (canopy > 0) canopied++;
+        const expected =
+          STORM_EXPOSURE_ZONE[seg.zone] * (1 + STORM_EXPOSURE_WOODED * wooded) * (1 + STORM_EXPOSURE_EDGE * edge) * (1 + STORM_EXPOSURE_CANOPY * canopy);
         expect(segmentExposure(city, seg.id)).toBeCloseTo(expected, 12);
       }
+      expect(canopied).toBeGreaterThan(0);
     }
   });
 
@@ -766,30 +791,44 @@ describe('round 4b: storm exposure', () => {
     expect(city.segments.some((s) => woodedAt(city, mid2(city, s.id).mx2 / 2, mid2(city, s.id).my2 / 2) > 0.3)).toBe(true);
   });
 
-  it('averages about 1 over a generated town, with sheltered, moderate and exposed streets', () => {
+  it('averages about 1 on open streets, with tree-lined blocks inside the town and sheltered, moderate and exposed streets', () => {
     for (const seed of TOWN_SEEDS) {
       const city = town(seed);
       const exposure = cityExposure(city);
       const feet = { sheltered: 0, moderate: 0, exposed: 0 };
       let sum = 0;
       let all = 0;
+      let residential = 0;
+      let canopied = 0;
       for (const seg of city.segments) {
+        feet[exposureBand(exposure[seg.id]!)] += seg.lengthFt;
+        if (seg.zone === 'residential') {
+          residential += seg.lengthFt;
+          if (streetCanopy(city, seg.id) > 0) canopied += seg.lengthFt;
+        }
+        // The streets without canopy keep round 4b's exposure, about 1 on average.
+        if (streetCanopy(city, seg.id) > 0) continue;
         sum += exposure[seg.id]! * seg.lengthFt;
         all += seg.lengthFt;
-        feet[exposureBand(exposure[seg.id]!)] += seg.lengthFt;
       }
-      expect(sum / all, `seed ${seed} mean`).toBeGreaterThan(0.95);
-      expect(sum / all, `seed ${seed} mean`).toBeLessThan(1.2);
-      expect(feet.sheltered / all, `seed ${seed} sheltered`).toBeGreaterThan(0.03);
-      expect(feet.exposed / all, `seed ${seed} exposed`).toBeGreaterThan(0.05);
-      expect(feet.moderate / all, `seed ${seed} moderate`).toBeGreaterThan(0.5);
-      // Rural streets are the most exposed, downtown the least.
-      const meanOf = (zone: Zone) => {
-        const segs = city.segments.filter((s) => s.zone === zone);
+      expect(sum / all, `seed ${seed} mean of open streets`).toBeGreaterThan(0.95);
+      expect(sum / all, `seed ${seed} mean of open streets`).toBeLessThan(1.2);
+      // Round 4c/4d: tree-lined blocks inside the town, a minority of its residential streets.
+      expect(canopied / residential, `seed ${seed} tree-lined`).toBeGreaterThan(0.1);
+      expect(canopied / residential, `seed ${seed} tree-lined`).toBeLessThan(0.5);
+      const total = feet.sheltered + feet.moderate + feet.exposed;
+      expect(feet.sheltered / total, `seed ${seed} sheltered`).toBeGreaterThan(0.03);
+      expect(feet.exposed / total, `seed ${seed} exposed`).toBeGreaterThan(0.05);
+      expect(feet.moderate / total, `seed ${seed} moderate`).toBeGreaterThan(0.3);
+      // Rural streets are more exposed than open residential ones, downtown the least; tree-lined residential blocks the most.
+      const meanOf = (keep: (s: (typeof city.segments)[number]) => boolean) => {
+        const segs = city.segments.filter(keep);
         return segs.reduce((t, s) => t + exposure[s.id]!, 0) / Math.max(1, segs.length);
       };
-      expect(meanOf('rural')).toBeGreaterThan(meanOf('residential'));
-      expect(meanOf('residential')).toBeGreaterThan(meanOf('downtown'));
+      const openResidential = meanOf((s) => s.zone === 'residential' && streetCanopy(city, s.id) === 0);
+      expect(meanOf((s) => s.zone === 'rural')).toBeGreaterThan(openResidential);
+      expect(openResidential).toBeGreaterThan(meanOf((s) => s.zone === 'downtown'));
+      expect(meanOf((s) => s.zone === 'residential' && streetCanopy(city, s.id) >= 0.8)).toBeGreaterThan(meanOf((s) => s.zone === 'rural'));
     }
   });
 
@@ -1021,5 +1060,205 @@ describe('round 4b: fair storm streams', () => {
       );
     expect(damage(b)).toEqual(damage(a));
     expect(damage(a).some((d) => d.length > 0)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 4c/4d (sim-economy, spec D): storm economics. Tree-lined streets
+// inside the town take far more storm damage on aerial cable, cost more to
+// repair and stay down longer, so burying them pays back within the game's
+// horizon, while sheltered and open blocks stay aerial; the method choice
+// weighs up-front money as the capital-bound game does.
+// ---------------------------------------------------------------------------
+
+/** Every generated town's poled streets at a day past STORM_START_DAY, with their canopy. */
+function poledStreets(seed: number): { state: GameState; streets: { seg: City['segments'][number]; canopy: number }[] } {
+  const state = newGame(seed);
+  state.day = STORM_START_DAY + 30;
+  const streets = state.city.segments.filter((s) => s.hasPoles).map((seg) => ({ seg, canopy: streetCanopy(state.city, seg.id) }));
+  return { state, streets };
+}
+
+/** Years within which the method choice buries a street: BUILD_METHOD_HORIZON_YEARS / METHOD_UPFRONT_WEIGHT. */
+const PAYBACK_YEARS = BUILD_METHOD_HORIZON_YEARS / METHOD_UPFRONT_WEIGHT;
+/** The game's horizon (the tuning targets judge five years). */
+const GAME_YEARS = 5;
+
+describe('round 4c/4d: canopy makes storms costlier on aerial plant', () => {
+  it('repairs an aerial span under canopy at (1 + REPAIR_CANOPY_SHARE x canopy) the plain price, underground at the plain price', () => {
+    const city = town(2027);
+    let lined = 0;
+    for (const seg of city.segments) {
+      const canopy = streetCanopy(city, seg.id);
+      const plain = Math.round(REPAIR_BASE_AERIAL + REPAIR_PER_FT_AERIAL * seg.lengthFt);
+      expect(repairCost(seg, 'aerial')).toBe(plain);
+      expect(repairCost(seg, 'aerial', city)).toBe(Math.round((REPAIR_BASE_AERIAL + REPAIR_PER_FT_AERIAL * seg.lengthFt) * (1 + REPAIR_CANOPY_SHARE * canopy)));
+      expect(repairCost(seg, 'underground', city)).toBe(repairCost(seg, 'underground'));
+      if (canopy > 0.5) {
+        lined++;
+        expect(repairCost(seg, 'aerial', city)).toBeGreaterThan(plain);
+      }
+    }
+    expect(lined).toBeGreaterThan(0);
+  });
+
+  it('keeps an aerial outage under canopy down longer, within the usual range: its days start round(OUTAGE_DAYS_CANOPY x canopy) later', () => {
+    for (const canopy of [0, 0.3, 0.5, 1]) {
+      const lo = Math.min(OUTAGE_DAYS_AERIAL_MAX, OUTAGE_DAYS_AERIAL_MIN + Math.round(OUTAGE_DAYS_CANOPY * canopy));
+      expect(outageDaysRange('aerial', canopy)).toEqual({ min: lo, max: OUTAGE_DAYS_AERIAL_MAX });
+      expect(meanOutageDays('aerial', canopy)).toBe((lo + OUTAGE_DAYS_AERIAL_MAX) / 2);
+      expect(outageDaysRange('underground', canopy)).toEqual({ min: OUTAGE_DAYS_UNDERGROUND_MIN, max: OUTAGE_DAYS_UNDERGROUND_MAX });
+      expect(meanOutageDays('underground', canopy)).toBe((OUTAGE_DAYS_UNDERGROUND_MIN + OUTAGE_DAYS_UNDERGROUND_MAX) / 2);
+    }
+    expect(meanOutageDays('aerial', 1)).toBeGreaterThan(meanOutageDays('aerial'));
+  });
+
+  it('draws a tree-lined street\'s days out from the later range with the same one draw (fair streams)', () => {
+    const state = stormyTown('aerial');
+    const lined = state.network.spans.find((s) => streetCanopy(state.city, s.segment) === 1)!;
+    const open = state.network.spans.find((s) => streetCanopy(state.city, s.segment) === 0)!;
+    expect(lined).toBeDefined();
+    expect(open).toBeDefined();
+    // A storm over the whole grid, severity 1; every damage roll comes up; real sub-streams for the days.
+    const rng = stormAt(state.city, 6, 2, STORM_RADIUS_MAX, 1);
+    weatherDay(state, rng, new FakeRng([], always));
+    for (const span of state.network.spans) {
+      const { min, max } = outageDaysRange('aerial', streetCanopy(state.city, span.segment));
+      expect(span.outage!.daysLeft).toBeGreaterThanOrEqual(min);
+      expect(span.outage!.daysLeft).toBeLessThanOrEqual(max);
+    }
+    expect(lined.outage!.daysLeft).toBeGreaterThanOrEqual(outageDaysRange('aerial', 1).min);
+  });
+
+  it('counts canopy only on the zones that have street trees, and memoizes it per city', () => {
+    const city = town(99);
+    for (const seg of city.segments) {
+      if (STORM_CANOPY_ZONE[seg.zone] === 0) expect(streetCanopy(city, seg.id)).toBe(0);
+      expect(streetCanopy(city, seg)).toBe(streetCanopy(city, seg.id));
+    }
+    expect(streetCanopy(city, 99_999)).toBe(0);
+    // A tree-lined street takes up to 1 + STORM_EXPOSURE_CANOPY times the storm damage of the same street in the open.
+    const lined = city.segments.find((s) => streetCanopy(city, s.id) === 1)!;
+    expect(lined).toBeDefined();
+    const open: City = { ...city, segments: city.segments.map((s) => (s.id === lined.id ? { ...s, zone: 'downtown' as Zone } : s)) };
+    const ratio = segmentExposure(city, lined.id) / (segmentExposure(open, lined.id) / STORM_EXPOSURE_ZONE.downtown) / STORM_EXPOSURE_ZONE.residential;
+    expect(ratio).toBeCloseTo(1 + STORM_EXPOSURE_CANOPY, 10);
+  });
+
+  it('expects several times the outages a year on a tree-lined street as on an open one, in every tuning town', () => {
+    for (const seed of [1, 2027, 424242, 99, 12345]) {
+      const { state, streets } = poledStreets(seed);
+      const mean = (keep: (canopy: number) => boolean) => {
+        const picked = streets.filter((s) => s.seg.zone === 'residential' && keep(s.canopy));
+        return picked.reduce((t, s) => t + stormRisk(state, s.seg, 'aerial').outagesPerYear, 0) / Math.max(1, picked.length);
+      };
+      expect(mean((c) => c >= 0.8), `seed ${seed}`).toBeGreaterThan(4 * mean((c) => c === 0));
+    }
+  });
+});
+
+describe('round 4c/4d: what a method costs a year and over its life', () => {
+  it('prices a year of a span as pole rent, expected repairs and its customers\' outages', () => {
+    const { state } = poledStreets(2027);
+    const homes = state.city.segments.filter((s) => s.hasPoles && state.city.parcels.some((p) => p.segment === s.id && p.appearsDay <= state.day));
+    const empty = state.city.segments.find((s) => s.hasPoles && !state.city.parcels.some((p) => p.segment === s.id))!;
+    expect(homes.length).toBeGreaterThan(0);
+    expect(empty).toBeDefined();
+    for (const seg of [...homes.slice(0, 20), empty]) {
+      const rent = polesOnSegment(seg) * POLE_RENT_PER_POLE_PER_MONTH * 12;
+      const aerial = methodYearlyCost(state, seg, 'aerial');
+      const underground = methodYearlyCost(state, seg, 'underground');
+      const outagesA = aerial - rent - stormRisk(state, seg, 'aerial').repairCostPerYear;
+      const outagesU = underground - stormRisk(state, seg, 'underground').repairCostPerYear;
+      if (seg === empty) {
+        // Nobody to cut off: rent and repairs alone.
+        expect(outagesA).toBeCloseTo(0, 9);
+        expect(outagesU).toBeCloseTo(0, 9);
+      } else {
+        expect(outagesA).toBeGreaterThan(0);
+        expect(outagesU).toBeGreaterThanOrEqual(0);
+      }
+      expect(lifetimeMethodCost(state, seg, 'aerial')).toBeCloseTo(METHOD_UPFRONT_WEIGHT * spanCharges(seg, 'aerial').total + BUILD_METHOD_HORIZON_YEARS * aerial, 6);
+      expect(lifetimeMethodCost(state, seg, 'underground')).toBeCloseTo(METHOD_UPFRONT_WEIGHT * spanCharges(seg, 'underground').total + BUILD_METHOD_HORIZON_YEARS * underground, 6);
+    }
+  });
+
+  it('charges a street of apartments more for its outages than the same street of houses', () => {
+    const houses = makeTestState(makeGridCity());
+    const flats = makeTestState(makeGridCity({ parcelKinds: (p) => (p.segment === 1 ? { kind: 'mdu', units: 12 } : undefined) }));
+    for (const state of [houses, flats]) state.day = STORM_START_DAY;
+    const seg = (state: GameState) => state.city.segments[1]!;
+    const extra = (state: GameState) =>
+      methodYearlyCost(state, seg(state), 'aerial') - polesOnSegment(seg(state)) * POLE_RENT_PER_POLE_PER_MONTH * 12 - stormRisk(state, seg(state), 'aerial').repairCostPerYear;
+    expect(extra(flats)).toBeGreaterThan(extra(houses));
+    expect(stormRisk(flats, seg(flats), 'aerial')).toEqual(stormRisk(houses, seg(houses), 'aerial'));
+  });
+
+  it('prefers the method with the lower lifetime cost on a generated town, and underground where there are no poles', () => {
+    const { state } = poledStreets(424242);
+    let aerial = 0;
+    let underground = 0;
+    for (const segment of state.city.segments) {
+      const a = lifetimeMethodCost(state, segment, 'aerial');
+      const u = lifetimeMethodCost(state, segment, 'underground');
+      const expected = !segment.hasPoles ? 'underground' : a <= u ? 'aerial' : 'underground';
+      expect(preferredMethod(state, segment), `segment ${segment.id}`).toBe(expected);
+      if (segment.hasPoles) {
+        if (expected === 'aerial') aerial++;
+        else underground++;
+        // Consistent with the payback it quotes: burying wins exactly when it pays back within PAYBACK_YEARS.
+        const p = buryPayback(state, segment)!;
+        if (p.extraCost > 0) expect(expected === 'underground', `segment ${segment.id}`).toBe(p.savedPerYear * PAYBACK_YEARS > p.extraCost);
+      }
+    }
+    // The mixed build: mostly aerial, some streets buried.
+    expect(aerial).toBeGreaterThan(underground);
+    expect(underground).toBeGreaterThan(0);
+  });
+});
+
+describe('round 4c/4d: burying pays back on exposed streets, not on sheltered ones', () => {
+  it('pays back within the game\'s horizon on tree-lined aerial runs, and the method choice buries them', () => {
+    for (const seed of [1, 2027, 424242, 99, 12345]) {
+      const { state, streets } = poledStreets(seed);
+      // Tree-lined residential blocks of a typical length.
+      const lined = streets.filter((s) => s.seg.zone === 'residential' && s.canopy >= 0.8 && s.seg.lengthFt >= 180 && s.seg.lengthFt <= 480);
+      expect(lined.length, `seed ${seed}`).toBeGreaterThan(5);
+      const years = lined.map((s) => buryPayback(state, s.seg)!.years ?? Infinity).sort((a, b) => a - b);
+      const median = years[Math.floor(years.length / 2)]!;
+      expect(median, `seed ${seed} median payback`).toBeLessThanOrEqual(PAYBACK_YEARS);
+      expect(median, `seed ${seed} median payback`).toBeLessThan(GAME_YEARS);
+      const buried = lined.filter((s) => preferredMethod(state, s.seg) === 'underground').length;
+      expect(buried / lined.length, `seed ${seed} buried`).toBeGreaterThan(0.6);
+    }
+  });
+
+  it('keeps sheltered dense blocks and open residential blocks aerial', () => {
+    for (const seed of [1, 2027, 424242, 99, 12345]) {
+      const { state, streets } = poledStreets(seed);
+      const sheltered = streets.filter((s) => exposureBand(segmentExposure(state.city, s.seg.id)) === 'sheltered');
+      expect(sheltered.length, `seed ${seed}`).toBeGreaterThan(5);
+      for (const s of sheltered) {
+        expect(preferredMethod(state, s.seg), `seed ${seed} segment ${s.seg.id}`).toBe('aerial');
+        const p = buryPayback(state, s.seg)!;
+        expect(p.years === null || p.years > PAYBACK_YEARS, `seed ${seed} segment ${s.seg.id}`).toBe(true);
+      }
+      // Open residential blocks of a typical length: burying takes far longer than the game to pay back.
+      const open = streets.filter((s) => s.seg.zone === 'residential' && s.canopy === 0 && s.seg.lengthFt >= 180 && s.seg.lengthFt <= 480);
+      const aerial = open.filter((s) => preferredMethod(state, s.seg) === 'aerial').length;
+      expect(aerial / open.length, `seed ${seed} open`).toBeGreaterThan(0.9);
+      const years = open.map((s) => buryPayback(state, s.seg)!.years ?? Infinity).sort((a, b) => a - b);
+      expect(years[Math.floor(years.length / 2)]!, `seed ${seed} open median`).toBeGreaterThan(2 * GAME_YEARS);
+    }
+  });
+
+  it('quotes no payback for a street without poles and none needed when burying costs no more', () => {
+    const { state } = poledStreets(2027);
+    const unpoled = state.city.segments.find((s) => !s.hasPoles);
+    if (unpoled) expect(buryPayback(state, unpoled)).toBeNull();
+    const seg = state.city.segments.find((s) => s.hasPoles)!;
+    const p = buryPayback(state, seg)!;
+    expect(p.extraCost).toBe(spanCharges(seg, 'underground').total - spanCharges(seg, 'aerial').total);
+    expect(p.savedPerYear).toBeCloseTo(methodYearlyCost(state, seg, 'aerial') - methodYearlyCost(state, seg, 'underground'), 9);
   });
 });

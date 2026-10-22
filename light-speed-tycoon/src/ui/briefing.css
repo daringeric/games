@@ -1,23 +1,97 @@
-/* Round 4: the month-end briefing sheet and the advisor's Show me highlight (ui-briefing workstream;
-   round 4b's glance-first layout, snoozes and neutral debt: briefing-advisor-polish).
-   Imported by main.ts after style.css and mapTools.css, so rules here may
-   override theirs; style.css itself is frozen for round 4. Colors and sizes come
-   from the theme variables themeCss.ts publishes (--card, --text, --accent,
-   --danger, --radius, --touch, ...), never literals. */
+/* The month-end summary (round 4c/4d, spec G: "Summary B + next step") and the
+   advisor's Show me highlight. ui-summary workstream; ui-briefing and
+   briefing-advisor-polish before. Imported by main.ts after style.css, so
+   rules here may override its sheet rules (style.css itself is frozen).
+   Colors and sizes come from the theme variables themeCss.ts publishes
+   (--card, --text, --success, --active, --cpp-amber, --radius, --touch, ...),
+   never literals; tints are color-mix() of those. Layout and hierarchy follow
+   the owner's mockup (SummaryMoney.dc.html): a centered card on a desktop,
+   one column on a phone, the footer always in view. */
 
 /* The sheet ----------------------------------------------------------------- */
 
-/* Round 4b: glance first. The headline tiles and the advisor's top cards fit
-   one desktop screen (Continue and the first card in view at 1280x800) and
-   roughly one phone screen; the rest folds away in closed <details>. */
 .sheet.briefing {
-  width: min(720px, calc(100vw - 24px));
+  width: min(680px, calc(100vw - 24px));
+  border-radius: calc(var(--radius) + 8px);
 }
 
-.briefing .sheet-body {
-  display: grid;
-  gap: 14px;
-  padding-bottom: 16px;
+.briefing .sheet-head {
+  padding: 26px 18px 6px 30px;
+}
+
+/* The dialog's name ("July 2029 briefing") is for screen readers; the kicker
+   and the headline say it on screen. */
+.briefing .sheet-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.briefing-kicker {
+  margin: 0 0 6px;
+  color: var(--text-2);
+  font: 800 13px / 1.3 var(--font-ui);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.briefing .sheet-subtitle.briefing-headline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: var(--text);
+  font: 600 32px / 1.12 var(--font-display);
+}
+
+.briefing-headline.tone-warn {
+  color: color-mix(in srgb, var(--cpp-amber) 72%, var(--text));
+}
+
+.briefing-headline.tone-danger {
+  color: var(--danger);
+}
+
+.briefing-headline-icon {
+  flex: none;
+  width: 0.9em;
+  height: 0.9em;
+  margin-top: 0.12em;
+}
+
+.briefing-headline-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.briefing-health {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 4px 12px 4px 8px;
+  border-radius: var(--pill);
+  background: color-mix(in srgb, var(--cpp-amber) 16%, var(--card));
+  color: var(--text);
+  font: 800 14px / 1.3 var(--font-ui);
+}
+
+.briefing-health.health-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.briefing-health.health-ok {
+  background: var(--chip);
+}
+
+.briefing-health-icon {
+  width: 18px;
+  height: 18px;
 }
 
 /* Something needs the player: the heading carries the accent. */
@@ -25,86 +99,45 @@
   box-shadow: inset 0 4px 0 var(--accent);
 }
 
-/* How often it shows: a compact select in the header, under the subtitle. */
-.briefing-frequency {
+.briefing .sheet-body {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 8px;
-  margin-top: 8px;
+  flex-direction: column;
+  gap: 18px;
+  padding: 12px 30px 22px;
 }
 
-.briefing-frequency label {
-  color: var(--text-2);
-  font: 800 11.5px / 1.2 var(--font-ui);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.briefing .field.briefing-frequency-select {
-  width: auto;
-  max-width: 100%;
-  min-height: 34px;
-  padding: 0 6px;
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.briefing-section {
-  display: grid;
-  gap: 8px;
+.briefing .sheet-body > * {
+  flex: none;
   min-width: 0;
-}
-
-.briefing-section-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 2px 12px;
-}
-
-.sheet .briefing-section h3 {
-  margin: 0;
-}
-
-.briefing-section h3:focus {
-  outline: none;
-}
-
-.briefing-section h3:focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.briefing-vs,
-.briefing-snoozed {
-  color: var(--text-2);
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.briefing-snoozed {
-  padding: 1px 8px;
-  border-radius: var(--pill);
-  background: var(--chip);
-}
-
-.briefing-empty,
-.briefing-more {
-  margin: 0;
-  color: var(--text-2);
-  font-size: 13.5px;
-  font-weight: 700;
-  line-height: 1.4;
 }
 
 .briefing .num {
   overflow-wrap: anywhere;
 }
 
+.briefing-empty {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.sheet.briefing h3 {
+  margin: 0;
+}
+
+.briefing h3:focus {
+  outline: none;
+}
+
+.briefing h3:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
 /* Tone classes: always next to words that say the same thing. Debt is never
-   success green: no tone in good standing, amber or red for covenant trouble. */
+   success green: amber or red only for the bank's trouble. */
 .briefing .tone-negative,
 .briefing .tone-danger {
   color: var(--danger);
@@ -123,10 +156,664 @@
   color: var(--cpp-red);
 }
 
-/* At a glance: four tiles a row on a desktop, two on a phone. */
+/* Money in and money out ------------------------------------------------------ */
+
+.briefing-money {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.briefing-money-head,
+.briefing-cash-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 12px;
+}
+
+.sheet.briefing .briefing-money-title,
+.sheet.briefing .briefing-cash-title {
+  color: var(--text);
+  font: 800 17px / 1.25 var(--font-ui);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.briefing-money-total {
+  font: 600 24px / 1.1 var(--font-display);
+}
+
+.briefing-money-total.total-in {
+  color: var(--success);
+}
+
+/* Money in that includes borrowing: neutral (debt is never success green). */
+.briefing-money-total.total-in.total-borrowed {
+  color: var(--text);
+}
+
+.briefing-money-total.total-out {
+  color: color-mix(in srgb, var(--active) 82%, var(--text));
+}
+
+/* One bar per side on one shared scale (the larger total is the full width;
+   the segments' widths are set inline); no track behind it, as in the mockup. */
+.briefing-bar {
+  display: flex;
+  height: 34px;
+}
+
+.briefing-seg {
+  display: flex;
+  flex: none;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  box-shadow: inset -2px 0 0 var(--card);
+}
+
+.briefing-seg:first-child {
+  border-radius: 10px 0 0 10px;
+}
+
+.briefing-seg:last-child {
+  border-radius: 0 10px 10px 0;
+  box-shadow: none;
+}
+
+.briefing-seg:only-child {
+  border-radius: 10px;
+}
+
+.briefing-seg-label {
+  padding: 0 14px;
+  overflow: hidden;
+  color: var(--active-text);
+  font: 700 15px / 1 var(--font-ui);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Segment and swatch colors: the legend's words always name them too. */
+.seg-bills {
+  background: var(--success);
+}
+
+/* Borrowed money: its own color, striped, so it never reads as earned. */
+.seg-borrowed {
+  background: repeating-linear-gradient(135deg, var(--tone-aerial) 0 6px, color-mix(in srgb, var(--tone-aerial) 55%, var(--card)) 6px 10px);
+}
+
+.seg-otherIn {
+  background: var(--tone-info);
+}
+
+.seg-running {
+  background: var(--text-2);
+}
+
+.seg-building {
+  background: var(--crew);
+}
+
+.seg-loans {
+  background: var(--tone-aerial);
+}
+
+.briefing-swatch {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+.briefing-in-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.briefing-in-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* Money out's legend: three groups side by side, each a button opening its lines. */
+.briefing-legend {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.briefing-group-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.briefing-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  min-height: var(--touch);
+  margin: -6px;
+  padding: 6px;
+  box-sizing: content-box;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.briefing-group:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.briefing-group:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 0;
+}
+
+.briefing-group:disabled {
+  cursor: default;
+}
+
+.briefing-group-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.briefing-chevron {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform 120ms ease;
+}
+
+.briefing-group[aria-expanded='true'] .briefing-chevron {
+  transform: rotate(-135deg) translate(-1px, -1px);
+}
+
+.briefing-group:disabled .briefing-chevron {
+  display: none;
+}
+
+.briefing-group-total {
+  font: 600 20px / 1.2 var(--font-display);
+}
+
+.briefing-group-sub,
+.briefing-group-note {
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.briefing-group-note {
+  font-weight: 800;
+}
+
+.briefing-group-lines {
+  display: grid;
+  gap: 3px;
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--chip);
+}
+
+.briefing-group-lines[hidden] {
+  display: none;
+}
+
+.briefing-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.briefing-line dt {
+  min-width: 0;
+}
+
+.briefing-line dd {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.briefing-line dd.negative {
+  color: var(--danger);
+}
+
+/* The cash card */
+.briefing-cash {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px 20px;
+  border-radius: 20px;
+  background: var(--page);
+}
+
+.briefing-cash-left {
+  color: var(--text-2);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.briefing-cash-line {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.briefing-cash-line b {
+  color: var(--text);
+  font-weight: 800;
+}
+
+/* The customers line */
+.briefing-customers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.briefing-customers-icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  color: var(--text-2);
+}
+
+.briefing-customers-text {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.briefing-customers-text b {
+  color: var(--text);
+  font-weight: 800;
+}
+
+.btn.briefing-link {
+  min-width: 0;
+  padding: 0 4px;
+  color: var(--success);
+  font: 800 15px / 1.2 var(--font-ui);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Needs attention */
+.briefing-attention-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sheet.briefing .briefing-attention-list h3 {
+  color: var(--text-2);
+}
+
+.briefing-attention-list ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.briefing-alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 8px 8px 8px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--cpp-amber) 13%, var(--card));
+  font-size: 14.5px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.briefing-alert.alert-danger {
+  background: var(--danger-bg);
+}
+
+.briefing-alert-icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  color: color-mix(in srgb, var(--cpp-amber) 72%, var(--text));
+}
+
+.alert-danger .briefing-alert-icon {
+  color: var(--danger);
+}
+
+.briefing-alert-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.btn.briefing-alert-action {
+  flex: none;
+  background: var(--card);
+  font-size: 15px;
+}
+
+/* Your next step */
+.briefing-next {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.briefing-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.briefing-card-main {
+  padding: 16px 18px;
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--cpp-amber) 14%, var(--card));
+}
+
+.briefing-card-text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sheet.briefing .briefing-step-label {
+  color: color-mix(in srgb, var(--cpp-amber) 55%, var(--text));
+  font: 800 13px / 1.3 var(--font-ui);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.sheet.briefing .briefing-card-title {
+  margin: 0;
+  color: var(--text);
+  font: 600 19px / 1.25 var(--font-display);
+}
+
+.briefing-card-why {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.briefing-card-detail summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.briefing-card-detail p {
+  margin: 2px 0 0;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.briefing-card-actions {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.btn.briefing-show {
+  max-width: 100%;
+  min-height: var(--touch);
+  padding: 0 20px;
+  background: var(--text);
+  color: var(--card);
+  white-space: normal;
+  text-align: center;
+}
+
+.btn.briefing-show:hover {
+  background: color-mix(in srgb, var(--text) 85%, var(--card));
+}
+
+.btn.briefing-snooze {
+  max-width: 100%;
+  color: var(--text-2);
+  font: 700 14px / 1.2 var(--font-ui);
+  white-space: normal;
+}
+
+.btn.briefing-snooze:hover {
+  color: var(--text);
+}
+
+/* The more tips: quiet until opened. */
+.briefing-tips > summary,
+.briefing-card-detail > summary {
+  list-style: none;
+}
+
+.briefing-tips > summary::-webkit-details-marker,
+.briefing-card-detail > summary::-webkit-details-marker {
+  display: none;
+}
+
+.briefing-tips-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--touch);
+  padding: 0 4px;
+  color: var(--text-2);
+  font: 800 14.5px / 1.2 var(--font-ui);
+  cursor: pointer;
+}
+
+.briefing-tips-summary::before,
+.briefing-card-detail > summary::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+.briefing-tips[open] > .briefing-tips-summary::before,
+.briefing-card-detail[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.briefing-tips-summary:hover,
+.briefing-card-detail summary:hover {
+  color: var(--text);
+}
+
+.briefing-tips-summary:focus-visible,
+.briefing-card-detail summary:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+.briefing-tip-list {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.briefing-card-tip {
+  padding: 10px 12px 10px 14px;
+  border-radius: 16px;
+  background: var(--chip);
+}
+
+.sheet.briefing .briefing-card-tip .briefing-card-title {
+  font-size: 16px;
+}
+
+.briefing-card-tip .briefing-card-why {
+  font-size: 14px;
+}
+
+.briefing-card-tip .btn.briefing-show {
+  padding: 0 16px;
+  font-size: 15px;
+}
+
+.briefing-snoozed {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 800;
+}
+
+/* The footer: See the full books / Back, and Continue, always in view. */
+.briefing .sheet-actions {
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px 16px;
+  padding: 14px 30px 22px;
+}
+
+.btn.briefing-books-open,
+.btn.briefing-back {
+  min-height: 52px;
+  padding: 0 20px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  font: 700 16px / 1.2 var(--font-ui);
+}
+
+.btn.briefing-books-open:hover,
+.btn.briefing-back:hover {
+  background: var(--hover);
+}
+
+.btn.briefing-continue {
+  min-width: 150px;
+  min-height: 56px;
+  padding: 0 36px;
+  font-size: 20px;
+}
+
+/* The full books -------------------------------------------------------------- */
+
+.briefing-books {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.briefing-books-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 12px;
+}
+
+.sheet.briefing .briefing-books-head h3 {
+  color: var(--text);
+  font: 600 22px / 1.2 var(--font-display);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.briefing-vs {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+/* How often it shows: a compact select. */
+.briefing-frequency {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.briefing-frequency label {
+  color: var(--text-2);
+  font: 800 12px / 1.2 var(--font-ui);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.briefing .field.briefing-frequency-select {
+  width: auto;
+  max-width: 100%;
+  min-height: var(--touch);
+  padding: 0 8px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+/* Tiles: four a row on a desktop, two on a phone. */
 .briefing-tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 8px;
   margin: 0;
 }
@@ -136,7 +823,7 @@
   align-content: start;
   gap: 1px;
   min-width: 0;
-  padding: 7px 10px 8px;
+  padding: 8px 10px 9px;
   border-radius: 14px;
   background: var(--chip);
 }
@@ -187,8 +874,6 @@
   color: var(--danger);
 }
 
-/* The debt tile carries the longest small print (the covenant figures) and
-   ends the grid: two columns wide wherever there are two columns. */
 .briefing-tile-debt {
   grid-column: span 2;
 }
@@ -199,198 +884,22 @@
   }
 }
 
-/* Notices that need the player, surfaced under the tiles. */
-.briefing-alerts {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.briefing-alert {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: start;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: 12px;
-  background: var(--danger-bg);
-  font-size: 13.5px;
-  font-weight: 700;
-  line-height: 1.4;
-}
-
-.briefing-alert.notice-warn {
-  background: color-mix(in srgb, var(--cpp-amber) 14%, var(--card));
-}
-
-/* Advisor */
-.briefing-advice {
-  display: grid;
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.briefing-card {
+.briefing-part {
   display: grid;
   gap: 6px;
-  padding: 10px 12px 10px;
-  border-left: 4px solid var(--tone-info);
-  border-radius: 14px;
-  background: var(--card);
-  box-shadow: inset 0 0 0 2px var(--card-border);
-}
-
-.briefing-card-urgent {
-  border-left-color: var(--danger);
-  background: var(--danger-bg);
-}
-
-.briefing-card-important {
-  border-left-color: var(--cpp-amber);
-}
-
-.briefing-card-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 8px;
-}
-
-.briefing-severity {
-  padding: 2px 8px;
-  border-radius: var(--pill);
-  background: var(--chip);
-  color: var(--text);
-  font: 800 11px / 1.4 var(--font-ui);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.briefing-severity-urgent {
-  background: var(--danger);
-  color: var(--active-text);
-}
-
-.briefing-severity-important {
-  background: color-mix(in srgb, var(--cpp-amber) 22%, var(--card));
-}
-
-.briefing-card-title {
-  flex: 1 1 200px;
-  margin: 0;
-  font: 600 16px / 1.25 var(--font-display);
-}
-
-.briefing-card-why {
-  margin: 0;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.4;
-}
-
-.briefing-card-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 10px;
-}
-
-.btn.briefing-show {
-  max-width: 100%;
-  white-space: normal;
-  text-align: center;
-}
-
-/* Snooze: quieter than Show me, but a full touch target. */
-.btn.briefing-snooze {
-  max-width: 100%;
-  color: var(--text-2);
-  font-size: 14px;
-  white-space: normal;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.btn.briefing-snooze:hover {
-  color: var(--text);
-}
-
-/* Details: closed by default, a full-width row with a chevron. */
-.briefing-details {
-  display: block;
+  padding-top: 10px;
   border-top: 1px dashed var(--card-border);
 }
 
-.briefing-summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: var(--touch);
-  color: var(--text-2);
-  font: 800 12px / 1.2 var(--font-ui);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
-  list-style: none;
-}
-
-.briefing-summary::-webkit-details-marker {
-  display: none;
-}
-
-.briefing-summary::before {
-  content: '';
-  flex: none;
-  width: 7px;
-  height: 7px;
-  margin: 0 3px 0 2px;
-  border-right: 2px solid currentColor;
-  border-bottom: 2px solid currentColor;
-  transform: rotate(-45deg);
-  transition: transform 120ms ease;
-}
-
-.briefing-details[open] > .briefing-summary::before {
-  transform: rotate(45deg);
-}
-
-.briefing-summary:hover {
-  color: var(--text);
-}
-
-.briefing-summary:focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
-  border-radius: 8px;
-}
-
-.briefing-details-body {
-  display: grid;
-  gap: 8px;
-  padding: 2px 0 6px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .briefing-summary::before {
-    transition: none;
-  }
-}
-
-/* What changed that is not a tile (in the money details) */
-.sheet .briefing-changes-block h4 {
+.sheet.briefing .briefing-part h4 {
   margin: 0 0 2px;
-  font: 600 14px / 1.2 var(--font-display);
+  font: 600 16px / 1.2 var(--font-display);
 }
 
 .briefing-changes {
   display: grid;
   gap: 2px;
-  margin: 0;
+  margin: 0 0 4px;
   padding: 0;
   list-style: none;
 }
@@ -400,12 +909,8 @@
   flex-wrap: wrap;
   align-items: baseline;
   gap: 2px 10px;
-  padding: 5px 0;
+  padding: 4px 0;
   border-bottom: 1px dashed var(--card-border);
-}
-
-.briefing-change:last-child {
-  border-bottom: 0;
 }
 
 .briefing-change-label {
@@ -422,9 +927,9 @@
 .briefing-change-delta {
   display: inline-flex;
   align-items: baseline;
+  justify-content: flex-end;
   gap: 4px;
   min-width: 112px;
-  justify-content: flex-end;
   color: var(--text-2);
   font-size: 13px;
   font-weight: 800;
@@ -432,6 +937,54 @@
 
 .briefing-arrow {
   font-size: 10px;
+}
+
+.briefing-subtotal,
+.briefing-books-group-head,
+.briefing-money-net {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 800;
+}
+
+.briefing-subtotal {
+  margin-top: 4px;
+  font: 600 16px / 1.2 var(--font-display);
+}
+
+.briefing-books-group {
+  display: grid;
+  gap: 2px;
+  padding-left: 10px;
+}
+
+.briefing-books-group-head {
+  color: var(--text-2);
+}
+
+.briefing-lines {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+}
+
+.briefing-lines-in {
+  padding-left: 10px;
+}
+
+.briefing-money-net {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--chip);
+  font: 600 16px / 1.2 var(--font-display);
+}
+
+.briefing-money-net .negative {
+  color: var(--danger);
 }
 
 /* Notices */
@@ -483,58 +1036,6 @@
   overflow-wrap: anywhere;
 }
 
-/* Money in and out */
-.briefing-money-group {
-  display: grid;
-  gap: 2px;
-}
-
-.sheet .briefing-money-group h4 {
-  margin: 4px 0 2px;
-  font: 600 14px / 1.2 var(--font-display);
-}
-
-.briefing-money-group dl {
-  display: grid;
-  gap: 2px;
-  margin: 0;
-}
-
-.briefing-money-row,
-.briefing-money-total,
-.briefing-money-net {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.briefing-money-row dt {
-  min-width: 0;
-}
-
-.briefing-money-row dd {
-  margin: 0;
-  white-space: nowrap;
-}
-
-.briefing-money-total {
-  padding-top: 2px;
-  border-top: 1px dashed var(--card-border);
-  color: var(--text-2);
-  font-weight: 800;
-}
-
-.briefing-money-net {
-  margin-top: 4px;
-  padding: 8px 10px;
-  border-radius: 12px;
-  background: var(--chip);
-  font: 600 16px / 1.2 var(--font-display);
-}
-
 /* Looking ahead */
 .briefing-forward {
   display: grid;
@@ -544,10 +1045,10 @@
 
 .briefing-forward-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
   gap: 4px 12px;
-  flex-wrap: wrap;
   padding: 4px 0;
   border-bottom: 1px dashed var(--card-border);
 }
@@ -558,8 +1059,8 @@
 
 .briefing-forward-row dt {
   display: grid;
-  gap: 1px;
   flex: 1 1 160px;
+  gap: 1px;
   min-width: 0;
   font-size: 14px;
   font-weight: 700;
@@ -577,46 +1078,99 @@
   text-align: right;
 }
 
-.btn.briefing-continue {
-  min-width: 140px;
+@media (prefers-reduced-motion: reduce) {
+  .briefing-chevron,
+  .briefing-tips-summary::before,
+  .briefing-card-detail > summary::before {
+    transition: none;
+  }
 }
 
-@media (max-width: 480px) {
+/* Phones: one column, the legend stacks, the footer stays in view. */
+@media (max-width: 560px) {
   .briefing .sheet-head {
-    padding: 12px 10px 6px 16px;
+    padding: 16px 10px 4px 18px;
+  }
+
+  .briefing .sheet-subtitle.briefing-headline {
+    font-size: 25px;
   }
 
   .briefing .sheet-body {
-    gap: 12px;
-    padding: 2px 16px 12px;
+    gap: 14px;
+    padding: 8px 18px 14px;
   }
 
-  .briefing .field.briefing-frequency-select {
-    min-height: var(--touch);
-    /* Beside its label on a 390px phone (one row less above the figures). */
-    flex: 1 1 120px;
-    min-width: 0;
+  .briefing-legend {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
   }
 
-  .briefing-tiles {
-    gap: 6px;
+  .briefing-group {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: 0 12px;
   }
 
-  .briefing-tile {
-    padding: 6px 8px 7px;
+  .briefing-group-name {
+    grid-column: 1;
   }
 
-  .briefing-tile-value {
+  .briefing-group-total {
+    grid-column: 2;
+    grid-row: 1;
     font-size: 18px;
   }
 
+  .briefing-group-sub,
+  .briefing-group-note {
+    grid-column: 1 / -1;
+  }
+
+  .briefing-cash {
+    padding: 14px 16px;
+  }
+
+  .briefing-card {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .briefing-card-main {
+    padding: 14px 16px;
+  }
+
+  .briefing-card-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .briefing-card-actions .btn.briefing-show {
+    flex: 1 1 auto;
+  }
+
   .briefing .sheet-actions {
-    justify-content: stretch;
-    padding: 10px 16px 14px;
+    padding: 10px 18px 14px;
+    gap: 10px;
+  }
+
+  .btn.briefing-books-open,
+  .btn.briefing-back {
+    flex: 1 1 auto;
+    min-height: 48px;
+    padding: 0 14px;
+    font-size: 15px;
   }
 
   .btn.briefing-continue {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 120px;
+    min-height: 52px;
+    padding: 0 20px;
+    font-size: 19px;
   }
 }
 

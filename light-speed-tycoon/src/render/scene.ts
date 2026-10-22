@@ -1,7 +1,7 @@
 // The map scene. Layers, bottom to top: board, roads, rock stipple, trees,
 // strong rock texture (underground tool), $/ft cost overlay, storm-exposure
 // overlay (round 4b), pole overlay,
-// parcels, recent storms' clouds, cables, coverage shading and route preview,
+// parcels, street trees on tree-lined blocks (round 4c/4d), recent storms' clouds, cables, coverage shading and route preview,
 // central office, cabinets, storm badges, tool marks. The world container is
 // a render group, so panning and zooming only change its transform; each
 // layer is redrawn only when the state it shows changes (the storm clouds on
@@ -16,7 +16,7 @@ import type { Bounds, Camera } from './camera';
 import { boardBounds, drawBoard, drawCostOverlay, drawExposureOverlay, drawPoleOverlay, drawRoads, drawRock, drawTrees, townBounds } from './cityLayer';
 import type { CostOverlayMode } from './cityLayer';
 import { buildCentralOffice } from './coLayer';
-import { placeTrees } from './decor';
+import { placeStreetTrees, placeTrees } from './decor';
 import { NetworkLayer, StormLayer } from './networkLayer';
 import { OverlayLayer } from './overlay';
 import type { OverlaySpec } from './overlay';
@@ -67,6 +67,8 @@ export class Scene {
   private exposureOn = false;
   private exposureDrawn: { city: City; bands: Record<ExposureBand, number> } | null = null;
   private readonly parcels: ParcelLayer;
+  /** Round 4c/4d: street trees on tree-lined blocks (decor.placeStreetTrees), over the lots' front yards. */
+  private readonly streetTrees = new Graphics();
   private readonly network: NetworkLayer;
   private readonly storms: StormLayer;
   private readonly overlay: OverlayLayer;
@@ -102,6 +104,7 @@ export class Scene {
       this.exposure,
       this.poles,
       this.parcels.container,
+      this.streetTrees,
       this.storms.under,
       this.network.below,
       this.overlay.under,
@@ -284,6 +287,9 @@ export class Scene {
     const trees = new Graphics();
     drawTrees(trees, placeTrees(city, this.theme), this.theme);
     this.ground.addChild(board, roads, rock, trees);
+
+    this.streetTrees.clear();
+    drawTrees(this.streetTrees, placeStreetTrees(city, this.theme), this.theme);
 
     this.poles.clear();
     drawPoleOverlay(this.poles, city, this.theme);

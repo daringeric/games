@@ -39,6 +39,8 @@ export interface DebugHook {
    * on every page.
    */
   startScreenOpen(): boolean;
+  /** Round 4c/4d: whether the Customers dashboard is open. */
+  customersOpen(): boolean;
 }
 
 declare global {

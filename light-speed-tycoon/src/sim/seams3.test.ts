@@ -336,13 +336,16 @@ describe('covenants through real play', () => {
 
   /**
    * The cure script, keyed by closes since the loan: after the third close
-   * (frozen) repay the line and prepay the term loan down to TERM_LOAN_MIN.
+   * (frozen) repay the line and prepay the term loan down to twice
+   * TERM_LOAN_MIN. Round 4c/4d: with the scaled overhead v2-town earns, so
+   * the frozen closes' sweeps take half its operating cash flow; at
+   * TERM_LOAN_MIN they paid the loan off before the cure finished.
    */
   function act(state: GameState, closesSoFar: number): void {
     if (closesSoFar !== 3) return;
     apply(state, { type: 'repayCredit', amount: state.debt.credit.balance });
     const loan = state.debt.loans[0]!;
-    apply(state, { type: 'prepayLoan', loan: loan.id, amount: loan.balance - TERM_LOAN_MIN });
+    apply(state, { type: 'prepayLoan', loan: loan.id, amount: loan.balance - 2 * TERM_LOAN_MIN });
   }
 
   it('escalate warning -> penalty -> frozen, block borrowing while frozen, then cure one stage per COVENANT_CURE_CLOSES compliant closes', () => {

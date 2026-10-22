@@ -1,46 +1,29 @@
 // Pure models behind the economy UI: report rows (financing and round-4
 // operations included), the month-close toast, milestone progress, the rate
-// card (round-4 rules included), notice tones, the
+// card (round-4 rules included; round 4c/4d's running costs that grow with
+// the company), the report's overhead lines, notice tones, the
 // game-over subtitle and the debug-hook gate (the pricing preview moved to
 // pricingPanel.test.ts and the HUD chips to hud.test.ts in round 4). Money is checked against balance.ts constants and
 // sim results, never literal dollar amounts.
 
 import { describe, expect, it } from 'vitest';
 import {
-  CABINET_COST,
-  CPP_AMBER_MULTIPLIER,
-  CPP_TARGET,
-  ENGINEERING_FEE,
-  INSTALL_COST_HOME,
-  INSTALL_COST_MDU_UNIT,
-  INSTALL_COST_SMB,
-  MAKE_READY_COST_PER_POLE,
-  MDU_ROUTER_COST,
-  OLT_CARD_COST,
-  OLT_START_PON_PORTS,
-  OVERHEAD_PER_MONTH,
-  PERMIT_FEE_AERIAL,
-  PERMIT_FEE_UNDERGROUND,
-  POLE_RENT_PER_POLE_PER_MONTH,
-  SPLITTER_COST,
-  SUPPORT_COST_PER_SUB_PER_MONTH,
-  UNDERGROUND_COST_PER_FT,
-  UNDERGROUND_ROCK_SURCHARGE_PER_FT,
+  ACCELERATION_CLOSES,
+  ACCELERATION_WARNING_CLOSES,
   AERIAL_COST_PER_FT,
-  CABINET_REACH_FT,
   BASE_RATE_BPS,
+  CABINET_COST,
+  CABINET_REACH_FT,
+  CAMPAIGN_COST_MIN,
+  CAMPAIGN_COST_PER_UNIT,
   COVENANT_CURE_CLOSES,
   COVENANT_MAX_LEVERAGE,
   COVENANT_MIN_COVERAGE,
+  CPP_AMBER_MULTIPLIER,
   CPP_SPREAD_BPS,
+  CPP_TARGET,
   CREDIT_LINE_EXTRA_BPS,
-  LEVERAGE_SPREAD_BANDS,
-  LEVERAGE_SPREAD_MAX_BPS,
-  PENALTY_STEP_UP_BPS,
-  TERM_EXTRA_BPS,
-  TERM_LOAN_YEARS,
-  ACCELERATION_CLOSES,
-  ACCELERATION_WARNING_CLOSES,
+  ENGINEERING_FEE,
   FROZEN_ACCELERATION_CLOSES,
   FROZEN_SWEEP_RESERVE,
   FROZEN_SWEEP_SHARE,
@@ -53,6 +36,15 @@ import {
   INCUMBENT_PROMO_MONTHS,
   INCUMBENT_PROMO_QUIET_MONTHS,
   INCUMBENT_PROMO_TAKE_RATE,
+  INSTALL_COST_HOME,
+  INSTALL_COST_MDU_UNIT,
+  INSTALL_COST_SMB,
+  LEVERAGE_SPREAD_BANDS,
+  LEVERAGE_SPREAD_MAX_BPS,
+  MAKE_READY_COST_PER_POLE,
+  MDU_ROUTER_COST,
+  OLT_CARD_COST,
+  OLT_START_PON_PORTS,
   OUTAGE_CHURN_BASE,
   OUTAGE_CHURN_MAX,
   OUTAGE_CHURN_PER_DAY,
@@ -60,17 +52,34 @@ import {
   OUTAGE_DAYS_AERIAL_MIN,
   OUTAGE_DAYS_UNDERGROUND_MAX,
   OUTAGE_DAYS_UNDERGROUND_MIN,
+  OVERHEAD_BASE_PER_MONTH,
+  OVERHEAD_PER_CABINET_PER_MONTH,
+  OVERHEAD_PER_CUSTOMER_PER_MONTH,
+  OVERHEAD_PER_MILE_PER_MONTH,
+  PENALTY_STEP_UP_BPS,
+  PERMIT_FEE_AERIAL,
+  PERMIT_FEE_UNDERGROUND,
+  POLE_RENT_PER_POLE_PER_MONTH,
   PRICE_STEP_CHURN_PER_RISE,
+  PROMO_BOOST_YOUNG_MONTHS,
   PROMO_MAX_PERCENT_OFF,
   PROMO_STEP_SHARE,
+  REFERRAL_CREDIT,
   REPAIR_BASE_AERIAL,
   REPAIR_BASE_UNDERGROUND,
   REPAIR_PER_FT_AERIAL,
   REPAIR_PER_FT_UNDERGROUND,
+  SPLITTER_COST,
   STORM_AERIAL_DAMAGE_CHANCE,
   STORM_CHANCE_PER_DAY,
+  STORM_EXPOSURE_CANOPY,
   STORM_START_DAY,
   STORM_UNDERGROUND_DAMAGE_CHANCE,
+  SUPPORT_LEVELS,
+  TERM_EXTRA_BPS,
+  TERM_LOAN_YEARS,
+  UNDERGROUND_COST_PER_FT,
+  UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from '../sim/balance';
 import { formatDate } from '../sim/calendar';
 import { runDays } from '../sim/game';
@@ -96,7 +105,7 @@ import {
 import { gameOverSubtitle } from './gameOverDialog';
 import { milestoneRows } from './milestonesPanel';
 import { noticeTone, toastLayout } from './overlays';
-import { financingRows, monthClosedMessage, reportRows, subscriberMovements } from './panel';
+import { financingRows, monthClosedMessage, overheadRows, reportRows, subscriberMovements } from './panel';
 import type { ReportRow } from './panel';
 import { rateCardSections } from './rateCard';
 
@@ -132,6 +141,10 @@ describe('report rows', () => {
       'costPerConnection',
       'operatingCashFlow',
       'poleRent',
+      'overhead',
+      'overheadBase',
+      'overheadCustomers',
+      'overheadPlant',
       'repairs',
       'passings',
       'outages',
@@ -156,6 +169,7 @@ describe('report rows', () => {
     expect(row(rows, 'operatingCashFlow').value).toBe(formatSignedMoney(operatingCashFlow(report)));
     expect(row(rows, 'passings').value).toBe(report.passings.toLocaleString('en-US'));
     expect(row(rows, 'poleRent').value).toBe(formatMoney(-(report.totals.poleRent ?? 0)));
+    expect(row(rows, 'overhead').value).toBe(formatMoney(-(report.totals.overhead ?? 0)));
     // The live plant was free, so no cost per passing to color... but connections cost installs.
     expect(row(rows, 'costPerConnection').value).toBe(formatMoney(kpis.costPerConnection!));
     for (const r of rows) expect(r.value).not.toMatch(/NaN|undefined|null|Infinity/);
@@ -242,6 +256,7 @@ describe('round-4 report rows', () => {
     incumbentPromos: 0,
     mrr: 0,
     outageCredits: 0,
+    overhead: null,
     ...over,
   });
   const report = (o: OpsStats | undefined, totals: MonthlyReport['totals'] = {}, debt?: DebtStats): MonthlyReport => ({
@@ -282,7 +297,7 @@ describe('round-4 report rows', () => {
     expect(row(rows, 'outages')).toMatchObject({ value: '0 sub-days', quiet: true });
     for (const key of ['priceChurn', 'tierMoves', 'incumbentPromos'] as const) expect(row(rows, key)).toMatchObject({ value: '0', quiet: true });
     // Rows from before round 4 never go quiet.
-    for (const r of rows) if (!['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'].includes(r.key)) expect(r.quiet).toBeUndefined();
+    for (const r of rows) if (!['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep', 'overheadBase', 'overheadCustomers', 'overheadPlant'].includes(r.key)) expect(r.quiet).toBeUndefined();
   });
 
   it('shows the frozen line’s sweep, or – on a report from before round 4', () => {
@@ -306,6 +321,39 @@ describe('round-4 report rows', () => {
     expect(row(financingRows(report(ops(), {}, { ...debt, sweep: 0, frozenCloses: 0 })), 'sweep')).toMatchObject({ value: '$0', detail: null, quiet: true });
     const { sweep: _sweep, frozenCloses: _closes, accelerationClosesLeft: _left, ...round3 } = debt;
     expect(row(financingRows(report(undefined, {}, round3)), 'sweep')).toMatchObject({ value: '–', quiet: true });
+  });
+
+  it('shows the overhead and, when the close recorded them, its base / per-customer / plant lines', () => {
+    const lines = { base: 2_000, perCustomer: 1_480, support: 960, perPlant: 730 };
+    const total = lines.base + lines.perCustomer + lines.perPlant;
+    const rows = reportRows(report(ops({ overhead: lines }), { overhead: -total }));
+    expect(row(rows, 'overhead')).toMatchObject({ label: 'Overhead', value: formatMoney(total), tone: null });
+    expect(row(rows, 'overheadBase')).toMatchObject({ label: 'Base overhead', value: formatMoney(lines.base), quiet: false });
+    expect(row(rows, 'overheadCustomers')).toMatchObject({ label: 'Per customer', value: formatMoney(lines.perCustomer), detail: `support ${formatMoney(lines.support)}`, quiet: false });
+    expect(row(rows, 'overheadPlant')).toMatchObject({ label: 'Plant upkeep', value: formatMoney(lines.perPlant), quiet: false });
+    // Right after pole rent, in this order.
+    const keys = rows.map((r) => r.key);
+    expect(keys.slice(keys.indexOf('poleRent') + 1, keys.indexOf('poleRent') + 5)).toEqual(['overhead', 'overheadBase', 'overheadCustomers', 'overheadPlant']);
+    // A report from an earlier build (no lines): the total alone, the lines left out.
+    const old = overheadRows(report(ops(), { overhead: -9_000 }));
+    expect(old.map((r) => [r.key, r.value, r.quiet])).toEqual([
+      ['overhead', formatMoney(9_000), undefined],
+      ['overheadBase', '–', true],
+      ['overheadCustomers', '–', true],
+      ['overheadPlant', '–', true],
+    ]);
+    expect(overheadRows(report(undefined, {}))[0]!.value).toBe(formatMoney(0));
+  });
+
+  it('records the overhead’s lines at a real close, adding up to the month’s overhead', () => {
+    const last = litGame(95).finance.reports.at(-1)!;
+    const lines = last.ops?.overhead;
+    expect(lines).toBeTruthy();
+    const rows = overheadRows(last);
+    expect(row(rows, 'overhead').value).toBe(formatMoney(-(last.totals.overhead ?? 0)));
+    expect(lines!.base + lines!.perCustomer + lines!.perPlant).toBe(-(last.totals.overhead ?? 0));
+    expect(row(rows, 'overheadBase').value).toBe(formatMoney(lines!.base));
+    expect(row(rows, 'overheadPlant').value).toBe(formatMoney(lines!.perPlant));
   });
 
   it('mentions storms and a sweep in the month-close toast', () => {
@@ -497,14 +545,44 @@ describe('rate card', () => {
     expect(value('Business install')).toBe(formatMoney(INSTALL_COST_SMB));
     expect(value('Apartment unit')).toBe(formatMoney(INSTALL_COST_MDU_UNIT));
     expect(value('Building router')).toBe(formatMoney(MDU_ROUTER_COST));
-    expect(value('Overhead')).toBe(`${formatMoney(OVERHEAD_PER_MONTH)}/mo`);
-    expect(value('Customer support')).toBe(`${formatMoney(SUPPORT_COST_PER_SUB_PER_MONTH)}/mo`);
     expect(value('Pole rent')).toBe(`${formatMoney(POLE_RENT_PER_POLE_PER_MONTH)}/mo`);
     expect(value('Target')).toBe(formatMoney(CPP_TARGET));
     expect(value('Amber')).toBe(`up to ${formatMoney(CPP_TARGET * CPP_AMBER_MULTIPLIER)}`);
     expect(value('Red')).toBe(`above ${formatMoney(CPP_TARGET * CPP_AMBER_MULTIPLIER)}`);
     const splitter = sections.flatMap((s) => s.rows).find((r) => r.label.startsWith('Splitter'));
     expect(splitter?.value).toBe(formatMoney(SPLITTER_COST));
+  });
+
+  it('lists the running costs that grow with the company: base, per customer, each support level, per cabinet, per mile, pole rent', () => {
+    const running = sections.find((s) => s.title === 'Running costs')!;
+    expect(running.rows.map((r) => r.label)).toEqual([
+      'Base overhead',
+      'Per customer',
+      ...(['basic', 'good', 'great'] as const).map((id) => `${SUPPORT_LEVELS[id].name} support`),
+      'Per cabinet',
+      'Per mile of cable',
+      'Pole rent',
+    ]);
+    expect(value('Base overhead')).toBe(`${formatMoney(OVERHEAD_BASE_PER_MONTH)}/mo`);
+    expect(value('Per customer')).toBe(`${formatMoney(OVERHEAD_PER_CUSTOMER_PER_MONTH)}/mo`);
+    for (const level of Object.values(SUPPORT_LEVELS)) expect(value(`${level.name} support`)).toBe(`${formatMoney(level.costPerSub)}/mo`);
+    expect(value('Per cabinet')).toBe(`${formatMoney(OVERHEAD_PER_CABINET_PER_MONTH)}/mo`);
+    expect(value('Per mile of cable')).toBe(`${formatMoney(OVERHEAD_PER_MILE_PER_MONTH)}/mo`);
+    // The default level says so; each says where to change it.
+    expect(running.rows.find((r) => r.label === `${SUPPORT_LEVELS.good.name} support`)!.note).toMatch(/where every company starts/);
+    for (const id of ['basic', 'great'] as const) expect(running.rows.find((r) => r.label === `${SUPPORT_LEVELS[id].name} support`)!.note).not.toMatch(/where every company starts/);
+    // The old flat overhead is gone from the card.
+    expect(running.rows.some((r) => r.label === 'Overhead' || r.label === 'Customer support')).toBe(false);
+  });
+
+  it('lists the customer levers (round 4c/4d): campaigns, referral credits and the intro promo, and tree-lined streets under storms', () => {
+    const customers = sections.find((s) => s.title === 'Customers')!;
+    expect(customers.rows.map((r) => r.label)).toEqual(['Neighborhood campaign', 'Campaign length', 'Referral credit', 'Intro promo reach']);
+    expect(value('Neighborhood campaign')).toBe(`${formatMoney(CAMPAIGN_COST_PER_UNIT)} a home`);
+    expect(customers.rows[0]!.note).toContain(formatMoney(CAMPAIGN_COST_MIN));
+    expect(value('Referral credit')).toBe(`${formatMoney(REFERRAL_CREDIT)} off, both sides`);
+    expect(value('Intro promo reach')).toBe(`streets lit within ${plural(PROMO_BOOST_YOUNG_MONTHS, 'month')}`);
+    expect(value('Tree-lined streets')).toBe(`up to ${1 + STORM_EXPOSURE_CANOPY} times the storm damage`);
   });
 
   it('lists what borrowing costs, from balance.ts', () => {

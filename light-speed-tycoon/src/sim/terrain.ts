@@ -14,7 +14,16 @@
 // draws and the trees are exactly those of round 4), blended bilinearly.
 // A cell's grove (0..1) is clamp((noise - GROVE_LOW) / GROVE_SPAN): open
 // country gets groves where it is high and clearings where it is low.
+//
+// Round 4c/4d (sim-economy, spec D): street canopy. Where the same field is
+// high inside the town, the neighborhood is an old, tree-lined one: its
+// streets run under mature trees whatever the lots along them
+// (canopyAt: clamp((noise - CANOPY_LOW) / CANOPY_SPAN)). Weather counts it
+// on residential streets (weather.segmentExposure), so storm exposure
+// varies block by block inside the town, not only at its wooded edges, and
+// the open country next to those neighborhoods carries the map's groves.
 
+import { CANOPY_LOW, CANOPY_SPAN } from './balance';
 import { Rng, deriveSeed } from './rng';
 import type { City } from './types';
 
@@ -128,4 +137,27 @@ export function woodedAt(city: City, x: number, y: number): number {
     }
   }
   return n > 0 ? sum / n : 0;
+}
+
+/**
+ * How much of a street at map point (x, y) runs under mature trees, 0 (open)
+ * .. 1 (fully tree-lined): clamp((groveNoise - CANOPY_LOW) / CANOPY_SPAN) of
+ * the city's grove field there, lots or not (street trees and old yards: a
+ * tree-lined block is tree-lined whatever is built along it). The field
+ * varies over GROVE_NOISE_CELLS-cell blocks, so canopy comes in
+ * neighborhoods: on the tuning towns a fifth to a third of the residential
+ * street feet have some, most of them fully tree-lined (the span is narrow).
+ * Pure, deterministic from the city (its seed and size), never stored.
+ */
+export function canopyAt(city: City, x: number, y: number): number {
+  return canopyIn(cityGroveField(city), x, y);
+}
+
+/**
+ * canopyAt from a grove field already drawn (render/decor.placeTrees, which
+ * draws the city's field itself): clamp((groveNoise - CANOPY_LOW) /
+ * CANOPY_SPAN) at map point (x, y).
+ */
+export function canopyIn(field: GroveField, x: number, y: number): number {
+  return Math.max(0, Math.min(1, (groveNoise(field, x, y) - CANOPY_LOW) / CANOPY_SPAN));
 }

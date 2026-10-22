@@ -1,7 +1,11 @@
 // The pricing panel's pure model (pricingPanel.ts): draft checks and the
-// preview of take rates, tier mix, business prices and the marketing boost.
-// Moved out of economy.test.ts by the round-4 contract. Money is checked
-// against balance.ts constants and sim results, never literal dollar amounts.
+// preview of take rates, tier mix and business prices. Moved out of
+// economy.test.ts by the round-4 contract. Round 4c/4d: the marketing budget
+// moved to the Customers dashboard (its checks and forecast lines are in
+// customersPanel.test.ts); here it is a read-only line, and the impact
+// figures' "after" counts the expected cancellations (spec C). Money is
+// checked against balance.ts constants and sim results, never literal dollar
+// amounts.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -14,7 +18,6 @@ import {
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
   INCUMBENT_PROMO_DISCOUNT,
-  MARKETING_MAX_PER_MONTH,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
   SMB_MULTIPLIER_MAX,
@@ -28,7 +31,6 @@ import { quoteRetention, reviewIncumbent } from '../sim/incumbent';
 import {
   defaultPricing,
   lockEndDay,
-  marketingBoost,
   monthlyRecurringRevenue,
   promoPrice,
   quotePricing,
@@ -46,13 +48,14 @@ import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtur
 import type { Account, CabinetId, GameState, TierId, TierSetting } from '../sim/types';
 import { formatMoney, formatPercent } from './format';
 import {
-  boostHint,
   draftFrom,
   draftPromo,
   grandfatherHint,
+  impactFigures,
   incumbentLine,
   incumbentOffer,
   incumbentRows,
+  marketingLine,
   parseNumberField,
   pricingImpact,
   pricingPreview,
@@ -70,19 +73,18 @@ import type { PricingDraft } from './pricingPanel';
 describe('pricing preview', () => {
   const pricing = defaultPricing();
   const draft = (edit: (d: PricingDraft) => void = () => {}): PricingDraft => {
-    const d = draftFrom(pricing, 1_000);
+    const d = draftFrom(pricing);
     edit(d);
     return d;
   };
 
-  it('previews the take rate, tier mix, business prices and marketing boost of the edited values', () => {
+  it('previews the take rate, tier mix and business prices of the edited values', () => {
     const d = draft((x) => {
       x.tiers[1]!.price = TIER_PRICE_MIN + 10;
       x.smbMultiplier = SMB_MULTIPLIER_MAX;
-      x.marketingPerMonth = 2_500;
     });
     const edited = { ...pricing, smbMultiplier: SMB_MULTIPLIER_MAX, tiers: pricing.tiers.map((t, i) => (i === 1 ? { ...t, price: TIER_PRICE_MIN + 10 } : t)) };
-    const p = pricingPreview(pricing, d, 800);
+    const p = pricingPreview(pricing, d);
     expect(p.valid).toBe(true);
     expect(p.problems).toEqual([]);
     expect(p.takeRate).toEqual({ home: targetTakeRate(edited, 'home'), mdu: targetTakeRate(edited, 'mdu'), smb: targetTakeRate(edited, 'smb') });
@@ -92,13 +94,12 @@ describe('pricing preview', () => {
       fiber1g: unitPrice(edited, 'fiber1g', 'smb'),
       fiber2g: unitPrice(edited, 'fiber2g', 'smb'),
     });
-    expect(p.boost).toBe(marketingBoost(2_500, 800));
     // A cheaper gig tier raises the target take rate.
     expect(p.takeRate!.home).toBeGreaterThan(targetTakeRate(pricing, 'home'));
   });
 
   it('lowers the business take rate as the business multiplier rises, leaving households alone', () => {
-    const at = (m: number) => pricingPreview(pricing, draft((x) => (x.smbMultiplier = m)), 100).takeRate!;
+    const at = (m: number) => pricingPreview(pricing, draft((x) => (x.smbMultiplier = m))).takeRate!;
     const low = at(SMB_MULTIPLIER_MIN);
     const high = at(SMB_MULTIPLIER_MAX);
     expect(high.smb).toBeLessThan(low.smb);
@@ -108,48 +109,44 @@ describe('pricing preview', () => {
 
   it('flags an out-of-range or missing price and previews nothing for the tiers', () => {
     for (const bad of [TIER_PRICE_MAX + 1, TIER_PRICE_MIN - 1, 55.5, Number.NaN]) {
-      const p = pricingPreview(pricing, draft((x) => (x.tiers[0]!.price = bad)), 100);
+      const p = pricingPreview(pricing, draft((x) => (x.tiers[0]!.price = bad)));
       expect(p.valid).toBe(false);
       expect(p.problems[0]).toContain('500 Mbps');
       expect(p.takeRate).toBeNull();
       expect(p.mix).toBeNull();
-      // The marketing half still previews.
-      expect(p.boost).toBe(marketingBoost(1_000, 100));
+      expect(p.smbPrices).toBeNull();
     }
   });
 
   it('needs at least one tier offered', () => {
-    const p = pricingPreview(pricing, draft((x) => x.tiers.forEach((t) => (t.offered = false))), 100);
+    const p = pricingPreview(pricing, draft((x) => x.tiers.forEach((t) => (t.offered = false))));
     expect(p.valid).toBe(false);
     expect(p.problems).toContain('Offer at least one tier');
   });
 
-  it('keeps the take-rate preview when only the multiplier or the budget is wrong', () => {
-    const smb = pricingPreview(pricing, draft((x) => (x.smbMultiplier = SMB_MULTIPLIER_MAX + 1)), 100);
+  it('keeps the take-rate preview when only the multiplier is wrong', () => {
+    const smb = pricingPreview(pricing, draft((x) => (x.smbMultiplier = SMB_MULTIPLIER_MAX + 1)));
     expect(smb.valid).toBe(false);
     expect(smb.takeRate).not.toBeNull();
     expect(smb.smbPrices).toBeNull();
-    const marketing = pricingPreview(pricing, draft((x) => (x.marketingPerMonth = MARKETING_MAX_PER_MONTH + 1)), 100);
-    expect(marketing.valid).toBe(false);
-    expect(marketing.boost).toBeNull();
-    expect(marketing.takeRate).not.toBeNull();
   });
 
-  it('calls a draft valid exactly when the sim accepts setPricing and setMarketing', () => {
+  // The marketing half of the old check (setMarketing) moved with the budget: customersPanel.test.ts checks
+  // marketingProblem against setMarketing over the same budgets.
+  it('calls a draft valid exactly when the sim accepts setPricing', () => {
     const prices = [TIER_PRICE_MIN - 1, TIER_PRICE_MIN, 64, TIER_PRICE_MAX, TIER_PRICE_MAX + 1, 70.5, Number.NaN];
     const multipliers = [0.5, 1, 1.25, SMB_MULTIPLIER_MAX, SMB_MULTIPLIER_MAX + 0.01, Number.NaN];
-    const budgets = [-1, 0, 1_500, MARKETING_MAX_PER_MONTH, MARKETING_MAX_PER_MONTH + 1, 10.5, Number.NaN];
+    const grandfathering = [0, GRANDFATHER_MONTHS_DEFAULT, GRANDFATHER_MONTHS_MAX, GRANDFATHER_MONTHS_MAX + 1, -1, 1.5, Number.NaN];
     let checked = 0;
     for (const price of prices) {
       for (const smbMultiplier of multipliers) {
-        for (const marketingPerMonth of budgets) {
+        for (const grandfatherMonths of grandfathering) {
           for (const offered of [true, false]) {
             const tiers: TierSetting[] = pricing.tiers.map((t, i) => ({ id: t.id, price: i === 2 ? price : t.price, offered: i === 0 ? offered : false }));
-            const d: PricingDraft = { ...draftFrom(pricing, marketingPerMonth), tiers, smbMultiplier };
+            const d: PricingDraft = { ...draftFrom(pricing), tiers, smbMultiplier, grandfatherMonths };
             const state = newGame(1, { city: makeGridCity() });
-            const a = applyCommand(state, { type: 'setPricing', tiers, smbMultiplier, grandfatherMonths: d.grandfatherMonths });
-            const b = applyCommand(state, { type: 'setMarketing', perMonth: marketingPerMonth });
-            expect(pricingPreview(state.sales.pricing, d, 0).valid, JSON.stringify(d)).toBe(a.ok && b.ok);
+            const a = applyCommand(state, { type: 'setPricing', tiers, smbMultiplier, grandfatherMonths });
+            expect(pricingPreview(state.sales.pricing, d).valid, JSON.stringify(d)).toBe(a.ok);
             checked++;
           }
         }
@@ -167,37 +164,35 @@ describe('pricing preview', () => {
   });
 
   it('starts from the game pricing and quotes the incumbent', () => {
-    const d = draftFrom(pricing, 1_234);
+    const d = draftFrom(pricing);
     expect(d.tiers).toEqual(pricing.tiers.map((t) => ({ id: t.id, price: t.price, offered: t.offered })));
-    expect(d).toMatchObject({ smbMultiplier: pricing.smbMultiplier, marketingPerMonth: 1_234, grandfatherMonths: GRANDFATHER_MONTHS_DEFAULT });
+    expect(d).toMatchObject({ smbMultiplier: pricing.smbMultiplier, grandfatherMonths: GRANDFATHER_MONTHS_DEFAULT });
+    expect(d).not.toHaveProperty('marketingPerMonth');
     expect(d.promo).toEqual({ enabled: false, ...PROMO_DRAFT_START });
-    expect(draftFrom(pricing, 0, { percentOff: 15, months: 2 }).promo).toEqual({ enabled: true, percentOff: 15, months: 2 });
+    expect(draftFrom(pricing, { percentOff: 15, months: 2 }).promo).toEqual({ enabled: true, percentOff: 15, months: 2 });
     expect(incumbentOffer()).toBe(`Incumbent cable: ${INCUMBENT_DOWN_MBPS} Mbps for ${formatMoney(INCUMBENT_PRICE)}/mo`);
   });
 
-  it('explains what the marketing budget does', () => {
-    expect(boostHint(null, -5, 10)).toBe('');
-    expect(boostHint(0, 0, 10)).toContain('natural pace');
-    expect(boostHint(marketingBoost(500, 0), 500, 0)).toContain('No homes passed yet');
-    const boost = marketingBoost(500, 300);
-    expect(boostHint(boost, 500, 300)).toBe(`Signups come ${formatPercent(boost)} faster at today's 300 passings.`);
+  it('shows the marketing budget read-only (the Customers dashboard sets it)', () => {
+    expect(marketingLine(1_234)).toBe(`${formatMoney(1_234)} a month`);
+    expect(marketingLine(0)).toBe('None');
   });
 });
 
 describe('grandfathering and the intro promo in the draft', () => {
   const pricing = defaultPricing();
   const draft = (edit: (d: PricingDraft) => void = () => {}): PricingDraft => {
-    const d = draftFrom(pricing, 1_000);
+    const d = draftFrom(pricing);
     edit(d);
     return d;
   };
 
   it('checks grandfathering the way setPricing does, and explains it', () => {
     for (const months of [0, 1, GRANDFATHER_MONTHS_DEFAULT, GRANDFATHER_MONTHS_MAX]) {
-      expect(pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months)), 0).valid).toBe(true);
+      expect(pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months))).valid).toBe(true);
     }
     for (const months of [-1, 1.5, GRANDFATHER_MONTHS_MAX + 1, Number.NaN]) {
-      const p = pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months)), 0);
+      const p = pricingPreview(pricing, draft((d) => (d.grandfatherMonths = months)));
       expect(p.valid).toBe(false);
       expect(p.problems).toContain(`Grandfathering must be a whole number of months from 0 to ${GRANDFATHER_MONTHS_MAX}`);
       // The rest still previews.
@@ -210,14 +205,14 @@ describe('grandfathering and the intro promo in the draft', () => {
   });
 
   it('checks the promo the way setPromo does, values it in the take rate and prices it', () => {
-    const off = pricingPreview(pricing, draft(), 0);
+    const off = pricingPreview(pricing, draft());
     expect(off.promoPrices).toBeNull();
     expect(promoHint(pricing, draft(), off)).toBe('No intro promo: new subscribers pay the list price.');
     // Switched off, whatever is typed in it does not count.
-    expect(pricingPreview(pricing, draft((d) => (d.promo = { enabled: false, percentOff: Number.NaN, months: 99 })), 0).valid).toBe(true);
+    expect(pricingPreview(pricing, draft((d) => (d.promo = { enabled: false, percentOff: Number.NaN, months: 99 }))).valid).toBe(true);
 
     const on = draft((d) => (d.promo = { enabled: true, percentOff: 20, months: 3 }));
-    const p = pricingPreview(pricing, on, 0);
+    const p = pricingPreview(pricing, on);
     expect(p.valid).toBe(true);
     const promo = draftPromo(on)!;
     expect(promo).toEqual({ percentOff: 20, months: 3 });
@@ -239,7 +234,7 @@ describe('grandfathering and the intro promo in the draft', () => {
       const state = newGame(1, { city: makeGridCity() });
       const d = draft((x) => (x.promo = bad));
       const accepted = applyCommand(state, { type: 'setPromo', promo: draftPromo(d) }).ok;
-      const q = pricingPreview(pricing, d, 0);
+      const q = pricingPreview(pricing, d);
       expect(q.valid, JSON.stringify(bad)).toBe(accepted);
       expect(q.valid).toBe(false);
       expect(q.problems.join(' ')).toMatch(/Intro promo must/);
@@ -271,7 +266,7 @@ describe('the preview of today\'s subscribers', () => {
 
   it('says who keeps what until when, who pays less at once, and quotes MRR and cancellations', () => {
     const state = market();
-    const d = draftFrom(state.sales.pricing, 1_000);
+    const d = draftFrom(state.sales.pricing);
     const old1g = d.tiers[1]!.price;
     const old500 = d.tiers[0]!.price;
     d.tiers[1]!.price = old1g + 10;
@@ -301,23 +296,48 @@ describe('the preview of today\'s subscribers', () => {
 
   it('says where a retired tier\'s subscribers move at the close', () => {
     const state = market();
-    const d = draftFrom(state.sales.pricing, 1_000);
+    const d = draftFrom(state.sales.pricing);
     d.tiers[2]!.offered = false;
     const impact = pricingImpact(state, d);
     expect(impact.lines).toEqual([`At the month close 3 subscribers on 2 Gig move to 1 Gig (${formatMoney(d.tiers[1]!.price)}/mo).`]);
     expect(impact.quote!.unitsMoving).toBe(3);
   });
 
+  it('quotes the bills after the step net of the expected cancellations it lists (spec C)', () => {
+    const state = market();
+    // Drop the two cheaper tiers: their subscribers move up at the close, and some cancel.
+    const d = draftFrom(state.sales.pricing);
+    d.tiers[0]!.offered = false;
+    d.tiers[1]!.offered = false;
+    const { quote } = pricingImpact(state, d);
+    expect(quote!.expectedChurn).toBeGreaterThan(0);
+    expect(quote!.mrrAfterChurn).toBeLessThan(quote!.mrrAfterLocks);
+    const figures = impactFigures(quote);
+    expect(figures).toEqual({
+      now: `${formatMoney(quote!.mrrNow)}/mo`,
+      after: `${formatMoney(quote!.mrrAfterChurn)}/mo`,
+      cancels: `~${quote!.expectedChurn}`,
+      note: `"After the step" is what today's subscribers pay once raised prices reach them and retired tiers move, after the ~${quote!.expectedChurn} ${quote!.expectedChurn === 1 ? 'cancellation' : 'cancellations'} expected.`,
+    });
+    // Nothing changes: no cancellations to count, and the note says only what the figure is.
+    const same = impactFigures(pricingImpact(state, draftFrom(state.sales.pricing)).quote);
+    expect(same.after).toBe(same.now);
+    expect(same.cancels).toBe('~0');
+    expect(same.note).not.toContain('cancellation');
+    // An invalid draft: dashes.
+    expect(impactFigures(null)).toEqual({ now: '–', after: '–', cancels: '–', note: '' });
+  });
+
   it('has nothing to quote for an invalid draft, and little to say with no subscribers', () => {
     const state = market();
-    const bad = draftFrom(state.sales.pricing, 1_000);
+    const bad = draftFrom(state.sales.pricing);
     bad.tiers[0]!.price = Number.NaN;
     expect(pricingImpact(state, bad)).toEqual({ quote: null, lines: [] });
     const empty = makeTestState(makeGridCity());
-    const impact = pricingImpact(empty, draftFrom(empty.sales.pricing, 0));
+    const impact = pricingImpact(empty, draftFrom(empty.sales.pricing));
     expect(impact.lines).toEqual(['No subscribers yet: everyone who signs up pays the new prices.']);
     expect(impact.quote!.mrrNow).toBe(monthlyRecurringRevenue(empty));
-    expect(pricingImpact(state, draftFrom(state.sales.pricing, 0)).lines).toEqual(["No change for today's subscribers."]);
+    expect(pricingImpact(state, draftFrom(state.sales.pricing)).lines).toEqual(["No change for today's subscribers."]);
   });
 });
 
@@ -328,7 +348,7 @@ describe('the incumbent\'s promos in the panel', () => {
     state.day = 100;
     const price = INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT;
     state.sales.incumbentPromos = [{ cabinet, startDay: 90, endDay: 151, price, quietUntil: 334, triggerTakePct: 45, answered: false, answeredWithPromo: false }];
-    const d = draftFrom(state.sales.pricing, 1_000);
+    const d = draftFrom(state.sales.pricing);
     const [row] = incumbentRows(state, d);
     const corner = cornerName(state.city, state.network.cabinets[0]!.node);
     expect(row).toEqual({
@@ -358,7 +378,7 @@ describe('who signs up (round 4b)', () => {
   const pricing = defaultPricing();
 
   it('lists each demand segment\'s share, take rate and favourite tier at the draft prices', () => {
-    const d = draftFrom(pricing, 1_000);
+    const d = draftFrom(pricing);
     const rows = segmentRows(pricing, d)!;
     const demand = segmentDemand(pricing);
     expect(rows.map((r) => r.segment)).toEqual(demand.map((seg) => seg.segment));
@@ -369,13 +389,13 @@ describe('who signs up (round 4b)', () => {
       expect(row.text).toBe(`${SEGMENT_LABELS[seg.segment]} (${formatPercent(seg.share)}): ${formatPercent(seg.takeRate)} sign up, mostly ${tierName}`);
     }
     // Invalid tiers: nothing to show.
-    const bad = draftFrom(pricing, 1_000);
+    const bad = draftFrom(pricing);
     bad.tiers[0]!.price = Number.NaN;
     expect(segmentRows(pricing, bad)).toBeNull();
   });
 
   it('warns when no plan suits a segment: dropping 500 Mbps loses the price-sensitive households', () => {
-    const d = draftFrom(pricing, 1_000);
+    const d = draftFrom(pricing);
     d.tiers[0]!.offered = false;
     d.tiers[1]!.offered = false;
     const value = segmentRows(pricing, d)!.find((r) => r.segment === 'value')!;
@@ -384,16 +404,16 @@ describe('who signs up (round 4b)', () => {
     expect(value.warning).toBe(`Price-sensitive households (${formatPercent(share)}) won't sign up: no plan at or under ${formatMoney(reservationPrice('value'))}`);
     expect(value.text).toBe(value.warning);
     // Dropping only 500 Mbps: 1 Gig is a little over their reservation, so only a few sign up.
-    const no500 = draftFrom(pricing, 1_000);
+    const no500 = draftFrom(pricing);
     no500.tiers[0]!.offered = false;
     const few = segmentRows(pricing, no500)!.find((r) => r.segment === 'value')!;
     expect(few.tier).toBe('fiber1g');
     expect(few.warning).toBe(`Price-sensitive households (${formatPercent(share)}): only ${formatPercent(few.takeRate)} sign up: no plan at or under ${formatMoney(reservationPrice('value'))}`);
-    expect(few.takeRate).toBeLessThan(segmentRows(pricing, draftFrom(pricing, 1_000))!.find((r) => r.segment === 'value')!.takeRate / 2);
+    expect(few.takeRate).toBeLessThan(segmentRows(pricing, draftFrom(pricing))!.find((r) => r.segment === 'value')!.takeRate / 2);
     // Mainstream households still find a plan.
     expect(segmentRows(pricing, no500)!.find((r) => r.segment === 'mainstream')!.warning).toBeNull();
     // The draft's intro promo counts, as in the take-rate preview.
-    const withPromo = draftFrom(pricing, 1_000);
+    const withPromo = draftFrom(pricing);
     withPromo.promo = { enabled: true, percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS };
     const rows = segmentRows(pricing, withPromo)!;
     expect(rows.map((r) => r.takeRate)).toEqual(segmentDemand(pricing, 'home', INCUMBENT_PRICE, draftPromo(withPromo)).map((seg) => seg.takeRate));
@@ -404,7 +424,7 @@ describe('when an intro promo pays (round 4b)', () => {
   it('shows quotePromo\'s advice and figures for the typed offer, even while it is switched off', () => {
     const state = makeTestState(makeGridCity({ cols: 4, rows: 4, coAt: [2, 2] }));
     addLivePlant(state);
-    const d = draftFrom(state.sales.pricing, 1_000);
+    const d = draftFrom(state.sales.pricing);
     expect(d.promo.enabled).toBe(false);
     const quote = quotePromo(state, PROMO_DRAFT_START);
     expect(quote.waitingUnits).toBeGreaterThan(0);
@@ -421,7 +441,7 @@ describe('when an intro promo pays (round 4b)', () => {
     expect(promoAdviceLine(state, d)).toBe(quotePromo(state, null).advice);
     // Nothing once the game is over.
     state.gameOver = { day: 0, reason: 'insolvent', message: 'Out of cash' };
-    expect(promoAdviceLine(state, draftFrom(state.sales.pricing, 1_000))).toBe('');
+    expect(promoAdviceLine(state, draftFrom(state.sales.pricing))).toBe('');
   });
 });
 
@@ -439,7 +459,7 @@ describe('the retention offer in the panel (round 4b)', () => {
 
   it('shows the offer\'s figures and an enabled button, then Answered once sent', () => {
     const { state, cabinet } = contested();
-    const d = draftFrom(state.sales.pricing, 1_000);
+    const d = draftFrom(state.sales.pricing);
     const [row] = incumbentRows(state, d);
     const q = row!.retention;
     expect(q).toEqual(quoteRetention(state, cabinet));
@@ -459,7 +479,7 @@ describe('the retention offer in the panel (round 4b)', () => {
   it('disables the button with the reason when no offer is possible', () => {
     const { state } = contested();
     state.sales.accounts = [];
-    const [row] = incumbentRows(state, draftFrom(state.sales.pricing, 1_000));
+    const [row] = incumbentRows(state, draftFrom(state.sales.pricing));
     expect(retentionButton(row!)).toEqual({ label: 'Answer with a retention offer', disabled: true, reason: 'Nobody subscribes there yet' });
     expect(retentionLine(row!)).toBe('No retention offer: Nobody subscribes there yet.');
   });

@@ -1,12 +1,14 @@
 // Report panel: the last closed month (net, revenue, subscribers, the
 // scorecard KPIs and, from round 3, financing: interest, principal, money
 // borrowed, debt, leverage and coverage; from round 4, repairs, outages,
-// price steps, tier moves, incumbent promos and the frozen-line sweep) and
+// price steps, tier moves, incumbent promos and the frozen-line sweep; from
+// round 4c/4d, the overhead and its base / per-customer / plant lines) and
 // this month's spending so far. On phones and short screens it starts
 // collapsed to three headline figures; "Details" opens the rest.
 //
 // Owner: ui-economy workstream; financing rows: ui-bank workstream; round-4
-// rows: ui-briefing workstream; round 4b's outage credits row: pricing-balance workstream.
+// rows: ui-briefing workstream; round 4b's outage credits row: pricing-balance workstream;
+// round 4c/4d's overhead rows: ui-summary workstream.
 
 import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatMonth } from '../sim/calendar';
@@ -26,6 +28,10 @@ export type ReportRowKey =
   | 'costPerConnection'
   | 'operatingCashFlow'
   | 'poleRent'
+  | 'overhead'
+  | 'overheadBase'
+  | 'overheadCustomers'
+  | 'overheadPlant'
   | 'repairs'
   | 'passings'
   | 'outages'
@@ -161,6 +167,7 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
       detail: null,
       hint: 'Rent for the utility poles your aerial cable hangs on',
     },
+    ...overheadRows(report),
     repairsRow(report),
     {
       key: 'passings',
@@ -172,6 +179,55 @@ export function reportRows(report: MonthlyReport): ReportRow[] {
     },
     ...operationsRows(report),
     ...financingRows(report),
+  ];
+}
+
+/**
+ * Round 4c/4d: the month's overhead (totals.overhead) and, when the report
+ * has them (ops.overhead; null on reports from earlier builds, which then
+ * show the total alone), its lines: the base that does not grow with the
+ * company, the per-customer part (support included) and the plant upkeep
+ * (cabinets and miles of live cable). The lines add up to the total.
+ */
+export function overheadRows(report: MonthlyReport): ReportRow[] {
+  const lines = report.ops?.overhead ?? null;
+  const line = (amount: number | undefined) => (lines ? formatMoney(amount ?? 0) : DASH);
+  return [
+    {
+      key: 'overhead',
+      label: 'Overhead',
+      value: formatMoney(0 - (report.totals.overhead ?? 0)),
+      tone: null,
+      detail: null,
+      hint: 'Running the company: a small base, plus costs that grow with your customers and your live plant',
+    },
+    {
+      key: 'overheadBase',
+      label: 'Base overhead',
+      value: line(lines?.base),
+      tone: null,
+      detail: null,
+      hint: 'The part of the overhead that does not grow with the company',
+      quiet: !lines,
+    },
+    {
+      key: 'overheadCustomers',
+      label: 'Per customer',
+      value: line(lines?.perCustomer),
+      tone: null,
+      detail: lines && lines.support > 0 ? `support ${formatMoney(lines.support)}` : null,
+      hint: 'Billing and accounts for each customer, plus the support level you chose (part of the overhead)',
+      quiet: !lines,
+    },
+    {
+      key: 'overheadPlant',
+      label: 'Plant upkeep',
+      value: line(lines?.perPlant),
+      tone: null,
+      detail: null,
+      hint: 'Each live cabinet and each mile of live cable costs a little to keep running (part of the overhead)',
+      quiet: !lines,
+    },
   ];
 }
 
@@ -362,7 +418,7 @@ interface RowView {
 }
 
 /** Rows whose secondary line sits right after the value rather than on a row of its own. */
-const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage', 'repairs', 'outages', 'incumbentPromos', 'sweep'];
+const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage', 'repairs', 'outages', 'incumbentPromos', 'sweep', 'overheadCustomers'];
 
 export class ReportPanel {
   readonly root: HTMLElement;
