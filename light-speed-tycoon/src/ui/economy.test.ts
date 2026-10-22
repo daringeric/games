@@ -142,7 +142,7 @@ const booksMoney = (report: MonthlyReport) => {
 };
 
 describe('report rows', () => {
-  it('lists the KPIs, support, operations and bank figures the full books do not show elsewhere, formatted from reportKpis', () => {
+  it('lists the KPIs, the overhead total, support, operations and bank figures the full books do not show elsewhere, formatted from reportKpis', () => {
     const state = litGame();
     const report = state.finance.reports.at(-1)!;
     expect(report.stats!.subscribers).toBeGreaterThan(0);
@@ -153,6 +153,7 @@ describe('report rows', () => {
       'cpga',
       'costPerConnection',
       'operatingCashFlow',
+      'overhead',
       'support',
       'outages',
       'outageCredits',
@@ -186,6 +187,9 @@ describe('report rows', () => {
     const running = books.moneyOut.find((g) => g.key === 'running')!;
     const overhead = running.lines.filter((l) => l.key.startsWith('overhead')).reduce((n, l) => n + l.amount, 0);
     expect(overhead).toBe(-(report.totals.overhead ?? 0));
+    // The old list's overhead total itself, not only its parts: a "More figures" row the books show.
+    expect(row(rows, 'overhead')).toMatchObject({ label: 'Overhead', value: formatMoney(overhead), tone: null, quiet: false });
+    expect(books.more.map((r) => r.key)).toContain('overhead');
     // Pole rent is itemized when the month paid any (the books leave $0 lines out).
     const poleRent = running.lines.find((l) => l.key === 'poleRent') ?? null;
     if (report.totals.poleRent) expect(poleRent!.value).toBe(formatMoney(-report.totals.poleRent));
@@ -267,6 +271,8 @@ describe('report rows', () => {
     for (const key of ['support', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
       expect(row(rows, key)).toMatchObject({ value: '–', quiet: true });
     }
+    // No overhead lines recorded (and here no overhead): no overhead row.
+    expect(row(rows, 'overhead').quiet).toBe(true);
     // Its money is itemized all the same (pole rent and building), and the panel says the cash change without a customers line.
     const money = booksMoney(v1);
     expect(money.line('poleRent')!.value).toBe(formatMoney(20));
@@ -386,10 +392,16 @@ describe('round-4 report rows', () => {
       ['overheadPlant', 'Per cabinet and mile of cable', formatMoney(lines.perPlant)],
     ]);
     expect(row(reportRows(r), 'support')).toMatchObject({ label: 'Customer support', value: formatMoney(lines.support), detail: 'included in the per-customer cost', quiet: false });
-    // A report from an earlier build (no lines): the overhead in one line, no support figure.
+    // The lines' total (the old panel's Overhead row) in "More figures", right before the support part.
+    const rows = reportRows(r);
+    expect(row(rows, 'overhead')).toMatchObject({ label: 'Overhead', value: formatMoney(total), detail: 'base costs, per customer, and per cabinet and mile of cable', tone: null, quiet: false });
+    expect(rows.map((x) => x.key).indexOf('support')).toBe(rows.map((x) => x.key).indexOf('overhead') + 1);
+    // A report from an earlier build (no lines): the overhead in one line, no support figure, and no total row (the line is the total).
     const old = report(ops(), { overhead: -9_000 });
     expect(booksMoney(old).groups.find((g) => g.key === 'running')!.lines.map((l) => [l.key, l.value])).toEqual([['overhead', formatMoney(9_000)]]);
     expect(row(reportRows(old), 'support')).toMatchObject({ value: '–', quiet: true });
+    expect(row(reportRows(old), 'overhead')).toMatchObject({ value: formatMoney(9_000), quiet: true });
+    expect(row(reportRows(report(ops({ overhead: { base: 0, perCustomer: 0, support: 0, perPlant: 0 } }), { overhead: 0 })), 'overhead').quiet).toBe(true);
     expect(booksMoney(report(undefined, {})).groups.find((g) => g.key === 'running')!.total).toBe(0);
   });
 
@@ -398,6 +410,7 @@ describe('round-4 report rows', () => {
     const lines = last.ops?.overhead;
     expect(lines).toBeTruthy();
     expect(lines!.base + lines!.perCustomer + lines!.perPlant).toBe(-(last.totals.overhead ?? 0));
+    expect(row(reportRows(last), 'overhead')).toMatchObject({ value: formatMoney(-(last.totals.overhead ?? 0)), quiet: false });
     const money = booksMoney(last);
     expect(money.line('overheadBase')!.value).toBe(formatMoney(lines!.base));
     expect(money.line('overheadPlant')!.value).toBe(formatMoney(lines!.perPlant));

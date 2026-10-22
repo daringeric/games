@@ -75,8 +75,13 @@ import {
 import { applyThemeCss } from './ui/themeCss';
 
 const HINT = 'Lay fiber out from the CO, then drop a cabinet to light homes.';
-/** Screens narrow enough that a full debt notice toast would cover most of the map. */
-const NARROW_TOASTS = '(max-width: 600px)';
+/**
+ * Screens where a full debt notice toast would cover most of the map: narrow
+ * phones, and short landscape screens, where the room between the HUD and
+ * the collapsed report panel (two rows once it shows the bank's word) is
+ * shorter than a full notice.
+ */
+const NARROW_TOASTS = '(max-width: 600px), (max-height: 500px)';
 /** How long "Show me" takes to glide the map to the place (instant with reduced motion). */
 const SHOW_ME_GLIDE_MS = 450;
 
@@ -514,7 +519,7 @@ async function boot(): Promise<void> {
     if (notice.kind === 'gameOver') return;
     // The open briefing lists the close's notices; later ones toast as usual.
     if (briefing.isOpen && !briefing.booksOnly && notice.id <= briefingNotices) return;
-    // On a phone a full debt notice covers most of the map: toast its headline, the Bank lists it in full.
+    // On a phone (or a short landscape screen) a full debt notice covers most of the map: toast its headline, the Bank lists it in full.
     const narrow = typeof window.matchMedia === 'function' && window.matchMedia(NARROW_TOASTS).matches;
     toasts.show(narrow && isBankNotice(notice.kind) ? noticeHeadline(notice.message) : notice.message, noticeTone(notice));
   });

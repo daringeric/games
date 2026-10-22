@@ -6,8 +6,10 @@
 // books" opening the briefing sheet's books view on its own (the game paused
 // behind it, not counted as a month-end briefing, Close returning to the
 // game and to the button); updates in place; the bank's word through every
-// state; and a phone pass that starts collapsed, fits without sideways
-// scrolling and has comfortable touch targets.
+// state; a phone pass that starts collapsed, fits without sideways
+// scrolling and has comfortable touch targets; and a landscape phone, where
+// the collapsed panel shows the bank's word on a second row and a bank
+// notice toasts only its headline, so the toast stays on screen under the HUD.
 //
 // Conditions are set up through window.__lst as bank.spec.ts does (closed
 // months with bills pushed into finance.reports give the town credit).
@@ -19,7 +21,7 @@
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import { briefingMoney } from '../src/sim/advisor';
-import { CPP_TARGET, LOAN_ROUNDING } from '../src/sim/balance';
+import { CPP_TARGET, LOAN_ROUNDING, TERM_LOAN_MIN } from '../src/sim/balance';
 import { bankHealth, creditLimit } from '../src/sim/debt';
 import { reportKpis } from '../src/sim/metrics';
 import type { GameState, MonthlyReport } from '../src/sim/types';
@@ -337,6 +339,63 @@ test.describe('on a phone', () => {
     expect((await books.locator('.briefing-close').boundingBox())!.height).toBeGreaterThanOrEqual(44);
     await books.locator('.briefing-close').tap();
     await expect(books).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+});
+
+test.describe('on a landscape phone', () => {
+  test.use({ viewport: { width: 844, height: 390 }, hasTouch: true });
+
+  test('a bank notice toasts its headline, on screen between the HUD and the collapsed panel with the bank’s word', async ({ page }) => {
+    const errors = watchErrors(page);
+    await open(page, SEED);
+    await page.evaluate(() => document.fonts.ready);
+    await page.getByRole('button', { name: 'Got it' }).tap();
+    await giveRevenue(page, 40_000, 20_000);
+    // Borrow, then (test-only, as bank.spec.ts does) rewrite the months it lent against into a cash-flow history that cannot carry the debt.
+    const loan = await page.evaluate(
+      ({ min }) => {
+        const lst = window.__lst!;
+        const r = lst.dispatch({ type: 'takeTermLoan', amount: min * 4, termYears: 5 });
+        for (const report of lst.getState().finance.reports) {
+          report.totals = { revenue: 100, overhead: -30_000 };
+          report.net = 100 - 30_000;
+        }
+        return r;
+      },
+      { min: TERM_LOAN_MIN },
+    );
+    expect(loan.ok, JSON.stringify(loan)).toBe(true);
+    // Three closes: Warning, Higher interest, then No more borrowing, each with its bank notice.
+    for (let i = 0; i < 3; i++) await tickToNextClose(page);
+    const s = await state(page);
+    expect(s.debt.covenant.stage).toBe('frozen');
+    const frozen = s.notices.filter((n) => n.kind === 'creditFrozen').at(-1);
+    expect(frozen, 'a creditFrozen notice').toBeDefined();
+
+    // The panel stays collapsed: the cash line, the customers line and the bank's word.
+    const panel = reportPanel(page);
+    await expect(panel.locator('.panel-toggle')).toHaveAttribute('aria-expanded', 'false');
+    expect(await shownParts(page)).toEqual(['cash', 'customers', 'bank']);
+    await expect(panel.getByTestId('panel-bank')).toHaveText('Bank: No more borrowing');
+
+    // The notice toasts only its headline (the Bank lists it in full), as on a narrow phone.
+    const start = frozen!.message.slice(0, 40);
+    const toast = page.locator('.toast').filter({ hasText: start });
+    await expect(toast).toHaveCount(1);
+    await expect(toast).toHaveText(/ Full notice in the Bank\.$/);
+    const shown = (await toast.textContent())!;
+    expect(shown.length).toBeLessThan(frozen!.message.length);
+    expect(frozen!.message.startsWith(shown.replace(/ Full notice in the Bank\.$/, '').replace(/[.…]$/, ''))).toBe(true);
+    // Let the slide-in animation finish, then measure: the toast is whole on screen, under the HUD and clear of the panel.
+    await page.waitForTimeout(400);
+    const box = await page.evaluate((start) => {
+      const r = (e: Element) => e.getBoundingClientRect();
+      const t = [...document.querySelectorAll('.toast')].find((e) => e.textContent?.startsWith(start))!;
+      return { toast: r(t).toJSON(), hud: r(document.querySelector('.hud')!).toJSON(), panel: r(document.querySelector('.panel')!).toJSON() };
+    }, start);
+    expect(box.toast.top, JSON.stringify(box)).toBeGreaterThanOrEqual(box.hud.bottom);
+    expect(box.toast.bottom, JSON.stringify(box)).toBeLessThanOrEqual(box.panel.top);
     expect(errors).toEqual([]);
   });
 });

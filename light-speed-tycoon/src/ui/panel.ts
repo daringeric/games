@@ -24,8 +24,8 @@
 //
 // Also here: subscriberMovements (the books' customers tile), the month-close
 // toast (monthClosedMessage / monthClosedTone, main.ts) and the full books'
-// "More figures" rows (reportRows: kpiRows, supportRow, operationsRows,
-// financingRows).
+// "More figures" rows (reportRows: kpiRows, overheadRow, supportRow,
+// operationsRows, financingRows).
 //
 // Owner: ui-summary workstream (round 4c/4d); ui-economy, ui-bank and
 // ui-briefing before.
@@ -53,6 +53,7 @@ export type ReportRowKey =
   | 'cpga'
   | 'costPerConnection'
   | 'operatingCashFlow'
+  | 'overhead'
   | 'support'
   | 'outages'
   | 'outageCredits'
@@ -93,16 +94,16 @@ export function subscriberMovements(report: MonthlyReport): string | null {
 
 /**
  * The figures of a closed month the full books' tiles and money lines do not
- * already show, in display order: the KPIs, the support part of the
- * per-customer cost, round 4's operations and the month's bank figures.
- * With the tiles (net, cash, customers and their moves, homes passed, take
- * rate, cost per home passed, debt) and the itemized money in and out (bills,
- * borrowing, every running cost and overhead line, pole rent, repairs,
- * building, interest, principal), these are every figure the old report
- * panel listed.
+ * already show, in display order: the KPIs, the overhead's total, the support
+ * part of the per-customer cost, round 4's operations and the month's bank
+ * figures. With the tiles (net, cash, customers and their moves, homes
+ * passed, take rate, cost per home passed, debt) and the itemized money in
+ * and out (bills, borrowing, every running cost and overhead line, pole rent,
+ * repairs, building, interest, principal), these are every figure the old
+ * report panel listed.
  */
 export function reportRows(report: MonthlyReport): ReportRow[] {
-  return [...kpiRows(report), supportRow(report), ...operationsRows(report), ...financingRows(report)];
+  return [...kpiRows(report), overheadRow(report), supportRow(report), ...operationsRows(report), ...financingRows(report)];
 }
 
 /**
@@ -151,6 +152,26 @@ export function kpiRows(report: MonthlyReport): ReportRow[] {
       quiet: false,
     },
   ];
+}
+
+/**
+ * The month's overhead (totals.overhead), the old panel's Overhead row: the
+ * books' running costs list its base, per-customer and plant lines (from
+ * OpsStats.overhead, which add up to it) but no subtotal of the three, so it
+ * is said here. Quiet when there was none, or when the report predates the
+ * lines (the books then show the overhead as one line, which is this total).
+ */
+export function overheadRow(report: MonthlyReport): ReportRow {
+  const total = 0 - (report.totals.overhead ?? 0);
+  return {
+    key: 'overhead',
+    label: 'Overhead',
+    value: formatMoney(total),
+    tone: null,
+    detail: 'base costs, per customer, and per cabinet and mile of cable',
+    hint: 'Running the company: a small base, plus costs that grow with your customers and your live plant. Running the business lists these parts; this is their total.',
+    quiet: !report.ops?.overhead || total === 0,
+  };
 }
 
 /**

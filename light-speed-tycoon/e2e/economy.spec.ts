@@ -133,6 +133,10 @@ test('lit homes sign up: subscribers and revenue in the HUD, the report and the 
   await expect(running.locator('.briefing-line[data-key="overheadCustomers"] dd')).toHaveText(money(overhead.lines!.perCustomer));
   await expect(running.locator('.briefing-line[data-key="overheadPlant"] dd')).toHaveText(money(overhead.lines!.perPlant));
   expect(overhead.lines!.base + overhead.lines!.perCustomer + overhead.lines!.perPlant).toBe(overhead.total);
+  // The old list's overhead total itself, on screen under "More figures".
+  const overheadRow = books.locator('.briefing-figure[data-key="overhead"]');
+  await expect(overheadRow.locator('dt')).toContainText('Overhead');
+  await expect(overheadRow.locator('dd')).toHaveText(money(overhead.total));
   // The old list's revenue, customers and take rate: the books' bills line and tiles.
   await expect(books.locator('.briefing-lines-in .briefing-line[data-key="bills"] dd')).toHaveText(money(last.totals.revenue!));
   await expect(books.locator('.briefing-tile-subscribers .briefing-tile-value')).toHaveText(String(stats.subscribers));
