@@ -30,7 +30,7 @@ export interface DebugHook {
    * URL has ?briefing=1 (the stored preference) or ?briefing=<frequency>.
    */
   setBriefing(setting: BriefingSetting): void;
-  /** Round 4: whether the month-end briefing sheet is open. */
+  /** Round 4: whether the month-end briefing sheet is open (round 4c/4d: not the full books the report panel opens on their own). */
   briefingOpen(): boolean;
   /**
    * Round 4b: whether the start screen is open. Debug pages skip it on a

@@ -590,6 +590,12 @@ body {
 
 /* Report panel --------------------------------------------------------------- */
 
+/* Round 4c/4d: a small version of the month summary (briefing.css): the cash
+   line, money in and out as two thin bars on one scale (the summary's segment
+   colors, .seg-*), the customers line, building, the bank's word, this
+   month's spending and "See the full books". Words always carry what a color
+   says. */
+
 .panel {
   position: absolute;
   z-index: 5;
@@ -600,6 +606,11 @@ body {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 8px 14px 12px;
+}
+
+/* Parts are shown and hidden in place; their own display rules never win over [hidden]. */
+.panel [hidden] {
+  display: none !important;
 }
 
 .panel-title {
@@ -650,101 +661,222 @@ body {
   display: none;
 }
 
-.stats {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-  margin: 0;
-}
-
-.stat dt {
-  color: var(--text-2);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.stat dd {
-  margin: 0;
-  font-size: var(--fs-num);
-  white-space: nowrap;
-}
-
-.report-details {
-  display: grid;
-  gap: 3px;
-  margin: 8px 0 0;
-  padding-top: 8px;
-  border-top: 1px dashed var(--card-border);
-}
-
-.panel:not(.expanded) .report-details {
-  display: none;
-}
-
 /* Opened on a short screen it may reach up to the tip card: stay readable over it. */
 .panel.expanded {
   z-index: 9;
 }
 
-.report-details .row {
+.panel-body {
   display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.report-details dt {
-  color: var(--text-2);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.report-details dd {
+.panel-body > p {
   margin: 0;
-  font-size: 14px;
-  text-align: right;
 }
 
-/* Small print after a value: the cost-per-passing target. */
-.report-details .row-sub {
-  margin-left: 6px;
+.panel-empty {
   color: var(--text-2);
-  font-size: 11.5px;
   font-weight: 700;
-  white-space: nowrap;
 }
 
-.row-movements .num {
-  font-family: var(--font-ui);
+/* "Cash went down $32,539 · $332,590 left": the change on the left, what is
+   left on the right, as on the summary's cash card (the dot is for screen readers). */
+.panel-cash {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0 10px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.panel-cash-head {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+/* Money in and money out: one shared scale, the larger total is the full width
+   (segment widths are set inline). */
+.panel-money {
+  display: grid;
+  gap: 8px;
+}
+
+.panel-flow {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.panel-flow-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
   font-size: 13px;
   font-weight: 800;
+}
+
+.panel-flow-total {
+  font: 600 16px / 1.1 var(--font-display);
+}
+
+.panel-flow-total.total-in {
+  color: var(--success);
+}
+
+/* Money in that includes borrowing: neutral (debt is never success green). */
+.panel-flow-total.total-in.total-borrowed {
+  color: var(--text);
+}
+
+.panel-flow-total.total-out {
+  color: color-mix(in srgb, var(--active) 82%, var(--text));
+}
+
+.panel-bar {
+  display: flex;
+  height: 10px;
+}
+
+.panel-seg {
+  flex: none;
+  /* A small amount still shows as a sliver beside its legend. */
+  min-width: 3px;
+  box-shadow: inset -2px 0 0 var(--card);
+}
+
+.panel-seg.is-first {
+  border-top-left-radius: 5px;
+  border-bottom-left-radius: 5px;
+}
+
+.panel-seg.is-last {
+  border-top-right-radius: 5px;
+  border-bottom-right-radius: 5px;
+  box-shadow: none;
+}
+
+.panel-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.panel-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.panel-legend .num {
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-weight: 800;
+}
+
+.panel-swatch {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+
+.panel-flow-empty {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+/* The customers line, with "See customers" */
+.panel-customers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0 8px;
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.panel-customers-text {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.panel-customers-text b {
+  color: var(--text);
+  font-weight: 800;
+}
+
+.btn.panel-link {
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 4px;
+  color: var(--success);
+  font: 800 13.5px / 1.2 var(--font-ui);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* The bank's word: never success green, amber or red for trouble (the word says it too). */
+.btn.panel-link.panel-bank {
+  margin-left: -4px;
+  color: var(--text);
+}
+
+.btn.panel-link.panel-bank.tone-warn {
+  color: color-mix(in srgb, var(--cpp-amber) 72%, var(--text));
+}
+
+.btn.panel-link.panel-bank.tone-danger {
+  color: var(--danger);
+}
+
+/* While building: what it cost and the cost per home passed, the band in words. */
+.panel-building {
+  color: color-mix(in srgb, var(--text) 85%, var(--text-2));
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.panel-band {
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .cpp-green {
   color: var(--cpp-green);
 }
 
-/* A covenant test the month failed (leverage over, coverage under the limit). */
-.report-details .breach {
-  color: var(--danger);
-}
-
 .cpp-amber {
-  color: var(--cpp-amber);
+  color: color-mix(in srgb, var(--cpp-amber) 72%, var(--text));
 }
 
 .cpp-red {
   color: var(--cpp-red);
 }
 
-.panel-empty {
-  margin: 0;
-  color: var(--text-2);
-  font-weight: 700;
-}
-
 .mtd {
-  margin: 8px 0 0;
   padding-top: 8px;
   border-top: 1px dashed var(--card-border);
   color: var(--text-2);
@@ -755,6 +887,27 @@ body {
 .mtd .num {
   color: var(--text);
   font-size: 15px;
+}
+
+.btn.panel-books {
+  width: 100%;
+  min-height: 36px;
+  border: 2px solid var(--card-border);
+  background: var(--card);
+  font: 700 14px / 1.2 var(--font-ui);
+}
+
+.btn.panel-books:hover {
+  background: var(--hover);
+}
+
+/* Touch screens and phones: every control is a comfortable touch target. */
+@media (pointer: coarse), (max-width: 880px) {
+  .panel-toggle,
+  .btn.panel-link,
+  .btn.panel-books {
+    min-height: var(--touch);
+  }
 }
 
 /* Hint card ------------------------------------------------------------------ */
@@ -1180,17 +1333,15 @@ body {
   }
 
   .panel-toggle {
-    min-height: 30px;
     font-size: 14px;
   }
 
-  .stat dd {
-    font-size: 15px;
+  .panel-body {
+    gap: 6px;
   }
 
   .mtd {
-    margin-top: 4px;
-    padding-top: 4px;
+    padding-top: 6px;
   }
 
   .hint-card {
@@ -1274,11 +1425,11 @@ body {
   }
 }
 
-/* Short landscape phones: the panel's collapsed figures sit on one line. */
+/* Short landscape phones: the collapsed panel's lines sit beside the toggle. */
 @media (max-width: 880px) and (max-height: 500px) {
   .panel:not(.expanded) {
     display: grid;
-    grid-template-columns: minmax(0, auto) 1fr auto;
+    grid-template-columns: auto minmax(0, 1fr);
     align-items: center;
     gap: 2px 12px;
   }
@@ -1287,26 +1438,20 @@ body {
     margin: 0;
   }
 
-  .panel:not(.expanded) .stats {
-    display: flex;
-    gap: 14px;
+  .panel:not(.expanded) .panel-toggle {
+    width: auto;
   }
 
-  .panel:not(.expanded) .stat {
-    display: flex;
-    align-items: baseline;
-    gap: 5px;
+  .panel:not(.expanded) .panel-body {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 14px;
   }
 
   .panel:not(.expanded) .mtd {
-    margin: 0;
     padding: 0;
     border: 0;
-    white-space: nowrap;
-  }
-
-  .panel:not(.expanded) .panel-empty {
-    grid-column: 2 / 4;
   }
 
   .toasts {

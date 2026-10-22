@@ -1036,14 +1036,16 @@
   overflow-wrap: anywhere;
 }
 
-/* Looking ahead */
-.briefing-forward {
+/* Looking ahead, and (round 4c/4d) the report's more figures, laid out alike */
+.briefing-forward,
+.briefing-figures {
   display: grid;
   gap: 4px;
   margin: 0;
 }
 
-.briefing-forward-row {
+.briefing-forward-row,
+.briefing-figure {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
@@ -1053,11 +1055,13 @@
   border-bottom: 1px dashed var(--card-border);
 }
 
-.briefing-forward-row:last-child {
+.briefing-forward-row:last-child,
+.briefing-figure:last-child {
   border-bottom: 0;
 }
 
-.briefing-forward-row dt {
+.briefing-forward-row dt,
+.briefing-figure dt {
   display: grid;
   flex: 1 1 160px;
   gap: 1px;
@@ -1066,13 +1070,15 @@
   font-weight: 700;
 }
 
-.briefing-forward-row dt small {
+.briefing-forward-row dt small,
+.briefing-figure dt small {
   color: var(--text-2);
   font-size: 12px;
   font-weight: 700;
 }
 
-.briefing-forward-row dd {
+.briefing-forward-row dd,
+.briefing-figure dd {
   margin: 0;
   font-size: 15px;
   text-align: right;

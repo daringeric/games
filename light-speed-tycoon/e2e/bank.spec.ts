@@ -7,9 +7,10 @@
 // taking and paying back emergency cash, paying a loan off early, the
 // verified cure's button, the health stepping up to No more borrowing and a
 // missed payment ending the game, the frozen line's sweep and countdown and
-// then the called loans, the financing rows of the monthly report, the
-// quote cards' cash-after and credit hints, and a phone-width pass with no
-// sideways scrolling and comfortable touch targets.
+// then the called loans, the month's financing in the full books the report
+// panel opens (round 4c/4d: the panel itself shows only the bank's word),
+// the quote cards' cash-after and credit hints, and a phone-width pass with
+// no sideways scrolling and comfortable touch targets.
 //
 // Conditions are set up through window.__lst the way economy.spec.ts does:
 // closed months with revenue pushed into finance.reports give the town
@@ -68,7 +69,9 @@ async function giveRevenue(page: Page, revenue: number, costs: number): Promise<
       const lst = window.__lst!;
       const s = lst.getState();
       for (let month = 10; month <= 12; month++) {
-        s.finance.reports.push({ year: 2026, month, totals: { revenue, overhead: -costs }, net: revenue - costs, cashEnd: s.finance.cash, passings: 0 });
+        // Quiet operations, as every round-4 close records them (the summary and the full books read the notice cursor from them).
+        const ops = { lastNoticeId: s.nextNoticeId - 1, tierMoves: 0, priceChurn: 0, outageChurn: 0, incumbentChurn: 0, outageUnitDays: 0, storms: 0, spansDamaged: 0, repairs: 0, incumbentPromos: 0, mrr: revenue, outageCredits: 0, overhead: null };
+        s.finance.reports.push({ year: 2026, month, totals: { revenue, overhead: -costs }, net: revenue - costs, cashEnd: s.finance.cash, passings: 0, ops });
       }
       lst.tick(1);
     },
@@ -88,11 +91,17 @@ async function tickToNextClose(page: Page): Promise<void> {
 const bankButton = (page: Page) => page.getByRole('button', { name: 'Bank', exact: true });
 const bankDialog = (page: Page) => page.getByRole('dialog', { name: 'Bank', exact: true });
 
-async function openReportDetails(page: Page): Promise<Locator> {
-  const panel = page.getByRole('region', { name: 'Monthly report' });
+const reportPanel = (page: Page) => page.getByRole('region', { name: 'Monthly report' });
+
+/** The full books for the report panel's month, opened from the panel ("See the full books"; the panel opened first if it is collapsed). */
+async function openBooksFromPanel(page: Page): Promise<Locator> {
+  const panel = reportPanel(page);
   const toggle = panel.locator('.panel-toggle');
   if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
-  return panel;
+  await panel.getByRole('button', { name: 'See the full books' }).click();
+  const books = page.locator('dialog.briefing-books-only');
+  await expect(books).toBeVisible();
+  return books;
 }
 
 /** Open a disclosure (a <details>) by its summary, if it is closed. */
@@ -231,18 +240,27 @@ test('takes and pays back emergency cash with previews in words; the debt chip a
   await expect(bank).toBeVisible();
   await page.keyboard.press('Escape');
 
-  // The month close charges interest on the line; the report shows the month's financing.
+  // The month close charges interest on the line; the full books the report panel opens show the month's financing.
   await tickToNextClose(page);
   const report = (await state(page)).finance.reports.at(-1)!;
   expect(report.debt).toBeDefined();
   expect(report.totals.interest ?? 0).toBeLessThan(0);
-  const panel = await openReportDetails(page);
-  await expect(panel.locator('.row-interest dd .num')).toHaveText(money(-(report.totals.interest ?? 0)));
-  await expect(panel.locator('.row-proceeds dd .num')).toHaveText(money(half));
-  await expect(panel.locator('.row-principal dd .num')).toHaveText(money(back));
-  await expect(panel.locator('.row-debt dd .num')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
-  await expect(panel.locator('.row-leverage dd')).toContainText('limit');
-  await expect(panel.locator('.row-coverage dd')).toContainText('min');
+  // The panel says the bank's health in the Bank's own word, and the word opens the Bank.
+  const word = reportPanel(page).getByTestId('panel-bank');
+  await expect(word).toHaveText('Bank: Good');
+  await word.click();
+  await expect(bank).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(bank).toBeHidden();
+  const books = await openBooksFromPanel(page);
+  await expect(books.locator('.briefing-line[data-key="interest"] dd')).toHaveText(money(-(report.totals.interest ?? 0)));
+  await expect(books.locator('.briefing-lines-in .briefing-line[data-key="borrowed"] dd')).toHaveText(money(half));
+  await expect(books.locator('.briefing-line[data-key="principal"] dd')).toHaveText(money(back));
+  await expect(books.locator('.briefing-figure[data-key="debt"] dd')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
+  await expect(books.locator('.briefing-figure[data-key="leverage"]')).toContainText('limit');
+  await expect(books.locator('.briefing-figure[data-key="coverage"]')).toContainText('min');
+  await books.locator('.briefing-close').click();
+  await expect(books).toBeHidden();
   expect(errors).toEqual([]);
 });
 
@@ -381,11 +399,14 @@ test.describe('on a phone', () => {
     const report = (await state(page)).finance.reports.at(-1)!;
     expect(report.totals.interest ?? 0).toBeLessThan(0);
     expect(report.totals.principal).toBe(-part);
-    const panel = await openReportDetails(page);
-    await expect(panel.locator('.row-interest dd .num')).toHaveText(money(-(report.totals.interest ?? 0)));
-    await expect(panel.locator('.row-principal dd .num')).toHaveText(money(part));
-    await expect(panel.locator('.row-proceeds dd .num')).toHaveText(money(third));
-    await expect(panel.locator('.row-debt dd .num')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
+    const books = await openBooksFromPanel(page);
+    await expect(books.locator('.briefing-line[data-key="interest"] dd')).toHaveText(money(-(report.totals.interest ?? 0)));
+    await expect(books.locator('.briefing-line[data-key="principal"] dd')).toHaveText(money(part));
+    await expect(books.locator('.briefing-lines-in .briefing-line[data-key="borrowed"] dd')).toHaveText(money(third));
+    await expect(books.locator('.briefing-figure[data-key="debt"] dd')).toHaveText(money(report.debt!.creditBalance + report.debt!.termBalance));
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+    await books.locator('.briefing-close').tap();
+    await expect(books).toBeHidden();
     expect(errors).toEqual([]);
   });
 
