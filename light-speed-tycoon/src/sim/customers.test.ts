@@ -66,6 +66,7 @@ import {
   switchingDay,
   whyNotSwitched,
   womSwitchFactor,
+  SUPPORT_LEVEL_IDS,
 } from './customers';
 import { applyCommand, newGame, runDays } from './game';
 import { getService } from './network';
@@ -73,7 +74,17 @@ import { withRng } from './rng';
 import { deserialize, hashState, serialize } from './save';
 import { closeDayAfter, closeSalesMonth, defaultPricing, segmentDeals, stepSales, subscriberUnits } from './sales';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
-import type { Account, CabinetId, City, GameState, IntroPromo, Pricing, TierId, TierSetting } from './types';
+import type { Account, CabinetId, City, GameState, IntroPromo, Pricing, SupportLevel, TierId, TierSetting } from './types';
+
+/**
+ * A support level whose customers, with nothing else to say, are happy, and
+ * one whose are not (bucket thresholds are balance values: since the
+ * round-4c/4d tuning a customer on Good support at the default prices is
+ * happy and one on Basic is not).
+ */
+const HAPPY_LEVEL = SUPPORT_LEVEL_IDS.find((l) => SUPPORT_LEVELS[l].happiness >= HAPPY_SCORE_MIN) as SupportLevel;
+const UNHAPPY_LEVEL = SUPPORT_LEVEL_IDS.find((l) => SUPPORT_LEVELS[l].happiness < HAPPY_SCORE_MIN) as SupportLevel;
+
 
 // 128 one-unit homes, every street in reach of one cabinet at the CO.
 const TOWN = makeGridCity({ cols: 4, rows: 4, coAt: [2, 2] });
@@ -374,7 +385,7 @@ describe('awareness', () => {
     expect(awarenessGainPerDay(0, 0, 1, false)).toBeGreaterThan(awarenessGainPerDay(0, 0, 0, false));
     const extra = awarenessGainPerDay(0, 0, 1, false) - awarenessGainPerDay(0, 0, 0, false);
     expect(awarenessGainPerDay(0, 0, 1, true) - awarenessGainPerDay(0, 0, 0, true)).toBeCloseTo(extra * REFERRAL_WOM_MULTIPLIER, 12);
-    const build = (support: 'good' | 'great', referrals: boolean): GameState => {
+    const build = (support: SupportLevel, referrals: boolean): GameState => {
       const { state, cabinet } = litTown({ marketing: 0 });
       state.customers.supportLevel = support;
       state.customers.referrals = referrals;
@@ -389,9 +400,9 @@ describe('awareness', () => {
       }
       return state;
     };
-    const okay = build('good', false).customers.streets[0]!.awareness;
-    const happy = build('great', false).customers.streets[0]!.awareness;
-    const referred = build('great', true).customers.streets[0]!.awareness;
+    const okay = build(UNHAPPY_LEVEL, false).customers.streets[0]!.awareness;
+    const happy = build(HAPPY_LEVEL, false).customers.streets[0]!.awareness;
+    const referred = build(HAPPY_LEVEL, true).customers.streets[0]!.awareness;
     expect(happy).toBeGreaterThan(okay);
     expect(referred).toBeGreaterThan(happy);
   });
@@ -511,8 +522,8 @@ describe('happiness', () => {
     const { state, cabinet } = litTown();
     subscribe(state, cabinet, 0.25);
     const account = state.sales.accounts[0]!;
-    // Good support at the default prices with nothing remembered: a score of 0, okay.
-    expect(accountHappiness(state, account)).toMatchObject({ score: 0, bucket: 'okay', factors: [] });
+    // Good support at the default prices with nothing remembered: a score of 0 (happy since the round-4c/4d tuning: HAPPY_SCORE_MIN <= 0).
+    expect(accountHappiness(state, account)).toMatchObject({ score: 0, bucket: 0 >= HAPPY_SCORE_MIN ? 'happy' : 'okay', factors: [] });
     state.customers.supportLevel = 'great';
     expect(accountHappiness(state, account)).toMatchObject({ score: SUPPORT_LEVELS.great.happiness, factors: [{ reason: 'support', score: SUPPORT_LEVELS.great.happiness }] });
     expect(accountHappiness(state, account).bucket).toBe(SUPPORT_LEVELS.great.happiness >= HAPPY_SCORE_MIN ? 'happy' : 'okay');
@@ -644,13 +655,13 @@ describe('happiness', () => {
 
   it('brings neighbors: a street\'s happy share speeds its switching up', () => {
     const { state, cabinet } = litTown({ aware: 1 });
-    state.customers.supportLevel = 'great';
+    state.customers.supportLevel = HAPPY_LEVEL;
     const segment = state.customers.streets[0]!.segment;
     const parcels = state.city.parcels.filter((p) => p.segment === segment);
     state.sales.accounts = [home(parcels[0]!.id, cabinet)];
     expect(streetHappiness(state).get(segment)).toEqual({ happy: 1, units: 1 });
     expect(switchingDay(state)(segment, cabinet, false).rate).toBeCloseTo(SWITCH_BASE_PER_DAY * womSwitchFactor(1, false), 15);
-    state.customers.supportLevel = 'good';
+    state.customers.supportLevel = UNHAPPY_LEVEL;
     expect(switchingDay(state)(segment, cabinet, false).rate).toBeCloseTo(SWITCH_BASE_PER_DAY, 15);
   });
 });
@@ -804,17 +815,22 @@ describe('forecasts', () => {
     expect(good).toMatchObject({ costChange: 0, netValue: 0, pays: false });
     expect(basic.cancellationsPerMonth).toBeGreaterThan(good.cancellationsPerMonth);
     expect(great.cancellationsPerMonth).toBeLessThan(good.cancellationsPerMonth);
-    expect(great.happy).toBeGreaterThan(good.happy);
+    // Since the round-4c/4d tuning Good's customers are happy too: Great keeps every one of them happy, Basic makes fewer so.
+    expect(great.happy).toBeGreaterThanOrEqual(good.happy);
+    expect(basic.happy).toBeLessThan(good.happy);
     expect(basic.costChange).toBeLessThan(0);
     expect(great.costChange).toBeGreaterThan(0);
-    expect(great.signupsPerMonth).toBeGreaterThanOrEqual(good.signupsPerMonth);
+    // Great's customers stay (and its happy ones bring neighbors): net of cancellations it grows at least as fast. (Its gross
+    // signups can be fewer: fewer cancellations leave less of the gap to refill.)
+    expect(great.signupsPerMonth - great.cancellationsPerMonth).toBeGreaterThanOrEqual(good.signupsPerMonth - good.cancellationsPerMonth);
   });
 
   it('weighs referral credits: nothing to credit without happy customers, a cost per referral with them', () => {
     const { state, cabinet } = litTown({ aware: 0.5 });
     subscribe(state, cabinet, 0.2);
+    state.customers.supportLevel = UNHAPPY_LEVEL;
     expect(quoteReferrals(state, true)).toMatchObject({ referralsPerMonth: 0, costPerMonth: 0, extraPerMonth: 0, costPerCustomer: null });
-    state.customers.supportLevel = 'great';
+    state.customers.supportLevel = HAPPY_LEVEL;
     const on = quoteReferrals(state, true);
     expect(on.referralsPerMonth).toBeGreaterThan(0);
     expect(on.costPerMonth).toBeCloseTo(on.referralsPerMonth * 2 * REFERRAL_CREDIT, 9);

@@ -17,11 +17,13 @@ import {
   COVENANT_MAX_LEVERAGE,
   COVENANT_MIN_COVERAGE,
   DEFAULT_SUPPORT_LEVEL,
+  HAPPY_SCORE_MIN,
   LOAN_ROUNDING,
   MARKETING_MAX_PER_MONTH,
   PENALTY_STEP_UP_BPS,
   SUPPORT_LEVELS,
   TERM_LOAN_MIN,
+  UNHAPPY_SCORE_MAX,
 } from './balance';
 import { ADVICE_ORDER, ADVICE_TITLE_MAX, ADVICE_WHY_MAX, actionLabelOf, ATTENTION_MAX, advise, attentionItems, briefingMoney, briefingStory, buildBriefing, growthOptions } from './advisor';
 import { dateOf, MONTH_LENGTHS } from './calendar';
@@ -602,7 +604,8 @@ describe('customers queries', () => {
     expect(report.happy + report.okay + report.unhappy).toBe(subscriberUnits(state));
     expect(bucketOf(10)).toBe('happy');
     expect(bucketOf(-10)).toBe('unhappy');
-    expect(bucketOf(0)).toBe('okay');
+    // Round 4c/4d tuning: the thresholds are balance values (a customer with nothing to complain about, score 0, is happy), so the okay band is between them.
+    expect(bucketOf((HAPPY_SCORE_MIN + UNHAPPY_SCORE_MAX) / 2)).toBe('okay');
     const account = state.sales.accounts[0]!;
     const good = accountHappiness(state, account).score;
     state.customers.supportLevel = 'great';

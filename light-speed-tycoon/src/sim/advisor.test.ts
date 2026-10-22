@@ -1734,7 +1734,8 @@ describe('expand above the CPP target (round 4c/4d)', () => {
         if (found || s.finance.reports.length === closes) return;
         closes = s.finance.reports.length;
         const p = planFor(s, 'expand');
-        if (p && cppBand(buildOutPlan(s, (p.advice.action as { node: number }).node).cpp ?? 0) === 'amber') found = { state: clone(s), p };
+        // The plan itself must be amber: a smaller, green plan at a corner whose whole build-out is amber is a green expand.
+        if (p && (p.advice.detail ?? '').includes(`costs more per home than the ${formatMoney(CPP_TARGET)} target`)) found = { state: clone(s), p };
       },
     });
     expect(found, 'an amber expand on the Angel-backed follower').not.toBeNull();
@@ -1876,6 +1877,8 @@ describe('growthOptions and growCustomers (round 4c/4d, spec I.6)', () => {
 
   it('cuts marketing that no longer brings customers for what it costs', () => {
     const state = freshTown(400);
+    // Referral credits already on: with happy customers they would otherwise be the cheaper lever offered first.
+    expect(applyCommand(state, { type: 'setReferrals', on: true }).ok).toBe(true);
     expect(applyCommand(state, { type: 'setMarketing', perMonth: 20_000 }).ok).toBe(true);
     const p = plan(state, 'growCustomers');
     expect(p.advice.key).toBe(ADVICE_KEYS.growCustomers('marketing'));

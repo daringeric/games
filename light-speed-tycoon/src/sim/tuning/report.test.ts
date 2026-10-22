@@ -4,8 +4,11 @@
 //
 //   TUNE_REPORT=1 npx vitest run src/sim/tuning/report.test.ts
 //
-// Optional: TUNE_SEEDS=1,2,3 (default TUNING_SEEDS), TUNE_MONTHS=60,
-// TUNE_SWEEP=0 to skip the constant-price sweep (the slowest part).
+// Optional: TUNE_SEEDS=1,2,3 or 1-100 (default TUNING_SEEDS), TUNE_MONTHS=60,
+// TUNE_SWEEP=0 to skip the constant-price sweep (the slowest part),
+// TUNE_PART=4cd for the round-4c/4d section only (difficulty levels, the
+// advisor follower, CASUAL, switching, the growth levers and the marketing
+// forecast: what the 100-seed confirmation runs).
 
 import { describe, expect, it } from 'vitest';
 import { CPP_TARGET, DIFFICULTY_LEVELS, INCUMBENT_PROMO_MIN_PASSINGS, START_CASH } from '../balance';
@@ -19,6 +22,19 @@ import {
   ANSWER_EXPERIMENT_MONTH,
   ANSWER_EXPERIMENT_MONTHS,
   carelessBot,
+  casualBot,
+  campaignExperiment,
+  CEILING_SHARE,
+  DISCOUNT_PRICE_MULTIPLIER,
+  discountBot,
+  MARKETING_FORECAST_MONTHS,
+  marketingForecastCheck,
+  OVERPRICED_PRICE_MULTIPLIER,
+  overpricedBot,
+  referralExperiment,
+  supportExperiment,
+  switchingExperiment,
+  SWITCHING_EXPERIMENT_MONTHS,
   FRESH_PROMO_MONTH,
   freshPromoExperiment,
   frozenHoarderBot,
@@ -58,6 +74,7 @@ import {
   runValue,
   stageHistory,
   stormExposure,
+  takeOfAreasLit,
   townBuildOut,
   townFacts,
   TUNING_SEEDS,
@@ -68,8 +85,13 @@ import type { RunResult } from './harness';
 
 const ENABLED = process.env.TUNE_REPORT === '1';
 const SEEDS: readonly number[] = process.env.TUNE_SEEDS
-  ? process.env.TUNE_SEEDS.split(',').map((s) => Number(s.trim()))
+  ? process.env.TUNE_SEEDS.split(',').flatMap((s) => {
+      const [a, b] = s.split('-').map((x) => Number(x.trim()));
+      if (b === undefined) return [a as number];
+      return Array.from({ length: (b as number) - (a as number) + 1 }, (_, i) => (a as number) + i);
+    })
   : TUNING_SEEDS;
+const PART = process.env.TUNE_PART ?? 'all';
 const MONTHS = Number(process.env.TUNE_MONTHS ?? 60);
 const SWEEP = process.env.TUNE_SWEEP !== '0';
 /** Months shown in the per-seed table. */
@@ -188,7 +210,7 @@ describe('balance report', () => {
     expect(ENABLED).toBe(false);
   });
 
-  it.runIf(ENABLED)(
+  it.runIf(ENABLED && PART === 'all')(
     'prints the per-seed numbers behind every balance target',
     () => {
       const summary: Array<Record<string, string>> = [];
@@ -365,5 +387,86 @@ describe('balance report', () => {
       expect(summary.length).toBe(SEEDS.length);
     },
     3_600_000,
+  );
+
+  it.runIf(ENABLED && (PART === 'all' || PART === '4cd'))(
+    'prints the round-4c/4d numbers: difficulty levels, the follower, CASUAL, switching, the levers, the forecast',
+    () => {
+      const out: string[] = [];
+      const levels: Array<Record<string, string>> = [];
+      const customers: Array<Record<string, string>> = [];
+      for (const seed of SEEDS) {
+        const shareOf = (run: RunResult) => (run.gameOver ? 0 : (passedShare(run, run.reports.length) ?? 0));
+        const won = (run: RunResult) => run.gameOver === null && (run.kpis.at(-1)?.operatingCashFlow ?? 0) > 0;
+        for (const level of DIFFICULTY_LEVELS) {
+          const state = () => newGame(seed, { difficulty: level.id });
+          const smart = runBot(seed, smartBot(), MONTHS, { state: state() });
+          const follower = runBot(seed, advisorFollowerBot, MONTHS, { state: state() });
+          const lite = runBot(seed, smartLiteBot(), MONTHS, { state: state() });
+          const casual = level.id === 'seed' || level.id === 'angel' ? runBot(seed, casualBot(), 36, { state: state() }) : null;
+          levels.push({
+            seed: String(seed),
+            level: level.name,
+            smart: gameOverText(smart),
+            won: won(smart) ? 'yes' : 'no',
+            'cf+': num(firstPositiveMonth(smart)),
+            share: pct(shareOf(smart)),
+            value: dollars(runValue(smart)),
+            'min cash': dollars(Math.min(...smart.reports.map((r) => r.cashEnd))),
+            worst: worstStage(smart),
+            follower: gameOverText(follower),
+            'f worst': worstStage(follower),
+            'f missed': String(missedPaymentMonths(follower).length),
+            'f share': pct(shareOf(follower)),
+            'f value': dollars(runValue(follower)),
+            'f loans': num(follower.commands.takeTermLoan ?? 0),
+            'f cf+': num(firstPositiveMonth(follower)),
+            'lite share': pct(shareOf(lite)),
+            'lite value': dollars(runValue(lite)),
+            'f >= lite': runValue(follower) >= runValue(lite) && shareOf(follower) >= shareOf(lite) ? 'yes' : 'no',
+            casual: casual ? `${gameOverText(casual)} min ${dollars(Math.min(...casual.reports.map((r) => r.cashEnd)))} warn ${casual.notices.insolvencyWarning ?? 0}` : '-',
+          });
+        }
+        const smart = runBot(seed, smartBot(), MONTHS);
+        const discount = runBot(seed, discountBot(), MONTHS);
+        const overpriced = runBot(seed, overpricedBot(), MONTHS);
+        const sw = switchingExperiment(seed);
+        const camp = campaignExperiment(seed);
+        const sup = supportExperiment(seed);
+        const ref = referralExperiment(seed);
+        const fc = MARKETING_FORECAST_MONTHS.map((m) => marketingForecastCheck(seed, m));
+        const ceil = (m: number | null) => (m === null ? `>${SWITCHING_EXPERIMENT_MONTHS}` : String(m));
+        customers.push({
+          seed: String(seed),
+          'take lit 3-5y': pct(takeOfAreasLit(smart, 36, 60)),
+          'value std/disc/over': `${dollars(runValue(smart))}/${dollars(runValue(discount))}/${dollars(runValue(overpriced))}`,
+          'subs std/disc/over': `${num(smart.reports.at(-1)?.stats?.subscribers)}/${num(discount.reports.at(-1)?.stats?.subscribers)}/${num(overpriced.reports.at(-1)?.stats?.subscribers)}`,
+          'ceiling months std/disc': `${ceil(sw.standard.monthsToCeiling)}/${ceil(sw.discount.monthsToCeiling)}`,
+          'take 12/24 std': `${pct(sw.standard.takes[11], 0)}/${pct(sw.standard.takes[23], 0)}`,
+          'take 12/24 disc': `${pct(sw.discount.takes[11], 0)}/${pct(sw.discount.takes[23], 0)}`,
+          'take 12/24 over': `${pct(sw.overpriced.takes[11], 0)}/${pct(sw.overpriced.takes[23], 0)}`,
+          'arpu std/disc': `${dollars(sw.standard.arpu)}/${dollars(sw.discount.arpu)}`,
+          'campaign fresh': camp.fresh ? `${camp.fresh.quote.pays ? 'pays' : 'no'} ${dollars(camp.fresh.areaValue)}` : '-',
+          'campaign signed': camp.signed ? `${camp.signed.quote.pays ? 'pays' : 'no'} ${dollars(camp.signed.areaValue)}` : '-',
+          'great-good hi long': dollars(sup.high.long.value.great - sup.high.long.value.good),
+          'great-good lo short': dollars(sup.low.short.value.great - sup.low.short.value.good),
+          'basic subs -': num(sup.high.long.subscribers.good - sup.high.long.subscribers.basic),
+          'referrals many': `${ref.many.quote.pays ? 'pays' : 'no'} ${dollars(ref.many.subsValue)}`,
+          'referrals few': `${ref.few.quote.pays ? 'pays' : 'no'} ${dollars(ref.few.subsValue)}`,
+          forecast: fc.map((c) => `${c.quoted.toFixed(0)}/${c.realized}`).join(' '),
+        });
+      }
+      out.push(
+        `\n=== round 4c/4d: difficulty levels (SMART, ADVISOR_FOLLOWER, SMART-lite; CASUAL 36 months at Seed round and Angel-backed)`,
+        table(levels),
+        `\n=== round 4c/4d: customers (targets: take on areas lit 3-5 years 40-55%; DISCOUNT x${DISCOUNT_PRICE_MULTIPLIER} reaches ${pct(CEILING_SHARE, 0)} of its ceiling >= 12 months sooner at a lower ARPU, ` +
+          `OVERPRICED x${OVERPRICED_PRICE_MULTIPLIER} clearly slower; campaigns pay fresh, not signed; Great pays high/long, not low/short; Basic loses customers; ` +
+          `referrals pay with many happy customers, not with few; forecast quoted/realized within 20%)`,
+        table(customers),
+      );
+      process.stdout.write(`${out.join('\n')}\n`);
+      expect(levels.length).toBe(SEEDS.length * DIFFICULTY_LEVELS.length);
+    },
+    7_200_000,
   );
 });

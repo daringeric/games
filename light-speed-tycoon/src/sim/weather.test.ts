@@ -1236,7 +1236,9 @@ describe('round 4c/4d: burying pays back on exposed streets, not on sheltered on
   it('keeps sheltered dense blocks and open residential blocks aerial', () => {
     for (const seed of [1, 2027, 424242, 99, 12345]) {
       const { state, streets } = poledStreets(seed);
-      const sheltered = streets.filter((s) => exposureBand(segmentExposure(state.city, s.seg.id)) === 'sheltered');
+      // Blocks of a typical length (a stub of a block or two of downtown frontage buries on its pole rent alone, round 4's
+      // rule for the short blocks, once the up-front weight lets a payback of a few years count: round 4c/4d tuning).
+      const sheltered = streets.filter((s) => exposureBand(segmentExposure(state.city, s.seg.id)) === 'sheltered' && s.seg.lengthFt >= 180);
       expect(sheltered.length, `seed ${seed}`).toBeGreaterThan(5);
       for (const s of sheltered) {
         expect(preferredMethod(state, s.seg), `seed ${seed} segment ${s.seg.id}`).toBe('aerial');

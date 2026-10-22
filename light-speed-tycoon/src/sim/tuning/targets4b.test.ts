@@ -16,8 +16,10 @@
 //   bust, keeps building and is worth at least SMART-lite's value; at
 //   Bootstrapped it never breaches a covenant or misses a payment (round 4b
 //   review: these targets ran at the Seed round only).
-// Targets the sim cannot reach today are `it.skip` with the reason (DESIGN.md,
-// "What round 4b could not reach"), ready to enable once the sim change lands.
+// The five round-4b targets the sim could not reach then (DESIGN.md, "What
+// round 4b could not reach") run since round 4c/4d: the scaled overhead, the
+// switching model and the storm economics made them reachable (DESIGN.md,
+// "Round 4c/4d").
 // The round-2/3 targets stay in targets.test.ts and round 4's in targets4.test.ts.
 //
 // When a balance.ts change breaks one of these, re-tune rather than widen a
@@ -194,9 +196,8 @@ describe('difficulty levels (only the starting cash differs)', () => {
     TEST_TIMEOUT_MS,
   );
 
-  // Unreachable with a fixed $9,000 overhead: a $200,000 network never covers it
-  // before the cash runs out (DESIGN.md, "What round 4b could not reach").
-  it.skip(
+  // Round 4c/4d: reachable once the overhead scales with the network (overhead.ts).
+  it(
     'Shoestring is winnable by smart play on most seeds: no game over and positive operating cash flow at month 60',
     () => {
       const wins = TUNING_SEEDS.filter((seed) => {
@@ -323,10 +324,10 @@ describe("pricing: the incumbent's promos", () => {
     TEST_TIMEOUT_MS,
   );
 
-  // Unreachable: the promo's signup boost (PROMO_SIGNUP_BOOST) speeds up every
-  // street's gap alike, and a mature town keeps a churn-held gap about as large
-  // per signup as a fresh one (DESIGN.md, "What round 4b could not reach").
-  it.skip(
+  // Round 4c/4d: reachable once switching works on awareness (customers.ts): in a
+  // mature town most homes that would switch already have, so the promo mostly
+  // discounts customers who would have signed anyway.
+  it(
     'the intro promo does not pay in a mature town (month 48, no new areas): quoted and realized',
     () => {
       const losses = TUNING_SEEDS.filter((seed) => {
@@ -390,11 +391,9 @@ describe('storms and the build method', () => {
     TEST_TIMEOUT_MS,
   );
 
-  // Unreachable: growth is capital-bound and lent against revenue, so a dollar
-  // not spent on a bore is worth about four in value at month 60; the exposure
-  // model's variation sits at the map's edges and groves, outside the dense
-  // areas both operators build (DESIGN.md, "What round 4b could not reach").
-  it.skip(
+  // Round 4c/4d: reachable once tree-lined aerial spans carry their storm cost
+  // (weather.ts canopy, spec D) and SMART buries those streets.
+  it(
     "SMART's mixed build is worth more at month 60 than all-aerial, on most seeds and on the mean",
     () => {
       let wins = 0;
@@ -468,10 +467,8 @@ describe('following the advisor', () => {
     TEST_TIMEOUT_MS,
   );
 
-  // Unreachable: SMART-lite spends the Angel purse on day one and passes ~70-75% of the town; the advisor
-  // suggests one build at a time, each keeping a real reserve, and ends near 60-80%, ahead on 2 of 5 (DESIGN.md,
-  // "What round 4b could not reach").
-  it.skip(
+  // Round 4c/4d: reachable once the advisor prices every candidate corner and the overhead scales (spec B).
+  it(
     'at Angel-backed: does at least as well as SMART-lite on value and share at month 60, on most seeds',
     () => {
       const ok = TUNING_SEEDS.filter((seed) => {
@@ -496,10 +493,8 @@ describe('following the advisor', () => {
     TEST_TIMEOUT_MS,
   );
 
-  // Unreachable with a fixed $9,000 overhead: no build the advisor can cost (green, with its reserve) fits
-  // $400,000 on day one, a smaller one later only stretches the burn, and the follower runs out of cash on
-  // overhead alone (DESIGN.md, "What round 4b could not reach").
-  it.skip(
+  // Round 4c/4d: reachable once the overhead scales and the advisor sizes a first build to the cash (spec B).
+  it(
     'at Bootstrapped: never goes bust by following the top suggestion',
     () => {
       for (const seed of TUNING_SEEDS) expect(followerAt(seed, 'bootstrapped').gameOver, `seed ${seed}`).toBeNull();

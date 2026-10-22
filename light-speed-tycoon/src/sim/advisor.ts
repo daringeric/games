@@ -2797,16 +2797,19 @@ function chooseBuild(state: GameState, r: Readings): BuildChoice | null {
     if (!funding) return null;
     return { node, plan, cpp: plan.cpp ?? Number.POSITIVE_INFINITY, funding, installs: area.installs, smaller, first, years, customers: area.target };
   };
+  // "Nothing burns" needs a closed month with lit homes behind it: before the first close (or while the first
+  // cabinet is still being built) runway reads null only because there is nothing to measure yet.
+  const nothingBurns = runway === null && passingsToday > 0 && state.finance.reports.length > 0;
   const usable = (plan: BuildOutPlan): 'green' | 'amber' | null => {
     if (plan.cpp === null || plan.passings < EXPAND_MIN_PASSINGS || !plan.commands.some((c) => c.type === 'placeCabinet')) return null;
     const band = cppBand(plan.cpp);
-    // Amber for a first build, or once nothing burns (runway null) and no green build is left that cash covers.
-    return band === 'green' ? 'green' : band === 'amber' && (first || runway === null) ? 'amber' : null;
+    // Amber for a first build, or once nothing burns and no green build is left that cash covers.
+    return band === 'green' ? 'green' : band === 'amber' && (first || nothingBurns) ? 'amber' : null;
   };
 
   const corners = r.corners();
   // Past the first EXPAND_CANDIDATES_MAX, only corners whose estimate looks green (amber for a first build, or when nothing burns) are worth a price.
-  const promising = new Set<NodeId>(corners.filter((c) => c.cpp <= (first || runway === null ? CPP_TARGET * CPP_AMBER_MULTIPLIER : CPP_TARGET)).map((c) => c.node));
+  const promising = new Set<NodeId>(corners.filter((c) => c.cpp <= (first || nothingBurns ? CPP_TARGET * CPP_AMBER_MULTIPLIER : CPP_TARGET)).map((c) => c.node));
   const ranked = rankCorners(corners, budget);
   const open: NodeId[] = [];
   let green: BuildChoice | null = null;

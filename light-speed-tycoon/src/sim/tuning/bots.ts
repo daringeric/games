@@ -110,7 +110,6 @@ import {
   COVENANT_MIN_COVERAGE,
   CPP_TARGET,
   CUSTOMER_QUOTE_MONTHS,
-  DEFAULT_SUPPORT_LEVEL,
   GRANDFATHER_MONTHS_MAX,
   INCUMBENT_PRICE,
   INCUMBENT_PROMO_MIN_PASSINGS,
@@ -228,7 +227,7 @@ import type {
   TierId,
 } from '../types';
 import { DAYS_PER_BILL, outageChurnProbability, stormRisk } from '../weather';
-import { cheapestMethod, constantPriceBot, cumulativeOperatingCashFlow, runBot, streetTree, treePath } from './harness';
+import { areaCurves, averageArpu, cheapestMethod, constantPriceBot, cumulativeOperatingCashFlow, runBot, runValue, streetTree, treePath } from './harness';
 import type { BotFactory, RunResult, Send } from './harness';
 import { newGame } from '../game';
 
@@ -417,14 +416,16 @@ export interface SmartOptions {
    * the area brings).
    */
   aerialFallback: boolean;
+  /** Add splitters (and OLT cards) as ports fill (false: the plant's ports stay as they are, as the customers forecast assumes). */
+  capacity: boolean;
 
   // Round 4c/4d: the growth levers (judged every LEVER_JUDGE_DAYS)
   /** Buy a neighborhood campaign in an area whenever customers.quoteCampaign says it pays there and its cost is spare cash. */
   campaigns: boolean;
-  /** The support level it keeps, or 'quote': the level customers.quoteSupport says is worth the most when it pays. */
-  support: SupportLevel | 'quote';
-  /** Referral credits on or off, or 'quote': switched when customers.quoteReferrals says the switch pays. */
-  referrals: boolean | 'quote';
+  /** The support level it keeps, 'quote': the level customers.quoteSupport says is worth the most when it pays, or 'keep': whatever is set. */
+  support: SupportLevel | 'quote' | 'keep';
+  /** Referral credits on or off, 'quote': switched when customers.quoteReferrals says the switch pays, or 'keep': whatever is set. */
+  referrals: boolean | 'quote' | 'keep';
   /** RunResult.bot. */
   name: string;
 }
@@ -486,9 +487,10 @@ export const SMART_DEFAULTS: SmartOptions = {
   cure: true,
   troughCheck: false,
   aerialFallback: false,
+  capacity: true,
   campaigns: false,
-  support: DEFAULT_SUPPORT_LEVEL,
-  referrals: false,
+  support: 'keep',
+  referrals: 'keep',
   name: 'smart',
 };
 
@@ -1610,7 +1612,7 @@ export const LEVER_JUDGE_DAYS = 28;
  * cost first, while the cost is cash above its reserve).
  */
 function manageLevers(state: GameState, send: Send, opts: SmartOptions, memo: SmartMemo): void {
-  if (opts.support !== 'quote' && opts.support !== state.customers.supportLevel) send({ type: 'setSupport', level: opts.support });
+  if (opts.support !== 'quote' && opts.support !== 'keep' && opts.support !== state.customers.supportLevel) send({ type: 'setSupport', level: opts.support });
   if (typeof opts.referrals === 'boolean' && opts.referrals !== state.customers.referrals) send({ type: 'setReferrals', on: opts.referrals });
   if (state.day - memo.leversDay < LEVER_JUDGE_DAYS) return;
   memo.leversDay = state.day;
@@ -1688,7 +1690,7 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
 
   const hold = opts.borrow ? cureOrDeleverage(state, send, opts) : false;
   if (opts.borrow) manageCredit(state, send, opts);
-  addCapacity(state, send, opts);
+  if (opts.capacity) addCapacity(state, send, opts);
   if (hold) return;
   manageLevers(state, send, opts, memo);
   convertHitSpans(state, send, opts);
@@ -1748,7 +1750,6 @@ export const LEAN_OPTIONS: Partial<SmartOptions> = {
   troughCheck: true,
   burnMonths: 2,
   installDays: 180,
-  buryGain: 3,
   stormWeight: 1,
   horizonYears: 12,
   streetOrder: 'density',
@@ -2277,6 +2278,9 @@ function randomLeverCommand(state: GameState, send: Send, rng: Rng): void {
   }
 }
 
+/** Chance per look that MIXED sends a growth-lever command (valid or junk: randomLeverCommand). */
+const MIXED_LEVER_CHANCE = 0.2;
+
 /**
  * SMART plus, each weekly look, a few random extras from its own Rng: cancel
  * or remove a span (any stage), remove a cabinet, add a splitter or an OLT
@@ -2284,18 +2288,22 @@ function randomLeverCommand(state: GameState, send: Send, rng: Rng): void {
  * promo (randomPromo), rebuild a span underground (randomConvert), a
  * financing command (randomDebtCommand), round 4b's retention offer
  * (randomAnswer) and briefing commands (randomAdviceCommand), round 4c/4d's
- * growth levers (randomLeverCommand), or send junk the sim must reject. SMART leaves the intro promo and the incumbent's
- * promos to these random commands (managePromo false).
+ * growth levers (randomLeverCommand, from a second Rng so the older mix plays
+ * as before), or send junk the sim must reject. SMART leaves the intro promo
+ * and the incumbent's promos to these random commands (managePromo false).
  */
 export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
   const opts: SmartOptions = { ...SMART_DEFAULTS, managePromo: false, ...options };
   return (seed) => {
     const rng = new Rng(deriveSeed(seed, 'bot:mixed'));
+    // The growth levers draw from their own stream, so the round-4b command mix (rng) plays as before.
+    const leverRng = new Rng(deriveSeed(seed, 'bot:mixed:levers'));
     const memo = newSmartMemo();
     return {
       name: 'mixed',
       act(state, send) {
         smartAct(state, send, opts, memo);
+        if (leverRng.chance(MIXED_LEVER_CHANCE)) randomLeverCommand(state, send, leverRng);
         const extras = rng.int(0, 3);
         for (let i = 0; i < extras; i++) {
           if (rng.chance(0.25)) {
@@ -2305,10 +2313,6 @@ export function mixedBot(options: Partial<SmartOptions> = {}): BotFactory {
           if (rng.chance(0.12)) {
             if (rng.chance(0.5)) randomAnswer(state, send, rng);
             else randomAdviceCommand(state, send, rng);
-            continue;
-          }
-          if (rng.chance(0.1)) {
-            randomLeverCommand(state, send, rng);
             continue;
           }
           const roll = rng.next();
@@ -2464,9 +2468,15 @@ export const FRESH_PROMO_LATEST_MONTH = 12;
 /** ... and plays this long, comparing the operating cash flow at each of FRESH_PROMO_CHECK_MONTHS. */
 export const FRESH_PROMO_MONTHS = 24;
 export const FRESH_PROMO_CHECK_MONTHS: readonly number[] = [12, 18, 24];
-/** The mature-town experiment starts at this month's close and plays a year with no new areas. */
+/** The mature-town experiment starts at this month's close and plays a year with no new areas ... */
 export const MATURE_PROMO_MONTH = 48;
 export const MATURE_PROMO_MONTHS = 12;
+/**
+ * ... once SMART, building nothing new, has finished what it was building
+ * then (at most this many more closes): streets that light during the year
+ * would be a fresh area, where the promo's boost is meant to pay.
+ */
+export const MATURE_SETTLE_MONTHS_MAX = 6;
 
 export interface PromoExperiment {
   /** sales.quotePromo(SMART_INTRO_PROMO) at the start. */
@@ -2500,13 +2510,18 @@ export function freshPromoExperiment(seed: number): PromoExperiment {
 }
 
 /**
- * The intro promo in a mature town: SMART's game at MATURE_PROMO_MONTH,
- * played MATURE_PROMO_MONTHS by SMART building nothing new, with
- * SMART_INTRO_PROMO set throughout against none (any incumbent promo
- * ignored).
+ * The intro promo in a mature town: SMART's game at MATURE_PROMO_MONTH, then
+ * SMART building nothing new until all its plant is live (at most
+ * MATURE_SETTLE_MONTHS_MAX closes), played MATURE_PROMO_MONTHS on by SMART
+ * building nothing new, with SMART_INTRO_PROMO set throughout against none
+ * (any incumbent promo ignored).
  */
 export function maturePromoExperiment(seed: number): PromoExperiment {
-  const start = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
+  let start = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
+  const building = (state: GameState) => state.network.spans.some((s) => s.stage !== 'live') || state.network.cabinets.some((c) => c.stage !== 'live');
+  for (let month = 0; month < MATURE_SETTLE_MONTHS_MAX && building(start); month++) {
+    start = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none' }), 1, { state: start }).state;
+  }
   const quote = quotePromo(start, SMART_INTRO_PROMO);
   const play = (standingPromo: IntroPromo | null) => {
     const run = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), MATURE_PROMO_MONTHS, { state: copyState(start) });
@@ -2685,21 +2700,33 @@ export interface MarketingForecastCheck {
   quoted: number;
   /** Units connected (stats.grossAdds) over the next CUSTOMER_QUOTE_MONTHS closes, SMART operating its network with the same budget and no new areas. */
   realized: number;
+  /** Diagnostics: cabinets turning signups away at the start, passings at the start and the end. */
+  fullAtStart: number;
+  passingsStart: number;
+  passingsEnd: number;
 }
 
 /**
  * The marketing forecast against what the sim then does: SMART's game at the
  * close of `month`, quoteMarketing at its budget, then CUSTOMER_QUOTE_MONTHS
- * of SMART operating that network (no new areas, so the forecast's "no new
- * streets" holds; its marketing per passing unchanged).
+ * of SMART operating that network as it stands, under the forecast's own
+ * assumptions (customers.forecastCustomers: no new streets and no new ports,
+ * so no new areas or splitters; the same marketing per passing).
  */
 export function marketingForecastCheck(seed: number, month: number): MarketingForecastCheck {
   const start = runBot(seed, smartBot(), month).state;
   const quote = quoteMarketing(start, start.sales.marketingPerMonth);
-  const run = runBot(seed, smartBot(OPERATOR_OPTIONS), CUSTOMER_QUOTE_MONTHS, { state: copyState(start) });
+  const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, capacity: false }), CUSTOMER_QUOTE_MONTHS, { state: copyState(start) });
   let realized = 0;
   for (const report of run.reports) realized += report.stats?.grossAdds ?? 0;
-  return { month, quoted: quote.signupsPerMonth * CUSTOMER_QUOTE_MONTHS, realized };
+  return {
+    month,
+    quoted: quote.signupsPerMonth * CUSTOMER_QUOTE_MONTHS,
+    realized,
+    fullAtStart: start.sales.fullCabinets.length,
+    passingsStart: getService(start).passings,
+    passingsEnd: run.reports.at(-1)?.passings ?? 0,
+  };
 }
 
 // Campaigns -----------------------------------------------------------------------------
@@ -2707,7 +2734,7 @@ export function marketingForecastCheck(seed: number, month: number): MarketingFo
 /** Months each lever experiment plays after its decision (the quotes' horizon). */
 export const LEVER_EXPERIMENT_MONTHS = CUSTOMER_QUOTE_MONTHS;
 /** A freshly lit area: its cabinet went live within this many days of the close the experiment starts from ... */
-export const FRESH_AREA_DAYS = 45;
+export const FRESH_AREA_DAYS = 60;
 /** ... found at the first such close up to this month. */
 export const FRESH_AREA_LATEST_MONTH = 18;
 /** A well-signed area: lit at least this many months at MATURE_PROMO_MONTH, the one with the highest take rate (INCUMBENT_PROMO_MIN_PASSINGS passings or more). */
@@ -2725,6 +2752,14 @@ export interface LeverArm {
 export interface CampaignArm extends LeverArm {
   cabinet: number;
   quote: CampaignQuote;
+  /**
+   * The campaign's realized worth in its own area over LEVER_EXPERIMENT_MONTHS:
+   * the extra subscriber-months there (CustomerStats.areas at each close, with
+   * against without) x what a unit pays less overhead.perCustomerCost (the
+   * quote's margin), less its cost. Its own area only, so the rest of the
+   * network's luck (storms, the sales stream's draws) does not drown it.
+   */
+  areaValue: number;
 }
 
 export interface CampaignExperiment {
@@ -2732,7 +2767,15 @@ export interface CampaignExperiment {
   signed: CampaignArm | null;
 }
 
-/** SMART's game at the first close (from month 1 up to FRESH_AREA_LATEST_MONTH) with a cabinet live for at most FRESH_AREA_DAYS, and that cabinet; null if none. */
+/** Fewest unsigned lit units an area needs to be the campaign experiment's fresh area. */
+export const FRESH_AREA_MIN_UNSIGNED = 40;
+
+/**
+ * SMART's game at the first close (from month 1 up to FRESH_AREA_LATEST_MONTH)
+ * with a cabinet live for at most FRESH_AREA_DAYS whose area has
+ * FRESH_AREA_MIN_UNSIGNED or more lit units not signed up (the one with the
+ * most), and that cabinet; null if none.
+ */
 function freshAreaStart(seed: number): { state: GameState; cabinet: number } | null {
   let state = newGame(seed);
   const bot = smartBot();
@@ -2740,9 +2783,9 @@ function freshAreaStart(seed: number): { state: GameState; cabinet: number } | n
     state = runBot(seed, bot, 1, { state }).state;
     const areas = customerAreas(state).filter((a) => {
       const cabinet = state.network.cabinets.find((c) => c.id === a.cabinet);
-      return cabinet && cabinet.liveDay !== null && state.day - cabinet.liveDay <= FRESH_AREA_DAYS && a.passings - a.subscribed > 0;
+      return cabinet && cabinet.liveDay !== null && state.day - cabinet.liveDay <= FRESH_AREA_DAYS && a.passings - a.subscribed >= FRESH_AREA_MIN_UNSIGNED;
     });
-    const best = areas.sort((a, b) => b.passings - a.passings || a.cabinet - b.cabinet)[0];
+    const best = areas.sort((a, b) => b.passings - b.subscribed - (a.passings - a.subscribed) || a.cabinet - b.cabinet)[0];
     if (best) return { state, cabinet: best.cabinet };
   }
   return null;
@@ -2757,20 +2800,29 @@ function signedAreaStart(seed: number): { state: GameState; cabinet: number } | 
   return best ? { state, cabinet: best.cabinet } : null;
 }
 
-/** One lever decision played both ways from `start` by SMART operating its network (no new areas) for LEVER_EXPERIMENT_MONTHS. */
-function leverArm(seed: number, start: GameState, decide: (state: GameState, send: Send) => void, operator: Partial<SmartOptions> = {}, months = LEVER_EXPERIMENT_MONTHS): LeverArm {
+/** One lever decision played both ways from `start` by SMART operating its network (no new areas) for `months`, and both runs. */
+function leverRuns(seed: number, start: GameState, decide: (state: GameState, send: Send) => void, operator: Partial<SmartOptions> = {}, months = LEVER_EXPERIMENT_MONTHS): { a: RunResult; b: RunResult } {
   const play = (lever: boolean) => {
     const bot = withFirst(lever ? decide : () => {}, smartBot({ ...OPERATOR_OPTIONS, ...operator }), lever ? 'lever' : 'none');
     return runBot(seed, bot, months, { state: copyState(start) });
   };
-  const a = play(true);
-  const b = play(false);
+  return { a: play(true), b: play(false) };
+}
+
+function armOf(a: RunResult, b: RunResult): LeverArm {
   return {
     withLever: cumulativeOperatingCashFlow(a),
     without: cumulativeOperatingCashFlow(b),
     subsWith: a.reports.at(-1)?.stats?.subscribers ?? 0,
     subsWithout: b.reports.at(-1)?.stats?.subscribers ?? 0,
   };
+}
+
+/** Subscribed units of cabinet `cabinet`'s area summed over the run's closes (CustomerStats.areas): its subscriber-months. */
+function areaUnitMonths(run: RunResult, cabinet: number): number {
+  let months = 0;
+  for (const report of run.reports) months += report.customers?.areas.find((a) => a.cabinet === cabinet)?.units ?? 0;
+  return months;
 }
 
 /**
@@ -2783,10 +2835,12 @@ export function campaignExperiment(seed: number): CampaignExperiment {
   const arm = (start: { state: GameState; cabinet: number } | null): CampaignArm | null => {
     if (!start) return null;
     const quote = quoteCampaign(start.state, start.cabinet);
-    const result = leverArm(seed, start.state, (_, send) => {
+    const { a, b } = leverRuns(seed, start.state, (_, send) => {
       send({ type: 'runCampaign', cabinet: start.cabinet });
     });
-    return { cabinet: start.cabinet, quote, ...result };
+    const margin = subscriberEconomics(start.state).margin;
+    const areaValue = (areaUnitMonths(a, start.cabinet) - areaUnitMonths(b, start.cabinet)) * margin - quote.cost;
+    return { cabinet: start.cabinet, quote, areaValue, ...armOf(a, b) };
   };
   return { fresh: arm(freshAreaStart(seed)), signed: arm(signedAreaStart(seed)) };
 }
@@ -2802,6 +2856,8 @@ export const SUPPORT_LONG_MONTHS = 36;
 export interface SupportCase {
   /** Cumulative operating cash flow less installs over the horizon, by level. */
   value: Record<SupportLevel, number>;
+  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level. */
+  worth: Record<SupportLevel, number>;
   /** Subscribers at the end, by level. */
   subscribers: Record<SupportLevel, number>;
   /** quoteSupport('great') at the start. */
@@ -2815,13 +2871,15 @@ export interface SupportExperiment {
 
 function supportCase(seed: number, start: GameState, months: number): SupportCase {
   const value = {} as Record<SupportLevel, number>;
+  const worth = {} as Record<SupportLevel, number>;
   const subscribers = {} as Record<SupportLevel, number>;
   for (const level of SUPPORT_LEVEL_IDS) {
     const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: copyState(start) });
     value[level] = operatingLessInstalls(run);
+    worth[level] = runValue(run);
     subscribers[level] = run.reports.at(-1)?.stats?.subscribers ?? 0;
   }
-  return { value, subscribers, greatQuote: quoteSupport(start, 'great') };
+  return { value, worth, subscribers, greatQuote: quoteSupport(start, 'great') };
 }
 
 /**
@@ -2843,11 +2901,13 @@ export function supportExperiment(seed: number): SupportExperiment {
 
 // Referral credits ------------------------------------------------------------------
 
-/** The referral experiment's "many": SMART's game at this close (young areas, customers next to many unsigned lit homes) ... */
+/** The referral experiment starts from SMART's game at this close (young areas: customers next to many unsigned lit homes). */
 export const REFERRAL_YOUNG_MONTH = 15;
 
 export interface ReferralArm extends LeverArm {
   quote: ReferralQuote;
+  /** Realized: the extra subscriber-months with credits on x the margin a unit brings, less the credits paid. */
+  subsValue: number;
   /** Happy share of the customers and unsigned share of the lit homes at the start. */
   happyShare: number;
   unsignedShare: number;
@@ -2860,25 +2920,126 @@ export interface ReferralExperiment {
 
 /**
  * The referral experiment: credits on against off from REFERRAL_YOUNG_MONTH
- * of SMART's game (many happy customers next to unsigned lit homes) and from
- * MATURE_PROMO_MONTH (a mature town: few unsigned homes left), SMART
- * operating its network for LEVER_EXPERIMENT_MONTHS, by realized operating
- * cash flow (the credits are in it) and quoteReferrals at the start.
+ * of SMART's game, SMART operating its network for LEVER_EXPERIMENT_MONTHS,
+ * by realized value (ReferralArm.subsValue) and quoteReferrals at the start:
+ * `many` as the game stands there (Good support: happy customers next to
+ * many unsigned lit homes), `few` with Basic support set first in both arms
+ * (customers merely okay: few happy ones to bring neighbors).
  */
 export function referralExperiment(seed: number): ReferralExperiment {
-  const arm = (month: number): ReferralArm => {
-    const start = runBot(seed, smartBot(), month).state;
+  const young = runBot(seed, smartBot(), REFERRAL_YOUNG_MONTH).state;
+  const arm = (start: GameState, operator: Partial<SmartOptions>): ReferralArm => {
     const units = subscriberUnits(start);
     const passings = getService(start).passings;
-    const result = leverArm(seed, start, (_, send) => {
-      send({ type: 'setReferrals', on: true });
-    });
+    const { a, b } = leverRuns(
+      seed,
+      start,
+      (_, send) => {
+        send({ type: 'setReferrals', on: true });
+      },
+      operator,
+    );
+    const margin = subscriberEconomics(start).margin;
+    let extra = 0;
+    let credits = 0;
+    for (const r of a.reports) {
+      extra += r.stats?.subscribers ?? 0;
+      credits += r.customers?.referralCredits ?? 0;
+    }
+    for (const r of b.reports) extra -= r.stats?.subscribers ?? 0;
     return {
       quote: quoteReferrals(start, true),
+      subsValue: extra * margin - credits,
       happyShare: units > 0 ? happinessReport(start).happy / units : 0,
       unsignedShare: passings > 0 ? (passings - units) / passings : 0,
-      ...result,
+      ...armOf(a, b),
     };
   };
-  return { many: arm(REFERRAL_YOUNG_MONTH), few: arm(MATURE_PROMO_MONTH) };
+  const basic = copyState(young);
+  basic.customers.supportLevel = 'basic';
+  return { many: arm(young, {}), few: arm(basic, { support: 'basic' }) };
+}
+
+// Switching speed by price -------------------------------------------------------
+
+/** The switching experiment starts from SMART's game at this close (its first areas lit) ... */
+export const SWITCHING_EXPERIMENT_MONTH = 12;
+/** ... and plays the network it has this long under each lineup. */
+export const SWITCHING_EXPERIMENT_MONTHS = 48;
+/** An area "reaches the ceiling" once its take rate is this share of its ceiling (AreaCurve.ceiling). */
+export const CEILING_SHARE = 0.9;
+
+export interface SwitchingArm {
+  /** Pooled over the areas lit at the start: whole months until their take rate reached CEILING_SHARE of their ceiling (null: not within the run). */
+  monthsToCeiling: number | null;
+  /** Their ceiling take rate and their take rate at the end. */
+  ceiling: number;
+  take: number;
+  /** Their take rate at each close of the run. */
+  takes: number[];
+  /** Revenue per subscriber-month over the run (ARPU), and revenue per home they pass in the last 12 months. */
+  arpu: number;
+  revenuePerHome: number;
+  /** Cumulative operating cash flow over the run. */
+  ocf: number;
+}
+
+export interface SwitchingExperiment {
+  /** The cabinets whose areas were lit at the start. */
+  cabinets: number[];
+  standard: SwitchingArm;
+  discount: SwitchingArm;
+  overpriced: SwitchingArm;
+}
+
+/**
+ * Switching speed by price, on one fixed set of areas: SMART's game at
+ * SWITCHING_EXPERIMENT_MONTH, then SWITCHING_EXPERIMENT_MONTHS of SMART
+ * operating the network it has (no new areas) at the default prices, at
+ * DISCOUNT_PRICE_MULTIPLIER of them and at OVERPRICED_PRICE_MULTIPLIER (set
+ * on the first day, the default grandfathering for a rise), measured on the
+ * areas lit at the start (their pooled take rate against their pooled
+ * ceiling: harness.areaCurves).
+ */
+export function switchingExperiment(seed: number): SwitchingExperiment {
+  const start = runBot(seed, smartBot(), SWITCHING_EXPERIMENT_MONTH).state;
+  const service = getService(start);
+  const cabinets = start.network.cabinets.filter((c) => c.liveDay !== null && (service.cabinetCoverage.get(c.id)?.passings ?? 0) > 0).map((c) => c.id);
+  const arm = (multiplier: number): SwitchingArm => {
+    const inner = smartBot(OPERATOR_OPTIONS);
+    const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
+    const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: copyState(start) });
+    const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
+    let target = 0;
+    let passings = 0;
+    for (const c of curves) {
+      target += c.ceiling * c.passings;
+      passings += c.passings;
+    }
+    const ceiling = passings > 0 ? target / passings : 0;
+    const takes = run.reports.map((report) => {
+      let units = 0;
+      let homes = 0;
+      for (const area of report.customers?.areas ?? []) {
+        if (!cabinets.includes(area.cabinet)) continue;
+        units += area.units;
+        homes += area.passings;
+      }
+      return homes > 0 ? units / homes : 0;
+    });
+    const reached = takes.findIndex((t) => t >= CEILING_SHARE * ceiling);
+    let revenue = 0;
+    for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
+    const lastPassings = run.reports.at(-1)?.passings ?? 0;
+    return {
+      monthsToCeiling: reached < 0 ? null : reached + 1,
+      ceiling,
+      take: takes.at(-1) ?? 0,
+      takes,
+      arpu: averageArpu(run) ?? 0,
+      revenuePerHome: lastPassings > 0 ? revenue / lastPassings : 0,
+      ocf: cumulativeOperatingCashFlow(run),
+    };
+  };
+  return { cabinets, standard: arm(1), discount: arm(DISCOUNT_PRICE_MULTIPLIER), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER) };
 }

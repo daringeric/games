@@ -26,6 +26,15 @@
 //   day; at a close, revenue + credits = the month's full billing); advisor
 //   snoozes and shown entries ascending, one per key, bounded; the company
 //   unchanged during play;
+// - round 4c/4d: customers.streets one entry per lit segment, ascending, with
+//   awareness in 0..AWARENESS_PPM; campaign, memory and wait records of valid
+//   shape (ascending, one per cabinet or parcel, days in order, never in the
+//   future); why homes haven't switched adds up (each area's reasons sum to
+//   its unsigned units, its passings less its subscribed units, and the areas
+//   sum to the overall row); the happiness buckets sum to the subscribers;
+//   at each close the overhead lines sum to -totals.overhead and the
+//   customer buckets to stats.subscribers; and for every briefing span (a
+//   month, a quarter) money in - money out = the period's cash change;
 // - saves round-trip (and a game reloaded mid-session replays identically);
 // - any single-field corruption of a mid-session save is rejected with a
 //   SaveError or loads a game that then runs every command and a month close
@@ -45,11 +54,12 @@ import {
   TIER_DEFAULTS,
 } from '../balance';
 import { isFirstOfMonth, MONTH_LENGTHS } from '../calendar';
-import { ADVISOR_MEMORY_MAX } from '../advisor';
+import { ADVISOR_MEMORY_MAX, buildBriefing } from '../advisor';
+import { AWARENESS_PPM, happinessReport, whyNotSwitched } from '../customers';
 import { creditAvailable, totalDebt } from '../debt';
 import { applyCommand, newGame, runDays, tick } from '../game';
 import { getService, ponPortsUsed } from '../network';
-import { cabinetPortCapacity, cabinetPortsUsed, monthlyRecurringRevenue, TIER_IDS } from '../sales';
+import { cabinetPortCapacity, cabinetPortsUsed, monthlyRecurringRevenue, subscriberUnits, TIER_IDS } from '../sales';
 import { deserialize, hashState, SaveError, serialize } from '../save';
 import { makeGridCity } from '../testing/fixtures';
 import type { GridCityOptions } from '../testing/fixtures';
@@ -77,6 +87,9 @@ const COMMAND_TYPES: readonly Command['type'][] = [
   'answerIncumbent',
   'snoozeAdvice',
   'noteAdviceShown',
+  'runCampaign',
+  'setSupport',
+  'setReferrals',
 ];
 const PLANT_CATEGORIES = ['construction', 'equipment', 'refund'] as const;
 const SESSION_SEEDS = [3, 2027];
@@ -157,8 +170,8 @@ function openBooks(state: GameState): Books {
   };
 }
 
-/** Plain-boolean checks (cheap enough to run after every command and tick): the first broken one, or null. */
-function brokenInvariant(state: GameState, books: Books): string | null {
+/** Plain-boolean checks (cheap enough to run after every command and tick; `synced` after a tick, when the day's steps have run): the first broken one, or null. */
+function brokenInvariant(state: GameState, books: Books, synced = false): string | null {
   const { finance } = state;
   if (books.opening + postedTotal(state) !== finance.cash) return `books: ${books.opening} + posted ${postedTotal(state)} != cash ${finance.cash}`;
   const plant = finance.capex.osp + finance.capex.co + postedIn(state, PLANT_CATEGORIES);
@@ -174,11 +187,11 @@ function brokenInvariant(state: GameState, books: Books): string | null {
     if ((used.get(cabinet.id) ?? 0) > cabinetPortCapacity(cabinet)) return `cabinet ${cabinet.id} carries more ports than its splitters`;
   }
   if (ponPortsUsed(state) > state.network.olt.ponPorts) return 'more splitters than OLT PON ports';
-  return brokenRound4Invariant(state);
+  return brokenRound4Invariant(state, synced);
 }
 
 /** Round-4 state invariants: price locks, outages, the frozen line. The first broken one, or null. */
-function brokenRound4Invariant(state: GameState): string | null {
+function brokenRound4Invariant(state: GameState, synced: boolean): string | null {
   for (const account of state.sales.accounts) {
     let last = -1;
     for (const lock of account.locks) {
@@ -202,7 +215,7 @@ function brokenRound4Invariant(state: GameState): string | null {
   if (acceleration !== null && (acceleration.closesLeft < 1 || acceleration.closesLeft > ACCELERATION_CLOSES)) {
     return `loans called with ${acceleration.closesLeft} closes left`;
   }
-  return brokenRound4bInvariant(state);
+  return brokenRound4bInvariant(state, synced);
 }
 
 const byKey = (a: { key: string }, b: { key: string }) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
@@ -211,7 +224,7 @@ const byKey = (a: { key: string }, b: { key: string }) => (a.key < b.key ? -1 : 
  * Round-4b state invariants: retention locks, the incumbent's promo memory,
  * the advisor's snoozes and shown entries. The first broken one, or null.
  */
-function brokenRound4bInvariant(state: GameState): string | null {
+function brokenRound4bInvariant(state: GameState, synced: boolean): string | null {
   const promos = state.sales.incumbentPromos;
   for (let i = 0; i < promos.length; i++) {
     const p = promos[i]!;
@@ -240,6 +253,80 @@ function brokenRound4bInvariant(state: GameState): string | null {
     for (let i = 1; i < list.length; i++) if (byKey(list[i - 1]!, list[i]!) >= 0) return `advisor ${label} not one per key in ascending order`;
   }
   for (const e of shown) if (e.times < 1 || e.lastDay < e.firstDay || e.lastDay > state.day) return `advisor shown ${e.key}: ${e.times} times, days ${e.firstDay}..${e.lastDay}`;
+  return brokenCustomersInvariant(state, synced);
+}
+
+/** True when `list` is strictly ascending by `key`. */
+function ascending<T>(list: readonly T[], key: (item: T) => number): boolean {
+  for (let i = 1; i < list.length; i++) if (key(list[i - 1] as T) >= key(list[i] as T)) return false;
+  return true;
+}
+
+/**
+ * Round-4c/4d state invariants: the customers state's shapes (awareness per
+ * lit street after a tick, ascending and in range always; campaigns,
+ * memories, waits). The first broken one, or null. Cheap enough for every
+ * command and tick.
+ */
+function brokenCustomersInvariant(state: GameState, synced: boolean): string | null {
+  const { customers } = state;
+  const lit = getService(state).litSegments;
+  // The street list follows the lit streets at each day's step (customers.stepCustomers), so a command that
+  // lights or darkens streets is reflected from the next day: one entry per lit street holds after a tick.
+  if (synced && customers.streets.length !== lit.size) return `${customers.streets.length} awareness entries for ${lit.size} lit streets`;
+  if (!ascending(customers.streets, (s) => s.segment)) return 'awareness entries not one per street in ascending order';
+  for (const street of customers.streets) {
+    if (synced && !lit.has(street.segment)) return `awareness for street ${street.segment}, which is not lit`;
+    if (!Number.isInteger(street.awareness) || street.awareness < 0 || street.awareness > AWARENESS_PPM) return `street ${street.segment}: awareness ${street.awareness} ppm`;
+    if (street.litDay < 0 || street.litDay > state.day) return `street ${street.segment}: lit on day ${street.litDay}`;
+  }
+  if (!ascending(customers.campaigns, (c) => c.cabinet)) return 'campaigns not one per cabinet in ascending order';
+  for (const c of customers.campaigns) {
+    if (!(c.startDay >= 0 && c.startDay <= state.day && c.startDay < c.endDay && c.endDay <= c.cooldownUntil)) return `campaign at ${c.cabinet}: days ${c.startDay} < ${c.endDay} <= ${c.cooldownUntil}`;
+    if (!Number.isInteger(c.cost) || c.cost < 0 || !Number.isInteger(c.units) || c.units < 0) return `campaign at ${c.cabinet}: cost ${c.cost}, units ${c.units}`;
+  }
+  if (!ascending(customers.memories, (m) => m.parcel)) return 'customer memories not one per parcel in ascending order';
+  for (const m of customers.memories) {
+    if (m.outageDays < 0 || (m.outageDay === null ? m.outageDays !== 0 : m.outageDay > state.day)) return `memory of parcel ${m.parcel}: ${m.outageDays} outage days, last ${m.outageDay}`;
+    if ((m.priceStepDay !== null && m.priceStepDay > state.day) || (m.waitedDay !== null && m.waitedDay > state.day)) return `memory of parcel ${m.parcel}: a day in the future`;
+  }
+  if (!ascending(customers.waits, (w) => w.cabinet)) return 'waits not one per cabinet in ascending order';
+  for (const w of customers.waits) if (w.day < 0 || w.day > state.day) return `wait at ${w.cabinet} on day ${w.day}`;
+  return null;
+}
+
+/** Why homes haven't switched adds up, and the happiness buckets cover every subscribed unit (run once a week: whyNotSwitched walks every lit street). */
+function brokenCustomerCounts(state: GameState): string | null {
+  const reasons = whyNotSwitched(state);
+  const sum = { unaware: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0 };
+  for (const row of [reasons.overall, ...reasons.areas]) {
+    const label = 'cabinet' in row ? `area ${row.cabinet}` : 'overall';
+    if (row.unaware + row.notWorth + row.tooExpensive + row.waiting !== row.unsigned) return `${label}: reasons sum to ${row.unaware + row.notWorth + row.tooExpensive + row.waiting}, not ${row.unsigned} unsigned`;
+    if (row.unsigned !== row.passings - row.subscribed) return `${label}: ${row.unsigned} unsigned of ${row.passings} passed with ${row.subscribed} subscribed`;
+    if (row.unaware < 0 || row.notWorth < 0 || row.tooExpensive < 0 || row.waiting < 0) return `${label}: a negative reason`;
+  }
+  for (const area of reasons.areas) for (const key of Object.keys(sum) as (keyof typeof sum)[]) sum[key] += area[key];
+  for (const key of Object.keys(sum) as (keyof typeof sum)[]) if (sum[key] !== reasons.overall[key]) return `areas' ${key} ${sum[key]} vs overall ${reasons.overall[key]}`;
+  const happiness = happinessReport(state);
+  if (happiness.happy + happiness.okay + happiness.unhappy !== subscriberUnits(state)) return `happiness buckets ${happiness.happy}+${happiness.okay}+${happiness.unhappy} vs ${subscriberUnits(state)} subscribed`;
+  return null;
+}
+
+/** At a close: every briefing span's money in less money out is the period's cash change. The first broken one, or null. */
+function brokenBriefingMoney(state: GameState, opening: number): string | null {
+  const reports = state.finance.reports;
+  for (const span of [1, 3]) {
+    if (reports.length < span) continue;
+    const briefing = buildBriefing(state, span);
+    if (!briefing) return `no briefing over ${span} months`;
+    const { money } = briefing;
+    const before = reports.length > span ? (reports[reports.length - 1 - span] as MonthlyReport).cashEnd : opening;
+    const change = (reports.at(-1) as MonthlyReport).cashEnd - before;
+    if (money.in - money.out !== money.cashChange || money.cashChange !== change) return `briefing over ${span} months: in ${money.in} - out ${money.out} vs cash change ${money.cashChange} (cash moved ${change})`;
+    let groups = 0;
+    for (const group of money.groups) groups += group.total;
+    if (groups !== money.out) return `briefing over ${span} months: groups ${groups} vs out ${money.out}`;
+  }
   return null;
 }
 
@@ -294,6 +381,15 @@ function brokenCloseInvariant(report: MonthlyReport): string | null {
   const left = debt.accelerationClosesLeft ?? null;
   if (left !== null && (owed === 0 || left < 1 || left > ACCELERATION_CLOSES)) return `${label}: loans called with ${left} closes left owing ${owed}`;
   if (frozenCloses >= FROZEN_ACCELERATION_CLOSES && owed > 0 && left === null) return `${label}: ${frozenCloses} frozen closes and the loans not called`;
+  // Round 4c/4d: the overhead lines and the customer buckets.
+  const lines = ops.overhead;
+  if (lines && lines.base + lines.perCustomer + lines.perPlant !== 0 - (report.totals.overhead ?? 0)) {
+    return `${label}: overhead lines ${lines.base} + ${lines.perCustomer} + ${lines.perPlant} vs ledger ${report.totals.overhead ?? 0}`;
+  }
+  const customers = report.customers;
+  if (customers && customers.happy + customers.okay + customers.unhappy !== stats.subscribers) {
+    return `${label}: customer buckets ${customers.happy}+${customers.okay}+${customers.unhappy} vs ${stats.subscribers} subscribers`;
+  }
   return null;
 }
 
@@ -332,6 +428,9 @@ describe('long mixed sessions on generated towns', () => {
           },
         };
       };
+      const opening = state.finance.cash;
+      let countChecks = 0;
+      let briefingChecks = 0;
       const run = runBot(seed, bot, SESSION_MONTHS, {
         state,
         afterCommand: (s, cmd, result, cashBefore) => {
@@ -344,12 +443,18 @@ describe('long mixed sessions on generated towns', () => {
             const { cabinet } = ensureIncumbentPromo(s);
             if (!answered) toAnswer = cabinet;
           }
-          const problem = brokenInvariant(s, books) ?? billing(s);
+          const problem = brokenInvariant(s, books, true) ?? billing(s);
           if (problem && problems.length < 10) problems.push(`day ${s.day}: ${problem}`);
           if ((s.company.name !== company.name || s.company.difficulty !== company.difficulty) && problems.length < 10) problems.push(`day ${s.day}: the company changed`);
           for (; closesChecked < s.finance.reports.length; closesChecked++) {
-            const closeProblem = brokenCloseInvariant(s.finance.reports[closesChecked] as MonthlyReport);
+            const closeProblem = brokenCloseInvariant(s.finance.reports[closesChecked] as MonthlyReport) ?? brokenBriefingMoney(s, opening);
+            briefingChecks++;
             if (closeProblem && problems.length < 10) problems.push(`day ${s.day}: ${closeProblem}`);
+          }
+          if (s.day % 7 === 3) {
+            countChecks++;
+            const countProblem = brokenCustomerCounts(s);
+            if (countProblem && problems.length < 10) problems.push(`day ${s.day}: ${countProblem}`);
           }
           if (isFirstOfMonth(s.day) && s.finance.reports.length % ROUND_TRIP_EVERY_MONTHS === 0) {
             const text = serialize(s);
@@ -375,6 +480,8 @@ describe('long mixed sessions on generated towns', () => {
       expect(run.notices.tierRetired ?? 0).toBeGreaterThan(0);
       expect(run.notices.storm ?? 0).toBeGreaterThan(0);
       expect(closesChecked).toBe(SESSION_MONTHS);
+      expect(briefingChecks).toBe(SESSION_MONTHS);
+      expect(countChecks).toBeGreaterThan(SESSION_MONTHS * 4);
     },
     LONG_TEST_MS,
   );

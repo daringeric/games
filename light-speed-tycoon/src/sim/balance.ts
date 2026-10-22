@@ -269,7 +269,15 @@ export const TAKE_RATE_KIND_FACTOR: Readonly<Record<ParcelKind, number>> = { hom
 // Marketing
 // ---------------------------------------------------------------------------
 
-export const MARKETING_DEFAULT_PER_MONTH = 1_000;
+/**
+ * Round 4c/4d tuning: 1,000 -> 500. Marketing now raises awareness with
+ * diminishing returns per passing, and a new company's first area is small:
+ * at $1,000 a Shoestring network's first months of marketing cost more than
+ * the awareness was worth, and the advisor found no first build that paid
+ * its way on one tuning town. Lit streets still learn of you from time and
+ * word of mouth (AWARENESS_BASE_PER_DAY, AWARENESS_WOM_PER_DAY).
+ */
+export const MARKETING_DEFAULT_PER_MONTH = 500;
 export const MARKETING_MAX_PER_MONTH = 100_000;
 // Round 4c/4d: marketing raises awareness, with diminishing returns
 // (AWARENESS_MARKETING_MAX_PER_DAY, AWARENESS_MARKETING_HALF_SAT_PER_PASSING
@@ -528,15 +536,19 @@ export const CHURN_TOTAL_MAX = 0.8;
 
 /** No storms or dig-ins before this day (the first year is for building). */
 export const STORM_START_DAY = 365;
-/** Chance a storm hits on any day from STORM_START_DAY (round 4: 1/60 -> 1/50, about 7 a year). */
-export const STORM_CHANCE_PER_DAY = 1 / 50;
+/** Chance a storm hits on any day from STORM_START_DAY (round 4: 1/60 -> 1/50, about 7 a year; round 4c/4d: 1/50 -> 1/55 with the canopy term, below, putting the damage where the trees are). */
+export const STORM_CHANCE_PER_DAY = 1 / 55;
 /** Radius of the area a storm hits, map cells. */
 export const STORM_RADIUS_MIN = 5; // first guess 8
 export const STORM_RADIUS_MAX = 15; // first guess 30: a storm covered up to half a 96x64 town, ~9% of revenue in repairs for all-aerial play
 /** Storm severity 1..this (uniform), scaling the damage chances. */
 export const STORM_SEVERITY_MAX = 3;
-/** Chance per unit of severity that a storm damages a live span in its area: aerial (round 4: 0.06 -> 0.07; ~0.06 outages a span-year) ... */
-export const STORM_AERIAL_DAMAGE_CHANCE = 0.07;
+/**
+ * Chance per unit of severity that a storm damages a live span in its area: aerial (round 4: 0.06 -> 0.07; ~0.06 outages a span-year).
+ * Round 4c/4d tuning: 0.07 -> 0.04, as STORM_EXPOSURE_CANOPY concentrates the damage on tree-lined streets: open aerial
+ * streets now see fewer outages, tree-lined ones several times more, and repairs stay a few percent of revenue ...
+ */
+export const STORM_AERIAL_DAMAGE_CHANCE = 0.04;
 /** ... and underground (washouts; rare). */
 export const STORM_UNDERGROUND_DAMAGE_CHANCE = 0.002;
 /** Dig-ins a year per mile (5,280 ft) of live underground cable. */
@@ -554,7 +566,8 @@ export const OUTAGE_DAYS_UNDERGROUND_MAX = 12;
  */
 export const REPAIR_BASE_AERIAL = 1_200;
 export const REPAIR_PER_FT_AERIAL = 1;
-export const REPAIR_BASE_UNDERGROUND = 4_000;
+/** Round 4c/4d tuning: 4,000 -> 3,000, so a dig-in on buried plant does not cost as much as the storms burying saves (spec D: burying exposed streets pays back). */
+export const REPAIR_BASE_UNDERGROUND = 3_000;
 export const REPAIR_PER_FT_UNDERGROUND = 1;
 /**
  * Extra churn for a subscribed unit one outage cut off d days (its own days
@@ -672,8 +685,12 @@ export const DEMAND_RESERVATION_SOFTNESS = 0.15;
  * promo has run in an area, the next one there needs the area's take rate
  * this many points (a fraction) above the one that started the last
  * (IncumbentPromo.triggerTakePct), so a mature area never cycles forever.
+ * Round 4c/4d tuning: 0.05 -> 0.07. Happy customers' word of mouth keeps an
+ * area growing past where round 4b's settled, so a mature area needs a
+ * larger step before the next promo (the target: at most two per area in
+ * five years).
  */
-export const INCUMBENT_PROMO_RETRIGGER_POINTS = 0.05;
+export const INCUMBENT_PROMO_RETRIGGER_POINTS = 0.07;
 /**
  * answerIncumbent: whole percent off the list price for the area's
  * subscribers until the promo ends. Round 4b tuning: 15 -> 12, with
@@ -698,9 +715,13 @@ export const RETENTION_STEP_SHARE = 1;
  * realized). It pays in a mature town too: the boost speeds every street's
  * gap alike, and churn keeps a mature town's gap about as large per signup as
  * a fresh one's; no value of it, PROMO_HORIZON_MONTHS or PROMO_QUOTE_MONTHS
- * separates the two (DESIGN.md, "What round 4b could not reach").
+ * separates the two (DESIGN.md, "What round 4b could not reach"). Round 4c
+ * made the boost act on young streets only (PROMO_BOOST_YOUNG_MONTHS), which
+ * separates them. Round 4c/4d tuning: 2 -> 2.5, so the promo still pays
+ * against the slower switching (SWITCH_BASE_PER_DAY) in a freshly lit area,
+ * quoted and realized.
  */
-export const PROMO_SIGNUP_BOOST = 2;
+export const PROMO_SIGNUP_BOOST = 2.5;
 /** sales.quotePromo: months its estimate looks ahead. */
 export const PROMO_QUOTE_MONTHS = 12;
 
@@ -776,16 +797,24 @@ export const BUILD_METHOD_HORIZON_YEARS = 12;
  * The part of the monthly overhead that does not grow with the business:
  * office, billing system, insurance, the founders' pay. Replaces the flat
  * OVERHEAD_PER_MONTH (round 4b's $9,000, which a small network could never
- * cover: DESIGN.md "What round 4b could not reach").
+ * cover: DESIGN.md "What round 4b could not reach"). Round 4c/4d tuning:
+ * the integrator's 2,000 -> 2,500 with the per-customer cost below, which
+ * puts the Seed round's first positive month at about 12-13 (spec A's 12-15)
+ * while Shoestring stays winnable.
  */
-export const OVERHEAD_BASE_PER_MONTH = 2_000;
+export const OVERHEAD_BASE_PER_MONTH = 2_500;
 /**
  * Per subscribed unit per month, besides support (billing, network
  * operations, customer accounts). The month's per-customer line is
  * (this + the support level's SUPPORT_LEVELS cost) x subscriber-days / days
- * in the month.
+ * in the month. Round 4c/4d tuning: 2 -> 8. A customer's running cost is
+ * what makes a cheaper lineup a real trade-off: at $2 (with Good support's
+ * $4) a lineup 17% below the defaults earned nearly as much per customer and
+ * signed many more, so it dominated on 5-year value; at $8 neither
+ * dominates (spec I.7). It also slows the Seed round's break-even toward
+ * spec A's band now that the base is small.
  */
-export const OVERHEAD_PER_CUSTOMER_PER_MONTH = 2;
+export const OVERHEAD_PER_CUSTOMER_PER_MONTH = 8;
 /** Per live cabinet per month (power, cooling, inspections, truck rolls): part of the per-plant line. */
 export const OVERHEAD_PER_CABINET_PER_MONTH = 200;
 /** Per route-mile (5,280 ft) of live cable per month (locates, patrols, plant records): the rest of the per-plant line. */
@@ -804,11 +833,17 @@ export interface SupportLevelSpec {
   happiness: number;
 }
 
-/** Basic / Good (default, round 4b's $4) / Great. */
+/**
+ * Basic / Good (default, round 4b's $4) / Great. Round 4c/4d tuning: Great
+ * $7 / +0.3 -> $6 / +0.6, so Great pays where outages keep customers
+ * unhappy (high exposure, long horizons) and not where they are rare (spec
+ * I.7); at +0.3 it never lifted a customer out of an outage's unhappiness
+ * and never paid.
+ */
 export const SUPPORT_LEVELS: Readonly<Record<SupportLevel, SupportLevelSpec>> = {
   basic: { id: 'basic', name: 'Basic', costPerSub: 2, happiness: -0.4 },
   good: { id: 'good', name: 'Good', costPerSub: 4, happiness: 0 },
-  great: { id: 'great', name: 'Great', costPerSub: 7, happiness: 0.3 },
+  great: { id: 'great', name: 'Great', costPerSub: 6, happiness: 0.6 },
 };
 /** The support level a new game (and every older save) starts with. */
 export const DEFAULT_SUPPORT_LEVEL: SupportLevel = 'good';
@@ -819,9 +854,12 @@ export const DEFAULT_SUPPORT_LEVEL: SupportLevel = 'good';
  * Daily share of a lit street's aware households inside its target (the
  * gap) that switch, at the default lineup's deal (dealFactor 1), before word
  * of mouth, campaigns and the intro promo. Round 4b's ramp was 1/550 x (1 +
- * marketing boost) on the whole gap.
+ * marketing boost) on the whole gap. Round 4c/4d tuning: 1/450 -> 1/525:
+ * with happy customers' word of mouth (HAPPY_SCORE_MIN) streets filled too
+ * fast (the Seed round broke even around month 10 and passed ~70% of the
+ * town); at 1/525 SMART's areas lit 3-5 years sit at 40-55% take.
  */
-export const SWITCH_BASE_PER_DAY = 1 / 450;
+export const SWITCH_BASE_PER_DAY = 1 / 525;
 /**
  * dealFactor = clamp(1 + SWITCH_PER_ADVANTAGE x (deal advantage - the
  * default lineup's), SWITCH_DEAL_MIN, SWITCH_DEAL_MAX): every 0.1 of
@@ -854,8 +892,12 @@ export const AWARENESS_WOM_PER_DAY = 1 / 90;
 
 // Neighborhood campaigns (customers.ts) -------------------------------------------
 
-/** A campaign costs this per lit unit not signed up in the cabinet's area when bought ... */
-export const CAMPAIGN_COST_PER_UNIT = 12;
+/**
+ * A campaign costs this per lit unit not signed up in the cabinet's area when bought ... Round 4c/4d tuning: 12 -> 20 with
+ * CAMPAIGN_SWITCH_BOOST 0.5 -> 1: a campaign pays in a freshly lit area (many unaware homes it reaches) and not in a
+ * well-signed one (its few unsigned homes mostly not worth switching), quoted and realized (spec I.7).
+ */
+export const CAMPAIGN_COST_PER_UNIT = 20;
 /** ... and at least this. */
 export const CAMPAIGN_COST_MIN = 500;
 /** Daily awareness gain in the area at full strength (a += (1 - a) x this x strength). */
@@ -864,8 +906,8 @@ export const CAMPAIGN_AWARENESS_PER_DAY = 1 / 25;
 export const CAMPAIGN_DAYS = 61;
 /** ... then fading linearly to nothing over this many days (NeighborhoodCampaign.endDay = start + both). */
 export const CAMPAIGN_FADE_DAYS = 61;
-/** Switching in the area speeds up by this x the campaign's strength (door-to-door sales). */
-export const CAMPAIGN_SWITCH_BOOST = 0.5;
+/** Switching in the area speeds up by this x the campaign's strength (door-to-door sales). Round 4c/4d tuning: 0.5 -> 1 (see CAMPAIGN_COST_PER_UNIT). */
+export const CAMPAIGN_SWITCH_BOOST = 1;
 /** No new campaign in an area until this many days after the last one there ended (NeighborhoodCampaign.cooldownUntil). */
 export const CAMPAIGN_COOLDOWN_DAYS = 120;
 
@@ -883,15 +925,21 @@ export const REFERRAL_WOM_MULTIPLIER = 2;
  * on Good support at the default prices with no recent trouble); its
  * regular churn is CHURN_MONTHLY_BASE x clamp(1 - score, HAPPY_CHURN_FLOOR,
  * CHURN_MONTHLY_MAX / CHURN_MONTHLY_BASE). Happy from HAPPY_SCORE_MIN up,
- * unhappy at UNHAPPY_SCORE_MAX or below, okay between.
+ * unhappy at UNHAPPY_SCORE_MAX or below, okay between. Round 4c/4d tuning:
+ * HAPPY_SCORE_MIN 0.2 -> -0.2, so a customer on Good support at the default
+ * prices with no recent trouble (score 0) is happy: at 0.2 nobody was happy
+ * without Great support, word of mouth and referral credits did nothing,
+ * and a lineup below the market (the good-deal bonus) was the only way to
+ * make customers happy.
  */
-export const HAPPY_SCORE_MIN = 0.2;
+export const HAPPY_SCORE_MIN = -0.2;
 export const UNHAPPY_SCORE_MAX = -0.5;
-/** The happiest customers still churn at this share of CHURN_MONTHLY_BASE. */
-export const HAPPY_CHURN_FLOOR = 0.5;
+/** The happiest customers still churn at this share of CHURN_MONTHLY_BASE. Round 4c/4d tuning: 0.5 -> 0.7, so Great support and a cheap lineup cannot halve churn (a cheaper lineup dominated). */
+export const HAPPY_CHURN_FLOOR = 0.7;
 /** Score lost per day without service in the recent past (outages within HAPPINESS_OUTAGE_MEMORY_DAYS of the last). */
 export const HAPPINESS_PER_OUTAGE_DAY = 0.1;
-export const HAPPINESS_OUTAGE_MEMORY_DAYS = 90;
+/** Round 4c/4d tuning: 90 -> 180, so outages weigh on happiness long enough for support to matter where storms are frequent. */
+export const HAPPINESS_OUTAGE_MEMORY_DAYS = 180;
 /**
  * Score lost per share paid above the market's price for the tier
  * (TIER_DEFAULTS; a business: x SMB_MULTIPLIER_DEFAULT). Round 4b's
@@ -932,8 +980,12 @@ export const HAPPINESS_PER_PRICE_OVER_CABLE =
   CHURN_MONTHLY_BASE > 0 && CABLE_PROMO_SHARE - HAPPINESS_CABLE_PREMIUM_TOLERATED > 0
     ? INCUMBENT_PROMO_CHURN / CHURN_MONTHLY_BASE / (CABLE_PROMO_SHARE - HAPPINESS_CABLE_PREMIUM_TOLERATED)
     : 0;
-/** Score gained per share paid below the market's price for the tier (a good deal), at most HAPPINESS_GOOD_DEAL_MAX. */
-export const HAPPINESS_PER_PRICE_UNDER_MARKET = 2;
+/**
+ * Score gained per share paid below the market's price for the tier (a good deal), at most HAPPINESS_GOOD_DEAL_MAX.
+ * Round 4c/4d tuning: 2 -> 0.25. At 2 a lineup 17% below the defaults made every customer much happier (lower churn,
+ * stronger word of mouth) on top of faster switching, and dominated; a cheaper lineup now pays mostly through switching.
+ */
+export const HAPPINESS_PER_PRICE_UNDER_MARKET = 0.25;
 export const HAPPINESS_GOOD_DEAL_MAX = 0.4;
 /** Score lost for a price step-up (a lock ending with a rise, a move to a dearer tier) within the last HAPPINESS_PRICE_STEP_MEMORY_DAYS. */
 export const HAPPINESS_PRICE_STEP = 0.5;
@@ -961,17 +1013,22 @@ export const PROMO_BOOST_YOUNG_MONTHS = 12;
  * residential street fully under mature trees takes this many times more
  * storm damage on aerial cable than an open one (falling limbs are most of a
  * storm's damage to aerial plant). Underground cable is hit by its own small
- * chance times the same exposure.
+ * chance times the same exposure. Round 4c/4d tuning: 6 -> 8 (with
+ * STORM_AERIAL_DAMAGE_CHANCE 0.07 -> 0.04): tree-lined aerial streets cost
+ * enough in storms that burying them pays back, while open ones see fewer
+ * outages and stay aerial (spec D).
  */
-export const STORM_EXPOSURE_CANOPY = 6;
+export const STORM_EXPOSURE_CANOPY = 8;
 /** Zones whose streets count their canopy (residential: old neighborhoods with street trees; rural streets count their woods through STORM_EXPOSURE_WOODED instead). */
 export const STORM_CANOPY_ZONE: Readonly<Record<Zone, number>> = { downtown: 0, residential: 1, industrial: 0, rural: 0 };
 /**
  * Round 4c/4d (spec D): an aerial repair under canopy costs 1 + this x the
  * street's canopy times the usual (a tree crew clears the fallen limbs and
- * more cable is replaced).
+ * more cable is replaced). Round 4c/4d tuning: 1 -> 2, so SMART's mix
+ * beats all-aerial on 5-year value: all-aerial strings the tree-lined
+ * streets SMART buries.
  */
-export const REPAIR_CANOPY_SHARE = 1;
+export const REPAIR_CANOPY_SHARE = 2;
 /**
  * ... and its days out are drawn from OUTAGE_DAYS_AERIAL_MIN + round(this x
  * canopy) (at most OUTAGE_DAYS_AERIAL_MAX) to OUTAGE_DAYS_AERIAL_MAX instead
@@ -987,9 +1044,13 @@ export const OUTAGE_DAYS_CANOPY = 3;
  * four dollars of value at month 60 for one up front: DESIGN.md "What round
  * 4b could not reach"). Over BUILD_METHOD_HORIZON_YEARS of running costs,
  * burying is chosen when what it saves a year pays its extra cost back
- * within BUILD_METHOD_HORIZON_YEARS / this years.
+ * within BUILD_METHOD_HORIZON_YEARS / this years. Round 4c/4d tuning: 3 ->
+ * 1.5: at 3 the choice strung tree-lined residential streets aerial whose
+ * storms then cost more than the bore (SMART's mix lost to all-underground
+ * on a tuning town); at 1.5 they are buried (payback within 8 years) and
+ * open blocks stay aerial.
  */
-export const METHOD_UPFRONT_WEIGHT = 3;
+export const METHOD_UPFRONT_WEIGHT = 1.5;
 /**
  * Months of a customer's margin (its price less the per-customer overhead)
  * the method choice counts for each cancellation an outage causes: its

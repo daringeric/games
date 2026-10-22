@@ -2062,11 +2062,15 @@ describe('the intro promo speeds signups up', () => {
   }
 
   /**
-   * The deepest one-month offer whose discount does not make its customers happy (a good deal of at least
-   * HAPPY_SCORE_MIN would add word of mouth, measured in customers.test.ts), so only the boost and the deal show.
+   * A one-month offer whose discount does not move its customers to another happiness bucket than the list
+   * price's (word of mouth, measured in customers.test.ts, would then differ between the races), so only the
+   * boost and the deal show: the deepest one short of HAPPY_SCORE_MIN when a customer at the list price
+   * (score 0) is not happy, else (round 4c/4d tuning: HAPPY_SCORE_MIN <= 0, both are happy) a 30% one, deep
+   * enough that its boost stands clear of the little a one-month offer adds to the deal.
    */
   function unhappyOffer(): IntroPromo {
-    const percentOff = Math.min(PROMO_MAX_PERCENT_OFF, Math.ceil((100 * HAPPY_SCORE_MIN) / HAPPINESS_PER_PRICE_UNDER_MARKET) - 1);
+    const percentOff =
+      HAPPY_SCORE_MIN > 0 ? Math.min(PROMO_MAX_PERCENT_OFF, Math.ceil((100 * HAPPY_SCORE_MIN) / HAPPINESS_PER_PRICE_UNDER_MARKET) - 1) : Math.min(PROMO_MAX_PERCENT_OFF, 30);
     expect(percentOff).toBeGreaterThan(0);
     return { percentOff, months: 1 };
   }
