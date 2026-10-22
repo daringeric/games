@@ -142,6 +142,7 @@ import {
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
   UNDERGROUND_FT_PER_DAY,
+  UNDERWRITING_MIN_MARGIN,
 } from '../balance';
 import { coveragePreview, segmentsWithinReach } from '../coverage';
 import {
@@ -369,6 +370,15 @@ export interface SmartOptions {
   stormWeight: number;
   /** Years of expected repairs on its plant (expectedRepairsPerYear) kept in the reserve: a bad storm is not a missed payment. */
   stormReserveYears: number;
+  /**
+   * Round 4c/4d: its loan and line buffers are judged with the annual
+   * operating cash flow less this many years of expected repairs on its plant
+   * (stormStressed): the covenants count a storm's repairs at their
+   * trailing-year total, so a network borrowed to the edge of its buffer
+   * breaches on the first bad storm (spec D made tree-lined aerial streets
+   * costly in storms).
+   */
+  stormCovenantYears: number;
   /** Rebuild storm-hit aerial spans underground when it pays back (round 4). */
   convert: boolean;
   /** Storm hits (in the weather log) that make an aerial span worth a look. */
@@ -474,6 +484,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   buryGain: 0,
   stormWeight: 1,
   stormReserveYears: 2,
+  stormCovenantYears: 0,
   convert: true,
   convertHits: 2,
   convertPaybackYears: 10,
@@ -1277,6 +1288,27 @@ export function withinBuffer(m: CovenantMetrics, leverageShare: number, coverage
   return true;
 }
 
+/**
+ * Round 4c/4d: `m` with `cushion` a year less operating cash flow (a storm
+ * year on top of the trailing one): the lender's cash flow max(annual
+ * operating cash flow - cushion, ARR x UNDERWRITING_MIN_MARGIN), and leverage
+ * and coverage from it as covenantMetrics rounds them.
+ */
+export function stormStressed(m: CovenantMetrics, cushion: number): CovenantMetrics {
+  if (!(cushion > 0)) return m;
+  const ocf = m.annualOperatingCashFlow - cushion;
+  const cash = Math.max(ocf, m.arr * UNDERWRITING_MIN_MARGIN);
+  const hundredth = (x: number) => Math.round(x * 100) / 100;
+  const leverage = m.totalDebt === 0 ? 0 : cash > 0 ? hundredth(m.totalDebt / cash) : null;
+  const coverage = m.annualDebtService === 0 ? null : hundredth(cash / m.annualDebtService);
+  return { ...m, annualOperatingCashFlow: ocf, underwritingCashFlow: cash, leverage, coverage };
+}
+
+/** The storm cushion SMART's buffers count (SmartOptions.stormCovenantYears of expectedRepairsPerYear). */
+function stormCushion(state: GameState, opts: SmartOptions): number {
+  return opts.stormCovenantYears > 0 ? opts.stormCovenantYears * expectedRepairsPerYear(state) : 0;
+}
+
 /** Largest multiple of `step` in [0, max] for which `ok` holds (`ok` true at 0 and monotone: once false, false above). */
 function largestOk(max: number, step: number, ok: (amount: number) => boolean): number {
   let lo = 0;
@@ -1307,9 +1339,10 @@ export function lineRoom(state: GameState, opts: SmartOptions): number {
   const offer = creditOffer(state);
   if (offer.available <= 0) return 0;
   const bps = offer.rate.effectiveRateBps;
+  const cushion = stormCushion(state, opts);
   return largestOk(offer.available, LOAN_ROUNDING, (amount) =>
     withinBuffer(
-      covenantMetrics(state, { addDebt: amount, addAnnualDebtService: Math.round((amount * bps) / 10_000) }),
+      stormStressed(covenantMetrics(state, { addDebt: amount, addAnnualDebtService: Math.round((amount * bps) / 10_000) }), cushion),
       opts.lineLeverageShare,
       opts.lineCoverageMultiple,
     ),
@@ -1328,10 +1361,11 @@ export function safeTermLoan(state: GameState, opts: SmartOptions): number {
   if (state.debt.covenant.stage !== 'compliant') return 0;
   const safe = maxSafeTermLoan(state, opts.termYears);
   if (safe < min) return 0;
+  const cushion = stormCushion(state, opts);
   const amount = largestOk(safe, LOAN_ROUNDING, (a) => {
     if (a < TERM_LOAN_MIN) return true;
     const quote = quoteTermLoan(state, a, opts.termYears);
-    return quote.ok && !quote.breachesCovenant && withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple);
+    return quote.ok && !quote.breachesCovenant && withinBuffer(stormStressed(quote.after, cushion), opts.loanLeverageShare, opts.loanCoverageMultiple);
   });
   return amount >= min ? amount : 0;
 }
@@ -1379,7 +1413,8 @@ function manageCredit(state: GameState, send: Send, opts: SmartOptions): void {
     state.debt.covenant.stage !== 'compliant' ||
     !withinBuffer(covenantMetrics(state), opts.lineLeverageShare, opts.lineCoverageMultiple);
   if (balance > 0) {
-    const keep = atRisk ? fixedCosts(state) + nextService : smartReserve(state, opts, nextService) + nextService;
+    // Round 4c/4d: with a covenant at risk it still keeps a storm's repairs in hand (cashFloor's storm term).
+    const keep = atRisk ? fixedCosts(state) + nextService + opts.floorStormYears * expectedRepairsPerYear(state) : smartReserve(state, opts, nextService) + nextService;
     const repay = Math.min(balance, Math.floor(cash - keep));
     if (repay >= 1) {
       send({ type: 'repayCredit', amount: repay });
@@ -1455,7 +1490,7 @@ function borrowFor(state: GameState, send: Send, opts: SmartOptions, project: Pr
   const amount = Math.min(room, Math.max(opts.minLoan, TERM_LOAN_MIN, Math.ceil(need / opts.loanStep) * opts.loanStep));
   if (amount < need) return false;
   const quote = quoteTermLoan(state, amount, opts.termYears);
-  if (!quote.ok || quote.breachesCovenant || !withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple)) return false;
+  if (!quote.ok || quote.breachesCovenant || !withinBuffer(stormStressed(quote.after, stormCushion(state, opts)), opts.loanLeverageShare, opts.loanCoverageMultiple)) return false;
   return send({ type: 'takeTermLoan', amount, termYears: opts.termYears }).ok;
 }
 
@@ -1748,6 +1783,7 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
  */
 export const LEAN_OPTIONS: Partial<SmartOptions> = {
   troughCheck: true,
+  stormCovenantYears: 1,
   burnMonths: 2,
   installDays: 180,
   stormWeight: 1,
@@ -2359,6 +2395,28 @@ function copyState(state: GameState): GameState {
 }
 
 /**
+ * Round 4c/4d: replicates a lever experiment averages over. Two runs that
+ * differ by one decision drift apart through the sales stream's draws (who
+ * signs up and who cancels when), by more than many levers are worth over a
+ * year or three; averaging over replicates that share their draws arm by arm
+ * (common random numbers) measures the decision's expected worth in that
+ * situation instead of one roll of the dice.
+ */
+export const EXPERIMENT_REPLICATES = 3;
+
+/**
+ * Test-only state edit: a copy of `state` for replicate `r` of an
+ * experiment: replicate 0 as it stands, replicate r > 0 with its sales stream
+ * (signups, tier choice, churn) re-seeded from r. The weather stream is kept,
+ * so every replicate meets the same storms (the situation under test).
+ */
+export function replicateState(state: GameState, r: number): GameState {
+  const copy = copyState(state);
+  if (r > 0) copy.rng.sales = (copy.rng.sales ^ Math.imul(r, 0x9e3779b9)) >>> 0;
+  return copy;
+}
+
+/**
  * Test-only state edit: an incumbent promo at the cabinet area with the most
  * passings among those with customers (round 4c/4d: the incumbent answers a
  * take rate, so a promo where nobody has signed up yet tests nothing; any
@@ -2854,11 +2912,11 @@ export const SUPPORT_SHORT_MONTHS = CUSTOMER_QUOTE_MONTHS;
 export const SUPPORT_LONG_MONTHS = 36;
 
 export interface SupportCase {
-  /** Cumulative operating cash flow less installs over the horizon, by level. */
+  /** Cumulative operating cash flow less installs over the horizon, by level (mean over EXPERIMENT_REPLICATES). */
   value: Record<SupportLevel, number>;
-  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level. */
+  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level (mean over the replicates). */
   worth: Record<SupportLevel, number>;
-  /** Subscribers at the end, by level. */
+  /** Subscribers at the end, by level (mean over the replicates). */
   subscribers: Record<SupportLevel, number>;
   /** quoteSupport('great') at the start. */
   greatQuote: SupportQuote;
@@ -2874,10 +2932,15 @@ function supportCase(seed: number, start: GameState, months: number): SupportCas
   const worth = {} as Record<SupportLevel, number>;
   const subscribers = {} as Record<SupportLevel, number>;
   for (const level of SUPPORT_LEVEL_IDS) {
-    const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: copyState(start) });
-    value[level] = operatingLessInstalls(run);
-    worth[level] = runValue(run);
-    subscribers[level] = run.reports.at(-1)?.stats?.subscribers ?? 0;
+    value[level] = 0;
+    worth[level] = 0;
+    subscribers[level] = 0;
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: replicateState(start, r) });
+      value[level] += operatingLessInstalls(run) / EXPERIMENT_REPLICATES;
+      worth[level] += runValue(run) / EXPERIMENT_REPLICATES;
+      subscribers[level] += (run.reports.at(-1)?.stats?.subscribers ?? 0) / EXPERIMENT_REPLICATES;
+    }
   }
   return { value, worth, subscribers, greatQuote: quoteSupport(start, 'great') };
 }
@@ -2888,7 +2951,8 @@ function supportCase(seed: number, start: GameState, months: number): SupportCas
  * all-underground one (low), each over SUPPORT_SHORT_MONTHS and
  * SUPPORT_LONG_MONTHS, SMART operating its network (no new areas), valued by
  * operating cash flow less installs (operatingLessInstalls: a cancellation
- * refilled costs a new install).
+ * refilled costs a new install), each the mean over EXPERIMENT_REPLICATES
+ * (replicateState: the same storms, the sales stream re-seeded).
  */
 export function supportExperiment(seed: number): SupportExperiment {
   const high = runBot(seed, allAerialBot(), SUPPORT_EXPERIMENT_MONTH).state;
@@ -2966,13 +3030,17 @@ export function referralExperiment(seed: number): ReferralExperiment {
 export const SWITCHING_EXPERIMENT_MONTH = 12;
 /** ... and plays the network it has this long under each lineup. */
 export const SWITCHING_EXPERIMENT_MONTHS = 48;
-/** An area "reaches the ceiling" once its take rate is this share of its ceiling (AreaCurve.ceiling). */
+/** Areas "reach the ceiling" once their take rate is this share of the ceiling at the default prices (AreaCurve.ceiling of the standard arm). */
 export const CEILING_SHARE = 0.9;
 
 export interface SwitchingArm {
-  /** Pooled over the areas lit at the start: whole months until their take rate reached CEILING_SHARE of their ceiling (null: not within the run). */
+  /**
+   * Pooled over the areas lit at the start: whole months until their take
+   * rate reached CEILING_SHARE of the ceiling at the default prices (the
+   * standard arm's `ceiling`; null: not within the run).
+   */
   monthsToCeiling: number | null;
-  /** Their ceiling take rate and their take rate at the end. */
+  /** Their ceiling take rate under this arm's prices and their take rate at the end. */
   ceiling: number;
   take: number;
   /** Their take rate at each close of the run. */
@@ -2999,47 +3067,57 @@ export interface SwitchingExperiment {
  * DISCOUNT_PRICE_MULTIPLIER of them and at OVERPRICED_PRICE_MULTIPLIER (set
  * on the first day, the default grandfathering for a rise), measured on the
  * areas lit at the start (their pooled take rate against their pooled
- * ceiling: harness.areaCurves).
+ * ceiling: harness.areaCurves), each figure the mean over
+ * EXPERIMENT_REPLICATES (replicateState). "Reaching the ceiling" is reaching
+ * CEILING_SHARE of the ceiling at the default prices (spec I.1: the
+ * realistic ceiling, ~45-55% of homes at the default prices, which a better
+ * deal reaches sooner); each arm's own ceiling (its target take rate at its
+ * prices) is reported beside it. Churn keeps an area's take below its own
+ * target: a lineup's areas settle where switching into the gap balances the
+ * cancellations out of it.
  */
 export function switchingExperiment(seed: number): SwitchingExperiment {
   const start = runBot(seed, smartBot(), SWITCHING_EXPERIMENT_MONTH).state;
   const service = getService(start);
   const cabinets = start.network.cabinets.filter((c) => c.liveDay !== null && (service.cabinetCoverage.get(c.id)?.passings ?? 0) > 0).map((c) => c.id);
-  const arm = (multiplier: number): SwitchingArm => {
-    const inner = smartBot(OPERATOR_OPTIONS);
-    const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
-    const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: copyState(start) });
-    const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
-    let target = 0;
-    let passings = 0;
-    for (const c of curves) {
-      target += c.ceiling * c.passings;
-      passings += c.passings;
-    }
-    const ceiling = passings > 0 ? target / passings : 0;
-    const takes = run.reports.map((report) => {
-      let units = 0;
-      let homes = 0;
-      for (const area of report.customers?.areas ?? []) {
-        if (!cabinets.includes(area.cabinet)) continue;
-        units += area.units;
-        homes += area.passings;
+  const arm = (multiplier: number, reference: number | null): SwitchingArm => {
+    let ceiling = 0;
+    let arpu = 0;
+    let revenuePerHome = 0;
+    let ocf = 0;
+    const takes: number[] = new Array<number>(SWITCHING_EXPERIMENT_MONTHS).fill(0);
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const inner = smartBot(OPERATOR_OPTIONS);
+      const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
+      const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: replicateState(start, r) });
+      const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
+      let target = 0;
+      let passings = 0;
+      for (const c of curves) {
+        target += c.ceiling * c.passings;
+        passings += c.passings;
       }
-      return homes > 0 ? units / homes : 0;
-    });
-    const reached = takes.findIndex((t) => t >= CEILING_SHARE * ceiling);
-    let revenue = 0;
-    for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
-    const lastPassings = run.reports.at(-1)?.passings ?? 0;
-    return {
-      monthsToCeiling: reached < 0 ? null : reached + 1,
-      ceiling,
-      take: takes.at(-1) ?? 0,
-      takes,
-      arpu: averageArpu(run) ?? 0,
-      revenuePerHome: lastPassings > 0 ? revenue / lastPassings : 0,
-      ocf: cumulativeOperatingCashFlow(run),
-    };
+      ceiling += (passings > 0 ? target / passings : 0) / EXPERIMENT_REPLICATES;
+      run.reports.forEach((report, i) => {
+        let units = 0;
+        let homes = 0;
+        for (const area of report.customers?.areas ?? []) {
+          if (!cabinets.includes(area.cabinet)) continue;
+          units += area.units;
+          homes += area.passings;
+        }
+        takes[i] = (takes[i] ?? 0) + (homes > 0 ? units / homes : 0) / EXPERIMENT_REPLICATES;
+      });
+      let revenue = 0;
+      for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
+      const lastPassings = run.reports.at(-1)?.passings ?? 0;
+      arpu += (averageArpu(run) ?? 0) / EXPERIMENT_REPLICATES;
+      revenuePerHome += (lastPassings > 0 ? revenue / lastPassings : 0) / EXPERIMENT_REPLICATES;
+      ocf += cumulativeOperatingCashFlow(run) / EXPERIMENT_REPLICATES;
+    }
+    const reached = takes.findIndex((t) => t >= CEILING_SHARE * (reference ?? ceiling));
+    return { monthsToCeiling: reached < 0 ? null : reached + 1, ceiling, take: takes.at(-1) ?? 0, takes, arpu, revenuePerHome, ocf };
   };
-  return { cabinets, standard: arm(1), discount: arm(DISCOUNT_PRICE_MULTIPLIER), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER) };
+  const standard = arm(1, null);
+  return { cabinets, standard, discount: arm(DISCOUNT_PRICE_MULTIPLIER, standard.ceiling), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER, standard.ceiling) };
 }

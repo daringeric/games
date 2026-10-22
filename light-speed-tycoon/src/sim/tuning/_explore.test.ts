@@ -163,6 +163,11 @@ describe.runIf(ENABLED && MODE !== 'runs')('experiments', () => {
           out = Object.fromEntries((['standard', 'discount', 'overpriced'] as const).map((k) => [k, { m: e[k].monthsToCeiling, ceil: e[k].ceiling, take: e[k].take, t12: e[k].takes[11], t24: e[k].takes[23], arpu: e[k].arpu, rph: e[k].revenuePerHome, ocf: e[k].ocf }]));
           break;
         }
+        case 'switch2': {
+          const e = Bots.switchingExperiment(seed);
+          out = Object.fromEntries((['standard', 'discount', 'overpriced'] as const).map((k) => [k, { m: e[k].monthsToCeiling, ceil: e[k].ceiling, takes: e[k].takes.filter((_, i) => i % 3 === 2).map((t) => Math.round(t * 1000) / 10), ocf: e[k].ocf }]));
+          break;
+        }
         case 'mature':
           out = Bots.maturePromoExperiment(seed);
           break;

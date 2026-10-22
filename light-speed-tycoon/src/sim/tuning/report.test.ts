@@ -459,7 +459,7 @@ describe('balance report', () => {
       out.push(
         `\n=== round 4c/4d: difficulty levels (SMART, ADVISOR_FOLLOWER, SMART-lite; CASUAL 36 months at Seed round and Angel-backed)`,
         table(levels),
-        `\n=== round 4c/4d: customers (targets: take on areas lit 3-5 years 40-55%; DISCOUNT x${DISCOUNT_PRICE_MULTIPLIER} reaches ${pct(CEILING_SHARE, 0)} of its ceiling >= 12 months sooner at a lower ARPU, ` +
+        `\n=== round 4c/4d: customers (targets: take on areas lit 3-5 years 40-55%; DISCOUNT x${DISCOUNT_PRICE_MULTIPLIER} reaches ${pct(CEILING_SHARE, 0)} of the default lineup's ceiling >= 12 months sooner at a lower ARPU, ` +
           `OVERPRICED x${OVERPRICED_PRICE_MULTIPLIER} clearly slower; campaigns pay fresh, not signed; Great pays high/long, not low/short; Basic loses customers; ` +
           `referrals pay with many happy customers, not with few; forecast quoted/realized within 20%)`,
         table(customers),

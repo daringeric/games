@@ -45,7 +45,7 @@ const MOST_SEEDS = 4;
 /** SMART's take rate at month 60 on the areas lit 3 to 5 years (spec I.7: 40-55%), every seed. */
 const TAKE_LIT_3_TO_5: [number, number] = [0.4, 0.55];
 const LIT_MONTHS: [number, number] = [36, 60];
-/** DISCOUNT reaches CEILING_SHARE of its ceiling at least this many months before the default lineup (switching experiment), on most seeds. */
+/** DISCOUNT reaches CEILING_SHARE of the ceiling at the default prices at least this many months before the default lineup does (switching experiment), on most seeds. */
 const SOONER_MONTHS = 12;
 /** OVERPRICED's take rate two years in is at most this share of the default lineup's (switching experiment), every seed. */
 const OVERPRICED_TAKE_MAX = 0.75;
