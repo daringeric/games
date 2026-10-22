@@ -157,8 +157,10 @@ export function openSheet(opts: SheetOptions): Sheet {
     dialog,
     body,
     actions,
+    // dialog.open turns false the moment the dialog closes (Esc, close()),
+    // while the 'close' event that clears `open` arrives a task later.
     get isOpen() {
-      return open;
+      return open && dialog.open;
     },
     close,
   };
