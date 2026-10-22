@@ -1,5 +1,6 @@
 // The economy UI end to end: subscribers in the HUD and report (round 4c/4d:
-// the overhead and its base / per-customer / plant lines), insolvency and game
+// the report panel as a small month summary, and the overhead's base /
+// per-customer / plant lines in the full books it opens), insolvency and game
 // over, milestones, the rate card (round 4c/4d: running costs that grow with
 // the company), importing a schemaVersion 1 save, and the debug-hook gate. (Round 4b: the pricing panel's tests moved to
 // pricing.spec.ts.)
@@ -13,8 +14,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
 import type { Page } from '@playwright/test';
+import { briefingMoney } from '../src/sim/advisor';
 import { CABINET_START_SPLITTERS, INSOLVENCY_GRACE_MONTHS, OLT_START_PON_PORTS } from '../src/sim/balance';
 import { defaultCompanyName } from '../src/sim/company';
+import type { MonthlyReport } from '../src/sim/types';
+import { formatMonthLong } from '../src/ui/format';
 import { open, routeFromCo, startCompany, startScreen, watchErrors } from './helpers';
 
 const closes = (n: number) => `${n} close${n === 1 ? '' : 's'}`;
@@ -85,27 +89,58 @@ test('lit homes sign up: subscribers and revenue in the HUD, the report and the 
   await expect.poll(async () => Number((await page.getByTestId('hud-subs').textContent())?.replace(/,/g, ''))).toBeGreaterThan(0);
   await expect(page.getByTestId('hud-mrr')).toHaveText(/^\$[1-9][\d,]*\/mo$/);
 
-  // The report panel shows the last close's revenue and take rate.
+  // The report panel tells the last close in plain words (round 4c/4d: a small month summary).
   const panel = page.getByRole('region', { name: 'Monthly report' });
   const toggle = panel.locator('.panel-toggle');
   if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
-  await expect(panel.locator('.row-revenue dt')).toHaveText('Revenue');
-  await expect(panel.locator('.row-revenue dd')).toHaveText(/^\$[1-9][\d,]*$/);
-  await expect(panel.locator('.stat-takeRate dd')).toHaveText(/^[1-9]\d*%$/);
-  await expect(panel.locator('.stat-subscribers dd')).toHaveText(/^[1-9][\d,]*$/);
+  const last = (await page.evaluate(() => window.__lst!.getState().finance.reports.at(-1)!)) as MonthlyReport;
+  const money = (n: number) => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US')}`;
+  const month = formatMonthLong(last.year, last.month);
+  await expect(panel.locator('.panel-title-text')).toHaveText(month);
+  await expect(panel.locator('.panel-cash')).toHaveText(`Cash went ${last.net < 0 ? 'down' : 'up'} ${money(Math.abs(last.net))} · ${money(last.cashEnd)} left`);
+  // Money in (the month's bills, all of it from customers) and money out, which add up to the cash change.
+  const flows = briefingMoney([last]);
+  expect(flows.in - flows.out).toBe(last.net);
+  expect(flows.in).toBe(last.totals.revenue);
+  await expect(panel.locator('.panel-flow-in .panel-flow-total')).toHaveText(money(flows.in));
+  await expect(panel.locator('.panel-flow-out .panel-flow-total')).toHaveText(money(flows.out));
+  await expect(panel.locator('.panel-bar-in')).toHaveAttribute('aria-label', `Money in ${money(flows.in)}: Customer bills ${money(flows.in)}.`);
+  const inLegend = panel.locator('.panel-flow-in .panel-legend li:not([hidden])');
+  await expect(inLegend).toHaveCount(1);
+  await expect(inLegend).toHaveText(`Customer bills ${money(flows.in)}`);
+  // The customers line: the count, who joined and left, and the take rate in words.
+  const stats = last.stats!;
+  expect(stats.subscribers).toBeGreaterThan(0);
+  await expect(panel.locator('.panel-customers-text')).toHaveText(
+    new RegExp(`^${stats.subscribers} customers?( \\(\\+${stats.grossAdds} joined, ${stats.churned + stats.lostService} left\\))? · ${Math.round((stats.subscribers / last.passings) * 100)}% of homes you pass$`),
+  );
+  await expect(panel.getByRole('button', { name: 'See customers' })).toBeVisible();
+  await expect(panel.locator('.mtd')).toHaveText(/^This month so far: \$[\d,]+ spent$/);
   await expect(panel.getByTestId('mtd-spend')).toHaveText(/^\$[\d,]+$/);
-  // Round 4c/4d: the overhead, and its lines that add up to it.
-  const overhead = await page.evaluate(() => {
-    const last = window.__lst!.getState().finance.reports.at(-1)!;
-    return { total: -(last.totals.overhead ?? 0), lines: last.ops?.overhead ?? null };
-  });
+  // No debt: no bank word. No jargon anywhere in the panel.
+  await expect(panel.getByTestId('panel-bank')).toBeHidden();
+  expect(await panel.innerText()).not.toMatch(/ARPU|CPGA|leverage|coverage|covenant|DSCR|\bARR\b|\bOCF\b|\bbps\b|×/i);
+  // Round 4c/4d: the overhead, and its lines that add up to it, in the full books the panel opens.
+  const overhead = { total: -(last.totals.overhead ?? 0), lines: last.ops?.overhead ?? null };
   expect(overhead.lines).not.toBeNull();
-  const money = (n: number) => `$${n.toLocaleString('en-US')}`;
-  await expect(panel.locator('.row-overhead dd .num')).toHaveText(money(overhead.total));
-  await expect(panel.locator('.row-overheadBase dd .num')).toHaveText(money(overhead.lines!.base));
-  await expect(panel.locator('.row-overheadCustomers dd .num')).toHaveText(money(overhead.lines!.perCustomer));
-  await expect(panel.locator('.row-overheadPlant dd .num')).toHaveText(money(overhead.lines!.perPlant));
+  const booksButton = panel.getByRole('button', { name: 'See the full books' });
+  await booksButton.click();
+  const books = page.getByRole('dialog', { name: `The full books for ${month}` });
+  await expect(books).toBeVisible();
+  const running = books.locator('.briefing-books-group.group-running');
+  await expect(running.locator('.briefing-books-group-head .num')).toHaveText(money(flows.groups.find((g) => g.key === 'running')!.total));
+  await expect(running.locator('.briefing-line[data-key="overheadBase"] dd')).toHaveText(money(overhead.lines!.base));
+  await expect(running.locator('.briefing-line[data-key="overheadCustomers"] dd')).toHaveText(money(overhead.lines!.perCustomer));
+  await expect(running.locator('.briefing-line[data-key="overheadPlant"] dd')).toHaveText(money(overhead.lines!.perPlant));
   expect(overhead.lines!.base + overhead.lines!.perCustomer + overhead.lines!.perPlant).toBe(overhead.total);
+  // The old list's revenue, customers and take rate: the books' bills line and tiles.
+  await expect(books.locator('.briefing-lines-in .briefing-line[data-key="bills"] dd')).toHaveText(money(last.totals.revenue!));
+  await expect(books.locator('.briefing-tile-subscribers .briefing-tile-value')).toHaveText(String(stats.subscribers));
+  await expect(books.locator('.briefing-tile-takeRate .briefing-tile-value')).toHaveText(/^[1-9]\d*%$/);
+  await expect(books.locator('.briefing-figure[data-key="arpu"] dd')).toHaveText(/^\$[\d,]+\/mo$/);
+  await books.locator('.briefing-close').click();
+  await expect(books).toBeHidden();
+  await expect(booksButton).toBeFocused();
 
   // Milestones: first light is dated, the rest say how far there is to go.
   await page.getByRole('button', { name: 'Milestones' }).click();
@@ -235,10 +270,19 @@ test('a schemaVersion 1 save imports and migrates', async ({ page }) => {
   expect(await page.evaluate(() => window.__lst!.getState().company)).toEqual({ name: incoming, difficulty: 'seed' });
   await expect(page.locator('.hud-town')).toHaveText(v1.city.name);
   await expect(page.getByTestId('hud-company')).toHaveText(incoming);
-  // Its reports predate subscribers: their KPIs read "–".
+  // Its reports predate subscribers: the panel has no customers line, but says how the cash moved;
+  // the full books read "–" for the customers.
   const panel = page.getByRole('region', { name: 'Monthly report' });
-  await expect(panel.locator('.stat-subscribers dd')).toHaveText('–');
-  await expect(panel.locator('.stat-net dd')).toHaveText(/^[+-]?\$[\d,]+$/);
+  await expect(panel.locator('.panel-customers')).toBeHidden();
+  await expect(panel.locator('.panel-cash')).toHaveText(/^(Cash went (down|up) \$[\d,]+|Cash stayed the same) · \$[\d,]+ (left|overdrawn)$/);
+  const toggle = panel.locator('.panel-toggle');
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click();
+  await panel.getByRole('button', { name: 'See the full books' }).click();
+  const books = page.locator('dialog.briefing-books-only');
+  await expect(books.locator('.briefing-tile-subscribers .briefing-tile-value')).toHaveText('–');
+  await expect(books.locator('.briefing-tile-net .briefing-tile-value')).toHaveText(/^[+-]?\$[\d,]+$/);
+  await books.locator('.briefing-close').click();
+  await expect(books).toBeHidden();
   expect(errors).toEqual([]);
 });
 

@@ -32,6 +32,7 @@ import {
   STORY_HEADLINE,
   actionPoint,
   attentionLine,
+  booksTitle,
   booksView,
   briefingAtClose,
   briefingDue,
@@ -39,6 +40,7 @@ import {
   briefingSpan,
   briefingTitle,
   cashCard,
+  cashHeadline,
   changeRow,
   condenseNotice,
   cppTargetText,
@@ -62,8 +64,9 @@ import {
   runwayPhrase,
 } from './briefing';
 import type { PreferenceStorage, SummaryView } from './briefing';
-import { formatMoney, formatPercent, formatSignedMoney, plural } from './format';
+import { formatMoney, formatMonthLong, formatPercent, formatRatio, formatSignedMoney, plural } from './format';
 import { HEALTH_TONE, HEALTH_WORD } from './health';
+import { reportRows } from './panel';
 
 /** A grid town fully lit from the CO, run `days` (closed months, subscribers). */
 function litGame(days = 120): GameState {
@@ -462,6 +465,14 @@ describe('the cash card', () => {
   const b = briefingOf(120);
   const card = (cash: Partial<Briefing['cash']>, over: Partial<Briefing> = {}) => cashCard({ ...b, ...over, cash: { ...b.cash, ...cash } });
 
+  it('shares its heading with the report panel: how cash moved and what is left', () => {
+    expect(cashHeadline({ change: -4_479, end: 43_753 })).toEqual({ headline: `Cash went down ${formatMoney(4_479)}`, left: `${formatMoney(43_753)} left`, direction: 'down' });
+    expect(cashHeadline({ change: 1_200, end: -2_100 })).toEqual({ headline: `Cash went up ${formatMoney(1_200)}`, left: `${formatMoney(2_100)} overdrawn`, direction: 'up' });
+    expect(cashHeadline({ change: 0, end: 0 })).toEqual({ headline: 'Cash stayed the same', left: `${formatMoney(0)} left`, direction: 'flat' });
+    const c = card({ change: -4_479, end: 43_753 });
+    expect({ headline: c.headline, left: c.left, direction: c.direction }).toEqual(cashHeadline({ change: -4_479, end: 43_753 }));
+  });
+
   it('says how cash moved, what is left, and how long it lasts when it falls', () => {
     const down = card({ change: -4_479, end: 43_753, paceMonths: 9, building: false, withoutBuilding: -4_479 }, { story: 'billsShort' });
     expect(down.headline).toBe(`Cash went down ${formatMoney(4_479)}`);
@@ -631,6 +642,57 @@ describe('your next step', () => {
 });
 
 describe('the full books', () => {
+  it('lists the rest of the latest report under "More figures", each trade term beside its plain meaning', () => {
+    const b = briefingOf(120);
+    const books = booksView(b);
+    expect(books.moreTitle).toBe(`More figures for ${formatMonthLong(b.report.year, b.report.month)}`);
+    expect(books.more).toEqual(reportRows(b.report).filter((r) => !r.quiet));
+    expect(books.more.map((r) => r.key).slice(0, 4)).toEqual(['arpu', 'cpga', 'costPerConnection', 'operatingCashFlow']);
+    // With a loan: the bank's figures at month end, the limits beside them.
+    const owed: Briefing = {
+      ...b,
+      report: {
+        ...b.report,
+        debt: {
+          creditBalance: 0,
+          termBalance: 90_000,
+          creditLimit: 0,
+          arr: 100_000,
+          annualOperatingCashFlow: 40_000,
+          annualDebtService: 20_000,
+          leverageX100: 225,
+          coverageX100: 200,
+          stage: 'compliant',
+          averageRateBps: 725,
+          missedPayment: false,
+          sweep: 0,
+          frozenCloses: 0,
+          accelerationClosesLeft: null,
+        },
+      },
+    };
+    const rows = booksView(owed).more;
+    expect(rows.filter((r) => ['debt', 'leverage', 'coverage'].includes(r.key)).map((r) => [r.label, r.value, r.detail])).toEqual([
+      ['Debt at month end', formatMoney(90_000), null],
+      ['Years of profit (leverage)', '2.25×', `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}`],
+      ['Earned per $1 of loan payments (coverage)', '2.00×', `min ${formatRatio(COVENANT_MIN_COVERAGE)}`],
+    ]);
+    // A trade term only ever follows its plain meaning, in brackets.
+    for (const r of rows) {
+      if (/ARPU|CPGA|leverage|coverage|operating cash flow/i.test(r.label)) expect(r.label, r.label).toMatch(/^[A-Z][a-z][^()]* \((ARPU|CPGA|leverage|coverage|operating cash flow)\)$/);
+      expect(`${r.value} ${r.detail ?? ''}`).not.toMatch(/NaN|undefined|null|Infinity/);
+    }
+    // A quarter's books still show the latest month's own figures.
+    const quarter = booksView(briefingOf(120, 3));
+    expect(quarter.moreTitle).toBe(`More figures for ${formatMonthLong(b.report.year, b.report.month)}`);
+  });
+
+  it('names the books on their own after the period (the report panel opens them so)', () => {
+    const b = briefingOf(120);
+    expect(booksTitle(b)).toBe(`The full books for ${formatMonthLong(b.report.year, b.report.month)}`);
+    expect(booksTitle(briefingOf(120, 3))).toMatch(/^The full books for [A-Z][a-z]{2}–[A-Z][a-z]{2} \d{4}$/);
+  });
+
   it('keeps every glance tile, each with its change against the period before', () => {
     const b = briefingOf(120);
     const books = booksView(b);

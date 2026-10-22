@@ -1,5 +1,7 @@
 // Pure models behind the economy UI: report rows (financing and round-4
-// operations included), the month-close toast, milestone progress, the rate
+// operations included; round 4c/4d: the full books' "More figures", with the
+// old report panel's other figures checked in the books' tiles and money and
+// the new panel's lines), the month-close toast, milestone progress, the rate
 // card (round-4 rules included; round 4c/4d's running costs that grow with
 // the company), the report's overhead lines, notice tones, the
 // game-over subtitle and the debug-hook gate (the pricing preview moved to
@@ -81,19 +83,22 @@ import {
   UNDERGROUND_COST_PER_FT,
   UNDERGROUND_ROCK_SURCHARGE_PER_FT,
 } from '../sim/balance';
+import { briefingMoney, buildBriefing } from '../sim/advisor';
 import { formatDate } from '../sim/calendar';
 import { runDays } from '../sim/game';
 import { operatingCashFlow, reportKpis } from '../sim/metrics';
 import { MILESTONES } from '../sim/milestones';
 import { INSTALLS_PAUSED_PREFIX, INSTALLS_RESUMED_PREFIX } from '../sim/sales';
 import { addLivePlant, makeGridCity, makeTestState } from '../sim/testing/fixtures';
-import type { DebtStats, GameState, MonthlyReport, Notice, NoticeKind, OpsStats } from '../sim/types';
+import type { DebtStats, GameState, MoneyLineKey, MonthlyReport, Notice, NoticeKind, OpsStats } from '../sim/types';
+import { booksView, moneyBars, moneyGroups, wordsText } from './briefing';
 import { debugHookEnabled, searchWithoutSeed } from './debugHook';
 import {
   formatBpsDelta,
   formatDayRange,
   formatFeet,
   formatMoney,
+  formatMonthLong,
   formatPerFt,
   formatPercent,
   formatPercentFine,
@@ -105,7 +110,7 @@ import {
 import { gameOverSubtitle } from './gameOverDialog';
 import { milestoneRows } from './milestonesPanel';
 import { noticeTone, toastLayout } from './overlays';
-import { financingRows, monthClosedMessage, overheadRows, reportRows, subscriberMovements } from './panel';
+import { financingRows, monthClosedMessage, reportPanelView, reportRows, subscriberMovements } from './panel';
 import type { ReportRow } from './panel';
 import { rateCardSections } from './rateCard';
 
@@ -123,59 +128,74 @@ const row = (rows: ReportRow[], key: ReportRow['key']) => {
   return found;
 };
 
+// Round 4c/4d: the report panel became a small version of the month summary
+// (panel.test.ts); every figure of its old list is in the full books: the
+// tiles and the itemized money (briefing.ts booksView / moneyGroups /
+// moneyBars) and the "More figures" rows built in panel.ts (reportRows).
+
+/** The full books' money view for one closed month (what the panel's books and a month's summary itemize). */
+const booksMoney = (report: MonthlyReport) => {
+  const figures = { money: briefingMoney([report]), span: 1, headline: { cpp: reportKpis(report)?.cpp ?? null, cppTarget: CPP_TARGET } };
+  const groups = moneyGroups(figures);
+  const line = (key: MoneyLineKey) => groups.flatMap((g) => g.lines).find((l) => l.key === key) ?? null;
+  return { bars: moneyBars(figures), groups, line };
+};
+
 describe('report rows', () => {
-  it('shows every KPI of a round-2 close, formatted from reportKpis', () => {
+  it('lists the KPIs, support, operations and bank figures the full books do not show elsewhere, formatted from reportKpis', () => {
     const state = litGame();
     const report = state.finance.reports.at(-1)!;
     expect(report.stats!.subscribers).toBeGreaterThan(0);
     const kpis = reportKpis(report)!;
     const rows = reportRows(report);
     expect(rows.map((r) => r.key)).toEqual([
-      'net',
-      'revenue',
-      'subscribers',
       'arpu',
       'cpga',
-      'takeRate',
-      'cpp',
       'costPerConnection',
       'operatingCashFlow',
-      'poleRent',
-      'overhead',
-      'overheadBase',
-      'overheadCustomers',
-      'overheadPlant',
-      'repairs',
-      'passings',
+      'support',
       'outages',
       'outageCredits',
       'priceChurn',
       'tierMoves',
       'incumbentPromos',
-      'interest',
-      'principal',
       'sweep',
-      'proceeds',
       'debt',
       'leverage',
       'coverage',
     ]);
-    expect(row(rows, 'net').value).toBe(formatSignedMoney(report.net));
-    expect(row(rows, 'revenue').value).toBe(formatMoney(kpis.revenue));
-    expect(row(rows, 'subscribers').value).toBe(String(report.stats!.subscribers));
-    expect(row(rows, 'subscribers').detail).toBe(subscriberMovements(report));
     expect(row(rows, 'arpu').value).toBe(`${formatMoney(kpis.arpu!)}/mo`);
-    expect(row(rows, 'takeRate').value).toBe(formatPercent(kpis.takeRate!));
     expect(row(rows, 'operatingCashFlow').value).toBe(formatSignedMoney(operatingCashFlow(report)));
-    expect(row(rows, 'passings').value).toBe(report.passings.toLocaleString('en-US'));
-    expect(row(rows, 'poleRent').value).toBe(formatMoney(-(report.totals.poleRent ?? 0)));
-    expect(row(rows, 'overhead').value).toBe(formatMoney(-(report.totals.overhead ?? 0)));
     // The live plant was free, so no cost per passing to color... but connections cost installs.
     expect(row(rows, 'costPerConnection').value).toBe(formatMoney(kpis.costPerConnection!));
     for (const r of rows) expect(r.value).not.toMatch(/NaN|undefined|null|Infinity/);
+    // Trade terms only in brackets after their plain meaning.
+    expect(row(rows, 'arpu').label).toBe('Average bill per customer (ARPU)');
+    expect(row(rows, 'cpga').label).toBe('Marketing per new customer (CPGA)');
+    expect(row(rows, 'operatingCashFlow').label).toBe('Bills less running costs (operating cash flow)');
+
+    // The old list's other figures are the full books' tiles and money lines.
+    const books = booksView(buildBriefing(state, 1)!);
+    const tile = (key: string) => books.tiles.find((t) => t.key === key)!;
+    expect(tile('net').value).toBe(formatSignedMoney(report.net));
+    expect(tile('subscribers').value).toBe(String(report.stats!.subscribers));
+    expect(tile('subscribers').detail).toBe(subscriberMovements(report));
+    expect(tile('takeRate').value).toBe(formatPercent(kpis.takeRate!));
+    expect(tile('passings').value).toBe(report.passings.toLocaleString('en-US'));
+    expect(books.moneyIn.find((l) => l.key === 'bills')!.value).toBe(formatMoney(kpis.revenue));
+    const running = books.moneyOut.find((g) => g.key === 'running')!;
+    const overhead = running.lines.filter((l) => l.key.startsWith('overhead')).reduce((n, l) => n + l.amount, 0);
+    expect(overhead).toBe(-(report.totals.overhead ?? 0));
+    // Pole rent is itemized when the month paid any (the books leave $0 lines out).
+    const poleRent = running.lines.find((l) => l.key === 'poleRent') ?? null;
+    if (report.totals.poleRent) expect(poleRent!.value).toBe(formatMoney(-report.totals.poleRent));
+    else expect(poleRent).toBeNull();
+    // The books list the report's own rows that have something to say.
+    expect(books.more).toEqual(rows.filter((r) => !r.quiet));
+    expect(books.moreTitle).toBe(`More figures for ${formatMonthLong(report.year, report.month)}`);
   });
 
-  it('colors cost per passing by band and negative money red', () => {
+  it('colors negative money red and says – with nothing to divide by; the panel colors the cost per home passed by band', () => {
     const base: MonthlyReport = {
       year: 2027,
       month: 4,
@@ -200,17 +220,27 @@ describe('report rows', () => {
       },
     };
     const rows = reportRows(base);
-    expect(row(rows, 'cpp')).toMatchObject({ value: formatMoney(CPP_TARGET), tone: 'green' });
-    expect(row(rows, 'net').tone).toBe('negative');
     expect(row(rows, 'operatingCashFlow')).toMatchObject({ value: formatSignedMoney(-400), tone: 'negative' });
+    // The month's net, in words: the panel's cash line, and the books' net tile in red.
+    const lost = makeTestState();
+    lost.finance.reports.push(base);
+    expect(reportPanelView(lost).cash).toMatchObject({ headline: `Cash went down ${formatMoney(400)}`, direction: 'down' });
+    expect(booksView(buildBriefing(lost, 1)!).tiles.find((t) => t.key === 'net')).toMatchObject({ value: formatSignedMoney(-400), tone: 'negative' });
     // No gross adds: no cost per gross add.
     expect(row(rows, 'cpga').value).toBe('–');
-    expect(row(rows, 'subscribers').detail).toBe('+0 new, 1 churned, 2 lost service');
+    expect(subscriberMovements(base)).toBe('+0 new, 1 churned, 2 lost service');
 
-    const amber = reportRows({ ...base, stats: { ...base.stats!, capexOsp: CPP_TARGET * CPP_AMBER_MULTIPLIER * 100 } });
-    expect(row(amber, 'cpp').tone).toBe('amber');
-    const red = reportRows({ ...base, stats: { ...base.stats!, capexOsp: CPP_TARGET * CPP_AMBER_MULTIPLIER * 100 + 100 } });
-    expect(row(red, 'cpp').tone).toBe('red');
+    // The cost per home passed's band, in color and in words, where the panel shows it: a building month.
+    const building = (capexOsp: number) => {
+      const r = { ...base, totals: { ...base.totals, construction: -1_000 }, net: -1_400, stats: { ...base.stats!, capexOsp } };
+      const state = makeTestState();
+      state.finance.reports.push(r);
+      return reportPanelView(state).building!;
+    };
+    expect(building(CPP_TARGET * 100)).toMatchObject({ band: 'green', bandText: 'Within target' });
+    expect(building(CPP_TARGET * 100).text).toContain(`${formatMoney(CPP_TARGET)} per home passed`);
+    expect(building(CPP_TARGET * CPP_AMBER_MULTIPLIER * 100)).toMatchObject({ band: 'amber', bandText: 'Over target' });
+    expect(building(CPP_TARGET * CPP_AMBER_MULTIPLIER * 100 + 100)).toMatchObject({ band: 'red', bandText: 'Far over target' });
   });
 
   it('reads – for KPIs with nothing to divide by', () => {
@@ -218,27 +248,42 @@ describe('report rows', () => {
     runDays(state, 31);
     const report = state.finance.reports[0]!;
     const rows = reportRows(report);
-    for (const key of ['arpu', 'cpga', 'takeRate', 'cpp', 'costPerConnection'] as const) expect(row(rows, key).value).toBe('–');
-    expect(row(rows, 'subscribers').value).toBe('0');
-    expect(row(rows, 'cpp').tone).toBeNull();
+    for (const key of ['arpu', 'cpga', 'costPerConnection'] as const) expect(row(rows, key).value).toBe('–');
+    // The books' tiles and the panel's customers line say the same of the take rate and the cost per home.
+    const books = booksView(buildBriefing(state, 1)!);
+    expect(books.tiles.find((t) => t.key === 'subscribers')!.value).toBe('0');
+    expect(books.tiles.find((t) => t.key === 'takeRate')!.value).toBe('–');
+    expect(books.tiles.find((t) => t.key === 'cpp')).toMatchObject({ value: '–', tone: null });
+    expect(wordsText(reportPanelView(state).customers!)).toBe('0 customers · no homes passed yet');
   });
 
   it('reads – for every KPI of a report migrated from a v1 save (no stats)', () => {
     const v1: MonthlyReport = { year: 2027, month: 1, totals: { construction: -5000, poleRent: -20 }, net: -5020, cashEnd: 1, passings: 12 };
     const rows = reportRows(v1);
-    for (const key of ['revenue', 'subscribers', 'arpu', 'cpga', 'takeRate', 'cpp', 'costPerConnection'] as const) {
-      expect(row(rows, key).value).toBe('–');
-    }
-    expect(row(rows, 'subscribers').detail).toBeNull();
-    expect(row(rows, 'net').value).toBe(formatSignedMoney(-5020));
+    for (const key of ['arpu', 'cpga', 'costPerConnection'] as const) expect(row(rows, key).value).toBe('–');
     expect(row(rows, 'operatingCashFlow').value).toBe(formatSignedMoney(operatingCashFlow(v1)));
-    expect(row(rows, 'poleRent').value).toBe(formatMoney(20));
-    expect(row(rows, 'passings').value).toBe('12');
-    for (const key of ['interest', 'principal', 'proceeds', 'debt', 'leverage', 'coverage'] as const) expect(row(rows, key).value).toBe('–');
-    // Round-4 figures read – too, and the panel leaves them out.
-    for (const key of ['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
+    for (const key of ['debt', 'leverage', 'coverage'] as const) expect(row(rows, key)).toMatchObject({ value: '–', quiet: true });
+    // Round-4 figures read – too, and the books leave them out.
+    for (const key of ['support', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep'] as const) {
       expect(row(rows, key)).toMatchObject({ value: '–', quiet: true });
     }
+    // Its money is itemized all the same (pole rent and building), and the panel says the cash change without a customers line.
+    const money = booksMoney(v1);
+    expect(money.line('poleRent')!.value).toBe(formatMoney(20));
+    expect(money.line('construction')!.value).toBe(formatMoney(5_000));
+    const state = makeTestState();
+    state.finance.reports.push(v1);
+    const view = reportPanelView(state);
+    expect(view.customers).toBeNull();
+    expect(view.cash!.text).toBe(`Cash went down ${formatMoney(5_020)} · ${formatMoney(1)} left`);
+    // The books: the net, no customer figures, the homes passed, and no customer bills.
+    const books = booksView(buildBriefing(state, 1)!);
+    const tile = (key: string) => books.tiles.find((t) => t.key === key)!;
+    expect(tile('net').value).toBe(formatSignedMoney(-5020));
+    expect(tile('subscribers')).toMatchObject({ value: '–', detail: null });
+    expect(tile('takeRate').value).toBe('–');
+    expect(tile('passings').value).toBe('12');
+    expect(books.moneyIn.find((l) => l.key === 'bills')).toBeUndefined();
   });
 });
 
@@ -270,16 +315,20 @@ describe('round-4 report rows', () => {
     debt,
   });
 
-  it('shows repairs, outages, price steps, tier moves and incumbent promos from report.ops', () => {
+  it('shows outages (with the spans damaged), price steps, tier moves and the cable company’s promos from report.ops; repairs in the money', () => {
     const o = ops({ outageUnitDays: 340, storms: 2, spansDamaged: 3, outageChurn: 4, priceChurn: 6, tierMoves: 21, incumbentPromos: 1, incumbentChurn: 5, repairs: 7_300 });
-    const rows = reportRows(report(o, { repair: -7_300 }));
-    expect(row(rows, 'repairs')).toMatchObject({ value: formatMoney(7_300), detail: '3 spans damaged', quiet: false });
-    expect(row(rows, 'outages')).toMatchObject({ value: '340 sub-days', detail: '2 storms, 4 cancelled', quiet: false });
+    const r = report(o, { repair: -7_300 });
+    const rows = reportRows(r);
+    expect(row(rows, 'outages')).toMatchObject({ value: '340 customer-days', detail: '2 storms, 3 spans damaged, 4 cancelled', quiet: false });
     expect(row(rows, 'priceChurn')).toMatchObject({ value: '6', quiet: false });
     expect(row(rows, 'tierMoves')).toMatchObject({ value: '21', quiet: false });
     expect(row(rows, 'incumbentPromos')).toMatchObject({ value: '1', detail: '5 cancelled', quiet: false });
     expect(row(rows, 'outageCredits')).toMatchObject({ value: '$0', quiet: true });
-    for (const r of rows) expect(`${r.value} ${r.detail ?? ''}`).not.toMatch(/NaN|undefined|null|Infinity/);
+    for (const r2 of rows) expect(`${r2.value} ${r2.detail ?? ''}`).not.toMatch(/NaN|undefined|null|Infinity/);
+    // The repairs are a running cost in the books' money out.
+    expect(booksMoney(r).line('repair')).toMatchObject({ label: 'Storm and dig-in repairs', value: formatMoney(7_300) });
+    // Spans damaged without an outage (a dig-in on an empty street) still show.
+    expect(row(reportRows(report(ops({ spansDamaged: 1 }))), 'outages')).toMatchObject({ detail: '0 storms, 1 span damaged, 0 cancelled', quiet: false });
   });
 
   it('shows the outage credits (billing not charged for outage days) right after the outages, quiet when $0', () => {
@@ -291,13 +340,14 @@ describe('round-4 report rows', () => {
     expect(row(reportRows(report(ops())), 'outageCredits')).toMatchObject({ value: '$0', quiet: true });
   });
 
-  it('reads zero for a quiet round-4 month, and the panel leaves those rows out', () => {
+  it('reads zero for a quiet round-4 month, and the books leave those rows out', () => {
     const rows = reportRows(report(ops()));
-    expect(row(rows, 'repairs')).toMatchObject({ value: '$0', detail: null, quiet: true });
-    expect(row(rows, 'outages')).toMatchObject({ value: '0 sub-days', quiet: true });
+    expect(row(rows, 'outages')).toMatchObject({ value: '0 customer-days', quiet: true });
+    // No repairs: no repairs line in the money either.
+    expect(booksMoney(report(ops())).line('repair')).toBeNull();
     for (const key of ['priceChurn', 'tierMoves', 'incumbentPromos'] as const) expect(row(rows, key)).toMatchObject({ value: '0', quiet: true });
-    // Rows from before round 4 never go quiet.
-    for (const r of rows) if (!['repairs', 'outages', 'outageCredits', 'priceChurn', 'tierMoves', 'incumbentPromos', 'sweep', 'overheadBase', 'overheadCustomers', 'overheadPlant'].includes(r.key)) expect(r.quiet).toBeUndefined();
+    // The KPIs never go quiet.
+    for (const key of ['arpu', 'cpga', 'costPerConnection', 'operatingCashFlow'] as const) expect(row(rows, key).quiet).toBe(false);
   });
 
   it('shows the frozen line’s sweep, or – on a report from before round 4', () => {
@@ -317,43 +367,41 @@ describe('round-4 report rows', () => {
       frozenCloses: 3,
       accelerationClosesLeft: null,
     };
-    expect(row(financingRows(report(ops(), {}, debt)), 'sweep')).toMatchObject({ value: formatMoney(6_500), detail: '3 frozen closes in a row', quiet: false });
+    expect(row(financingRows(report(ops(), {}, debt)), 'sweep')).toMatchObject({ label: 'Spare cash the bank took', value: formatMoney(6_500), detail: '3 frozen closes in a row', quiet: false });
     expect(row(financingRows(report(ops(), {}, { ...debt, sweep: 0, frozenCloses: 0 })), 'sweep')).toMatchObject({ value: '$0', detail: null, quiet: true });
     const { sweep: _sweep, frozenCloses: _closes, accelerationClosesLeft: _left, ...round3 } = debt;
     expect(row(financingRows(report(undefined, {}, round3)), 'sweep')).toMatchObject({ value: '–', quiet: true });
   });
 
-  it('shows the overhead and, when the close recorded them, its base / per-customer / plant lines', () => {
+  it('itemizes the overhead’s base / per-customer / plant lines in the books when the close recorded them, and the support part of the per-customer line', () => {
     const lines = { base: 2_000, perCustomer: 1_480, support: 960, perPlant: 730 };
     const total = lines.base + lines.perCustomer + lines.perPlant;
-    const rows = reportRows(report(ops({ overhead: lines }), { overhead: -total }));
-    expect(row(rows, 'overhead')).toMatchObject({ label: 'Overhead', value: formatMoney(total), tone: null });
-    expect(row(rows, 'overheadBase')).toMatchObject({ label: 'Base overhead', value: formatMoney(lines.base), quiet: false });
-    expect(row(rows, 'overheadCustomers')).toMatchObject({ label: 'Per customer', value: formatMoney(lines.perCustomer), detail: `support ${formatMoney(lines.support)}`, quiet: false });
-    expect(row(rows, 'overheadPlant')).toMatchObject({ label: 'Plant upkeep', value: formatMoney(lines.perPlant), quiet: false });
-    // Right after pole rent, in this order.
-    const keys = rows.map((r) => r.key);
-    expect(keys.slice(keys.indexOf('poleRent') + 1, keys.indexOf('poleRent') + 5)).toEqual(['overhead', 'overheadBase', 'overheadCustomers', 'overheadPlant']);
-    // A report from an earlier build (no lines): the total alone, the lines left out.
-    const old = overheadRows(report(ops(), { overhead: -9_000 }));
-    expect(old.map((r) => [r.key, r.value, r.quiet])).toEqual([
-      ['overhead', formatMoney(9_000), undefined],
-      ['overheadBase', '–', true],
-      ['overheadCustomers', '–', true],
-      ['overheadPlant', '–', true],
+    const r = report(ops({ overhead: lines }), { overhead: -total });
+    const money = booksMoney(r);
+    const running = money.groups.find((g) => g.key === 'running')!;
+    expect(running.total).toBe(total);
+    expect(running.lines.map((l) => [l.key, l.label, l.value])).toEqual([
+      ['overheadBase', 'Base costs (any size)', formatMoney(lines.base)],
+      ['overheadCustomers', 'Per customer (support and billing)', formatMoney(lines.perCustomer)],
+      ['overheadPlant', 'Per cabinet and mile of cable', formatMoney(lines.perPlant)],
     ]);
-    expect(overheadRows(report(undefined, {}))[0]!.value).toBe(formatMoney(0));
+    expect(row(reportRows(r), 'support')).toMatchObject({ label: 'Customer support', value: formatMoney(lines.support), detail: 'included in the per-customer cost', quiet: false });
+    // A report from an earlier build (no lines): the overhead in one line, no support figure.
+    const old = report(ops(), { overhead: -9_000 });
+    expect(booksMoney(old).groups.find((g) => g.key === 'running')!.lines.map((l) => [l.key, l.value])).toEqual([['overhead', formatMoney(9_000)]]);
+    expect(row(reportRows(old), 'support')).toMatchObject({ value: '–', quiet: true });
+    expect(booksMoney(report(undefined, {})).groups.find((g) => g.key === 'running')!.total).toBe(0);
   });
 
   it('records the overhead’s lines at a real close, adding up to the month’s overhead', () => {
     const last = litGame(95).finance.reports.at(-1)!;
     const lines = last.ops?.overhead;
     expect(lines).toBeTruthy();
-    const rows = overheadRows(last);
-    expect(row(rows, 'overhead').value).toBe(formatMoney(-(last.totals.overhead ?? 0)));
     expect(lines!.base + lines!.perCustomer + lines!.perPlant).toBe(-(last.totals.overhead ?? 0));
-    expect(row(rows, 'overheadBase').value).toBe(formatMoney(lines!.base));
-    expect(row(rows, 'overheadPlant').value).toBe(formatMoney(lines!.perPlant));
+    const money = booksMoney(last);
+    expect(money.line('overheadBase')!.value).toBe(formatMoney(lines!.base));
+    expect(money.line('overheadPlant')!.value).toBe(formatMoney(lines!.perPlant));
+    if (lines!.perCustomer > 0) expect(money.line('overheadCustomers')!.value).toBe(formatMoney(lines!.perCustomer));
   });
 
   it('mentions storms and a sweep in the month-close toast', () => {
@@ -403,21 +451,29 @@ describe('financing report rows', () => {
     debt: d,
   });
 
-  it('shows the month’s interest, principal and borrowing, and debt, leverage and coverage at month end', () => {
-    const rows = financingRows(report(debt(), { interest: -2_345, principal: -6_100, loanProceeds: 50_000 }));
-    expect(row(rows, 'interest')).toMatchObject({ value: formatMoney(2_345), tone: null });
-    expect(row(rows, 'principal').value).toBe(formatMoney(6_100));
-    expect(row(rows, 'proceeds').value).toBe(formatMoney(50_000));
-    expect(row(rows, 'debt').value).toBe(formatMoney(412_000));
-    expect(row(rows, 'leverage')).toMatchObject({ value: '4.58×', tone: null, detail: `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}` });
-    expect(row(rows, 'coverage')).toMatchObject({ value: '1.50×', tone: null, detail: `min ${formatRatio(COVENANT_MIN_COVERAGE)}` });
+  it('shows debt, leverage and coverage at month end, and the month’s interest, principal and borrowing in the books’ money', () => {
+    const r = report(debt(), { interest: -2_345, principal: -6_100, loanProceeds: 50_000 });
+    const rows = financingRows(r);
+    expect(row(rows, 'debt')).toMatchObject({ value: formatMoney(412_000), quiet: false });
+    expect(row(rows, 'leverage')).toMatchObject({ label: 'Years of profit (leverage)', value: '4.58×', tone: null, detail: `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}`, quiet: false });
+    expect(row(rows, 'coverage')).toMatchObject({ label: 'Earned per $1 of loan payments (coverage)', value: '1.50×', tone: null, detail: `min ${formatRatio(COVENANT_MIN_COVERAGE)}`, quiet: false });
+    const money = booksMoney(r);
+    expect(money.line('interest')!.value).toBe(formatMoney(2_345));
+    expect(money.line('principal')!.value).toBe(formatMoney(6_100));
+    expect(money.groups.find((g) => g.key === 'loans')!.total).toBe(2_345 + 6_100);
+    expect(money.bars.in.segments.find((s) => s.key === 'borrowed')).toMatchObject({ label: 'Borrowed', value: formatMoney(50_000) });
   });
 
-  it('reads $0 for money that did not move in a round-3 month, and – for nothing scheduled', () => {
-    const rows = financingRows(report(debt({ creditBalance: 0, termBalance: 0, leverageX100: 0, coverageX100: null })));
-    for (const key of ['interest', 'principal', 'proceeds', 'debt'] as const) expect(row(rows, key).value).toBe('$0');
-    expect(row(rows, 'leverage').value).toBe('0.00×');
-    expect(row(rows, 'coverage').value).toBe('–');
+  it('reads $0 for money that did not move in a round-3 month, and – for nothing scheduled; with nothing owed the books leave the bank figures out', () => {
+    const r = report(debt({ creditBalance: 0, termBalance: 0, leverageX100: 0, coverageX100: null }));
+    const rows = financingRows(r);
+    expect(row(rows, 'debt')).toMatchObject({ value: '$0', quiet: true });
+    expect(row(rows, 'leverage')).toMatchObject({ value: '0.00×', quiet: true });
+    expect(row(rows, 'coverage')).toMatchObject({ value: '–', quiet: true });
+    // No loan payments and no borrowing in the money either.
+    const money = booksMoney(r);
+    expect(money.groups.find((g) => g.key === 'loans')).toMatchObject({ total: 0, lines: [] });
+    expect(money.bars.in.segments.some((s) => s.key === 'borrowed')).toBe(false);
   });
 
   it('marks a covenant breach, and debt with no cash flow as not measurable', () => {
@@ -431,10 +487,17 @@ describe('financing report rows', () => {
     expect(row(unmeasurable, 'leverage')).toMatchObject({ value: 'not measurable', tone: 'breach' });
   });
 
-  it('keeps net as the full cash flow and says operating cash flow is before financing', () => {
-    const rows = reportRows(report(debt(), { revenue: 9_000, overhead: -4_000, interest: -1_000, loanProceeds: 20_000 }));
-    expect(row(rows, 'operatingCashFlow').hint).toContain('financing');
-    expect(row(rows, 'net').hint).toContain('financing included');
+  it('says operating cash flow is before loans, and the panel’s cash change is the whole month, borrowing included', () => {
+    // A month whose net is everything in and out: bills, overhead, interest and the borrowing.
+    const r = { ...report(debt(), { revenue: 9_000, overhead: -4_000, interest: -1_000, loanProceeds: 20_000 }), net: 24_000, cashEnd: 100_000 };
+    const rows = reportRows(r);
+    expect(row(rows, 'operatingCashFlow')).toMatchObject({ value: formatSignedMoney(5_000) });
+    expect(row(rows, 'operatingCashFlow').hint).toContain('before building, installs and loans');
+    const state = makeTestState();
+    state.finance.reports.push(r);
+    const view = reportPanelView(state);
+    expect(view.cash!.headline).toBe(`Cash went up ${formatMoney(24_000)}`);
+    expect(view.money!.in.total - view.money!.out.total).toBe(24_000);
   });
 });
 

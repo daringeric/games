@@ -1,73 +1,88 @@
-// Report panel: the last closed month (net, revenue, subscribers, the
-// scorecard KPIs and, from round 3, financing: interest, principal, money
-// borrowed, debt, leverage and coverage; from round 4, repairs, outages,
-// price steps, tier moves, incumbent promos and the frozen-line sweep; from
-// round 4c/4d, the overhead and its base / per-customer / plant lines) and
-// this month's spending so far. On phones and short screens it starts
-// collapsed to three headline figures; "Details" opens the rest.
+// The report panel at the right edge of the map (round 4c/4d: a small
+// version of the month summary, after the owner found the old list of every
+// figure "almost too much density of information"). For the last closed
+// month, top to bottom: the month and the collapse toggle; "Cash went down
+// $32,539 · $332,590 left"; money in and money out as two thin bars on one
+// scale, each with its total and a compact legend (the summary's sources,
+// groups and colors); the customers line with "See customers"; while the
+// month built fiber, what building cost and the cost per home passed against
+// the target, in words; with debt, the bank's health in the one word the
+// Bank, the HUD chip and the summary share, as a link to the Bank; this
+// month's spending so far; and "See the full books", which opens the
+// briefing sheet's books view for this report on its own. Every figure the
+// old list had is in those books (the tiles, the itemized money, and the
+// "More figures" rows built here: reportRows). Phones and short screens
+// start collapsed to the cash line, the customers line and the bank's word.
+// No jargon in the panel (no ARPU, CPGA, leverage, coverage, ×).
 //
-// Owner: ui-economy workstream; financing rows: ui-bank workstream; round-4
-// rows: ui-briefing workstream; round 4b's outage credits row: pricing-balance workstream;
-// round 4c/4d's overhead rows: ui-summary workstream.
+// The words come from the month summary's view model (briefing.ts:
+// moneyBars, cashHeadline, CPP_BAND_TEXT) and ui/health.ts; the figures from
+// the sim only (advisor.briefingMoney over the one report, metrics.reportKpis,
+// debt.bankHealth for today's health, like the HUD chip and the Bank). The
+// panel computes no money figure itself. reportPanelView is pure and
+// unit-tested; ReportPanel builds its DOM once and updates it in place.
+//
+// Also here: subscriberMovements (the books' customers tile), the month-close
+// toast (monthClosedMessage / monthClosedTone, main.ts) and the full books'
+// "More figures" rows (reportRows: kpiRows, supportRow, operationsRows,
+// financingRows).
+//
+// Owner: ui-summary workstream (round 4c/4d); ui-economy, ui-bank and
+// ui-briefing before.
 
-import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_AMBER_MULTIPLIER, CPP_TARGET } from '../sim/balance';
+import { briefingMoney } from '../sim/advisor';
+import { COVENANT_MAX_LEVERAGE, COVENANT_MIN_COVERAGE, CPP_TARGET } from '../sim/balance';
 import { MONTH_ABBR, dateOf, formatMonth } from '../sim/calendar';
+import { bankHealth } from '../sim/debt';
 import { operatingCashFlow, reportKpis } from '../sim/metrics';
 import type { CppBand, GameState, MonthlyReport } from '../sim/types';
+// briefing.ts imports this module's row builders too: both use each other's exports only inside functions.
+import { CPP_BAND_TEXT, cashHeadline, moneyBars, wordsText } from './briefing';
+import type { MoneyBar, Words } from './briefing';
 import { el, setText } from './dom';
-import { formatMaybeMoney, formatMoney, formatNumber, formatPercent, formatRatio, formatSignedMoney, plural } from './format';
+import { formatMaybeMoney, formatMoney, formatMonthLong, formatNumber, formatPercent, formatRatio, formatSignedMoney, plural } from './format';
+import { HEALTH_TONE, healthSentence, healthWordOf } from './health';
+import type { HealthTone } from './health';
+
+// ---------------------------------------------------------------------------
+// The full books' "More figures" (briefing.ts booksView lists these rows)
+// ---------------------------------------------------------------------------
 
 export type ReportRowKey =
-  | 'net'
-  | 'revenue'
-  | 'subscribers'
   | 'arpu'
   | 'cpga'
-  | 'takeRate'
-  | 'cpp'
   | 'costPerConnection'
   | 'operatingCashFlow'
-  | 'poleRent'
-  | 'overhead'
-  | 'overheadBase'
-  | 'overheadCustomers'
-  | 'overheadPlant'
-  | 'repairs'
-  | 'passings'
+  | 'support'
   | 'outages'
   | 'outageCredits'
   | 'priceChurn'
   | 'tierMoves'
   | 'incumbentPromos'
-  | 'interest'
-  | 'principal'
   | 'sweep'
-  | 'proceeds'
   | 'debt'
   | 'leverage'
   | 'coverage';
 
 export interface ReportRow {
   key: ReportRowKey;
+  /** Plain words; a trade term only in brackets after its plain meaning ("Average bill per customer (ARPU)"). */
   label: string;
-  /** Display value; '–' when the KPI is undefined (no subscribers, no passings, a report from a v1 or v2 save). */
+  /** Display value; '–' when the figure is undefined (no customers, a report from an earlier build). */
   value: string;
-  /** Coloring: a negative amount, the cost-per-passing band, or a covenant breach. */
-  tone: 'negative' | CppBand | 'breach' | null;
-  /** Secondary line, e.g. the subscriber movements of the month. */
+  /** Coloring beside the words: a negative amount, or a bank limit the month went over. */
+  tone: 'negative' | 'breach' | null;
+  /** Secondary line, e.g. the bank's limit. */
   detail: string | null;
   /** Longer explanation for a tooltip. */
   hint: string;
-  /**
-   * Round-4 rows only: nothing happened this month (or the report predates
-   * round 4 and reads '–'), so the panel leaves the row out to stay short.
-   */
-  quiet?: boolean;
+  /** Nothing to say this month (nothing happened, or the report predates the figure): the books leave the row out. */
+  quiet: boolean;
 }
 
 const DASH = '–';
 
-/** "+30 new, 5 churned, 2 lost service" for a month's subscriber movements. */
+/** "+30 new, 5 churned, 2 lost service" for a month's subscriber movements (the full books' customers tile). */
 export function subscriberMovements(report: MonthlyReport): string | null {
   const stats = report.stats;
   if (!stats) return null;
@@ -77,193 +92,107 @@ export function subscriberMovements(report: MonthlyReport): string | null {
 }
 
 /**
- * Every figure the report panel shows for a closed month, in display order.
- * KPIs come from metrics.reportKpis (null for a report without stats, i.e.
- * one migrated from a schemaVersion 1 save: those read '–').
+ * The figures of a closed month the full books' tiles and money lines do not
+ * already show, in display order: the KPIs, the support part of the
+ * per-customer cost, round 4's operations and the month's bank figures.
+ * With the tiles (net, cash, customers and their moves, homes passed, take
+ * rate, cost per home passed, debt) and the itemized money in and out (bills,
+ * borrowing, every running cost and overhead line, pole rent, repairs,
+ * building, interest, principal), these are every figure the old report
+ * panel listed.
  */
 export function reportRows(report: MonthlyReport): ReportRow[] {
+  return [...kpiRows(report), supportRow(report), ...operationsRows(report), ...financingRows(report)];
+}
+
+/**
+ * The month's KPIs (metrics.reportKpis; '–' for a report without stats, one
+ * migrated from a schemaVersion 1 save, or with nothing to divide by) and its
+ * operating cash flow (metrics.operatingCashFlow, which works on any report).
+ */
+export function kpiRows(report: MonthlyReport): ReportRow[] {
   const kpis = reportKpis(report);
-  const stats = report.stats ?? null;
   const flow = operatingCashFlow(report);
-  const money = (amount: number | null | undefined) => formatMaybeMoney(amount ?? null);
   return [
     {
-      key: 'net',
-      label: 'Net',
-      value: formatSignedMoney(report.net),
-      tone: report.net < 0 ? 'negative' : null,
-      detail: null,
-      hint: 'Net cash flow: everything in and out this month, building, installs and financing included',
-    },
-    {
-      key: 'revenue',
-      label: 'Revenue',
-      value: kpis ? formatMoney(kpis.revenue) : DASH,
-      tone: null,
-      detail: null,
-      hint: 'Subscriber billing for the month',
-    },
-    {
-      key: 'subscribers',
-      label: 'Subscribers',
-      value: stats ? formatNumber(stats.subscribers) : DASH,
-      tone: null,
-      detail: subscriberMovements(report),
-      hint: 'Subscribed homes, businesses and apartments at month end',
-    },
-    {
       key: 'arpu',
-      label: 'ARPU',
+      label: 'Average bill per customer (ARPU)',
       value: kpis?.arpu != null ? `${formatMoney(kpis.arpu)}/mo` : DASH,
       tone: null,
       detail: null,
-      hint: 'Average revenue per subscriber: billing over the month\'s average subscribers',
+      hint: 'The month’s customer bills over its average number of customers',
+      quiet: false,
     },
     {
       key: 'cpga',
-      label: 'CPGA',
-      value: money(kpis?.cpga),
+      label: 'Marketing per new customer (CPGA)',
+      value: formatMaybeMoney(kpis?.cpga ?? null),
       tone: null,
       detail: null,
-      hint: 'Cost per gross add: marketing spend per new subscriber',
-    },
-    {
-      key: 'takeRate',
-      label: 'Take rate',
-      value: kpis?.takeRate != null ? formatPercent(kpis.takeRate) : DASH,
-      tone: null,
-      detail: null,
-      hint: 'Subscribers as a share of homes passed',
-    },
-    {
-      key: 'cpp',
-      label: 'Cost per passing',
-      value: money(kpis?.cpp),
-      tone: kpis?.cppBand ?? null,
-      detail: kpis?.cpp != null ? `target ${formatMoney(CPP_TARGET)}` : null,
-      hint: `Lifetime outside-plant spend (cable, cabinets, splitters) per home passed. Target ${formatMoney(CPP_TARGET)}: green at or under it, amber up to ${formatMoney(CPP_TARGET * CPP_AMBER_MULTIPLIER)}, red above`,
+      hint: 'The month’s marketing spend over the customers who joined',
+      quiet: false,
     },
     {
       key: 'costPerConnection',
-      label: 'Cost per connection',
-      value: money(kpis?.costPerConnection),
+      label: 'Install cost per connection',
+      value: formatMaybeMoney(kpis?.costPerConnection ?? null),
       tone: null,
       detail: null,
-      hint: 'Lifetime install spend (drops, ONTs, building routers) per connection',
+      hint: 'Lifetime install spend (drops, ONTs, building routers) over every connection made',
+      quiet: false,
     },
     {
       key: 'operatingCashFlow',
-      label: 'Operating cash flow',
+      label: 'Bills less running costs (operating cash flow)',
       value: formatSignedMoney(flow),
       tone: flow < 0 ? 'negative' : null,
       detail: null,
-      hint: 'Revenue minus running costs, before building, installs and financing',
+      hint: 'Customer bills minus running costs, before building, installs and loans',
+      quiet: false,
     },
-    {
-      key: 'poleRent',
-      label: 'Pole rent',
-      value: formatMoney(-(report.totals.poleRent ?? 0)),
-      tone: null,
-      detail: null,
-      hint: 'Rent for the utility poles your aerial cable hangs on',
-    },
-    ...overheadRows(report),
-    repairsRow(report),
-    {
-      key: 'passings',
-      label: 'Passings',
-      value: formatNumber(report.passings),
-      tone: null,
-      detail: null,
-      hint: 'Homes and businesses your lit network passes',
-    },
-    ...operationsRows(report),
-    ...financingRows(report),
   ];
 }
 
 /**
- * Round 4c/4d: the month's overhead (totals.overhead) and, when the report
- * has them (ops.overhead; null on reports from earlier builds, which then
- * show the total alone), its lines: the base that does not grow with the
- * company, the per-customer part (support included) and the plant upkeep
- * (cabinets and miles of live cable). The lines add up to the total.
+ * The support level's part of the per-customer cost (OpsStats.overhead's
+ * support line, round 4c/4d; the per-customer line itself is in the money
+ * out). Quiet when nothing was spent on it or the report predates it.
  */
-export function overheadRows(report: MonthlyReport): ReportRow[] {
+export function supportRow(report: MonthlyReport): ReportRow {
   const lines = report.ops?.overhead ?? null;
-  const line = (amount: number | undefined) => (lines ? formatMoney(amount ?? 0) : DASH);
-  return [
-    {
-      key: 'overhead',
-      label: 'Overhead',
-      value: formatMoney(0 - (report.totals.overhead ?? 0)),
-      tone: null,
-      detail: null,
-      hint: 'Running the company: a small base, plus costs that grow with your customers and your live plant',
-    },
-    {
-      key: 'overheadBase',
-      label: 'Base overhead',
-      value: line(lines?.base),
-      tone: null,
-      detail: null,
-      hint: 'The part of the overhead that does not grow with the company',
-      quiet: !lines,
-    },
-    {
-      key: 'overheadCustomers',
-      label: 'Per customer',
-      value: line(lines?.perCustomer),
-      tone: null,
-      detail: lines && lines.support > 0 ? `support ${formatMoney(lines.support)}` : null,
-      hint: 'Billing and accounts for each customer, plus the support level you chose (part of the overhead)',
-      quiet: !lines,
-    },
-    {
-      key: 'overheadPlant',
-      label: 'Plant upkeep',
-      value: line(lines?.perPlant),
-      tone: null,
-      detail: null,
-      hint: 'Each live cabinet and each mile of live cable costs a little to keep running (part of the overhead)',
-      quiet: !lines,
-    },
-  ];
-}
-
-/** Storm and dig-in repairs (totals.repair); '–' on a report from before round 4 (no ops). */
-export function repairsRow(report: MonthlyReport): ReportRow {
-  const ops = report.ops ?? null;
-  const spent = 0 - (report.totals.repair ?? 0);
   return {
-    key: 'repairs',
-    label: 'Repairs',
-    value: ops ? formatMoney(spent) : DASH,
+    key: 'support',
+    label: 'Customer support',
+    value: lines ? formatMoney(lines.support) : DASH,
     tone: null,
-    detail: ops && ops.spansDamaged > 0 ? `${plural(ops.spansDamaged, 'span')} damaged` : null,
-    hint: 'Fixing spans storms and excavators damaged. Aerial cable is hit far more often than underground',
-    quiet: !ops || (spent === 0 && ops.spansDamaged === 0),
+    detail: lines ? 'included in the per-customer cost' : null,
+    hint: 'What the support level you chose cost this month (part of the per-customer running cost)',
+    quiet: !lines || !(lines.support > 0),
   };
 }
 
 /**
- * Round 4's operating figures (report.ops): outages, price-step and
- * tier-move cancellations, and the incumbent's promos; round 4b: the outage
- * credits (billing not charged for outage days, quiet when $0). A report
- * from before round 4 (no ops) reads '–' throughout.
+ * Round 4's operating figures (report.ops): outages (with the storms, the
+ * spans damaged and the cancellations they caused), outage credits (round
+ * 4b), price-step and tier-move cancellations, and the cable company's
+ * promos. Each is quiet when nothing happened; a report from before round 4
+ * (no ops) reads '–' and is quiet throughout.
  */
 export function operationsRows(report: MonthlyReport): ReportRow[] {
   const ops = report.ops ?? null;
   const count = (n: number | undefined) => (ops ? formatNumber(n ?? 0) : DASH);
+  const outageDetail = ops
+    ? [plural(ops.storms, 'storm'), ...(ops.spansDamaged > 0 ? [`${plural(ops.spansDamaged, 'span')} damaged`] : []), `${formatNumber(ops.outageChurn)} cancelled`].join(', ')
+    : null;
   return [
     {
       key: 'outages',
       label: 'Outages',
-      value: ops ? `${formatNumber(ops.outageUnitDays)} sub-days` : DASH,
+      value: ops ? `${formatNumber(ops.outageUnitDays)} customer-days` : DASH,
       tone: null,
-      detail: ops ? `${plural(ops.storms, 'storm')}, ${formatNumber(ops.outageChurn)} cancelled` : null,
-      hint: 'Subscriber-days without service because a damaged span cut their street off, the storms that hit, and the cancellations the outages caused',
-      quiet: !ops || (ops.outageUnitDays === 0 && ops.storms === 0 && ops.outageChurn === 0),
+      detail: outageDetail,
+      hint: 'Days customers went without service because a damaged span cut their street off, the storms that hit, the spans damaged and the cancellations the outages caused',
+      quiet: !ops || (ops.outageUnitDays === 0 && ops.storms === 0 && ops.outageChurn === 0 && ops.spansDamaged === 0),
     },
     {
       key: 'outageCredits',
@@ -271,111 +200,99 @@ export function operationsRows(report: MonthlyReport): ReportRow[] {
       value: ops ? formatMoney(ops.outageCredits ?? 0) : DASH,
       tone: null,
       detail: null,
-      hint: 'Billing not charged for the days subscribers had no service because of outages (revenue is already net of it)',
+      hint: 'Bills not charged for the days customers had no service because of outages (customer bills are already net of it)',
       quiet: !ops || !(ops.outageCredits > 0),
     },
     {
       key: 'priceChurn',
-      label: 'Price-step cancels',
+      label: 'Cancelled after a price rise',
       value: count(ops?.priceChurn),
       tone: null,
       detail: null,
-      hint: 'Subscribers who cancelled at this close because their price stepped up (a price lock or intro promo ending, or a move off a retired tier)',
+      hint: 'Customers who cancelled at this close because their price stepped up (a price lock or intro promo ending, or a move off a retired tier)',
       quiet: !ops || ops.priceChurn === 0,
     },
     {
       key: 'tierMoves',
-      label: 'Tier moves',
+      label: 'Moved off retired tiers',
       value: count(ops?.tierMoves),
       tone: null,
       detail: null,
-      hint: 'Subscribers moved off tiers you no longer offer, to the offered tier nearest in price',
+      hint: 'Customers moved off tiers you no longer offer, to the offered tier nearest in price',
       quiet: !ops || ops.tierMoves === 0,
     },
     {
       key: 'incumbentPromos',
-      label: 'Incumbent promos',
+      label: 'Cable company promos',
       value: count(ops?.incumbentPromos),
       tone: null,
       detail: ops && ops.incumbentPromos > 0 ? `${formatNumber(ops.incumbentChurn)} cancelled` : null,
-      hint: 'Areas where the cable company ran a promo this month, and your subscribers it took',
+      hint: 'Areas where the cable company ran a promo this month, and your customers it took',
       quiet: !ops || (ops.incumbentPromos === 0 && ops.incumbentChurn === 0),
     },
   ];
 }
 
 /**
- * The month's financing: interest, principal repaid and money borrowed (from
- * totals), and debt, leverage and coverage at month end (report.debt). A
- * report from before round 3 (no `debt`) reads '–' throughout.
+ * The month's bank figures (report.debt, at month end): the spare cash the
+ * bank took from a frozen line, the debt, and the two checks (leverage as
+ * years of profit, coverage as profit per $1 of loan payments) against the
+ * bank's limits. The month's interest, principal and borrowing are in the
+ * full books' money in and out. The debt and the checks are quiet with
+ * nothing owed; a report from before round 3 (no `debt`) is quiet and reads
+ * '–' throughout.
  */
 export function financingRows(report: MonthlyReport): ReportRow[] {
   const debt = report.debt ?? null;
-  const spent = (amount: number | undefined) => (debt ? formatMoney(0 - (amount ?? 0)) : DASH);
+  const owed = debt ? debt.creditBalance + debt.termBalance : 0;
   const leverage = debt?.leverageX100;
   const coverage = debt?.coverageX100;
-  const leverageBreach = debt !== null && (leverage === null ? debt.creditBalance + debt.termBalance > 0 : (leverage ?? 0) > COVENANT_MAX_LEVERAGE * 100);
+  const leverageBreach = debt !== null && (leverage === null ? owed > 0 : (leverage ?? 0) > COVENANT_MAX_LEVERAGE * 100);
   const coverageBreach = debt !== null && coverage != null && coverage < COVENANT_MIN_COVERAGE * 100;
+  const nothingOwed = !debt || owed === 0;
   return [
     {
-      key: 'interest',
-      label: 'Interest',
-      value: spent(report.totals.interest),
-      tone: null,
-      detail: null,
-      hint: 'Interest on the credit line and term loans, accrued interest on prepayments, and any late fee',
-    },
-    {
-      key: 'principal',
-      label: 'Principal repaid',
-      value: spent(report.totals.principal),
-      tone: null,
-      detail: null,
-      hint: 'Credit-line repayments, scheduled term-loan principal and prepayments',
-    },
-    {
       key: 'sweep',
-      label: 'Swept by the bank',
+      label: 'Spare cash the bank took',
       value: debt?.sweep === undefined ? DASH : formatMoney(debt.sweep),
       tone: null,
       detail: debt?.frozenCloses ? `${plural(debt.frozenCloses, 'frozen close')} in a row` : null,
-      hint: 'While the credit line is frozen the bank takes part of each month’s operating cash flow to repay debt (included in principal repaid)',
+      hint: 'While you can’t borrow, the bank takes part of each month’s spare cash to pay down your debt (part of paying back loans)',
       quiet: !debt?.sweep,
-    },
-    {
-      key: 'proceeds',
-      label: 'Borrowed',
-      value: debt ? formatMoney(report.totals.loanProceeds ?? 0) : DASH,
-      tone: null,
-      detail: null,
-      hint: 'Credit-line draws and new term loans this month',
     },
     {
       key: 'debt',
       label: 'Debt at month end',
-      value: debt ? formatMoney(debt.creditBalance + debt.termBalance) : DASH,
+      value: debt ? formatMoney(owed) : DASH,
       tone: null,
       detail: null,
-      hint: 'Credit-line balance plus every term loan still owed, after this close’s payments',
+      hint: 'Emergency cash used plus every loan still owed, after this close’s payments',
+      quiet: nothingOwed,
     },
     {
       key: 'leverage',
-      label: 'Leverage',
+      label: 'Years of profit (leverage)',
       value: !debt || leverage === undefined ? DASH : leverage === null ? 'not measurable' : formatRatio(leverage / 100),
       tone: leverageBreach ? 'breach' : null,
       detail: debt ? `limit ${formatRatio(COVENANT_MAX_LEVERAGE)}` : null,
-      hint: `Debt over the cash flow the bank counts (yearly operating cash flow, or a share of recurring revenue if that is more). The covenant allows at most ${formatRatio(COVENANT_MAX_LEVERAGE)}`,
+      hint: `What you owe over the yearly profit the bank counts (bills less running costs, or a share of yearly bills if that is more). The bank allows at most ${formatRatio(COVENANT_MAX_LEVERAGE)}`,
+      quiet: nothingOwed,
     },
     {
       key: 'coverage',
-      label: 'Coverage',
+      label: 'Earned per $1 of loan payments (coverage)',
       value: !debt || coverage == null ? DASH : formatRatio(coverage / 100),
       tone: coverageBreach ? 'breach' : null,
       detail: debt ? `min ${formatRatio(COVENANT_MIN_COVERAGE)}` : null,
-      hint: `The cash flow the bank counts over the next 12 months of debt service. The covenant asks for at least ${formatRatio(COVENANT_MIN_COVERAGE)}`,
+      hint: `The yearly profit the bank counts over the next 12 months of loan payments. The bank asks for at least ${formatRatio(COVENANT_MIN_COVERAGE)}`,
+      quiet: nothingOwed,
     },
   ];
 }
+
+// ---------------------------------------------------------------------------
+// The month-close toast (main.ts)
+// ---------------------------------------------------------------------------
 
 /**
  * "Mar 2027 closed: net +$1,200, 412 subs, 1,034 passings" (no subscriber
@@ -398,83 +315,327 @@ export function monthClosedTone(report: MonthlyReport): 'ok' | 'warn' {
   return report.debt?.missedPayment ? 'warn' : 'ok';
 }
 
-/** A report used only to lay out the rows (labels and hints). */
-const SAMPLE: MonthlyReport = { year: 2027, month: 1, totals: {}, net: 0, cashEnd: 0, passings: 0 };
+// ---------------------------------------------------------------------------
+// The panel's view model
+// ---------------------------------------------------------------------------
 
-/** Shown in the collapsed panel, in this order. */
-const HEADLINE: readonly ReportRowKey[] = ['net', 'subscribers', 'takeRate'];
+/** The panel's parts, top to bottom: each one element, shown or hidden in place. */
+export type PanelPart = 'empty' | 'cash' | 'money' | 'customers' | 'seeCustomers' | 'building' | 'bank' | 'mtd' | 'books';
 
-/** Phones and short screens start with the details collapsed. */
-const COMPACT_QUERY = '(max-width: 880px), (max-height: 500px)';
+export const PANEL_PARTS: readonly PanelPart[] = ['empty', 'cash', 'money', 'customers', 'seeCustomers', 'building', 'bank', 'mtd', 'books'];
 
-interface RowView {
-  /** The row's own element (round-4 rows hide while quiet). */
-  row: HTMLElement;
-  value: HTMLElement;
-  /** Where the row's secondary line goes (the subscriber movements), if anywhere. */
-  detail: HTMLElement | null;
-  /** Small print shown right after the value (the cost-per-passing target). */
-  inline: HTMLElement | null;
+/** What stays on screen collapsed (phones and short screens start so): the cash line, the customers line and the bank's word. */
+export const COLLAPSED_PARTS: readonly PanelPart[] = ['cash', 'customers', 'bank'];
+
+export interface PanelCash {
+  /** "Cash went down $32,539" (briefing.cashHeadline, the summary's cash card). */
+  headline: string;
+  /** "$332,590 left" / "$2,100 overdrawn". */
+  left: string;
+  direction: 'up' | 'down' | 'flat';
+  /** "Cash went down $32,539 · $332,590 left" */
+  text: string;
 }
 
-/** Rows whose secondary line sits right after the value rather than on a row of its own. */
-const INLINE_DETAIL: readonly ReportRowKey[] = ['cpp', 'leverage', 'coverage', 'repairs', 'outages', 'incumbentPromos', 'sweep', 'overheadCustomers'];
+export interface PanelMoney {
+  /** briefing.moneyBars for the month: both bars on one scale (the larger total is the full width). */
+  in: MoneyBar;
+  out: MoneyBar;
+  /** Money in includes borrowing: its total is never success green (debt is not earnings). */
+  borrowed: boolean;
+}
+
+export interface PanelBuilding {
+  /** "Building: $80,540 · $2,333 per home passed (target $1,000)" */
+  text: string;
+  /** The cost per home passed's band, or null without one. */
+  band: CppBand | null;
+  /** The band in words beside its color: "Within target", "Over target", "Far over target"; null without one. */
+  bandText: string | null;
+}
+
+export interface PanelBank {
+  /** The shared word (ui/health.ts): "Good", "Watch", "Warning", "Higher interest", "No more borrowing", "Loans called". */
+  word: string;
+  /** "Bank: Watch" (the link's text, like the HUD chip). */
+  text: string;
+  /** HEALTH_TONE of the level, 'danger' once the loans are called. Never success green. */
+  tone: HealthTone;
+  /** The plain sentence under the word in the Bank (the link's tooltip). */
+  sentence: string;
+}
+
+export interface ReportPanelView {
+  /** The toggle's text: the closed month ("August 2027"), or "Monthly report" before the first close. */
+  title: string;
+  /** A month has closed (the toggle works and "See the full books" has a report to open). */
+  hasReport: boolean;
+  /** "First report arrives Feb 1." before the first close, else null. */
+  empty: string | null;
+  cash: PanelCash | null;
+  money: PanelMoney | null;
+  /** "**31 customers** (+4 joined, 1 left) · 18% of homes you pass", or null for a report without customer figures. */
+  customers: Words | null;
+  /** Only when the month built fiber, else null. */
+  building: PanelBuilding | null;
+  /** Only with debt (or while the bank's health is not Good), else null. Today's health, as the HUD chip and the Bank show it. */
+  bank: PanelBank | null;
+  /** "This month so far: $1,100 spent" and its amount. */
+  mtd: { amount: string; text: string };
+}
+
+/** The customers line: the month-end count, who joined and left (as the Customers dashboard counts them), and the take rate in words. */
+export function customersWords(report: MonthlyReport): Words | null {
+  const stats = report.stats;
+  if (!stats) return null;
+  const joined = stats.grossAdds;
+  const left = stats.churned + stats.lostService;
+  const take = reportKpis(report)?.takeRate ?? null;
+  return [
+    { text: plural(stats.subscribers, 'customer'), strong: true },
+    { text: joined === 0 && left === 0 ? '' : ` (+${formatNumber(joined)} joined, ${formatNumber(left)} left)` },
+    { text: take === null ? ' · no homes passed yet' : ` · ${formatPercent(take)} of homes you pass` },
+  ];
+}
+
+/** "Building: $80,540 · $2,333 per home passed (target $1,000)", with the band in words; null when the month built nothing. */
+export function buildingLine(money: PanelMoney, report: MonthlyReport): PanelBuilding | null {
+  const spent = money.out.segments.find((s) => s.key === 'building');
+  if (!spent) return null;
+  const kpis = reportKpis(report);
+  if (!kpis) return { text: `Building: ${spent.value}`, band: null, bandText: null };
+  const perHome = kpis.cpp === null ? 'no homes passed yet' : `${formatMoney(kpis.cpp)} per home passed`;
+  const band = kpis.cpp === null ? null : kpis.cppBand;
+  return {
+    text: `Building: ${spent.value} · ${perHome} (target ${formatMoney(CPP_TARGET)})`,
+    band,
+    bandText: band ? `${CPP_BAND_TEXT[band]} target` : null,
+  };
+}
+
+/** The bank's word as a link, today's health (debt.bankHealth); null with no debt while the health is Good. */
+export function bankLine(state: GameState): PanelBank | null {
+  const health = bankHealth(state);
+  if (health.noDebt && health.level === 'good') return null;
+  const word = healthWordOf(health);
+  return { word, text: `Bank: ${word}`, tone: health.called ? 'danger' : HEALTH_TONE[health.level], sentence: healthSentence(health) };
+}
+
+/** Everything the panel shows for `state`, in words. Pure. */
+export function reportPanelView(state: GameState): ReportPanelView {
+  const { finance } = state;
+  const report = finance.reports.at(-1) ?? null;
+  const spent = finance.monthToDate.reduce((sum, e) => sum + (e.amount < 0 ? -e.amount : 0), 0);
+  const mtdAmount = formatMoney(spent);
+  const mtd = { amount: mtdAmount, text: `This month so far: ${mtdAmount} spent` };
+  const bank = bankLine(state);
+  if (!report) {
+    const next = dateOf(state.day);
+    const month = next.month === 12 ? 1 : next.month + 1;
+    return { title: 'Monthly report', hasReport: false, empty: `First report arrives ${MONTH_ABBR[month - 1]} 1.`, cash: null, money: null, customers: null, building: null, bank, mtd };
+  }
+  // The month's money exactly as the month summary partitions it (one report: a span of 1).
+  const figures = { money: briefingMoney([report]), span: 1, headline: { cpp: reportKpis(report)?.cpp ?? null, cppTarget: CPP_TARGET } };
+  const bars = moneyBars(figures);
+  const money: PanelMoney = { in: bars.in, out: bars.out, borrowed: bars.in.segments.some((s) => s.key === 'borrowed') };
+  const head = cashHeadline({ change: figures.money.cashChange, end: report.cashEnd });
+  return {
+    title: formatMonthLong(report.year, report.month),
+    hasReport: true,
+    empty: null,
+    cash: { ...head, text: `${head.headline} · ${head.left}` },
+    money,
+    customers: customersWords(report),
+    building: buildingLine(money, report),
+    bank,
+    mtd,
+  };
+}
+
+/** The parts on screen: everything there is when expanded, COLLAPSED_PARTS when not; before the first close, the empty line, the bank and the spending so far either way. */
+export function visibleParts(view: ReportPanelView, expanded: boolean): PanelPart[] {
+  const has: Record<PanelPart, boolean> = {
+    empty: view.empty !== null,
+    cash: view.cash !== null,
+    money: view.money !== null,
+    customers: view.customers !== null,
+    // Beside the customers line, so only with it.
+    seeCustomers: view.customers !== null,
+    building: view.building !== null,
+    bank: view.bank !== null,
+    mtd: true,
+    books: view.hasReport,
+  };
+  const wanted: readonly PanelPart[] = !view.hasReport ? ['empty', 'bank', 'mtd'] : expanded ? PANEL_PARTS : COLLAPSED_PARTS;
+  return PANEL_PARTS.filter((part) => has[part] && wanted.includes(part));
+}
+
+/** Every string the panel shows (the toggle's title included), expanded or collapsed: for the tests' no-jargon and collapsed checks. */
+export function panelText(view: ReportPanelView, expanded: boolean): string[] {
+  const out: string[] = [view.title];
+  for (const part of visibleParts(view, expanded)) {
+    switch (part) {
+      case 'empty':
+        out.push(view.empty ?? '');
+        break;
+      case 'cash':
+        out.push(view.cash?.text ?? '');
+        break;
+      case 'money':
+        for (const [name, bar] of [['Money in', view.money!.in], ['Money out', view.money!.out]] as const) {
+          out.push(name, bar.value, bar.description);
+          if (bar.empty) out.push(bar.empty);
+          for (const s of bar.segments) out.push(s.label, s.value);
+        }
+        break;
+      case 'customers':
+        out.push(wordsText(view.customers ?? []));
+        break;
+      case 'seeCustomers':
+        out.push(SEE_CUSTOMERS_TEXT);
+        break;
+      case 'building':
+        out.push(view.building!.text, ...(view.building!.bandText ? [view.building!.bandText] : []));
+        break;
+      case 'bank':
+        out.push(view.bank!.text);
+        break;
+      case 'mtd':
+        out.push(view.mtd.text);
+        break;
+      case 'books':
+        out.push(BOOKS_TEXT);
+        break;
+    }
+  }
+  return out;
+}
+
+const SEE_CUSTOMERS_TEXT = 'See customers';
+const BOOKS_TEXT = 'See the full books';
+
+// ---------------------------------------------------------------------------
+// The panel
+// ---------------------------------------------------------------------------
+
+/** Phones and short screens start collapsed. */
+const COMPACT_QUERY = '(max-width: 880px), (max-height: 500px)';
+
+/** The money-in sources and money-out groups each bar can show, in moneyBars' order. */
+const IN_KEYS = ['bills', 'borrowed', 'otherIn'] as const;
+const OUT_KEYS = ['running', 'building', 'loans'] as const;
+
+export interface ReportPanelDeps {
+  /** "See customers": the Customers dashboard. */
+  customers(): void;
+  /** "Bank: <word>": the Bank. */
+  bank(): void;
+  /** "See the full books": the briefing sheet's books view for the latest report, on its own. */
+  books(): void;
+}
+
+/** One bar's elements, made once: the total, the track's segments and the legend's items, each keyed by source or group. */
+interface BarView {
+  total: HTMLElement;
+  track: HTMLElement;
+  segments: Map<string, HTMLElement>;
+  items: Map<string, { item: HTMLElement; value: HTMLElement }>;
+  empty: HTMLElement;
+}
+
+function percent(share: number): string {
+  return `${Math.max(0, Math.min(100, share * 100)).toFixed(2)}%`;
+}
 
 export class ReportPanel {
   readonly root: HTMLElement;
   private readonly title: HTMLElement;
   private readonly toggle: HTMLButtonElement;
-  private readonly headline: HTMLElement;
-  private readonly details: HTMLElement;
-  private readonly rows = new Map<ReportRowKey, RowView>();
-  private readonly mtdLabel: HTMLElement;
-  private readonly mtd: HTMLElement;
+  private readonly parts = new Map<PanelPart, HTMLElement>();
   private readonly empty: HTMLElement;
+  private readonly cashHead: HTMLElement;
+  private readonly cashLeft: HTMLElement;
+  private readonly bars: { in: BarView; out: BarView };
+  private readonly customersText: HTMLElement;
+  private readonly buildingText: HTMLElement;
+  private readonly buildingBand: HTMLElement;
+  private readonly bankLink: HTMLButtonElement;
+  private readonly mtd: HTMLElement;
+  private customersKey = '';
+  private view: ReportPanelView | null = null;
   private key = '';
   private state: GameState | null = null;
 
-  constructor() {
+  constructor(deps: ReportPanelDeps) {
     this.title = el('span', { class: 'panel-title-text' });
     this.toggle = el(
       'button',
       {
         class: 'btn panel-toggle',
-        attrs: { type: 'button', 'aria-expanded': 'false', 'aria-controls': 'report-details' },
-        on: { click: () => this.setExpanded(this.toggle.getAttribute('aria-expanded') !== 'true') },
+        attrs: { type: 'button', 'aria-expanded': 'false', 'aria-controls': 'report-body' },
+        on: { click: () => this.setExpanded(!this.expanded) },
       },
       [this.title, el('span', { class: 'panel-toggle-label', text: 'Details' })],
     );
-    this.headline = el('dl', { class: 'stats' });
-    this.details = el('dl', { class: 'report-details', attrs: { id: 'report-details' } });
-    // Build one view per row; the sample report only provides labels and hints.
-    for (const row of reportRows(SAMPLE)) {
-      const headline = HEADLINE.includes(row.key);
-      const kind = headline ? 'stat' : 'row';
-      const value = el('span', { class: 'num' });
-      const inline = INLINE_DETAIL.includes(row.key) ? el('small', { class: 'row-sub', attrs: { hidden: '' } }) : null;
-      const line = el('div', { class: `${kind} ${kind}-${row.key}`, attrs: { title: row.hint } }, [el('dt', { text: row.label }), el('dd', {}, [value, inline])]);
-      this.rows.set(row.key, { row: line, value, detail: null, inline });
-      (headline ? this.headline : this.details).append(line);
-    }
-    // The subscriber headline's movements get a row of their own in the details.
-    const moves = el('span', { class: 'num' });
-    const movesRow = el('div', { class: 'row row-movements', attrs: { title: 'New subscribers, cancellations and disconnections this month' } }, [
-      el('dt', { text: 'Movement' }),
-      el('dd', {}, [moves]),
-    ]);
-    this.details.insertBefore(movesRow, this.details.firstChild);
-    (this.rows.get('subscribers') as RowView).detail = moves;
 
-    this.mtdLabel = el('span');
-    this.mtd = el('span', { class: 'num', attrs: { 'data-testid': 'mtd-spend' } });
     this.empty = el('p', { class: 'panel-empty' });
-    this.root = el('section', { class: 'panel pill-card', attrs: { 'aria-label': 'Monthly report' } }, [
-      el('h2', { class: 'panel-title' }, [this.toggle]),
-      this.headline,
-      this.details,
-      this.empty,
-      el('p', { class: 'mtd' }, [this.mtdLabel, ' ', this.mtd]),
-    ]);
+    this.cashHead = el('b', { class: 'panel-cash-head' });
+    this.cashLeft = el('span', { class: 'panel-cash-left' });
+    const cash = el('p', { class: 'panel-cash' }, [this.cashHead, el('span', { class: 'panel-cash-dot visually-hidden', text: ' · ' }), this.cashLeft]);
+
+    const inBar = this.bar('in', 'Money in', IN_KEYS);
+    const outBar = this.bar('out', 'Money out', OUT_KEYS);
+    this.bars = { in: inBar.view, out: outBar.view };
+    const money = el('div', { class: 'panel-money' }, [inBar.root, outBar.root]);
+
+    this.customersText = el('span', { class: 'panel-customers-text' });
+    const seeCustomers = el('button', {
+      class: 'btn panel-link panel-see-customers',
+      text: SEE_CUSTOMERS_TEXT,
+      attrs: { type: 'button' },
+      on: { click: () => deps.customers() },
+    });
+    const customers = el('p', { class: 'panel-customers' }, [this.customersText, ' ', seeCustomers]);
+
+    this.buildingText = el('span', { class: 'panel-building-text' });
+    this.buildingBand = el('span', { class: 'panel-band' });
+    const building = el('p', { class: 'panel-building' }, [this.buildingText, ' ', this.buildingBand]);
+
+    this.bankLink = el('button', {
+      class: 'btn panel-link panel-bank',
+      attrs: { type: 'button', 'data-testid': 'panel-bank' },
+      on: { click: () => deps.bank() },
+    });
+    const bank = el('p', { class: 'panel-bank-line' }, [this.bankLink]);
+
+    this.mtd = el('span', { class: 'num', attrs: { 'data-testid': 'mtd-spend' } });
+    const mtd = el('p', { class: 'mtd' }, ['This month so far: ', this.mtd, ' spent']);
+
+    const books = el('button', {
+      class: 'btn panel-books',
+      text: BOOKS_TEXT,
+      attrs: { type: 'button' },
+      on: { click: () => deps.books() },
+    });
+
+    const elements: Record<PanelPart, HTMLElement> = {
+      empty: this.empty,
+      cash,
+      money,
+      customers,
+      seeCustomers,
+      building,
+      bank,
+      mtd,
+      books,
+    };
+    for (const part of PANEL_PARTS) {
+      elements[part].dataset.part = part;
+      this.parts.set(part, elements[part]);
+    }
+    const body = el('div', { class: 'panel-body', attrs: { id: 'report-body' } }, [this.empty, cash, money, customers, building, bank, mtd, books]);
+    this.root = el('section', { class: 'panel pill-card', attrs: { 'aria-label': 'Monthly report' } }, [el('h2', { class: 'panel-title' }, [this.toggle]), body]);
+
     let compact = false;
     try {
       compact = window.matchMedia(COMPACT_QUERY).matches;
@@ -482,6 +643,37 @@ export class ReportPanel {
       // No matchMedia: show everything.
     }
     this.setExpanded(!compact);
+  }
+
+  /** One bar: its heading and total, the track (role img, its words as the label), the legend, and the words said instead of an empty bar. */
+  private bar(kind: 'in' | 'out', label: string, keys: readonly string[]): { root: HTMLElement; view: BarView } {
+    const total = el('span', { class: `num panel-flow-total total-${kind}` });
+    const track = el('div', { class: `panel-bar panel-bar-${kind}`, attrs: { role: 'img' } });
+    const list = el('ul', { class: 'panel-legend' });
+    const segments = new Map<string, HTMLElement>();
+    const items = new Map<string, { item: HTMLElement; value: HTMLElement }>();
+    for (const key of keys) {
+      const seg = el('span', { class: `panel-seg seg-${key}`, attrs: { 'data-key': key, hidden: '' } });
+      segments.set(key, seg);
+      track.append(seg);
+      const value = el('span', { class: 'num' });
+      const item = el('li', { attrs: { 'data-key': key, hidden: '' } }, [
+        el('span', { class: `panel-swatch seg-${key}`, attrs: { 'aria-hidden': 'true' } }),
+        el('span', { class: 'panel-legend-label' }),
+        ' ',
+        value,
+      ]);
+      items.set(key, { item, value });
+      list.append(item);
+    }
+    const empty = el('p', { class: 'panel-flow-empty', attrs: { hidden: '' } });
+    const root = el('div', { class: `panel-flow panel-flow-${kind}` }, [
+      el('p', { class: 'panel-flow-head' }, [el('span', { class: 'panel-flow-label', text: label }), ' ', total]),
+      track,
+      list,
+      empty,
+    ]);
+    return { root, view: { total, track, segments, items, empty } };
   }
 
   get expanded(): boolean {
@@ -492,6 +684,14 @@ export class ReportPanel {
     this.toggle.setAttribute('aria-expanded', String(open));
     this.root.classList.toggle('expanded', open);
     setText(this.toggle.querySelector('.panel-toggle-label') as HTMLElement, open ? 'Less' : 'Details');
+    this.showParts();
+  }
+
+  /** Show exactly the parts visibleParts names for the current view and state of the toggle. */
+  private showParts(): void {
+    const view = this.view;
+    const shown = new Set(view ? visibleParts(view, this.expanded) : []);
+    for (const [part, node] of this.parts) node.hidden = !shown.has(part);
   }
 
   update(state: GameState): void {
@@ -501,38 +701,71 @@ export class ReportPanel {
     if (key === this.key && state === this.state) return;
     this.key = key;
     this.state = state;
+    const view = reportPanelView(state);
+    this.view = view;
 
-    const last = finance.reports[finance.reports.length - 1];
-    this.headline.hidden = !last;
-    this.details.hidden = !last;
-    this.toggle.disabled = !last;
-    this.empty.hidden = !!last;
-    if (last) {
-      setText(this.title, `${formatMonth(last.year, last.month)} report`);
-      for (const row of reportRows(last)) {
-        const view = this.rows.get(row.key);
-        if (!view) continue;
-        view.row.hidden = row.quiet === true;
-        setText(view.value, row.value);
-        view.value.classList.toggle('negative', row.tone === 'negative');
-        view.value.classList.toggle('breach', row.tone === 'breach');
-        for (const band of ['green', 'amber', 'red'] as const) view.value.classList.toggle(`cpp-${band}`, row.tone === band);
-        if (view.detail) setText(view.detail, row.detail ?? '–');
-        if (view.inline) {
-          setText(view.inline, row.detail ?? '');
-          view.inline.hidden = !row.detail;
-        }
-      }
-    } else {
-      setText(this.title, 'Monthly report');
-      const next = dateOf(state.day);
-      const month = next.month === 12 ? 1 : next.month + 1;
-      setText(this.empty, `First report arrives ${MONTH_ABBR[month - 1]} 1.`);
+    setText(this.title, view.title);
+    this.toggle.disabled = !view.hasReport;
+    setText(this.empty, view.empty ?? '');
+    if (view.cash) {
+      setText(this.cashHead, view.cash.headline);
+      setText(this.cashLeft, view.cash.left);
     }
+    if (view.money) {
+      this.fillBar(this.bars.in, view.money.in);
+      this.fillBar(this.bars.out, view.money.out);
+      this.bars.in.total.classList.toggle('total-borrowed', view.money.borrowed);
+    }
+    this.setCustomers(view.customers);
+    if (view.building) {
+      setText(this.buildingText, view.building.text);
+      setText(this.buildingBand, view.building.bandText ?? '');
+      this.buildingBand.hidden = view.building.bandText === null;
+      for (const band of ['green', 'amber', 'red'] as const) this.buildingBand.classList.toggle(`cpp-${band}`, view.building.band === band);
+    }
+    if (view.bank) {
+      setText(this.bankLink, view.bank.text);
+      if (this.bankLink.title !== view.bank.sentence) this.bankLink.title = view.bank.sentence;
+      for (const tone of ['ok', 'warn', 'danger'] as const) this.bankLink.classList.toggle(`tone-${tone}`, view.bank.tone === tone);
+    }
+    setText(this.mtd, view.mtd.amount);
+    this.showParts();
+  }
 
-    const spent = finance.monthToDate.reduce((sum, e) => sum + (e.amount < 0 ? -e.amount : 0), 0);
-    const now = dateOf(state.day);
-    setText(this.mtdLabel, `Spent in ${MONTH_ABBR[now.month - 1]} so far`);
-    setText(this.mtd, formatMoney(spent));
+  private fillBar(bar: BarView, model: MoneyBar): void {
+    setText(bar.total, model.value);
+    if (bar.track.getAttribute('aria-label') !== model.description) bar.track.setAttribute('aria-label', model.description);
+    bar.track.hidden = model.empty !== null;
+    setText(bar.empty, model.empty ?? '');
+    bar.empty.hidden = model.empty === null;
+    const first = model.segments[0]?.key;
+    const last = model.segments.at(-1)?.key;
+    for (const [key, seg] of bar.segments) {
+      const segment = model.segments.find((s) => s.key === key);
+      seg.hidden = !segment;
+      // The bar's rounded ends go on the first and last segments shown (the others stay in the DOM, hidden).
+      seg.classList.toggle('is-first', key === first);
+      seg.classList.toggle('is-last', key === last);
+      if (segment) {
+        const width = percent(segment.share);
+        if (seg.style.width !== width) seg.style.width = width;
+      }
+    }
+    for (const [key, { item, value }] of bar.items) {
+      const segment = model.segments.find((s) => s.key === key);
+      item.hidden = !segment;
+      if (segment) {
+        setText(item.querySelector('.panel-legend-label') as HTMLElement, segment.label);
+        setText(value, segment.value);
+      }
+    }
+  }
+
+  /** The customers line's words (the count in bold), rebuilt only when they change. */
+  private setCustomers(words: Words | null): void {
+    const key = words ? JSON.stringify(words) : '';
+    if (key === this.customersKey) return;
+    this.customersKey = key;
+    this.customersText.replaceChildren(...(words ?? []).filter((w) => w.text).map((w) => (w.strong ? el('b', { text: w.text }) : document.createTextNode(w.text))));
   }
 }

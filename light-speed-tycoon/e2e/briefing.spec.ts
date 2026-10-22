@@ -155,7 +155,9 @@ test('See the full books holds the tiles, the itemized money, the notices, the l
   await expect(books.getByRole('heading', { name: 'The full books' })).toBeFocused();
   await expect(books.locator('.briefing-tile')).toHaveCount(7);
   await expect(books.locator('.briefing-tile dt')).toHaveText(['Net this month', 'Cash', 'Customers', 'Homes passed', 'Take rate', 'Cost per home passed', 'Debt']);
-  await expect(books.locator('.briefing-part h4')).toHaveText(['Money in and out', /^This month’s notices \(\d+\)$/, 'Looking ahead']);
+  // Round 4c/4d: with the rest of the report's figures (what the side panel used to list) after the money.
+  await expect(books.locator('.briefing-part h4')).toHaveText(['Money in and out', 'More figures for January 2027', /^This month’s notices \(\d+\)$/, 'Looking ahead']);
+  await expect(books.locator('.briefing-figure[data-key="arpu"] dt')).toContainText('Average bill per customer (ARPU)');
   await expect(books.locator('.briefing-money-net')).toContainText(/Cash change[+-]?\$[\d,]+/);
   // The overhead's lines are itemized under running the business.
   await expect(books.locator('.group-running .briefing-line[data-key="overheadBase"]')).toHaveCount(1);

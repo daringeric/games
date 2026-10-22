@@ -16,8 +16,13 @@
 // rest behind "N more tips". Everything the round-4b briefing had that is
 // no longer on the first view is one tap away in "See the full books": the
 // glance tiles, the itemized money, every notice, the look ahead and the
-// frequency select. No jargon on the first view (no leverage, covenant,
-// DSCR, ARR, OCF, bps or ×); debt is never success green.
+// frequency select, and (since the report panel became a small summary too)
+// "More figures" for the latest month: the KPIs, operations and bank figures
+// the panel used to list (panel.reportRows), each trade term beside its plain
+// meaning. The report panel opens these books on their own (openBooks): not
+// a month-end briefing, Close returns to the game. No jargon on the first
+// view (no leverage, covenant, DSCR, ARR, OCF, bps or ×); debt is never
+// success green.
 //
 // The data is advisor.buildBriefing (pure sim: Briefing.story, money, cash,
 // attention, advice); this file only turns it into words (summaryView, pure
@@ -43,6 +48,7 @@ import type {
   AttentionItem,
   BankHealthLevel,
   Briefing,
+  BriefingCash,
   BriefingChange,
   BriefingChangeKey,
   BriefingStory,
@@ -67,7 +73,9 @@ import type { HealthTone } from './health';
 import { ICONS } from './icons';
 import { noticeTone } from './overlays';
 import type { ToastTone } from './overlays';
-import { subscriberMovements } from './panel';
+// panel.ts imports this module's view model too: both use each other's exports only inside functions.
+import { reportRows, subscriberMovements } from './panel';
+import type { ReportRow } from './panel';
 
 // ---------------------------------------------------------------------------
 // The preference: how often the briefing shows
@@ -233,6 +241,11 @@ function periodOf(b: Pick<Briefing, 'span'>): PeriodWord {
 /** "March 2028 briefing", or "Jan–Mar 2028 briefing" for a quarter: the dialog's accessible name. */
 export function briefingTitle(briefing: Pick<Briefing, 'report' | 'span' | 'label'>): string {
   return `${periodLabel(briefing)} briefing`;
+}
+
+/** "The full books for March 2028": the dialog's accessible name when the report panel opens the books on their own. */
+export function booksTitle(briefing: Pick<Briefing, 'report' | 'span' | 'label'>): string {
+  return `The full books for ${periodLabel(briefing)}`;
 }
 
 /** "March 2028", or "Jan–Mar 2028" for a quarter. */
@@ -465,8 +478,16 @@ function orderLines(lines: readonly MoneyLine[]): MoneyLineView[] {
 /** Most parts a group's sub-label names. */
 const SUB_PARTS_MAX = 3;
 
+/**
+ * What the money bars and groups read: the period's money, its span and the
+ * cost per home passed. A Briefing has them all; the report panel builds
+ * them for its one month from the sim (advisor.briefingMoney and the
+ * report's KPIs) without the advisor's suggestions.
+ */
+export type MoneyFigures = Pick<Briefing, 'money' | 'span'> & { headline: Pick<Briefing['headline'], 'cpp' | 'cppTarget'> };
+
 /** The money-out groups, always all three, with their sub-labels and lines (spec G.3). */
-export function moneyGroups(b: Pick<Briefing, 'money' | 'headline' | 'span'>): MoneyGroupView[] {
+export function moneyGroups(b: MoneyFigures): MoneyGroupView[] {
   const period = periodOf(b);
   return (['running', 'building', 'loans'] as const).map((key) => {
     const group = b.money.groups.find((g) => g.key === key);
@@ -492,7 +513,7 @@ export function moneyGroups(b: Pick<Briefing, 'money' | 'headline' | 'span'>): M
  * source (customer bills, borrowed, other: only those that are not zero);
  * money out by group.
  */
-export function moneyBars(b: Pick<Briefing, 'money' | 'headline' | 'span'>): { scale: number; in: MoneyBar; out: MoneyBar; inLegend: boolean } {
+export function moneyBars(b: MoneyFigures): { scale: number; in: MoneyBar; out: MoneyBar; inLegend: boolean } {
   const { money } = b;
   const period = periodOf(b);
   const scale = Math.max(money.in, money.out);
@@ -560,6 +581,20 @@ export function runwayPhrase(months: number): string {
 }
 
 /**
+ * The cash card's heading and what is left: "Cash went down $4,479" and
+ * "$43,753 left" (or "went up", "stayed the same", "$2,100 overdrawn").
+ * Shared by the summary's cash card and the report panel's cash line.
+ */
+export function cashHeadline(cash: Pick<BriefingCash, 'change' | 'end'>): Pick<CashCardView, 'headline' | 'left' | 'direction'> {
+  const change = cash.change;
+  return {
+    headline: change < 0 ? `Cash went down ${formatMoney(-change)}` : change > 0 ? `Cash went up ${formatMoney(change)}` : 'Cash stayed the same',
+    left: cash.end < 0 ? `${formatMoney(-cash.end)} overdrawn` : `${formatMoney(cash.end)} left`,
+    direction: change < 0 ? 'down' : change > 0 ? 'up' : 'flat',
+  };
+}
+
+/**
  * The cash card (spec G.4): how much cash moved and what is left; when it
  * fell, how long it lasts at this pace (BriefingCash.paceMonths: the
  * period's own pace, building included, as the mockup reads); when the
@@ -572,9 +607,7 @@ export function cashCard(b: Pick<Briefing, 'cash' | 'money' | 'story' | 'span'>)
   const { cash } = b;
   const period = periodOf(b);
   const change = cash.change;
-  const direction = change < 0 ? 'down' : change > 0 ? 'up' : 'flat';
-  const headline = change < 0 ? `Cash went down ${formatMoney(-change)}` : change > 0 ? `Cash went up ${formatMoney(change)}` : 'Cash stayed the same';
-  const left = cash.end < 0 ? `${formatMoney(-cash.end)} overdrawn` : `${formatMoney(cash.end)} left`;
+  const { headline, left, direction } = cashHeadline(cash);
   const lines: Words[] = [];
   const borrowed = b.money.inLines.find((l) => l.key === 'borrowed')?.amount ?? 0;
   if (change < 0 && cash.paceMonths !== null) {
@@ -843,6 +876,15 @@ export interface BooksView {
   notices: NoticeRow[];
   noticeCount: number;
   forward: ForwardRow[];
+  /** "More figures for March 2028": the latest report's own month, even in a quarter. */
+  moreTitle: string;
+  /**
+   * The rest of the latest report (panel.reportRows: average bill, marketing
+   * per new customer, outages, the bank's figures, ...), the rows with
+   * nothing to say left out: with the tiles and the money above, every figure
+   * the old report panel listed.
+   */
+  more: ReportRow[];
 }
 
 const TONE_LABEL: Readonly<Record<ToastTone, string>> = { ok: 'Good news', warn: 'Heads up', err: 'Problem' };
@@ -1040,6 +1082,8 @@ export function booksView(b: Briefing): BooksView {
     notices,
     noticeCount: b.notices.length,
     forward: forwardRows(b),
+    moreTitle: `More figures for ${formatMonthLong(b.report.year, b.report.month)}`,
+    more: reportRows(b.report).filter((row) => !row.quiet),
   };
 }
 
@@ -1251,6 +1295,7 @@ export class BriefingSheet {
   private companyName = '';
   private renderId = 0;
   private modeNow: BriefingMode = 'summary';
+  private booksOnlyNow = false;
   /** Reports whose close-time briefing recorded its suggestions (noteAdviceShown): never twice. */
   private readonly noted = new WeakSet<MonthlyReport>();
   private nextSection: HTMLElement | null = null;
@@ -1273,22 +1318,52 @@ export class BriefingSheet {
   }
 
   /**
+   * The open sheet shows the full books on their own (the report panel's "See
+   * the full books"), not a month-end briefing: false while a briefing or
+   * nothing is open.
+   */
+  get booksOnly(): boolean {
+    return this.isOpen && this.booksOnlyNow;
+  }
+
+  /**
    * Show a briefing (the caller has paused the game); `companyName` leads the
-   * header. Over one already open (a later close while it shows), the content
-   * is replaced in place, back on the summary. A close-time briefing
-   * (isCloseTimeBriefing) records the suggestions it shows (noteAdviceShown)
-   * once per report; the menu's reopened one does not.
+   * header. Over one already open (a later close while it shows, or the books
+   * the report panel opened), the content is replaced in place, back on the
+   * summary. A close-time briefing (isCloseTimeBriefing) records the
+   * suggestions it shows (noteAdviceShown) once per report; the menu's
+   * reopened one does not.
    */
   open(briefing: Briefing, companyName: string): void {
+    this.show(briefing, companyName, false);
+    this.noteShown(briefing);
+  }
+
+  /**
+   * The report panel's "See the full books": the books view of `briefing`
+   * (its latest report's month) opened directly (the caller has paused the
+   * game). It is not a month-end briefing: it records nothing (no
+   * noteAdviceShown), has no summary to go back to, and Close (or Esc, or the
+   * backdrop) returns to the game through deps.onContinue. Ignored while a
+   * sheet is already open.
+   */
+  openBooks(briefing: Briefing, companyName: string): void {
+    if (this.isOpen) return;
+    this.show(briefing, companyName, true);
+  }
+
+  private show(briefing: Briefing, companyName: string, booksOnly: boolean): void {
     const view = summaryView(briefing, companyName);
+    const title = booksOnly ? booksTitle(briefing) : view.title;
     this.shown = briefing;
     this.companyName = companyName;
-    this.modeNow = 'summary';
+    this.modeNow = booksOnly ? 'books' : 'summary';
+    this.booksOnlyNow = booksOnly;
     let entry = this.current;
     if (!entry || !entry.sheet.dialog.open) {
       const created: { sheet: Sheet | null; exit: Exit } = { sheet: null, exit: { kind: 'continue' } };
       const sheet = openSheet({
-        title: view.title,
+        title,
         subtitle: view.headline.text,
         className: 'briefing',
         onClose: () => {
@@ -1302,9 +1377,9 @@ export class BriefingSheet {
       entry = created as { sheet: Sheet; exit: Exit };
       this.current = entry;
     }
-    this.header(entry.sheet, view);
+    entry.sheet.dialog.classList.toggle('briefing-books-only', booksOnly);
+    this.header(entry.sheet, view, title);
     this.render(entry.sheet, view);
-    this.noteShown(briefing);
   }
 
   /** Close without resuming (the game in play was replaced, or ended). */
@@ -1327,16 +1402,17 @@ export class BriefingSheet {
   }
 
   /**
-   * The header: the dialog's name (briefingTitle, kept for screen readers and
-   * the tests, shown only to them), the period and company over the
-   * headline, and the bank's health under it when the bank leads.
+   * The header: the dialog's name (`name`: briefingTitle, or booksTitle for
+   * the books on their own; kept for screen readers and the tests, shown only
+   * to them), the period and company over the headline, and the bank's
+   * health under it when the bank leads.
    */
-  private header(sheet: Sheet, view: SummaryView): void {
+  private header(sheet: Sheet, view: SummaryView, name: string): void {
     const heading = sheet.dialog.querySelector('.sheet-heading');
     const title = sheet.dialog.querySelector('.sheet-title');
     const subtitle = sheet.dialog.querySelector<HTMLElement>('.sheet-subtitle');
     if (!heading || !title || !subtitle) return;
-    setTextOf(title, view.title);
+    setTextOf(title, name);
     let kicker = heading.querySelector<HTMLElement>('.briefing-kicker');
     if (!kicker) {
       kicker = el('p', { class: 'briefing-kicker' });
@@ -1394,13 +1470,25 @@ export class BriefingSheet {
       this.nextSection = null;
       const section = this.books(view);
       body.replaceChildren(section);
-      const back = el('button', {
-        class: 'btn sheet-secondary briefing-back',
-        text: 'Back',
-        attrs: { type: 'button', 'aria-label': 'Back to the summary' },
-        on: { click: () => this.switchTo('summary') },
-      });
-      actions.replaceChildren(back, go);
+      if (this.booksOnlyNow) {
+        // Opened on their own from the report panel: no summary to go back to; Close returns to the game.
+        actions.replaceChildren(
+          el('button', {
+            class: 'btn sheet-primary briefing-continue briefing-close',
+            text: 'Close',
+            attrs: { type: 'button' },
+            on: { click: () => this.finish({ kind: 'continue' }) },
+          }),
+        );
+      } else {
+        const back = el('button', {
+          class: 'btn sheet-secondary briefing-back',
+          text: 'Back',
+          attrs: { type: 'button', 'aria-label': 'Back to the summary' },
+          on: { click: () => this.switchTo('summary') },
+        });
+        actions.replaceChildren(back, go);
+      }
       body.scrollTop = 0;
       section.querySelector<HTMLElement>('h3')?.focus({ preventScroll: true });
     }
@@ -1668,8 +1756,26 @@ export class BriefingSheet {
       this.frequency(),
       this.tiles(books),
       this.booksMoney(books, quarter),
+      this.more(books),
       this.notices(books, quarter),
       this.forward(books),
+    ]);
+  }
+
+  /** The rest of the latest report's figures (panel.reportRows), each with its plain explanation as a tooltip. */
+  private more(books: BooksView): HTMLElement {
+    if (books.more.length === 0) return this.part('more', books.moreTitle, [el('p', { class: 'briefing-empty', text: 'Nothing more to report.' })]);
+    return this.part('more', books.moreTitle, [
+      el(
+        'dl',
+        { class: 'briefing-figures' },
+        books.more.map((row) =>
+          el('div', { class: 'briefing-figure', attrs: { 'data-key': row.key, title: row.hint } }, [
+            el('dt', {}, [el('span', { text: row.label }), row.detail ? el('small', { text: row.detail }) : null]),
+            el('dd', { class: `num${row.tone === 'negative' ? ' tone-negative' : row.tone === 'breach' ? ' tone-danger' : ''}`, text: row.value }),
+          ]),
+        ),
+      ),
     ]);
   }
 
