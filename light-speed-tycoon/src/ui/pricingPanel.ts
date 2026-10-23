@@ -31,7 +31,6 @@ import {
   INCUMBENT_PRICE,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
-  PROMO_QUOTE_MONTHS,
   RETENTION_PERCENT_OFF,
   SMB_MULTIPLIER_MAX,
   SMB_MULTIPLIER_MIN,
@@ -285,7 +284,7 @@ export function promoHint(base: Pricing, draft: PricingDraft, preview: PricingPr
  * controls hold (even while switched off, so the player sees when one would
  * pay; with no valid offer typed, the general advice), its advice sentence
  * and, for an offer with households waiting, its figures over
- * PROMO_QUOTE_MONTHS. Empty once the game is over. Pure.
+ * promoQuoteMonths (quote.months). Empty once the game is over. Pure.
  */
 export function promoAdviceLine(state: GameState, draft: PricingDraft): string {
   const typed = inRange(draft.promo.percentOff, 1, PROMO_MAX_PERCENT_OFF) && inRange(draft.promo.months, 1, PROMO_MAX_MONTHS);
@@ -294,7 +293,7 @@ export function promoAdviceLine(state: GameState, draft: PricingDraft): string {
   if (!quote.ok) return '';
   if (offer === null || quote.waitingUnits <= 0) return quote.advice;
   return (
-    `${quote.advice} ${offer.percentOff}% off for ${plural(offer.months, 'month')}, over the next ${PROMO_QUOTE_MONTHS} months: ` +
+    `${quote.advice} ${offer.percentOff}% off for ${plural(offer.months, 'month')}, over the next ${quote.months} months: ` +
     `${quote.extraSignups < 1 ? 'less than one more signup' : `about ${plural(quote.extraSignups, 'more signup')}`}, ` +
     `${roughMoney(quote.valueGained)} of margin against ${roughMoney(quote.discountCost)} of discounts.`
   );

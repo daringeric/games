@@ -504,8 +504,9 @@ describe('#9 covenant cures and the bank\'s call', () => {
     const plans = advicePlans(state);
     const cure = plans.find((p) => p.advice.id === 'covenantCure')!;
     expect(cure.advice.severity).toBe('urgent');
-    expect(cure.advice.title).toBe(`Repay all ${formatMoney(totalDebt(state))} you owe`);
-    expect(plans.every((p) => !/^Prepay|Grow operating/.test(p.advice.title))).toBe(true);
+    // Round 4c/4d: in the Bank's words ("pay back", "loan 1"), never a prepayment or a growth target.
+    expect(cure.advice.title).toBe(`Pay back all ${formatMoney(totalDebt(state))} you owe`);
+    expect(plans.every((p) => !/^Pay \$[\d,]+ off loan|^Pay off loan|^Raise profit|^Grow profit/.test(p.advice.title))).toBe(true);
     // Following it: no debt, no call, and the close clears the stage.
     const after = follow(state, cure.commands);
     expect(totalDebt(after)).toBe(0);
@@ -528,8 +529,8 @@ describe('#9 covenant cures and the bank\'s call', () => {
     expect(cureOptions(state)[0]?.kind).toBe('grow');
     const plans = advicePlans(state);
     const cure = plans.find((p) => p.advice.id === 'covenantCure')!;
-    expect(cure.advice.title).toBe(`Repay all ${formatMoney(totalDebt(state))} you owe`);
-    expect(plans.some((p) => /Grow operating cash flow/.test(p.advice.title))).toBe(false);
+    expect(cure.advice.title).toBe(`Pay back all ${formatMoney(totalDebt(state))} you owe`);
+    expect(plans.some((p) => /^Raise profit|^Grow profit/.test(p.advice.title))).toBe(false);
     // Repaying is not borrowing: a later card never calls it "the borrowing suggested above".
     for (const p of plans) expect(`${p.advice.why} ${p.advice.detail ?? ''}`, p.advice.id).not.toMatch(/borrowing suggested above/);
     const runway = plans.find((p) => p.advice.id === 'cashRunway');
@@ -653,6 +654,6 @@ describe('#12 the grow cure', () => {
     expect(option.text).toContain(`from ${formatMoney(m.annualOperatingCashFlow)} to ${formatMoney(option.after.annualOperatingCashFlow)} a year`);
     expect(option.text).toContain(`the bank counts ${formatMoney(m.underwritingCashFlow)}`);
     const p = planFor(state, 'covenantCure')!;
-    expect(p.advice.title).toMatch(/^Raise cash flow to about \$[\d,]+ a year$/);
+    expect(p.advice.title).toMatch(/^Raise profit to about \$[\d,]+ a year$/);
   });
 });

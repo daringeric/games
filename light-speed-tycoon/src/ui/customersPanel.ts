@@ -87,9 +87,10 @@ export const GROWTH_MONTHS = 24;
 /** Quotes refresh at most this often while the clock runs (a command or an edit refreshes at once). A UI pace, not balance. */
 export const QUOTE_REFRESH_MS = 1_000;
 
-/** "a year" for the quotes' horizon (CUSTOMER_QUOTE_MONTHS), else "12 months". */
+/** A quote's horizon in words: "a year" (CUSTOMER_QUOTE_MONTHS), "two years", "three years" (the support quote's), else "18 months". */
 export function horizonWords(months: number = CUSTOMER_QUOTE_MONTHS): string {
-  return months === 12 ? 'a year' : plural(months, 'month');
+  const years: Record<number, string> = { 12: 'a year', 24: 'two years', 36: 'three years', 48: 'four years', 60: 'five years' };
+  return years[months] ?? plural(months, 'month');
 }
 
 /** A forecast count in words: "about 12", "less than one", "none" (n not rounded). */
@@ -551,7 +552,8 @@ export const MARKETING_NOTHING_LIT = 'No lit streets yet: marketing starts helpi
 /**
  * The marketing forecast line (spec I.4): "At $1,500 a month: about 12 new
  * customers a month, about $95 per new customer it brings." With no budget,
- * where new customers come from; with a budget that adds hardly any, says so;
+ * where new customers come from; with a budget that adds hardly any (fewer
+ * extra customers than aboutCount names), says so;
  * with no homes to sell to yet (`canSell` false: nothing lit), says that
  * instead. Empty for a quote that is not ok. Pure.
  */
@@ -560,7 +562,11 @@ export function marketingForecast(q: MarketingQuote, canSell = true): string {
   if (!canSell) return MARKETING_NOTHING_LIT;
   const at = `At ${formatMoney(q.perMonth)} a month: ${aboutCustomers(q.signupsPerMonth, 'new')} a month`;
   if (q.perMonth === 0) return `${at}, from neighbors and time alone.`;
-  if (q.costPerCustomer === null) return `${at}, but marketing adds hardly any of them: most homes on your lit streets already know you.`;
+  // Under the count's own floor ("no new customers"), a price per extra customer would price customers it says don't
+  // come ("about 3 new customers a month, about $23,360 per new customer it brings"): say it adds hardly any.
+  if (q.costPerCustomer === null || aboutCount(q.extraPerMonth) === 'none') {
+    return `${at}, but marketing adds hardly any of them: most homes on your lit streets already know you.`;
+  }
   return `${at}, about ${formatMoney(q.costPerCustomer)} per new customer it brings.`;
 }
 
@@ -593,7 +599,7 @@ export interface SupportOption {
   price: string;
   /** "$2,058 a month for your 294 customers. About 3 cancel a month; 294 happy." */
   effect: string;
-  /** "Your level now." / "Better than now by about $6,300 over a year." / "Worse than now by about $300 over a year." */
+  /** "Your level now." / "Better than now by about $6,300 over three years." / "Worse than now by about $300 over three years." (the quote's horizon, SupportQuote.months) */
   verdict: string;
 }
 
@@ -609,9 +615,9 @@ export function supportOption(current: SupportLevel, customers: number, q: Suppo
       : 'No customers yet, so it costs nothing today.';
   let verdict: string;
   if (isCurrent) verdict = 'Your level now.';
-  else if (customers === 0 || Math.abs(q.netValue) < 50) verdict = `About the same as now over ${horizonWords()}.`;
-  else if (q.netValue > 0) verdict = `Better than now by about ${roughMoney(q.netValue)} over ${horizonWords()}.`;
-  else verdict = `Worse than now by about ${roughMoney(-q.netValue)} over ${horizonWords()}.`;
+  else if (customers === 0 || Math.abs(q.netValue) < 50) verdict = `About the same as now over ${horizonWords(q.months)}.`;
+  else if (q.netValue > 0) verdict = `Better than now by about ${roughMoney(q.netValue)} over ${horizonWords(q.months)}.`;
+  else verdict = `Worse than now by about ${roughMoney(-q.netValue)} over ${horizonWords(q.months)}.`;
   return { level: q.level, name: spec.name, current: isCurrent, price: `${formatMoney(spec.costPerSub)} a customer a month`, effect, verdict };
 }
 

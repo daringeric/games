@@ -9,7 +9,7 @@
 // dollar amounts.
 
 import { describe, expect, it } from 'vitest';
-import { CAMPAIGN_DAYS, CUSTOMER_QUOTE_MONTHS, MARKETING_MAX_PER_MONTH, REFERRAL_CREDIT, SUPPORT_LEVELS } from '../sim/balance';
+import { CAMPAIGN_DAYS, CUSTOMER_QUOTE_MONTHS, MARKETING_MAX_PER_MONTH, REFERRAL_CREDIT, SUPPORT_LEVELS, SUPPORT_QUOTE_MONTHS } from '../sim/balance';
 import { formatDate, formatMonth } from '../sim/calendar';
 import {
   AREA_TREND_MONTHS,
@@ -330,6 +330,7 @@ describe('areas and campaigns', () => {
     unsignedUnits: 120,
     unawareUnits: 60,
     extraSignups: 18.4,
+    splitterCost: 0,
     costPerCustomer: 78,
     valueGained: 2_000,
     pays: true,
@@ -426,6 +427,7 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
     months: CUSTOMER_QUOTE_MONTHS,
     signupsPerMonth: 12.3,
     extraPerMonth: 4.1,
+    splitterCost: 0,
     costPerCustomer: 366,
     ...over,
   });
@@ -436,6 +438,13 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
     expect(marketingForecast(mq({ extraPerMonth: 0, costPerCustomer: null }))).toBe(
       `At ${formatMoney(1_500)} a month: about 12 new customers a month, but marketing adds hardly any of them: most homes on your lit streets already know you.`,
     );
+    // Fewer extra customers than the count's floor: never a price per customer it says hardly come (round 4c/4d check:
+    // "about 3 new customers a month, about $23,360 per new customer it brings" at $500 with most homes aware).
+    for (const extraPerMonth of [0.011, 0.0214, 0.05]) {
+      const few = marketingForecast(mq({ perMonth: 500, signupsPerMonth: 3.2, extraPerMonth, costPerCustomer: Math.round(500 / extraPerMonth) }));
+      expect(few).toBe(`At ${formatMoney(500)} a month: about 3 new customers a month, but marketing adds hardly any of them: most homes on your lit streets already know you.`);
+    }
+    expect(marketingForecast(mq({ extraPerMonth: 0.06, costPerCustomer: 25_000 }))).toContain(`about ${formatMoney(25_000)} per new customer it brings`);
     expect(marketingForecast(mq({ signupsPerMonth: 1 }))).toContain('about 1 new customer a month');
     expect(marketingForecast(mq({ signupsPerMonth: 0.3 }))).toContain('less than one new customer a month');
     expect(marketingForecast(mq({ signupsPerMonth: 0 }))).toContain('no new customers a month');
@@ -487,6 +496,7 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
 describe('support level and referral credits', () => {
   const sq = (over: Partial<SupportQuote> = {}): SupportQuote => ({
     level: 'great',
+    months: SUPPORT_QUOTE_MONTHS,
     ok: true,
     reasons: [],
     costPerMonth: 700,
@@ -496,6 +506,7 @@ describe('support level and referral credits', () => {
     unhappy: 0,
     cancellationsPerMonth: 1.4,
     signupsPerMonth: 9,
+    splitterCost: 0,
     netValue: 1_234,
     pays: true,
     ...over,
@@ -508,15 +519,18 @@ describe('support level and referral credits', () => {
       current: false,
       price: `${formatMoney(SUPPORT_LEVELS.great.costPerSub)} a customer a month`,
       effect: `${formatMoney(700)} a month for your 100 customers. About 1 cancels a month; 90 happy.`,
-      verdict: `Better than now by about ${roughMoney(1_234)} over ${horizonWords()}.`,
+      verdict: `Better than now by about ${roughMoney(1_234)} over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.`,
     });
-    expect(supportOption('good', 100, sq({ level: 'basic', netValue: -420, pays: false })).verdict).toBe(`Worse than now by about ${roughMoney(420)} over ${horizonWords()}.`);
+    expect(supportOption('good', 100, sq({ level: 'basic', netValue: -420, pays: false })).verdict).toBe(`Worse than now by about ${roughMoney(420)} over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.`);
+    // Round 4c/4d fix: the support quote looks three years ahead, and the verdict says so.
+    expect(horizonWords(SUPPORT_QUOTE_MONTHS)).toBe('three years');
+    expect(horizonWords(CUSTOMER_QUOTE_MONTHS)).toBe('a year');
     expect(supportOption('great', 100, sq()).verdict).toBe('Your level now.');
     expect(supportOption('great', 100, sq()).current).toBe(true);
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 3.2 })).effect).toContain('About 3 cancel a month');
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 0.2 })).effect).toContain('Less than one cancel a month');
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 0 })).effect).toContain('Hardly anyone cancels');
-    expect(supportOption('good', 0, sq({ costPerMonth: 0, netValue: 0 }))).toMatchObject({ effect: 'No customers yet, so it costs nothing today.', verdict: `About the same as now over ${horizonWords()}.` });
+    expect(supportOption('good', 0, sq({ costPerMonth: 0, netValue: 0 }))).toMatchObject({ effect: 'No customers yet, so it costs nothing today.', verdict: `About the same as now over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.` });
   });
 
   it('reads every level from the sim\'s quotes', () => {
@@ -538,6 +552,7 @@ describe('support level and referral credits', () => {
     referralsPerMonth: 3.2,
     costPerMonth: 3.2 * 2 * REFERRAL_CREDIT,
     extraPerMonth: 1.1,
+    splitterCost: 0,
     costPerCustomer: 145,
     netValue: 480,
     pays: true,

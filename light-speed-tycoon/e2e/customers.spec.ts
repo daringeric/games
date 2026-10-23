@@ -155,7 +155,8 @@ test('each lever changes the game: marketing budget, support level and referral 
   const support = dialog.getByRole('group', { name: 'Support level' });
   await expect(support.locator('[data-level="good"]')).toHaveAttribute('aria-pressed', 'true');
   await expect(support.locator('[data-level="great"] .customers-choice-price')).toHaveText(`${money(SUPPORT_LEVELS.great.costPerSub)} a customer a month`);
-  await expect(support.locator('[data-level="great"] .customers-choice-verdict')).toHaveText(/^(Better|Worse) than now by about \$[\d,]+ over a year\.$|^About the same as now over a year\.$/);
+  // Round 4c/4d fix: the support quote looks three years ahead, with the outages the plant can expect.
+  await expect(support.locator('[data-level="great"] .customers-choice-verdict')).toHaveText(/^(Better|Worse) than now by about \$[\d,]+ over three years\.$|^About the same as now over three years\.$/);
   await support.locator('[data-level="great"]').click();
   await expect.poll(toasts).toContainEqual(toast('ok', `Support set to ${SUPPORT_LEVELS.great.name}`));
   expect(await page.evaluate(() => window.__lst!.getState().customers.supportLevel)).toBe('great');

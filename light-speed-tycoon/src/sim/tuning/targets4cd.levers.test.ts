@@ -34,7 +34,7 @@ import {
   SWITCHING_EXPERIMENT_MONTHS,
 } from './bots';
 import type { CampaignExperiment, MarketingForecastCheck, ReferralExperiment, SupportExperiment, SwitchingExperiment } from './bots';
-import { runBot, runValue, takeOfAreasLit, TUNING_SEEDS } from './harness';
+import { constantPriceBot, runBot, runValue, takeOfAreasLit, TUNING_SEEDS } from './harness';
 
 // ---------------------------------------------------------------------------
 // Target bands
@@ -51,6 +51,13 @@ const SOONER_MONTHS = 12;
 /** OVERPRICED's take rate two years in is at most this share of the default lineup's (switching experiment), every seed. */
 const OVERPRICED_TAKE_MAX = 0.75;
 const OVERPRICED_CHECK_MONTH = 24;
+/**
+ * Round 4c/4d review (spec I.1, price is a trade-off): a modest premium over every default price ...
+ * (round 4c/4d had any premium make customers unhappy: x1.05 lost 31-40% of five-year value) ...
+ */
+const MODEST_PREMIUM_MULTIPLIER = 1.05;
+/** ... is worth at least this share of the default lineup's runValue at month 60, on every seed. */
+const MODEST_PREMIUM_VALUE_MIN = 0.85;
 /** The marketing forecast is within this share of the realized signups ... */
 const FORECAST_TOLERANCE = 0.2;
 /** ... on at least this share of its checks (MARKETING_FORECAST_MONTHS on every seed). */
@@ -71,6 +78,7 @@ function cached<T>(key: string, make: () => T): T {
 
 const smart = (seed: number) => cached(`smart:${seed}`, () => runBot(seed, smartBot(), MONTHS));
 const discount = (seed: number) => cached(`discount:${seed}`, () => runBot(seed, discountBot(), MONTHS));
+const premium = (seed: number) => cached(`premium:${seed}`, () => runBot(seed, constantPriceBot(smartBot(), MODEST_PREMIUM_MULTIPLIER), MONTHS));
 const switching = (seed: number) => cached(`switching:${seed}`, (): SwitchingExperiment => switchingExperiment(seed));
 const campaign = (seed: number) => cached(`campaign:${seed}`, (): CampaignExperiment => campaignExperiment(seed));
 const support = (seed: number) => cached(`support:${seed}`, (): SupportExperiment => supportExperiment(seed));
@@ -110,6 +118,18 @@ describe('switching responds to the deal', () => {
         );
       }
       expect(sooner).toBeGreaterThanOrEqual(MOST_SEEDS);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'a modest premium (every price x1.05) is a trade-off, not a cliff: never a game over and at least 0.85 of the default lineup\'s value at month 60, every seed',
+    () => {
+      for (const seed of TUNING_SEEDS) {
+        const run = premium(seed);
+        expect(run.gameOver, `seed ${seed}`).toBeNull();
+        expect(runValue(run), `seed ${seed}`).toBeGreaterThanOrEqual(MODEST_PREMIUM_VALUE_MIN * runValue(smart(seed)));
+      }
     },
     TEST_TIMEOUT_MS,
   );

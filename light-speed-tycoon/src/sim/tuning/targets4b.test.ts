@@ -38,7 +38,9 @@ import {
   allUndergroundBot,
   freshPromoExperiment,
   incumbentAnswerExperiment,
-  maturePromoExperiment,
+  MATURE_PROMO_CASES,
+  maturePromoExperiments,
+  SMART_INTRO_PROMO,
   noCheapTierBot,
   smartBot,
   smartLiteBot,
@@ -134,7 +136,7 @@ const liteAt = (seed: number, difficulty: DifficultyId) =>
   cached(`lite:${difficulty}:${seed}`, () => runBot(seed, smartLiteBot(), MONTHS, { state: newGame(seed, { difficulty }) }));
 const answer = (seed: number) => cached(`answer:${seed}`, (): AnswerExperiment => incumbentAnswerExperiment(seed));
 const fresh = (seed: number) => cached(`fresh:${seed}`, (): PromoExperiment => freshPromoExperiment(seed));
-const mature = (seed: number) => cached(`mature:${seed}`, (): PromoExperiment => maturePromoExperiment(seed));
+const mature = (seed: number) => cached(`mature:${seed}`, (): PromoExperiment[] => maturePromoExperiments(seed, [SMART_INTRO_PROMO, ...MATURE_PROMO_CASES]));
 
 /** Share of the town passed at month 60, 0 for a run that ended before it. */
 function shareAt60(run: RunResult): number {
@@ -329,14 +331,26 @@ describe("pricing: the incumbent's promos", () => {
   // mature town most homes that would switch already have, so the promo mostly
   // discounts customers who would have signed anyway.
   it(
-    'the intro promo does not pay in a mature town (month 48, no new areas): quoted and realized',
+    'the intro promo does not pay in a mature town (month 48, no new areas): quoted and realized, for short, long, shallow and deep offers',
     () => {
-      const losses = TUNING_SEEDS.filter((seed) => {
-        const e = mature(seed);
-        return (e.withPromo[0] as number) < (e.without[0] as number);
+      // Round 4c/4d fix (spec C): a long standing promo raised every street's ceiling for good and paid there; each offer is
+      // played over its quote's horizon (the step churn when its locks end inside it), judged by operating cash flow and by
+      // cash with the installs counted.
+      const offers = [SMART_INTRO_PROMO, ...MATURE_PROMO_CASES];
+      offers.forEach((offer, i) => {
+        const label = `${offer.percentOff}% for ${offer.months} months`;
+        const ocfLosses = TUNING_SEEDS.filter((seed) => {
+          const e = mature(seed)[i]!;
+          return (e.withPromo[0] as number) < (e.without[0] as number);
+        });
+        const cashLosses = TUNING_SEEDS.filter((seed) => {
+          const e = mature(seed)[i]!;
+          return (e.withPromoCash[0] as number) < (e.withoutCash[0] as number);
+        });
+        expect(ocfLosses.length, `${label}: operating cash flow`).toBeGreaterThanOrEqual(MOST_SEEDS);
+        expect(cashLosses.length, `${label}: cash with installs`).toBeGreaterThanOrEqual(MOST_SEEDS);
+        for (const seed of TUNING_SEEDS) expect(mature(seed)[i]!.quote.pays, `${label}: seed ${seed} quote`).toBe(false);
       });
-      expect(losses.length).toBeGreaterThanOrEqual(MOST_SEEDS);
-      for (const seed of TUNING_SEEDS) expect(mature(seed).quote.pays, `seed ${seed}`).toBe(false);
     },
     TEST_TIMEOUT_MS,
   );

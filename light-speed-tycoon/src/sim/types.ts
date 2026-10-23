@@ -2020,11 +2020,13 @@ export interface PromoQuote {
   promo: IntroPromo | null;
   /** Units waiting to sign up across lit areas today (target take less subscribed), the gap a promo speeds up. */
   waitingUnits: number;
-  /** Extra signups the promo brings within PROMO_QUOTE_MONTHS (its signup boost on the waiting gap). */
+  /** Round 4c/4d fix: the quote's horizon, months (the promo's own months plus PROMO_QUOTE_MONTHS, so the step churn when its locks end is inside it). */
+  months: number;
+  /** Extra signups the promo brings within the horizon (its signup boost and lift on the waiting gap where it applies). */
   extraSignups: number;
   /** Revenue given up on the discounted signups within the horizon, dollars. */
   discountCost: number;
-  /** Margin the extra (and earlier) signups bring within the horizon, dollars. */
+  /** Margin the extra (and earlier) signups bring within the horizon, less the installs and splitters they need, dollars (at least 0). */
   valueGained: number;
   /** valueGained > discountCost. */
   pays: boolean;
@@ -2494,7 +2496,12 @@ export interface MarketingQuote {
   signupsPerMonth: number;
   /** Of those, the ones this budget brings beyond no marketing at all, a month, not rounded (>= 0). */
   extraPerMonth: number;
-  /** perMonth / extraPerMonth, whole dollars; null when extraPerMonth is about 0 (or the budget is 0). */
+  /**
+   * Round 4c/4d fix: the splitters (and OLT line cards) the extra signups need beyond no marketing over the horizon,
+   * dollars (customers.splittersCost).
+   */
+  splitterCost: number;
+  /** (perMonth x months + splitterCost) / (extraPerMonth x months), whole dollars; null when extraPerMonth is about 0 (or the budget is 0). */
   costPerCustomer: number | null;
 }
 
@@ -2511,19 +2518,23 @@ export interface CampaignQuote {
   unawareUnits: number;
   /** Expected signups it brings beyond no campaign, within the horizon (not rounded). */
   extraSignups: number;
-  /** cost / extraSignups, whole dollars; null when extraSignups is about 0. */
+  /** Round 4c/4d fix: the splitters (and OLT line cards) its extra signups need beyond no campaign over the horizon, dollars (customers.splittersCost). */
+  splitterCost: number;
+  /** (cost + splitterCost) / extraSignups, whole dollars; null when extraSignups is about 0. */
   costPerCustomer: number | null;
   /** Margin the extra signups bring within the horizon (their bills less per-customer costs; installs left out), dollars. */
   valueGained: number;
-  /** valueGained > cost. */
+  /** valueGained > cost + splitterCost. */
   pays: boolean;
   /** When the area's cooldown ends (no campaign before it), or null when none holds it back. */
   availableDay: number | null;
 }
 
-/** Round 4c/4d: what a support level would do against today's (customers.quoteSupport). Estimates over CUSTOMER_QUOTE_MONTHS. */
+/** Round 4c/4d: what a support level would do against today's (customers.quoteSupport). Estimates over SUPPORT_QUOTE_MONTHS (round 4c/4d fix). */
 export interface SupportQuote {
   level: SupportLevel;
+  /** The horizon of the estimates below, months (SUPPORT_QUOTE_MONTHS). */
+  months: number;
   /** setSupport would accept it (always, while the game is not over). */
   ok: boolean;
   reasons: string[];
@@ -2539,7 +2550,9 @@ export interface SupportQuote {
   cancellationsPerMonth: number;
   /** Expected new customers a month at this level (word of mouth moves it; not rounded). */
   signupsPerMonth: number;
-  /** Value over the horizon against today's level: margin of the customers kept and gained less the extra cost (negative: worse). Dollars. */
+  /** Round 4c/4d fix: the splitters (and OLT line cards) this level's customers need beyond today's level's over the horizon, dollars. */
+  splitterCost: number;
+  /** Value over the horizon against today's level: margin of the customers kept and gained less the extra cost and splitterCost (negative: worse). Dollars. */
   netValue: number;
   /** netValue > 0 (false for today's own level). */
   pays: boolean;
@@ -2556,9 +2569,11 @@ export interface ReferralQuote {
   costPerMonth: number;
   /** Signups a month credits on bring beyond credits off (>= 0; 0 for off), not rounded. */
   extraPerMonth: number;
-  /** costPerMonth / extraPerMonth, whole dollars; null when extraPerMonth is about 0. */
+  /** Round 4c/4d fix: the splitters (and OLT line cards) the extra signups credits on bring need over the horizon, dollars (0 for off). */
+  splitterCost: number;
+  /** (costPerMonth + splitterCost / months) / extraPerMonth, whole dollars; null when extraPerMonth is about 0. */
   costPerCustomer: number | null;
-  /** Value over the horizon of this setting against the other (margin of extra customers less credits). Dollars. */
+  /** Value over the horizon of this setting against the other (margin of extra customers less credits and splitterCost). Dollars. */
   netValue: number;
   pays: boolean;
 }
@@ -2571,7 +2586,10 @@ export interface GrowthOption {
   lever: GrowthLever;
   /** Expected extra customers within CUSTOMER_QUOTE_MONTHS (not rounded). */
   customers: number;
-  /** What it costs over that horizon (marketing: the extra budget x months; campaign: its price; referrals: the credits; build: the build-out plan with its installs), dollars. */
+  /**
+   * What it costs over that horizon (marketing: the extra budget x months; campaign: its price; referrals: the credits;
+   * each with the splitters its extra signups need; build: the build-out plan with its installs), dollars.
+   */
   cost: number;
   /** cost / customers, whole dollars; null when customers is about 0. */
   costPerCustomer: number | null;

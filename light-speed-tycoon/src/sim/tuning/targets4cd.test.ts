@@ -13,7 +13,9 @@
 //   network that breaks even;
 // - D, storm economics street by street: the method choice (the advisor's and
 //   SMART's) buries the exposed streets, each paying its extra cost back
-//   within the horizon, and keeps the sheltered ones aerial;
+//   within the horizon, and keeps the sheltered ones aerial; and at
+//   Bootstrapped SMART's mix is worth more than all-aerial and
+//   all-underground (at Shoestring, more than all-aerial);
 // - F, "it's really quite a tough game": a first-time player (CASUAL) never
 //   goes insolvent within three years at the Seed round or Angel-backed.
 // The customers targets (spec C and I.7) are in targets4cd.levers.test.ts,
@@ -30,7 +32,7 @@ import { BUILD_METHOD_HORIZON_YEARS, DIFFICULTY_LEVELS, METHOD_UPFRONT_WEIGHT } 
 import { newGame } from '../game';
 import type { DifficultyId, GameState } from '../types';
 import { buryPayback, cityExposure, exposureBand, preferredMethod, streetCanopy } from '../weather';
-import { advisorFollowerBot, casualBot, smartBot, smartLiteBot } from './bots';
+import { advisorFollowerBot, allAerialBot, allUndergroundBot, casualBot, smartBot, smartLiteBot } from './bots';
 import { firstPositiveMonth, median, missedPaymentMonths, passedShare, runBot, runValue, TUNING_SEEDS, worstStage } from './harness';
 import type { RunResult } from './harness';
 
@@ -65,6 +67,14 @@ const EXPOSED_BURIED_MIN = 0.8;
 const SHELTERED_AERIAL_MIN = 0.9;
 /** A street this tree-lined (weather.streetCanopy) or more counts as tree-lined. */
 const TREE_LINED = 0.5;
+/**
+ * Round 4c/4d review (spec D at small purses): at Bootstrapped SMART's mix is worth more at month 60 than both
+ * all-aerial and all-underground on at least this many of the five seeds and on the mean; at Shoestring more than
+ * all-aerial on the mean (against all-underground it is not: see DESIGN.md "What round 4c/4d could not reach").
+ */
+const SMALL_PURSE_MIX_WINS_MIN = 3;
+/** Round 4c/4d review: the Seed-round town of the 100-seed confirmation that defaulted after a severe storm (month 22). */
+const SEED_ROUND_STORM_TOWN = 91;
 
 const TEST_TIMEOUT_MS = 900_000;
 const LEVELS: readonly DifficultyId[] = DIFFICULTY_LEVELS.map((l) => l.id);
@@ -85,6 +95,10 @@ const smart = (seed: number, difficulty: DifficultyId) => cached(`smart:${diffic
 const follower = (seed: number, difficulty: DifficultyId) =>
   cached(`follower:${difficulty}:${seed}`, () => runBot(seed, advisorFollowerBot, MONTHS, { state: at(seed, difficulty) }));
 const lite = (seed: number, difficulty: DifficultyId) => cached(`lite:${difficulty}:${seed}`, () => runBot(seed, smartLiteBot(), MONTHS, { state: at(seed, difficulty) }));
+const strung = (seed: number, difficulty: DifficultyId) =>
+  cached(`aerial:${difficulty}:${seed}`, () => runBot(seed, allAerialBot(), MONTHS, { state: at(seed, difficulty) }));
+const buried = (seed: number, difficulty: DifficultyId) =>
+  cached(`underground:${difficulty}:${seed}`, () => runBot(seed, allUndergroundBot(), MONTHS, { state: at(seed, difficulty) }));
 const casual = (seed: number, difficulty: DifficultyId) =>
   cached(`casual:${difficulty}:${seed}`, () => runBot(seed, casualBot(), CASUAL_MONTHS, { state: at(seed, difficulty) }));
 
@@ -134,6 +148,16 @@ describe('A. difficulty levels: only the starting cash differs', () => {
       const share = medianOf('seed', shareAt60);
       expect(share).toBeGreaterThanOrEqual(SEED_SHARE[0]);
       expect(share).toBeLessThanOrEqual(SEED_SHARE[1]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'regression town from the 100-seed confirmation: the Seed round SMART on seed 91, whose cash a severe storm took below zero with its line drawn, bridges it and never defaults',
+    () => {
+      const run = smart(SEED_ROUND_STORM_TOWN, 'seed');
+      expect(run.gameOver).toBeNull();
+      expect(missedPaymentMonths(run)).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );
@@ -212,6 +236,31 @@ describe('B. following the advisor at every level', () => {
   );
 
   it(
+    'regression towns from the 100-seed confirmation: the Seed round seed 13 follower, which built a second area in its first week, never goes bust',
+    () => {
+      const run = follower(13, 'seed');
+      expect(run.gameOver).toBeNull();
+      expect(missedPaymentMonths(run)).toEqual([]);
+      expect(Math.min(...run.reports.map((r) => r.cashEnd))).toBeGreaterThanOrEqual(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'Shoestring seed 12345, where no area the purse covers pays its way whole: the follower still builds, lights homes and does at least as well as SMART-lite',
+    () => {
+      const run = follower(12345, 'shoestring');
+      expect(run.state.network.cabinets.length).toBeGreaterThan(0);
+      expect(run.reports.at(-1)?.passings ?? 0).toBeGreaterThan(0);
+      expect(run.gameOver).toBeNull();
+      const l = lite(12345, 'shoestring');
+      expect(runValue(run)).toBeGreaterThanOrEqual(runValue(l));
+      expect(shareAt60(run)).toBeGreaterThanOrEqual(shareAt60(l));
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     'does at least as well as SMART-lite on value and share at month 60, on most seeds, at every level',
     () => {
       for (const difficulty of LEVELS) {
@@ -276,6 +325,39 @@ describe('D. the method choice buries exposed streets that pay it back and strin
       if (sheltered > 0) expect(aerial / sheltered, `seed ${seed} aerial share of sheltered streets`).toBeGreaterThanOrEqual(SHELTERED_AERIAL_MIN);
     }
   });
+});
+
+describe('D. SMART\'s mixed build at the small purses', () => {
+  // Round 4c/4d review: round 4b's lean planner ranked areas and streets at the cheapest method's prices and then
+  // built them with the street-by-street mix, so a small purse bought sparse areas; burying everything matched or
+  // beat it at Bootstrapped and Shoestring. LEAN_OPTIONS now prices what it builds (chosenCosts), plans every
+  // candidate area (bestOfPlans) and weighs the make-ready wait (waitWeight); all three bots share the planner.
+  it(
+    'at Bootstrapped is worth more at month 60 than all-aerial and all-underground, on the mean and on most seeds; at Shoestring more than all-aerial on the mean',
+    () => {
+      for (const difficulty of ['bootstrapped', 'shoestring'] as const) {
+        let mixed = 0;
+        let aerial = 0;
+        let underground = 0;
+        let wins = 0;
+        for (const seed of TUNING_SEEDS) {
+          const m = runValue(smart(seed, difficulty));
+          const a = runValue(strung(seed, difficulty));
+          const u = runValue(buried(seed, difficulty));
+          mixed += m;
+          aerial += a;
+          underground += u;
+          if (m > a && m > u) wins++;
+        }
+        expect(mixed, `${difficulty}: mix vs all-aerial`).toBeGreaterThan(aerial);
+        if (difficulty === 'bootstrapped') {
+          expect(mixed, `${difficulty}: mix vs all-underground`).toBeGreaterThan(underground);
+          expect(wins, difficulty).toBeGreaterThanOrEqual(SMALL_PURSE_MIX_WINS_MIN);
+        }
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 // ---------------------------------------------------------------------------

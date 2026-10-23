@@ -161,7 +161,9 @@ describe('round 4c/4d: schemaVersion 4 extended in place', () => {
       delete report.customers;
     }
     const state = deserialize(JSON.stringify(save));
-    expect(state.customers).toEqual(newCustomers());
+    // Round 4c/4d fix: the defaults, with the lit streets seeded from the plant (customers.seedStreets).
+    expect({ ...state.customers, streets: [] }).toEqual(newCustomers());
+    expect(state.customers.streets.map((s) => s.segment)).toEqual([...getService(state).litSegments].sort((a, b) => a - b));
     expect(state.finance.reports.every((r) => r.ops?.overhead === null && r.customers === undefined)).toBe(true);
     const fresh = newGame(state.seed, { city: state.city });
     expect(Object.keys(state)).toEqual(Object.keys(fresh));
@@ -175,7 +177,10 @@ describe('round 4c/4d: schemaVersion 4 extended in place', () => {
 
   it.each(['v1-grid', 'v1-town', 'v2-grid', 'v2-town', 'v3-grid', 'v3-town'] as const)('gives the frozen %s save the customers defaults', (name) => {
     const state = deserialize(readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8'));
-    expect(state.customers).toEqual(newCustomers());
+    // Round 4c/4d fix: the defaults, with the lit streets seeded from the plant (customers.seedStreets).
+    expect({ ...state.customers, streets: [] }).toEqual(newCustomers());
+    expect(state.customers.streets.map((s) => s.segment)).toEqual([...getService(state).litSegments].sort((a, b) => a - b));
+    for (const street of state.customers.streets) expect(street.litDay).toBeLessThanOrEqual(state.day);
     expect(Object.keys(state)).toEqual(Object.keys(newGame(state.seed, { city: state.city })));
     // And it plays on, closing months with the new records.
     runDays(state, 40);

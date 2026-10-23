@@ -983,11 +983,23 @@ export const HAPPINESS_PER_OUTAGE_DAY = 0.1;
 export const HAPPINESS_OUTAGE_MEMORY_DAYS = 180;
 /**
  * Score lost per share paid above the market's price for the tier
- * (TIER_DEFAULTS; a business: x SMB_MULTIPLIER_DEFAULT). Round 4b's
- * CHURN_PRICE_SENSITIVITY (10: 10% over the market doubles churn), moved
- * into the score.
+ * (TIER_DEFAULTS; a business: x SMB_MULTIPLIER_DEFAULT) beyond the premium
+ * customers accept for fiber (HAPPINESS_MARKET_PREMIUM_TOLERATED). Round
+ * 4b's CHURN_PRICE_SENSITIVITY (10: 10% over the market doubles churn),
+ * moved into the score.
  */
 export const HAPPINESS_PER_PRICE_OVER_MARKET = 10;
+/**
+ * Round 4c/4d fix (spec I.1: price is a real trade-off): the share above the
+ * market's price customers pay without complaint (the market price is a
+ * reference, not a cliff). At 0 every lineup above the defaults lost: 2%
+ * over took customers out of happy (no word of mouth) and 5% made them
+ * unhappy (churn x1.5), so a 5% premium cost 31-40% of five-year value and
+ * 20% over went bust. With this tolerance a modest premium trades slower
+ * switching and a lower ceiling for more per customer, while an overpriced
+ * lineup (x1.2) still makes customers unhappy.
+ */
+export const HAPPINESS_MARKET_PREMIUM_TOLERATED = 0.08;
 /** Share above cable's price a customer at the default price pays where cable runs its promo ((INCUMBENT_PRICE - promo price) / promo price). */
 const CABLE_PROMO_PRICE = Math.max(1, INCUMBENT_PRICE - INCUMBENT_PROMO_DISCOUNT);
 const CABLE_PROMO_SHARE = (INCUMBENT_PRICE - CABLE_PROMO_PRICE) / CABLE_PROMO_PRICE;
@@ -1039,6 +1051,16 @@ export const HAPPINESS_WAIT_MEMORY_DAYS = 90;
 
 /** Months the customers quotes (marketing, campaign, support, referrals) look ahead. */
 export const CUSTOMER_QUOTE_MONTHS = 12;
+/**
+ * Round 4c/4d fix (spec I.4/I.6/I.7): the support level's quote
+ * (customers.quoteSupport) looks this many months ahead, with the outages
+ * the network's plant can expect (forecastCustomers' `outages`): Great
+ * support pays where storms keep knocking customers out, and that shows only
+ * over years (the support experiment's long horizon); over CUSTOMER_QUOTE_MONTHS
+ * with no outage foreseen it never quoted as paying, so the advisor never
+ * suggested it.
+ */
+export const SUPPORT_QUOTE_MONTHS = 36;
 /**
  * Round 4c (spec C): the intro promo's signup boost (PROMO_SIGNUP_BOOST)
  * applies only on streets lit within this many months (a freshly lit area),

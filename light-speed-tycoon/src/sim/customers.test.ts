@@ -24,9 +24,11 @@ import {
   INCUMBENT_PROMO_CHURN,
   INCUMBENT_PROMO_DISCOUNT,
   MARKETING_MAX_PER_MONTH,
+  MAX_SPLITTERS_PER_CABINET,
   REFERRAL_CREDIT,
   REFERRAL_WOM_MULTIPLIER,
   SMB_MULTIPLIER_DEFAULT,
+  SPLITTER_COST,
   START_CASH,
   SUPPORT_LEVELS,
   SWITCH_BASE_PER_DAY,
@@ -44,14 +46,18 @@ import {
   awarenessGainPerDay,
   awarenessOf,
   campaignStrength,
+  campaignStrengthOn,
   campaignSwitchFactor,
   churnFromScore,
   closeCustomersMonth,
+  customerAreas,
+  customerSnapshot,
   dealAdvantage,
   dealFactor,
   forecastCustomers,
   happinessReport,
   INSTALL_WAIT_WINDOW_DAYS,
+  isYoungStreet,
   marketingAwarenessPerDay,
   nextAwareness,
   priceScores,
@@ -67,12 +73,13 @@ import {
   whyNotSwitched,
   womSwitchFactor,
   SUPPORT_LEVEL_IDS,
+  splittersCost,
 } from './customers';
-import { applyCommand, newGame, runDays } from './game';
-import { getService } from './network';
+import { applyCommand, newGame, runDays, tick } from './game';
+import { getService, litSinceDays } from './network';
 import { withRng } from './rng';
 import { deserialize, hashState, serialize } from './save';
-import { closeDayAfter, closeSalesMonth, defaultPricing, segmentDeals, stepSales, subscriberUnits } from './sales';
+import { cabinetPortCapacity, cabinetPortsUsed, closeDayAfter, closeSalesMonth, defaultPricing, segmentDeals, stepSales, subscriberUnits } from './sales';
 import { addLivePlant, makeGridCity, makeTestState } from './testing/fixtures';
 import type { Account, CabinetId, City, GameState, IntroPromo, Pricing, SupportLevel, TierId, TierSetting } from './types';
 
@@ -316,6 +323,31 @@ describe('switching responds to the deal', () => {
 // ---------------------------------------------------------------------------
 
 describe('awareness', () => {
+  it('a save from before round 4c/4d knows how long its streets have been lit: none of its old streets is young or back at AWARENESS_ON_LIT', () => {
+    for (const name of ['v2-town', 'v3-town'] as const) {
+      const state = deserialize(readFileSync(new URL(`./testing/${name}.save.json`, import.meta.url), 'utf8'));
+      const since = litSinceDays(state);
+      expect(since.size, name).toBeGreaterThan(0);
+      // Seeded as it loads, every lit street from the day its plant lit it (or its first customer, if earlier).
+      expect(state.customers.streets.map((s) => s.segment), name).toEqual([...since.keys()].sort((a, b) => a - b));
+      tick(state);
+      let old = 0;
+      for (const entry of state.customers.streets) {
+        const litFor = state.day - (since.get(entry.segment) ?? state.day);
+        expect(entry.litDay, `${name} street ${entry.segment}`).toBeLessThanOrEqual(since.get(entry.segment) ?? state.day);
+        if (litFor < 365) continue;
+        old++;
+        expect(isYoungStreet(entry.litDay, state.day), `${name} street ${entry.segment} lit ${litFor} days ago`).toBe(false);
+        expect(entry.awareness, `${name} street ${entry.segment}`).toBeGreaterThan(Math.round(AWARENESS_ON_LIT * AWARENESS_PPM));
+      }
+      expect(old, name).toBeGreaterThan(0);
+      // The intro promo's quote counts only the streets lit within its window as newly lit.
+      let young = 0;
+      for (const entry of state.customers.streets) if (state.day - (since.get(entry.segment) ?? state.day) < PROMO_BOOST_YOUNG_DAYS) young++;
+      expect(state.customers.streets.filter((e) => isYoungStreet(e.litDay, state.day)).length, name).toBeLessThanOrEqual(young);
+    }
+  });
+
   it('starts a newly lit street at AWARENESS_ON_LIT, lit today, and drops it once it is dark', () => {
     const { state, a, b } = twoAreas();
     state.day = 5;
@@ -543,6 +575,34 @@ describe('why homes have not switched', () => {
 // ---------------------------------------------------------------------------
 // 4. Happiness
 // ---------------------------------------------------------------------------
+
+describe('the Areas list counts customers where the reasons and the campaign quote do', () => {
+  it('a nearer cabinet that takes over streets takes their customers into its area row too (no area at 0% with customers on its streets)', () => {
+    const { state } = litTown();
+    runDays(state, 400);
+    expect(subscriberUnits(state)).toBeGreaterThan(0);
+    // A second live cabinet next to the first: the streets nearer to it move to it; the accounts stay on the first.
+    const b = addLivePlant(state, { node: state.city.coNode + 1, splitters: 8, segments: [] }) as CabinetId;
+    runDays(state, 1);
+    const service = getService(state);
+    expect([...service.servingCabinet.values()]).toContain(b);
+    expect(state.sales.accounts.some((a) => a.cabinet !== service.servingCabinet.get(state.city.parcels[a.parcel]!.segment))).toBe(true);
+    const reasons = whyNotSwitched(state);
+    const areas = customerAreas(state);
+    expect(areas.map((a) => a.cabinet)).toEqual(reasons.areas.map((a) => a.cabinet));
+    for (const area of areas) {
+      const row = reasons.areas.find((a) => a.cabinet === area.cabinet)!;
+      expect(area.passings, `area ${area.cabinet} passings`).toBe(row.passings);
+      expect(area.subscribed, `area ${area.cabinet} customers`).toBe(row.subscribed);
+      // The campaign is sized on the homes the row says are unsigned.
+      expect(quoteCampaign(state, area.cabinet).unsignedUnits).toBe(area.passings - area.subscribed);
+    }
+    expect(areas.find((a) => a.cabinet === b)!.subscribed).toBeGreaterThan(0);
+    // The close's snapshot (report areas, trends) is the same list.
+    expect(customerSnapshot(state).areas.map((a) => [a.cabinet, a.passings, a.units])).toEqual(areas.map((a) => [a.cabinet, a.passings, a.subscribed]));
+    expect(areas.reduce((n, a) => n + a.subscribed, 0)).toBe(subscriberUnits(state));
+  });
+});
 
 describe('happiness', () => {
   it('puts every customer in a bucket from its factors: support, prices against the market and cable, memories', () => {
@@ -775,6 +835,47 @@ describe('levers', () => {
     expect(campaignStrength(record, record.startDay + CAMPAIGN_DAYS + Math.floor(CAMPAIGN_FADE_DAYS / 2))).toBeLessThan(1);
     expect(quoteCampaign(state, cabinet).ok).toBe(false);
   });
+
+  it('boosts only the streets lit when it was bought (what it is priced on), not the ones its cabinet lights later in its run', () => {
+    // Half the town lit from the CO's cabinet; the rest of its cable goes live ten days after the campaign is bought.
+    const state = makeTestState(TOWN, { rngSales: 54321 });
+    const all = state.city.segments.map((s) => s.id);
+    const now = all.filter((_, i) => i % 2 === 0);
+    const later = all.filter((_, i) => i % 2 === 1);
+    const cabinet = addLivePlant(state, { splitters: 8, segments: now }) as CabinetId;
+    state.sales.marketingPerMonth = 0;
+    state.finance.cash = START_CASH * 10;
+    step(state, 1);
+    const litAtPurchase = new Set(getService(state).litSegments);
+    const units = quoteCampaign(state, cabinet).unsignedUnits;
+    const withCampaign = deserialize(serialize(state));
+    expect(applyCommand(withCampaign, { type: 'runCampaign', cabinet }).ok).toBe(true);
+    expect(withCampaign.customers.campaigns[0]!.units).toBe(units);
+    step(state, 10);
+    step(withCampaign, 10);
+    for (const s of [state, withCampaign]) addLivePlant(s, { node: null, segments: later });
+    step(state, 40);
+    step(withCampaign, 40);
+    const awareness = (s: GameState) => new Map(s.customers.streets.map((e) => [e.segment, e.awareness]));
+    const a = awareness(state);
+    const b = awareness(withCampaign);
+    let newlyLit = 0;
+    for (const [segment, ppm] of b) {
+      if (litAtPurchase.has(segment)) expect(ppm, `street ${segment} lit at purchase`).toBeGreaterThan(a.get(segment)!);
+      else {
+        newlyLit++;
+        expect(ppm, `street ${segment} lit after`).toBe(a.get(segment));
+      }
+    }
+    expect(newlyLit).toBeGreaterThan(0);
+    // The switching rule reads the same: a street gets the campaign's strength only if it was lit by the purchase day.
+    const record = withCampaign.customers.campaigns[0]!;
+    const on = { strength: campaignStrength(record, withCampaign.day), startDay: record.startDay };
+    expect(on.strength).toBeGreaterThan(0);
+    expect(campaignStrengthOn(on, record.startDay)).toBe(on.strength);
+    expect(campaignStrengthOn(on, record.startDay + 1)).toBe(0);
+    expect(campaignStrengthOn(undefined, record.startDay)).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -797,6 +898,38 @@ describe('forecasts', () => {
       expect(quote.signupsPerMonth / actual, `seed ${seed} day ${day}: ${quote.signupsPerMonth} vs ${actual}`).toBeGreaterThan(0.8);
       expect(quote.signupsPerMonth / actual, `seed ${seed} day ${day}: ${quote.signupsPerMonth} vs ${actual}`).toBeLessThan(1.2);
     }
+  });
+
+  it('does not stop at today\'s free ports: it lets signups take the splitters a player adds as a cabinet fills, and the quotes charge for them', () => {
+    // One splitter (32 ports) for 128 homes that all know you: today's free ports hold a fraction of a year's signups.
+    const { state, cabinet } = litTown({ splitters: 1, aware: 1 });
+    step(state, 1);
+    const free = cabinetPortCapacity(state.network.cabinets[0]!) - (cabinetPortsUsed(state).get(cabinet) ?? 0);
+    const forecast = forecastCustomers(state);
+    expect(forecast.signups).toBeGreaterThan(1.5 * free);
+    expect(forecast.splitters).toBeGreaterThan(0);
+    expect(forecast.splitters).toBeLessThanOrEqual(MAX_SPLITTERS_PER_CABINET - 1);
+    expect(splittersCost(state, forecast.splitters)).toBeGreaterThanOrEqual(forecast.splitters * SPLITTER_COST);
+    expect(splittersCost(state, 0)).toBe(0);
+    // What the sim then does with a player adding a splitter whenever the cabinet turns signups away: within about 20%.
+    const quote = quoteMarketing(state, state.sales.marketingPerMonth);
+    const played = deserialize(serialize(state));
+    const start = played.sales.connectsTotal;
+    for (let d = 0; d < Math.round((CUSTOMER_QUOTE_MONTHS * 365) / 12); d++) {
+      if (played.sales.fullCabinets.includes(cabinet)) expect(applyCommand(played, { type: 'addSplitter', cabinet }).ok).toBe(true);
+      runDays(played, 1);
+    }
+    const actual = (played.sales.connectsTotal - start) / CUSTOMER_QUOTE_MONTHS;
+    expect(played.network.cabinets[0]!.splitters).toBeGreaterThan(1);
+    expect(quote.signupsPerMonth / actual, `${quote.signupsPerMonth} vs ${actual}`).toBeGreaterThan(0.8);
+    expect(quote.signupsPerMonth / actual, `${quote.signupsPerMonth} vs ${actual}`).toBeLessThan(1.2);
+    // A campaign's quote charges the splitters its extra signups need, and its cost per customer counts them.
+    const fresh = litTown({ splitters: 1, marketing: 0 });
+    step(fresh.state, 1);
+    const q = quoteCampaign(fresh.state, fresh.cabinet);
+    expect(q.extraSignups).toBeGreaterThan(0);
+    expect(q.costPerCustomer).toBe(Math.round((q.cost + q.splitterCost) / q.extraSignups));
+    expect(q.pays).toBe(q.valueGained > q.cost + q.splitterCost);
   });
 
   it('says what more marketing buys: more where few know you, nothing where everybody does', () => {

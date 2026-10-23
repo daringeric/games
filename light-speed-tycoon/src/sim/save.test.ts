@@ -1023,8 +1023,13 @@ function withoutRound4(state: GameState): Save {
   delete copy.company;
   delete copy.advisor;
   delete copy.sales.month.outageCreditDollarDays;
-  // Round 4c/4d: the customers model at its defaults.
-  expect(copy.customers).toEqual(newCustomers());
+  // Round 4c/4d: the customers model at its defaults, its lit streets seeded from the plant (customers.seedStreets).
+  const { streets, ...customers } = copy.customers;
+  const { streets: none, ...defaults } = newCustomers();
+  expect(none).toEqual([]);
+  expect(customers).toEqual(defaults);
+  expect(streets.map((s: { segment: number }) => s.segment)).toEqual([...getService(state).litSegments].sort((a, b) => a - b));
+  for (const street of streets) expect(street.litDay).toBeLessThanOrEqual(state.day);
   delete copy.customers;
   return copy;
 }

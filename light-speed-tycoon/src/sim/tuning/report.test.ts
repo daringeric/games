@@ -9,7 +9,9 @@
 // TUNE_PART=4cd for the round-4c/4d section only (difficulty levels, the
 // advisor follower, CASUAL, switching, the growth levers and the marketing
 // forecast: what the 100-seed confirmation runs), TUNE_PART=kept for the
-// round-2..4b section only (the kept targets).
+// round-2..4b section only (the kept targets), TUNE_PART=mix for SMART's mix
+// against all-aerial and all-underground at the small purses only (round
+// 4c/4d review, spec D; also part of 4cd).
 
 import { describe, expect, it } from 'vitest';
 import { CPP_TARGET, DIFFICULTY_LEVELS, INCUMBENT_PROMO_MIN_PASSINGS, START_CASH } from '../balance';
@@ -467,6 +469,33 @@ describe('balance report', () => {
       );
       process.stdout.write(`${out.join('\n')}\n`);
       expect(levels.length).toBe(SEEDS.length * DIFFICULTY_LEVELS.length);
+    },
+    7_200_000,
+  );
+  it.runIf(ENABLED && (PART === 'all' || PART === '4cd' || PART === 'mix'))(
+    "prints SMART's mix against all-aerial and all-underground at the small purses (round 4c/4d review, spec D)",
+    () => {
+      const rows: Array<Record<string, string>> = [];
+      for (const seed of SEEDS) {
+        for (const level of ['bootstrapped', 'shoestring'] as const) {
+          const state = () => newGame(seed, { difficulty: level });
+          const mix = runBot(seed, smartBot(), MONTHS, { state: state() });
+          const strung = runBot(seed, allAerialBot(), MONTHS, { state: state() });
+          const buried = runBot(seed, allUndergroundBot(), MONTHS, { state: state() });
+          const [m, a, u] = [mix, strung, buried].map((run) => runValue(run));
+          rows.push({
+            seed: String(seed),
+            level,
+            'mix value': dollars(m as number),
+            'aerial value': dollars(a as number),
+            'underground value': dollars(u as number),
+            'mix ahead of both': (m as number) > (a as number) && (m as number) > (u as number) ? 'yes' : 'no',
+            'game overs mix/aerial/ug': [mix, strung, buried].map((run) => (run.gameOver ? '1' : '0')).join('/'),
+          });
+        }
+      }
+      process.stdout.write(`\n=== round 4c/4d review: SMART's mix vs all-aerial and all-underground at Bootstrapped and Shoestring (runValue at month ${MONTHS})\n${table(rows)}\n`);
+      expect(rows.length).toBe(SEEDS.length * 2);
     },
     7_200_000,
   );

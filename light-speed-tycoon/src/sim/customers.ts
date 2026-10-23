@@ -23,7 +23,8 @@
 //        x womSwitchFactor (1 + SWITCH_WOM_BOOST x the street's happy share,
 //          x REFERRAL_WOM_MULTIPLIER while referral credits are on)
 //        x campaignSwitchFactor (1 + CAMPAIGN_SWITCH_BOOST x the area's
-//          campaign strength)
+//          campaign strength, on the streets lit when it was bought:
+//          campaignStrengthOn)
 //        x the intro promo's boost (sales.promoSignupFactor) on a young
 //          street (lit within PROMO_BOOST_YOUNG_MONTHS) or where the
 //          incumbent runs a promo (a contested area), else 1
@@ -44,13 +45,15 @@
 //    marketing boost)) is retired: marketing works through awareness (the
 //    ramp's constants and sales.marketingBoost are gone).
 // 2. Awareness (CustomersState.streets, ppm). stepCustomers adds a street the
-//    day it is lit at AWARENESS_ON_LIT (a street that already has customers,
-//    as in a save from before round 4c/4d, starts where time alone would
-//    have taken it since its first customer) and drops it the day it is not
-//    lit. Each later day a += (1 - a) x g, g = AWARENESS_BASE_PER_DAY +
+//    day it is lit at AWARENESS_ON_LIT (a street that already has customers
+//    starts where time alone would have taken it since its first customer)
+//    and drops it the day it is not lit. A save from before round 4c/4d has
+//    its lit streets seeded as it loads (seedStreets: from the day its plant
+//    lit each one, network.litSinceDays, or its first customer's if earlier). Each later day a += (1 - a) x g, g = AWARENESS_BASE_PER_DAY +
 //    marketingAwarenessPerDay (AWARENESS_MARKETING_*: diminishing in dollars
 //    per passing) + CAMPAIGN_AWARENESS_PER_DAY x the area's campaign strength
-//    + AWARENESS_WOM_PER_DAY x the street's happy share (x
+//    (streets lit when it was bought only) + AWARENESS_WOM_PER_DAY x the
+//    street's happy share (x
 //    REFERRAL_WOM_MULTIPLIER with credits on). Integer ppm, rounded once per
 //    day, never above AWARENESS_PPM.
 // 3. Why homes haven't switched (whyNotSwitched): per lit street, its
@@ -137,6 +140,7 @@ import {
   HAPPINESS_CABLE_PREMIUM_TOLERATED,
   HAPPINESS_GOOD_DEAL_MAX,
   HAPPINESS_INSTALL_WAIT,
+  HAPPINESS_MARKET_PREMIUM_TOLERATED,
   HAPPINESS_OUTAGE_MEMORY_DAYS,
   HAPPINESS_PER_OUTAGE_DAY,
   HAPPINESS_PER_PRICE_OVER_CABLE,
@@ -149,13 +153,19 @@ import {
   HAPPY_SCORE_MIN,
   INCUMBENT_PRICE,
   MARKETING_MAX_PER_MONTH,
+  MAX_SPLITTERS_PER_CABINET,
   MDU_PORTS_PER_BUILDING,
+  OLT_CARD_COST,
+  OLT_PORTS_PER_CARD,
   PROMO_BOOST_YOUNG_MONTHS,
   PROMO_STEP_SHARE,
   REFERRAL_CREDIT,
   REFERRAL_WOM_MULTIPLIER,
   SMB_MULTIPLIER_DEFAULT,
+  SPLIT_RATIO,
+  SPLITTER_COST,
   SUPPORT_LEVELS,
+  SUPPORT_QUOTE_MONTHS,
   SWITCH_BASE_PER_DAY,
   SWITCH_DEAL_MAX,
   SWITCH_DEAL_MIN,
@@ -166,7 +176,7 @@ import {
 } from './balance';
 import { DAYS_PER_YEAR, dateOf, formatMonth } from './calendar';
 import { formatMoney, groupThousands, postEntry, postEntryOn } from './finance';
-import { getService } from './network';
+import { getService, litSinceDays, ponPortsUsed } from './network';
 import { perCustomerCost } from './overhead';
 import {
   accountUnitPrice,
@@ -174,6 +184,8 @@ import {
   cabinetPortCapacity,
   cabinetPortsUsed,
   defaultPricing,
+  installCost,
+  promoPrice,
   promoSignupFactor,
   segmentDeals,
   segmentOffset,
@@ -182,10 +194,12 @@ import {
   targetTakeRate,
   tierMix,
 } from './sales';
-import { cornerName } from './streets';
+import { cornerName, otherEnd, segmentsAtNode } from './streets';
+import { outageChurnProbability, stormRisk } from './weather';
 import type {
   Account,
   AccountHappiness,
+  CableSpan,
   AreaSnapshot,
   CabinetId,
   CampaignQuote,
@@ -203,12 +217,15 @@ import type {
   IntroPromo,
   MarketingQuote,
   NeighborhoodCampaign,
+  NodeId,
   ParcelId,
   ParcelKind,
   Pricing,
   ReferralQuote,
   SegmentId,
+  ServiceSnapshot,
   StreetAwareness,
+  StreetSegment,
   SupportLevel,
   SupportQuote,
   SwitchReasonCounts,
@@ -366,7 +383,9 @@ export function unsignedUnitsIn(state: GameState, cabinet: CabinetId): number {
  * CAMPAIGN_FADE_DAYS, cooldownUntil: endDay + CAMPAIGN_COOLDOWN_DAYS, cost,
  * units } in place of the area's old record (ascending cabinet). Returns
  * { ok: true, cost }. The awareness burst and the switching boost start
- * with the next daily step (stepCustomers, stepSales).
+ * with the next daily step (stepCustomers, stepSales), on the streets lit
+ * today (what it is priced on: campaignStrengthOn), not on those its
+ * cabinet lights later in its run.
  */
 export function runCampaign(state: GameState, cabinet: CabinetId): CommandResult {
   const quote = quoteCampaign(state, cabinet);
@@ -375,6 +394,8 @@ export function runCampaign(state: GameState, cabinet: CabinetId): CommandResult
   const place = node === undefined ? 'a cabinet' : cornerName(state.city, node);
   postEntry(state, 'marketing', -quote.cost, `Neighborhood campaign at ${place}`);
   state.customers.month.campaignSpend += quote.cost;
+  // The streets it is priced on are the ones lit now: each gets its entry (lit today if it had none) so the boost knows them.
+  trackLitStreets(state);
   const record = campaignRecord(cabinet, state.day, quote.cost, quote.unsignedUnits);
   state.customers.campaigns = [...state.customers.campaigns.filter((c) => c.cabinet !== cabinet), record].sort((a, b) => a.cabinet - b.cabinet);
   return { ok: true, cost: quote.cost };
@@ -385,14 +406,32 @@ function campaignRecord(cabinet: CabinetId, day: number, cost: number, units: nu
   return { cabinet, startDay: day, endDay, cooldownUntil: endDay + CAMPAIGN_COOLDOWN_DAYS, cost, units };
 }
 
-/** Each cabinet's campaign strength on `day` (cabinets with a record only). */
-function campaignStrengths(campaigns: readonly NeighborhoodCampaign[], day: number): Map<CabinetId, number> {
-  const out = new Map<CabinetId, number>();
+/** A cabinet's running campaign on a day: its strength and the day it was bought. */
+interface CampaignOn {
+  strength: number;
+  startDay: number;
+}
+
+/** Each cabinet's campaign strength on `day` and its purchase day (cabinets with a record only). */
+function campaignStrengths(campaigns: readonly NeighborhoodCampaign[], day: number): Map<CabinetId, CampaignOn> {
+  const out = new Map<CabinetId, CampaignOn>();
   for (const c of campaigns) {
     const s = campaignStrength(c, day);
-    if (s > 0) out.set(c.cabinet, s);
+    if (s > 0) out.set(c.cabinet, { strength: s, startDay: c.startDay });
   }
   return out;
+}
+
+/**
+ * The campaign strength a street lit since `litDay` gets from its area's
+ * running campaign (`on`, or none): the campaign's strength when the street
+ * was lit when it was bought (litDay <= startDay), else 0. Round 4c/4d fix: a
+ * campaign is priced on the homes lit when it is bought (quoteCampaign,
+ * unsignedUnitsIn), so streets its cabinet lights later in its run are not
+ * part of it.
+ */
+export function campaignStrengthOn(on: CampaignOn | undefined, litDay: number): number {
+  return on !== undefined && litDay <= on.startDay ? on.strength : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +520,17 @@ export function promoBoost(promo: IntroPromo | null, young: boolean, contested: 
   return young || contested ? promoSignupFactor(promo) : 1;
 }
 
+/**
+ * Round 4c/4d fix (spec C): whether the intro promo is valued on a street:
+ * a promo is set and the street is young or contested (where its boost
+ * applies). There it lifts the target, the signup mix and the deal factor
+ * (its discount share, sales.promoDiscountShare); elsewhere it only
+ * discounts its signups.
+ */
+export function promoApplies(promo: IntroPromo | null, young: boolean, contested: boolean): boolean {
+  return promo !== null && (young || contested);
+}
+
 /** Share of a street's gap that switches in a day: awareness x SWITCH_BASE_PER_DAY x the factors (at most 1). */
 export function switchRate(awareness: number, deal: number, wom: number, campaign: number, boost: number): number {
   return Math.min(1, Math.max(0, awareness * SWITCH_BASE_PER_DAY * deal * wom * campaign * boost));
@@ -533,6 +583,8 @@ export interface StreetSwitching {
   rate: number;
   /** A signup's referral share there (referralShareOf). */
   referral: number;
+  /** Round 4c/4d fix: the intro promo is valued there (promoApplies: set, and the street young or contested). */
+  promoApplies: boolean;
 }
 
 /**
@@ -553,11 +605,12 @@ export function switchingDay(state: GameState): (segment: SegmentId, cabinet: Ca
     const young = entry ? isYoungStreet(entry.litDay, day) : true;
     const h = happy.get(segment);
     const share = h && h.units > 0 ? h.happy / h.units : 0;
-    const strength = strengths.get(cabinet) ?? 0;
+    const strength = campaignStrengthOn(strengths.get(cabinet), entry ? entry.litDay : day);
     const wom = womSwitchFactor(share, referrals);
     return {
       rate: switchRate(awareness, 1, wom, campaignSwitchFactor(strength), promoBoost(promo, young, contested)),
       referral: referralShareOf(share, referrals),
+      promoApplies: promoApplies(promo, young, contested),
     };
   };
 }
@@ -604,7 +657,9 @@ export interface PriceScores {
  * With over / under = the share above / below the tier's market price
  * (TIER_DEFAULTS) and overCable = the share above cable's local price for
  * that kind of plan (cablePrice x the tier's market price / INCUMBENT_PRICE):
- *   priceVsMarket = -HAPPINESS_PER_PRICE_OVER_MARKET x over
+ *   priceVsMarket = -HAPPINESS_PER_PRICE_OVER_MARKET x max(0, over -
+ *                   HAPPINESS_MARKET_PREMIUM_TOLERATED) (round 4c/4d fix: a
+ *                   modest premium is accepted)
  *   goodDeal      = min(HAPPINESS_GOOD_DEAL_MAX, HAPPINESS_PER_PRICE_UNDER_MARKET x under)
  *   priceVsCable  = -HAPPINESS_PER_PRICE_OVER_CABLE x max(0, overCable - over - HAPPINESS_CABLE_PREMIUM_TOLERATED)
  * (priceVsCable is 0 wherever cable charges its standard price, and for a
@@ -620,7 +675,7 @@ export function priceScores(tier: TierId, kind: ParcelKind, paid: number, smbMul
   const overTolerated = overCable - over - HAPPINESS_CABLE_PREMIUM_TOLERATED;
   return {
     priceVsCable: overTolerated > 0 ? -HAPPINESS_PER_PRICE_OVER_CABLE * overTolerated : 0,
-    priceVsMarket: over > 0 ? -HAPPINESS_PER_PRICE_OVER_MARKET * over : 0,
+    priceVsMarket: over > HAPPINESS_MARKET_PREMIUM_TOLERATED ? -HAPPINESS_PER_PRICE_OVER_MARKET * (over - HAPPINESS_MARKET_PREMIUM_TOLERATED) : 0,
     goodDeal: under > 0 ? Math.min(HAPPINESS_GOOD_DEAL_MAX, HAPPINESS_PER_PRICE_UNDER_MARKET * under) : 0,
   };
 }
@@ -943,16 +998,68 @@ export function noteInstallWaits(state: GameState, parcels: Iterable<ParcelId>):
 
 /**
  * A street seen lit for the first time today: AWARENESS_ON_LIT from today,
- * unless it already has customers (a save from before round 4c/4d, whose
- * streets list is empty): then from its first customer's day, at the
- * awareness time alone (AWARENESS_BASE_PER_DAY) would have brought it to.
+ * unless it was lit before (`since`: a save from before round 4c/4d, whose
+ * streets list is empty, or one of its streets with customers): then from
+ * that day, at the awareness time alone (AWARENESS_BASE_PER_DAY) would have
+ * brought it to.
  */
-function newStreet(segment: SegmentId, day: number, firstCustomer: number | undefined): StreetAwareness {
+function newStreet(segment: SegmentId, day: number, since: number | undefined): StreetAwareness {
   const start = Math.round(AWARENESS_ON_LIT * AWARENESS_PPM);
-  if (firstCustomer === undefined || firstCustomer >= day) return { segment, litDay: day, awareness: start };
-  const litDay = Math.max(0, firstCustomer);
+  if (since === undefined || since >= day) return { segment, litDay: day, awareness: start };
+  const litDay = Math.max(0, since);
   const keep = powInt(1 - clamp(AWARENESS_BASE_PER_DAY, 0, 1), day - litDay);
   return { segment, litDay, awareness: Math.min(AWARENESS_PPM, Math.round(AWARENESS_PPM - (AWARENESS_PPM - start) * keep)) };
+}
+
+/**
+ * Add an entry for every street lit today that has none yet (as
+ * stepCustomers would on its next step: newStreet, lit today unless it has
+ * customers from before), keeping streets ascending; nothing else changes.
+ * runCampaign calls it so the streets a campaign is priced on are known to
+ * be lit by its purchase day (campaignStrengthOn).
+ */
+function trackLitStreets(state: GameState): void {
+  const known = new Set(state.customers.streets.map((s) => s.segment));
+  const missing = [...getService(state).litSegments].filter((segment) => !known.has(segment));
+  if (missing.length === 0) return;
+  const first = firstCustomerDays(state);
+  state.customers.streets = [...state.customers.streets, ...missing.map((segment) => newStreet(segment, state.day, first.get(segment)))].sort((a, b) => a.segment - b.segment);
+}
+
+/** The earliest account's `since` per street (its parcel's segment). */
+function firstCustomerDays(state: GameState): Map<SegmentId, number> {
+  const first = new Map<SegmentId, number>();
+  for (const account of state.sales.accounts) {
+    const parcel = state.city.parcels[account.parcel];
+    if (!parcel) continue;
+    const seen = first.get(parcel.segment);
+    if (seen === undefined || account.since < seen) first.set(parcel.segment, account.since);
+  }
+  return first;
+}
+
+/**
+ * Round 4c/4d fix: the streets of a save from before round 4c/4d (its
+ * customers state is customers.newCustomers(), streets empty), seeded when
+ * it loads (save.ts) from what its plant says: every street lit today gets
+ * litDay = the earlier of the day its plant first lit it
+ * (network.litSinceDays) and its first customer's day, and the awareness
+ * time alone would have brought it to since then (newStreet). A street lit
+ * years ago is neither young (the intro promo's boost) nor back at
+ * AWARENESS_ON_LIT. A save that already has streets is left as it is.
+ */
+export function seedStreets(state: GameState): void {
+  if (state.customers.streets.length > 0) return;
+  const since = litSinceDays(state);
+  if (since.size === 0) return;
+  const first = firstCustomerDays(state);
+  state.customers.streets = [...since.keys()]
+    .sort((a, b) => a - b)
+    .map((segment) => {
+      const lit = since.get(segment);
+      const customer = first.get(segment);
+      return newStreet(segment, state.day, customer === undefined ? lit : lit === undefined ? customer : Math.min(lit, customer));
+    });
 }
 
 /**
@@ -964,8 +1071,9 @@ function newStreet(segment: SegmentId, day: number, firstCustomer: number | unde
  *    longer lit are dropped.
  * 2. Awareness: every street that already had an entry grows by
  *    awarenessGainPerDay (marketing at today's budget over today's
- *    passings, its area's campaign strength today, its happy share today,
- *    referral credits), nextAwareness.
+ *    passings, its area's campaign strength today when the street was lit
+ *    by the campaign's purchase day, its happy share today, referral
+ *    credits), nextAwareness.
  * 3. Waits: each cabinet in Sales.fullCabinets (the list as yesterday's
  *    step left it) gets today; records older than INSTALL_WAIT_WINDOW_DAYS
  *    or of cabinets gone are dropped. pausedDay = today while installs are
@@ -989,22 +1097,14 @@ export function stepCustomers(state: GameState): void {
     while (i < old.length && (old[i] as StreetAwareness).segment < segment) i++;
     const prev = i < old.length && (old[i] as StreetAwareness).segment === segment ? (old[i] as StreetAwareness) : null;
     if (!prev) {
-      if (firstCustomer === null) {
-        firstCustomer = new Map<SegmentId, number>();
-        for (const account of state.sales.accounts) {
-          const parcel = state.city.parcels[account.parcel];
-          if (!parcel) continue;
-          const seen = firstCustomer.get(parcel.segment);
-          if (seen === undefined || account.since < seen) firstCustomer.set(parcel.segment, account.since);
-        }
-      }
+      firstCustomer ??= firstCustomerDays(state);
       streets.push(newStreet(segment, day, firstCustomer.get(segment)));
       continue;
     }
     const h = happy.get(segment);
     const share = h && h.units > 0 ? h.happy / h.units : 0;
     const cabinet = service.servingCabinet.get(segment);
-    const strength = cabinet === undefined ? 0 : (strengths.get(cabinet) ?? 0);
+    const strength = cabinet === undefined ? 0 : campaignStrengthOn(strengths.get(cabinet), prev.litDay);
     const gain = awarenessGainPerDay(marketing, strength, share, customers.referrals);
     streets.push({ segment, litDay: prev.litDay, awareness: nextAwareness(prev.awareness, gain) });
   }
@@ -1089,13 +1189,18 @@ const OUTAGE_MEMORY_DAYS_MAX = 366;
  * The parts of CustomerStats that are a pure read of the state now:
  * subscribed units by happiness bucket (accountHappiness) and the per-area
  * snapshot (active cabinets serving lit streets, ascending: passings on
- * the streets they serve, subscribed units on their accounts). A quiet
+ * the streets they serve, subscribed units on those same streets). A quiet
  * close's stats are this with zero referrals and campaign spend.
+ * Round 4c/4d fix: subscribed units are counted by the street's serving
+ * cabinet, as the passings, whyNotSwitched's area rows, unsignedUnitsIn and
+ * quoteCampaign count them (an account stays on its old cabinet while that
+ * still reaches the street: sales.serviceChanges), so an area's take rate
+ * never counts customers on streets a nearer cabinet now serves.
  */
 export function customerSnapshot(state: GameState): Pick<CustomerStats, 'happy' | 'okay' | 'unhappy' | 'areas'> {
   const report = happinessReport(state);
   const service = getService(state);
-  const units = unitsByCabinet(state);
+  const units = unitsByServingCabinet(state, service);
   const areas: AreaSnapshot[] = [];
   for (const cabinet of [...service.cabinetCoverage.keys()].sort((a, b) => a - b)) {
     const coverage = service.cabinetCoverage.get(cabinet);
@@ -1105,9 +1210,15 @@ export function customerSnapshot(state: GameState): Pick<CustomerStats, 'happy' 
   return { happy: report.happy, okay: report.okay, unhappy: report.unhappy, areas };
 }
 
-function unitsByCabinet(state: GameState): Map<CabinetId, number> {
+/** Subscribed units per cabinet area: each account's units under its street's serving cabinet (its own cabinet when the street has none). */
+function unitsByServingCabinet(state: GameState, service: ServiceSnapshot): Map<CabinetId, number> {
   const units = new Map<CabinetId, number>();
-  for (const account of state.sales.accounts) units.set(account.cabinet, (units.get(account.cabinet) ?? 0) + accountUnits(account));
+  const parcels = state.city.parcels;
+  for (const account of state.sales.accounts) {
+    const segment = parcels[account.parcel]?.segment;
+    const cabinet = (segment === undefined ? undefined : service.servingCabinet.get(segment)) ?? account.cabinet;
+    units.set(cabinet, (units.get(cabinet) ?? 0) + accountUnits(account));
+  }
   return units;
 }
 
@@ -1183,17 +1294,20 @@ function reasonsIn(state: GameState, only?: CabinetId): SwitchReasons {
   const paused = state.sales.installsPaused;
   const cable = cablePricesOn(state, state.day);
   const models = new Map<number, { take: Record<ParcelKind, number>; expensive: Record<ParcelKind, number> }>();
-  const modelAt = (price: number) => {
-    let model = models.get(price);
+  // Round 4c/4d fix: the intro promo valued only where it applies (promoApplies: young or contested streets).
+  const modelAt = (price: number, valued: boolean) => {
+    const key = price * 2 + (valued ? 1 : 0);
+    let model = models.get(key);
     if (!model) {
       const take = { home: 0, mdu: 0, smb: 0 };
       const expensive = { home: 0, mdu: 0, smb: 0 };
+      const offer = valued ? promo : null;
       for (const kind of KINDS) {
-        take[kind] = targetTakeRate(pricing, kind, price, promo);
-        expensive[kind] = tooExpensiveShare(pricing, kind, price, promo);
+        take[kind] = targetTakeRate(pricing, kind, price, offer);
+        expensive[kind] = tooExpensiveShare(pricing, kind, price, offer);
       }
       model = { take, expensive };
-      models.set(price, model);
+      models.set(key, model);
     }
     return model;
   };
@@ -1208,7 +1322,9 @@ function reasonsIn(state: GameState, only?: CabinetId): SwitchReasons {
       row = { cabinet, target: 0, expensive: 0, units: 0, subscribed: 0 };
       streets.set(parcel.segment, row);
     }
-    const model = modelAt(cable.get(cabinet) ?? INCUMBENT_PRICE);
+    const entry = streetIndex(state.customers.streets, parcel.segment);
+    const valued = promoApplies(promo, entry ? isYoungStreet(entry.litDay, state.day) : true, cable.has(cabinet));
+    const model = modelAt(cable.get(cabinet) ?? INCUMBENT_PRICE, valued);
     row.target += model.take[parcel.kind] * parcel.units;
     row.expensive += model.expensive[parcel.kind] * parcel.units;
     row.units += parcel.units;
@@ -1304,6 +1420,109 @@ export interface ForecastOptions {
   cabinet?: CabinetId;
   /** Default CUSTOMER_QUOTE_MONTHS. */
   months?: number;
+  /**
+   * Round 4c/4d fix: foresee the outages each street's own live cable can
+   * expect (streetOutageExposure): their acute churn, and the outage memory
+   * a share of its customers carries at any time (happiness, so churn and
+   * word of mouth). Default false (the other quotes see no future outage).
+   */
+  outages?: boolean;
+}
+
+/** What a street's own cable's expected outages do to its customers in a forecast (streetOutageExposure). */
+interface OutageExposure {
+  /** Share of its customers remembering an outage at any time (one within HAPPINESS_OUTAGE_MEMORY_DAYS). */
+  share: number;
+  /** The happiness score that memory costs (HAPPINESS_PER_OUTAGE_DAY x the mean days out of one outage). */
+  penalty: number;
+  /** Extra monthly churn the outages cause when they happen (outagesPerYear / 12 x outageChurnProbability of the mean days). */
+  churn: number;
+}
+
+const NO_EXPOSURE: OutageExposure = { share: 0, penalty: 0, churn: 0 };
+
+/**
+ * Round 4c/4d fix: the live segments on the way from a cabinet's node to
+ * each segment it can reach over live cable, the segment itself last
+ * (shortest by length, ties to the lower segment id): an outage on any of
+ * them cuts the street off from that cabinet. Arithmetic only.
+ */
+function cabinetPaths(state: GameState, node: NodeId, live: ReadonlySet<SegmentId>): Map<SegmentId, readonly SegmentId[]> {
+  const city = state.city;
+  const dist = new Map<NodeId, number>([[node, 0]]);
+  const via = new Map<NodeId, SegmentId>();
+  const done = new Set<NodeId>();
+  for (;;) {
+    let u: NodeId | null = null;
+    let best = Number.POSITIVE_INFINITY;
+    for (const [n, d] of dist) if (!done.has(n) && (d < best || (d === best && u !== null && n < u))) (u = n), (best = d);
+    if (u === null) break;
+    done.add(u);
+    for (const id of segmentsAtNode(city, u)) {
+      if (!live.has(id)) continue;
+      const seg = city.segments[id] as StreetSegment;
+      const v = otherEnd(seg, u);
+      const d = best + seg.lengthFt;
+      const old = dist.get(v);
+      if (old === undefined || d < old) {
+        dist.set(v, d);
+        via.set(v, id);
+      }
+    }
+  }
+  const pathTo = (n: NodeId): SegmentId[] => {
+    const out: SegmentId[] = [];
+    for (let at = n, guard = 0; at !== node && guard < city.segments.length; guard++) {
+      const id = via.get(at);
+      if (id === undefined) break;
+      out.push(id);
+      at = otherEnd(city.segments[id] as StreetSegment, at);
+    }
+    return out;
+  };
+  const paths = new Map<SegmentId, readonly SegmentId[]>();
+  for (const id of live) {
+    const seg = city.segments[id] as StreetSegment;
+    const da = dist.get(seg.a);
+    const db = dist.get(seg.b);
+    if (da === undefined && db === undefined) continue;
+    const near = db === undefined || (da !== undefined && da <= db) ? seg.a : seg.b;
+    paths.set(id, [...pathTo(near).filter((s) => s !== id), id]);
+  }
+  return paths;
+}
+
+/**
+ * Round 4c/4d fix: the outage exposure of a street's customers from the live
+ * spans on its way from its serving cabinet, its own included (`path`:
+ * weather.stormRisk at each span's method, summed): with outages at rate r a
+ * year of mean d days each, a customer remembers one with probability
+ * 1 - (1 - r / 365)^HAPPINESS_OUTAGE_MEMORY_DAYS, costing
+ * HAPPINESS_PER_OUTAGE_DAY x d of happiness, and each outage cancels
+ * outageChurnProbability(d) of them. Pure, an estimate (another way round
+ * from another cabinet is ignored).
+ */
+function streetOutageExposure(state: GameState, spans: ReadonlyMap<SegmentId, readonly CableSpan[]>, path: readonly SegmentId[]): OutageExposure {
+  let perYear = 0;
+  let days = 0;
+  for (const segment of path) {
+    const seg = state.city.segments[segment];
+    const list = spans.get(segment);
+    if (!seg || !list) continue;
+    for (const span of list) {
+      const risk = stormRisk(state, seg, span.method);
+      perYear += risk.outagesPerYear;
+      days += risk.outageDaysPerYear;
+    }
+  }
+  if (!(perYear > 0)) return NO_EXPOSURE;
+  const mean = days / perYear;
+  const daily = Math.min(1, perYear / DAYS_PER_YEAR);
+  return {
+    share: 1 - powInt(1 - daily, HAPPINESS_OUTAGE_MEMORY_DAYS),
+    penalty: HAPPINESS_PER_OUTAGE_DAY * mean,
+    churn: (perYear / 12) * outageChurnProbability(mean),
+  };
 }
 
 /** What forecastCustomers expects over its horizon (not rounded). */
@@ -1317,7 +1536,7 @@ export interface CustomerForecast {
   signups: number;
   /** Of them, credited to referral credits. */
   referrals: number;
-  /** Expected cancellations (regular churn by happiness, and the intro promo's step). */
+  /** Expected cancellations (regular churn by happiness, the intro promo's step, foreseen outages' churn). */
   cancellations: number;
   /** Subscriber-days. */
   unitDays: number;
@@ -1325,13 +1544,25 @@ export interface CustomerForecast {
   promoUnitDays: number;
   /** What a unit pays a month there on average (today's bills per unit; the new signups' list price with nobody subscribed). */
   price: number;
-  /** The average list price a new signup picks (the household mix with the promo valued). */
+  /** The average list price a new signup picks (the household mix, with the promo valued where it applies). */
   signupPrice: number;
   /** Share of the gap switching a day today, gap-weighted (units-weighted with no gap) over the streets counted. */
   rate: number;
   /** Of `gap`, the units on young streets (isYoungStreet: the intro promo's boost applies) and on streets where cable runs a promo. */
   youngGap: number;
   contestedGap: number;
+  /**
+   * Round 4c/4d fix: splitters the signups need beyond today's ports over the
+   * horizon (whole splitters per cabinet, up to MAX_SPLITTERS_PER_CABINET):
+   * the forecast lets signups take ports a player adds as cabinets fill, so
+   * the quotes charge for them (splittersCost).
+   */
+  splitters: number;
+  /** Round 4c/4d fix: the signups' install capex (sales.installCost of each street's open units; a building's router once), dollars. */
+  installs: number;
+  /** Round 4c/4d fix: subscribed units at the horizon's end, and the units still waiting then (the streets' open gaps), on the streets counted. */
+  unitsEnd: number;
+  gapEnd: number;
 }
 
 /** forecastCustomers advances this many days at a time, compounding the daily rules over each step (a week: within a few percent of day by day). */
@@ -1344,17 +1575,40 @@ interface ForecastStreet {
   inTarget: number;
   surplus: number;
   awareness: number;
+  /** Its deal factor while the intro promo applies there (or throughout when it never does), and once it no longer does. */
   deal: number;
+  dealAfter: number;
+  /** Whole units its target falls by when the intro promo stops applying there (round 4c/4d fix; 0 when it never applies). */
+  lift: number;
   litDay: number;
   contestedUntil: number;
-  /** Happy share of today's customers there, and of new signups. */
+  /** Happy share of today's customers there, and of new signups (on the list price, and while on the intro promo's discount). */
   happyOld: number;
   happyNew: number;
-  /** Monthly churn of today's customers there (average), and of new signups. */
+  happyPromo: number;
+  /** Monthly churn of today's customers there (average), and of new signups (likewise). */
   churnOld: number;
   churnNew: number;
+  churnPromo: number;
   /** Ports a new signup takes (new accounts' ports over open units). */
   portsPerUnit: number;
+  /** Install capex of a new signup there (over its open units). */
+  installPerUnit: number;
+}
+
+/** A new signup's tier in a forecast model: its share of signups, its score on the list price and on the intro promo's price. */
+interface SignupTier {
+  share: number;
+  score: number;
+  promoScore: number;
+}
+
+/** A score's happy share and churn with a street's outage exposure (a share of customers carrying the outage memory's penalty), its acute churn added. */
+function exposed(score: number, e: OutageExposure): { happy: number; churn: number } {
+  const keep = 1 - e.share;
+  const happy = keep * (score >= HAPPY_SCORE_MIN ? 1 : 0) + e.share * (score - e.penalty >= HAPPY_SCORE_MIN ? 1 : 0);
+  const churn = keep * churnFromScore(score) + (e.share > 0 ? e.share * churnFromScore(score - e.penalty) : 0) + e.churn;
+  return { happy, churn };
 }
 
 /**
@@ -1365,10 +1619,18 @@ interface ForecastStreet {
  * (model 1: awareness x SWITCH_BASE_PER_DAY x its deal factor x word of
  * mouth x campaign x the promo's boost while young or contested), and
  * cancellations at its customers' happiness churn (today's customers at
- * their scores with the forecast's support level, new signups at the list
- * price of the household mix), which reopen the gap. New accounts take
- * free ports per cabinet. Future streets, parcels, outages, cash and
- * incumbent promos are not foreseen.
+ * their scores with the forecast's support level, new signups at the price
+ * of the household mix: while on the intro promo's discount at that price),
+ * which reopen the gap. Round 4c/4d fixes: the intro promo is valued in a
+ * street's target and deal factor only while it applies there (young or
+ * contested: promoApplies), its target falling back after; its cohorts take
+ * the step churn as their locks end and reopen the gap; new accounts take
+ * ports per cabinet up to MAX_SPLITTERS_PER_CABINET splitters (splitters
+ * are added as a cabinet fills, as SMART, CASUAL and the advisor do;
+ * `splitters` counts those needed beyond today's); `installs` is the
+ * signups' install capex; with `outages`, each street's own cable's expected
+ * outages (streetOutageExposure). Future streets, parcels, cash and
+ * incumbent promos are not foreseen (nor outages without `outages`).
  */
 export function forecastCustomers(state: GameState, opts: ForecastOptions = {}): CustomerForecast {
   const service = getService(state);
@@ -1385,48 +1647,94 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
   const mult = womMultiplier(referrals);
   const boost = promoSignupFactor(promo);
 
-  // Per incumbent price: take rates, deal factors and what a new signup is like.
-  const models = new Map<number, { take: Record<ParcelKind, number>; deal: Record<ParcelKind, number>; happyNew: number; churnNew: number; price: number }>();
-  const modelAt = (price: number) => {
-    let model = models.get(price);
+  // Per incumbent price and whether the intro promo is valued there: take rates, deal factors and what a new signup is like.
+  interface Model {
+    take: Record<ParcelKind, number>;
+    deal: Record<ParcelKind, number>;
+    tiers: SignupTier[];
+    price: number;
+  }
+  const models = new Map<number, Model>();
+  const modelAt = (price: number, valued: boolean): Model => {
+    const key = price * 2 + (valued ? 1 : 0);
+    let model = models.get(key);
     if (!model) {
+      const offer = valued ? promo : null;
       const take = { home: 0, mdu: 0, smb: 0 };
-      for (const kind of KINDS) take[kind] = targetTakeRate(pricing, kind, price, promo);
-      const mix = tierMix(pricing, 'home', price, promo);
-      let happyNew = 0;
-      let churnNew = 0;
+      for (const kind of KINDS) take[kind] = targetTakeRate(pricing, kind, price, offer);
+      const mix = tierMix(pricing, 'home', price, offer);
+      const tiers: SignupTier[] = [];
       let list = 0;
       for (const tier of pricing.tiers) {
         const share = mix[tier.id];
         if (!(share > 0)) continue;
         const p = priceScores(tier.id, 'home', tier.price, pricing.smbMultiplier, price);
-        const score = ctx.support + p.priceVsCable + p.priceVsMarket + p.goodDeal;
-        if (score >= HAPPY_SCORE_MIN) happyNew += share;
-        churnNew += share * churnFromScore(score);
+        // Every signup gets the promo's lock while one is set (sales.promoLock), valued or not.
+        const paid = promo ? Math.min(tier.price, promoPrice(tier.price, promo.percentOff)) : tier.price;
+        const q = paid === tier.price ? p : priceScores(tier.id, 'home', paid, pricing.smbMultiplier, price);
+        tiers.push({ share, score: ctx.support + p.priceVsCable + p.priceVsMarket + p.goodDeal, promoScore: ctx.support + q.priceVsCable + q.priceVsMarket + q.goodDeal });
         list += share * tier.price;
       }
-      model = { take, deal: dealFactors(pricing, price, promo), happyNew, churnNew, price: list };
-      models.set(price, model);
+      model = { take, deal: dealFactors(pricing, price, offer), tiers, price: list };
+      models.set(key, model);
     }
     return model;
+  };
+
+  // Each street's own live cable's expected outages (with `outages`).
+  const spansOn = new Map<SegmentId, CableSpan[]>();
+  if (opts.outages) {
+    for (const span of state.network.spans) {
+      if (span.stage !== 'live') continue;
+      const list = spansOn.get(span.segment);
+      if (list) list.push(span);
+      else spansOn.set(span.segment, [span]);
+    }
+  }
+  const exposures = new Map<SegmentId, OutageExposure>();
+  const paths = new Map<CabinetId, Map<SegmentId, readonly SegmentId[]>>();
+  const live = new Set(spansOn.keys());
+  const exposureOf = (segment: SegmentId): OutageExposure => {
+    if (!opts.outages) return NO_EXPOSURE;
+    let e = exposures.get(segment);
+    if (!e) {
+      const cabinet = service.servingCabinet.get(segment);
+      const node = cabinet === undefined ? undefined : state.network.cabinets.find((c) => c.id === cabinet)?.node;
+      let fromCabinet = cabinet === undefined ? undefined : paths.get(cabinet);
+      if (cabinet !== undefined && node !== undefined && !fromCabinet) {
+        fromCabinet = cabinetPaths(state, node, live);
+        paths.set(cabinet, fromCabinet);
+      }
+      e = streetOutageExposure(state, spansOn, fromCabinet?.get(segment) ?? [segment]);
+      exposures.set(segment, e);
+    }
+    return e;
   };
 
   // Accounts per parcel, and their happiness at the forecast's support level.
   const accountAt = new Map<ParcelId, Account>();
   for (const account of state.sales.accounts) accountAt.set(account.parcel, account);
+  const routers = new Set(state.sales.routerParcels);
 
   interface Row {
     cabinet: CabinetId;
-    raw: number;
-    deal: number;
+    /** Target units and deal-weighted target units with the promo valued and without. */
+    rawOn: number;
+    dealOn: number;
+    rawOff: number;
+    dealOff: number;
+    valued: boolean;
     sub: number;
     open: number;
     newPorts: number;
+    installs: number;
     happy: number;
     churn: number;
     billed: number;
   }
   const rows = new Map<SegmentId, Row>();
+  const contested = new Map<CabinetId, number>();
+  for (const p of state.sales.incumbentPromos) if (p.startDay <= day0 && day0 < p.endDay) contested.set(p.cabinet, p.endDay);
   for (const id of service.passedParcels) {
     const parcel = state.city.parcels[id];
     if (!parcel) continue;
@@ -1434,23 +1742,38 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
     if (cabinet === undefined || (opts.cabinet !== undefined && cabinet !== opts.cabinet)) continue;
     let row = rows.get(parcel.segment);
     if (!row) {
-      row = { cabinet, raw: 0, deal: 0, sub: 0, open: 0, newPorts: 0, happy: 0, churn: 0, billed: 0 };
+      const entry = streetIndex(state.customers.streets, parcel.segment);
+      const litDay = entry ? entry.litDay : day0;
+      const valued = promoApplies(promo, isYoungStreet(litDay, day0 + 1), day0 + 1 < (contested.get(cabinet) ?? -1));
+      row = { cabinet, rawOn: 0, dealOn: 0, rawOff: 0, dealOff: 0, valued, sub: 0, open: 0, newPorts: 0, installs: 0, happy: 0, churn: 0, billed: 0 };
       rows.set(parcel.segment, row);
     }
-    const model = modelAt(cable.get(cabinet) ?? INCUMBENT_PRICE);
-    const t = model.take[parcel.kind] * parcel.units;
-    row.raw += t;
-    row.deal += t * model.deal[parcel.kind];
+    const price = cable.get(cabinet) ?? INCUMBENT_PRICE;
+    const off = modelAt(price, false);
+    const tOff = off.take[parcel.kind] * parcel.units;
+    row.rawOff += tOff;
+    row.dealOff += tOff * off.deal[parcel.kind];
+    if (row.valued) {
+      const on = modelAt(price, true);
+      const tOn = on.take[parcel.kind] * parcel.units;
+      row.rawOn += tOn;
+      row.dealOn += tOn * on.deal[parcel.kind];
+    }
     const account = accountAt.get(id);
     const sub = account ? accountUnits(account) : 0;
+    const open = Math.max(0, parcel.units - sub);
     row.sub += sub;
-    row.open += Math.max(0, parcel.units - sub);
+    row.open += open;
     if (!account && parcel.units > 0) row.newPorts += parcel.kind === 'mdu' ? MDU_PORTS_PER_BUILDING : 1;
+    if (open > 0) row.installs += open * installCost(parcel.kind, true) + (parcel.kind === 'mdu' && !routers.has(id) ? installCost('mdu', false) - installCost('mdu', true) : 0);
     if (account) {
       const s = accountScores(ctx, account);
       const score = s.base + ctx.support;
-      if (score >= HAPPY_SCORE_MIN) row.happy += s.units;
-      row.churn += s.units * churnFromScore(score);
+      const e = exposureOf(parcel.segment);
+      // A customer remembering an outage now keeps that memory's score; the others carry the street's expected share of one.
+      const h = s.memory.outages < 0 ? { happy: score >= HAPPY_SCORE_MIN ? 1 : 0, churn: churnFromScore(score) + e.churn } : exposed(score, e);
+      row.happy += s.units * h.happy;
+      row.churn += s.units * h.churn;
       for (const tier of pricing.tiers) {
         const n = account.tierUnits[tier.id];
         if (n) row.billed += n * accountUnitPrice(state, account, tier.id);
@@ -1461,14 +1784,13 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
   const strengthOf = new Map<CabinetId, NeighborhoodCampaign>();
   for (const c of state.customers.campaigns) strengthOf.set(c.cabinet, c);
   if (opts.campaignAt !== undefined) strengthOf.set(opts.campaignAt, campaignRecord(opts.campaignAt, day0, 0, 0));
-  const contested = new Map<CabinetId, number>();
-  for (const p of state.sales.incumbentPromos) if (p.startDay <= day0 && day0 < p.endDay) contested.set(p.cabinet, p.endDay);
 
   const streets: ForecastStreet[] = [];
   let gapTotal = 0;
   let units = 0;
   let billed = 0;
   let signupPrice = 0;
+  let priceWeight = 0;
   let rateNum = 0;
   let rateDen = 0;
   let rateUnits = 0;
@@ -1477,23 +1799,46 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
   let contestedGap = 0;
   for (const segment of [...rows.keys()].sort((a, b) => a - b)) {
     const row = rows.get(segment)!;
-    const target = Math.max(0, Math.ceil(row.raw - segmentOffset(state.seed, segment)));
+    const offset = segmentOffset(state.seed, segment);
+    const targetOff = Math.max(0, Math.ceil(row.rawOff - offset));
+    const targetOn = row.valued ? Math.max(0, Math.ceil(row.rawOn - offset)) : targetOff;
+    const target = row.valued ? targetOn : targetOff;
     const entry = streetIndex(state.customers.streets, segment);
-    const model = modelAt(cable.get(row.cabinet) ?? INCUMBENT_PRICE);
+    const price = cable.get(row.cabinet) ?? INCUMBENT_PRICE;
+    const model = modelAt(price, row.valued);
+    const e = exposureOf(segment);
+    let happyNew = 0;
+    let churnNew = 0;
+    let happyPromo = 0;
+    let churnPromo = 0;
+    for (const tier of model.tiers) {
+      const atList = exposed(tier.score, e);
+      const atPromo = exposed(tier.promoScore, e);
+      happyNew += tier.share * atList.happy;
+      churnNew += tier.share * atList.churn;
+      happyPromo += tier.share * atPromo.happy;
+      churnPromo += tier.share * atPromo.churn;
+    }
+    const dealOff = row.rawOff > 0 ? row.dealOff / row.rawOff : SWITCH_DEAL_MIN;
     const street: ForecastStreet = {
       cabinet: row.cabinet,
       gap: Math.min(row.open, Math.max(0, target - row.sub)),
       inTarget: Math.min(row.sub, target),
       surplus: Math.max(0, row.sub - target),
       awareness: entry ? entry.awareness / AWARENESS_PPM : AWARENESS_ON_LIT,
-      deal: row.raw > 0 ? row.deal / row.raw : SWITCH_DEAL_MIN,
+      deal: row.valued ? (row.rawOn > 0 ? row.dealOn / row.rawOn : SWITCH_DEAL_MIN) : dealOff,
+      dealAfter: dealOff,
+      lift: targetOn - targetOff,
       litDay: entry ? entry.litDay : day0,
       contestedUntil: contested.get(row.cabinet) ?? -1,
       happyOld: row.sub > 0 ? row.happy / row.sub : 0,
-      happyNew: model.happyNew,
-      churnOld: row.sub > 0 ? row.churn / row.sub : model.churnNew,
-      churnNew: model.churnNew,
+      happyNew,
+      happyPromo,
+      churnOld: row.sub > 0 ? row.churn / row.sub : churnNew,
+      churnNew,
+      churnPromo,
       portsPerUnit: row.open > 0 ? row.newPorts / row.open : 0,
+      installPerUnit: row.open > 0 ? row.installs / row.open : 0,
     };
     streets.push(street);
     gapTotal += street.gap;
@@ -1501,10 +1846,13 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
     if (day0 + 1 < street.contestedUntil) contestedGap += street.gap;
     units += row.sub;
     billed += row.billed;
+    // The average new signup's list price, over the streets weighted by their gaps.
+    signupPrice += (street.gap + 1e-9) * model.price;
+    priceWeight += street.gap + 1e-9;
     // Today's rate there (the first forecast day's, before awareness grows).
     const h = row.sub > 0 ? row.happy / row.sub : 0;
     const record = strengthOf.get(row.cabinet);
-    const strength = record ? campaignStrength(record, day0 + 1) : 0;
+    const strength = record && street.litDay <= record.startDay ? campaignStrength(record, day0 + 1) : 0;
     const young = isYoungStreet(street.litDay, day0 + 1);
     const rate = switchRate(street.awareness, street.deal, womSwitchFactor(h, referrals), campaignSwitchFactor(strength), young || day0 + 1 < street.contestedUntil ? boost : 1);
     rateNum += street.gap * rate;
@@ -1512,22 +1860,24 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
     rateUnitsNum += (row.sub + row.open) * rate;
     rateUnits += row.sub + row.open;
   }
-  // The average new signup's list price, over the streets' incumbent prices weighted by their gaps.
-  let priceWeight = 0;
-  for (const street of streets) {
-    const model = modelAt(cable.get(street.cabinet) ?? INCUMBENT_PRICE);
-    signupPrice += (street.gap + 1e-9) * model.price;
-    priceWeight += street.gap + 1e-9;
-  }
-  signupPrice = priceWeight > 0 ? signupPrice / priceWeight : modelAt(INCUMBENT_PRICE).price;
+  signupPrice = priceWeight > 0 ? signupPrice / priceWeight : modelAt(INCUMBENT_PRICE, false).price;
 
   // The day loop runs on flat arrays (it is the quotes' hot path).
   const n = streets.length;
   const cabinetAt = new Map<CabinetId, number>();
   state.network.cabinets.forEach((c, i) => cabinetAt.set(c.id, i));
+  // Ports up to a full cabinet (MAX_SPLITTERS_PER_CABINET splitters): a player adds splitters as a cabinet fills.
   const used = cabinetPortsUsed(state);
+  const fullPorts = MAX_SPLITTERS_PER_CABINET * SPLIT_RATIO;
   const freePorts = new Float64Array(state.network.cabinets.length);
-  state.network.cabinets.forEach((c, i) => (freePorts[i] = Math.max(0, cabinetPortCapacity(c) - (used.get(c.id) ?? 0))));
+  const portCap = new Float64Array(state.network.cabinets.length);
+  const peakUsed = new Float64Array(state.network.cabinets.length);
+  state.network.cabinets.forEach((c, i) => {
+    const inUse = used.get(c.id) ?? 0;
+    portCap[i] = Math.max(fullPorts, cabinetPortCapacity(c));
+    freePorts[i] = Math.max(0, (portCap[i] as number) - inUse);
+    peakUsed[i] = inUse;
+  });
   const campaigns: { at: number; record: NeighborhoodCampaign }[] = [];
   for (const [cabinet, record] of strengthOf) {
     const at = cabinetAt.get(cabinet);
@@ -1540,56 +1890,100 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
   const added = new Float64Array(n);
   const awareness = new Float64Array(n);
   const deal = new Float64Array(n);
+  const lift = new Float64Array(n);
   const boostUntil = new Float64Array(n);
   const happyOld = new Float64Array(n);
   const happyNew = new Float64Array(n);
+  const happyPromo = new Float64Array(n);
   const churnOld = new Float64Array(n);
   const churnNew = new Float64Array(n);
+  const churnPromo = new Float64Array(n);
   const ports = new Float64Array(n);
+  const installPerUnit = new Float64Array(n);
   const cab = new Int32Array(n);
+  // 1 where the area's campaign covers the street (lit when it was bought: campaignStrengthOn).
+  const inCampaign = new Uint8Array(n);
   streets.forEach((street, i) => {
     gap[i] = street.gap;
     inTarget[i] = street.inTarget;
     surplus[i] = street.surplus;
     awareness[i] = street.awareness;
     deal[i] = street.deal;
+    lift[i] = street.lift;
     boostUntil[i] = Math.max(street.litDay + PROMO_BOOST_YOUNG_DAYS, street.contestedUntil);
     happyOld[i] = street.happyOld;
     happyNew[i] = street.happyNew;
+    happyPromo[i] = street.happyPromo;
     churnOld[i] = street.churnOld / DAYS_PER_MONTH;
     churnNew[i] = street.churnNew / DAYS_PER_MONTH;
+    churnPromo[i] = street.churnPromo / DAYS_PER_MONTH;
     ports[i] = street.portsPerUnit;
+    installPerUnit[i] = street.installPerUnit;
     cab[i] = cabinetAt.get(street.cabinet) ?? -1;
+    const record = strengthOf.get(street.cabinet);
+    inCampaign[i] = record && street.litDay <= record.startDay ? 1 : 0;
   });
 
   const promoDays = promo ? Math.round((promo.months + 0.5) * DAYS_PER_MONTH) : 0;
   const stepChurn = promo ? stepChurnProbability(signupPrice * (1 - promo.percentOff / 100), signupPrice, PROMO_STEP_SHARE) : 0;
-  // Each step's signups (for the intro promo's step churn when its locks end), by the step's first day.
+  // Each step's signups (for the intro promo's step churn when its locks end, and the share of new signups still on it), by the step's first day.
   const cohorts: { day: number; signups: number }[] = [];
   let cohortsEnded = 0;
+  let locked = 0;
   const womAwareness = AWARENESS_WOM_PER_DAY * mult;
   const womSwitch = SWITCH_WOM_BOOST * mult;
   const baseGain = AWARENESS_BASE_PER_DAY + marketing;
-  let stepped = 0;
   let signups = 0;
   let referred = 0;
   let cancellations = 0;
   let unitDays = 0;
   let promoUnitDays = 0;
+  let installs = 0;
   // FORECAST_STEP_DAYS days at a time, compounding the daily rules over the step (the quotes' hot path).
   for (let t = 0; t < days; t += FORECAST_STEP_DAYS) {
     const span = Math.min(FORECAST_STEP_DAYS, days - t);
     const first = day0 + 1 + t;
     const mid = first + Math.floor(span / 2);
     for (const c of campaigns) strengthToday[c.at] = campaignStrength(c.record, mid);
+    // Cohorts whose promo locks have ended by now take their step churn: those households cancel and reopen the gap.
+    if (promo) {
+      while (cohortsEnded < cohorts.length && (cohorts[cohortsEnded] as { day: number }).day + promoDays <= first) {
+        const cohort = cohorts[cohortsEnded] as { signups: number };
+        locked -= cohort.signups;
+        if (stepChurn > 0 && cohort.signups > 0) {
+          let pool = 0;
+          for (let i = 0; i < n; i++) pool += added[i] as number;
+          const lost = Math.min(pool, cohort.signups * stepChurn);
+          if (pool > 0 && lost > 0) {
+            for (let i = 0; i < n; i++) {
+              const take = (lost * (added[i] as number)) / pool;
+              added[i] = (added[i] as number) - take;
+              gap[i] = (gap[i] as number) + take;
+              const at = cab[i] as number;
+              if (at >= 0) freePorts[at] = (freePorts[at] as number) + take * (ports[i] as number);
+            }
+            cancellations += lost;
+          }
+        }
+        cohortsEnded++;
+      }
+    }
+    const lockedShare = promo && signups > 0 ? Math.min(1, Math.max(0, locked / signups)) : 0;
     let today = 0;
     for (let i = 0; i < n; i++) {
+      // The intro promo no longer applies here (the street aged out, cable's promo ended): its target and deal fall back.
+      if ((lift[i] as number) !== 0 && mid >= (boostUntil[i] as number)) {
+        gap[i] = (gap[i] as number) - (lift[i] as number);
+        lift[i] = 0;
+        deal[i] = (streets[i] as ForecastStreet).dealAfter;
+      }
       const old = (inTarget[i] as number) + (surplus[i] as number);
       const fresh = added[i] as number;
       const total = old + fresh;
-      const h = total > 0 ? ((happyOld[i] as number) * old + (happyNew[i] as number) * fresh) / total : 0;
+      const hNew = lockedShare > 0 ? lockedShare * (happyPromo[i] as number) + (1 - lockedShare) * (happyNew[i] as number) : (happyNew[i] as number);
+      const h = total > 0 ? ((happyOld[i] as number) * old + hNew * fresh) / total : 0;
       const at = cab[i] as number;
-      const strength = campaigns.length > 0 && at >= 0 ? (strengthToday[at] as number) : 0;
+      const strength = campaigns.length > 0 && at >= 0 && inCampaign[i] === 1 ? (strengthToday[at] as number) : 0;
       // Model 2 over the step: a_k = 1 - (1 - a) x q^k with q = 1 - g; switching sees their mean.
       let gain = baseGain + CAMPAIGN_AWARENESS_PER_DAY * strength + womAwareness * h;
       if (gain > 1) gain = 1;
@@ -1602,22 +1996,27 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
       const wom = 1 + womSwitch * h;
       let rate = meanA * SWITCH_BASE_PER_DAY * (deal[i] as number) * wom * (1 + CAMPAIGN_SWITCH_BOOST * strength) * (mid < (boostUntil[i] as number) ? boost : 1);
       if (rate > 1) rate = 1;
-      let x = (gap[i] as number) * (1 - powInt(1 - rate, span));
+      const open = gap[i] as number;
+      let x = open > 0 ? open * (1 - powInt(1 - rate, span)) : 0;
       const ppu = ports[i] as number;
       if (x > 0 && ppu > 0 && at >= 0) {
         const free = freePorts[at] as number;
         if (x * ppu > free) x = free / ppu;
         freePorts[at] = free - x * ppu;
+        const inUse = (portCap[at] as number) - (freePorts[at] as number);
+        if (inUse > (peakUsed[at] as number)) peakUsed[at] = inUse;
       }
       const startUnits = total;
-      gap[i] = (gap[i] as number) - x;
+      gap[i] = open - x;
       added[i] = fresh + x;
       signups += x;
       today += x;
+      installs += x * (installPerUnit[i] as number);
       if (referrals) referred += x * ((wom - 1) / wom);
       if (promo) promoUnitDays += x * Math.min(promoDays, days - t - span / 2);
       const keepOld = powInt(1 - (churnOld[i] as number), span);
-      const keepNew = powInt(1 - (churnNew[i] as number), span);
+      const cNew = lockedShare > 0 ? lockedShare * (churnPromo[i] as number) + (1 - lockedShare) * (churnNew[i] as number) : (churnNew[i] as number);
+      const keepNew = powInt(1 - cNew, span);
       const lostIn = (inTarget[i] as number) * (1 - keepOld);
       const lostOver = (surplus[i] as number) * (1 - keepOld);
       const lostNew = (added[i] as number) * (1 - keepNew);
@@ -1630,18 +2029,23 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
       const endUnits = (inTarget[i] as number) + (surplus[i] as number) + (added[i] as number);
       unitDays += ((startUnits + endUnits) / 2) * span;
     }
-    if (promo && stepChurn > 0) {
+    if (promo) {
       cohorts.push({ day: first, signups: today });
-      // Cohorts whose promo locks have ended by the end of this step take their step churn.
-      while (cohortsEnded < cohorts.length && (cohorts[cohortsEnded] as { day: number }).day + promoDays < first + span) {
-        const lost = (cohorts[cohortsEnded] as { signups: number }).signups * stepChurn;
-        stepped += lost;
-        cancellations += lost;
-        cohortsEnded++;
-      }
+      locked += today;
     }
-    unitDays -= stepped * span;
   }
+  let unitsEnd = 0;
+  let gapEnd = 0;
+  for (let i = 0; i < n; i++) {
+    unitsEnd += (inTarget[i] as number) + (surplus[i] as number) + (added[i] as number);
+    gapEnd += Math.max(0, gap[i] as number);
+  }
+  // Whole splitters each cabinet needs beyond today's to hold its busiest day's ports.
+  let splitters = 0;
+  state.network.cabinets.forEach((c, i) => {
+    const over = (peakUsed[i] as number) - cabinetPortCapacity(c);
+    if (over > 1e-6) splitters += Math.min(Math.max(0, MAX_SPLITTERS_PER_CABINET - c.splitters), Math.ceil(over / SPLIT_RATIO - 1e-9));
+  });
   return {
     days,
     gap: gapTotal,
@@ -1656,7 +2060,28 @@ export function forecastCustomers(state: GameState, opts: ForecastOptions = {}):
     rate: rateDen > 0 ? rateNum / rateDen : rateUnits > 0 ? rateUnitsNum / rateUnits : 0,
     youngGap,
     contestedGap,
+    splitters,
+    installs,
+    unitsEnd,
+    gapEnd,
   };
+}
+
+/**
+ * Round 4c/4d fix: what `splitters` more splitters cost (the quotes' charge
+ * for the ports their extra signups need): SPLITTER_COST each, plus an OLT
+ * line card (OLT_CARD_COST) for every OLT_PORTS_PER_CARD PON ports they need
+ * beyond the free ones. Whole dollars, 0 for none.
+ */
+export function splittersCost(state: GameState, splitters: number): number {
+  if (!(splitters > 0)) return 0;
+  const cards = Math.max(0, Math.ceil((ponPortsUsed(state) + splitters - state.network.olt.ponPorts) / OLT_PORTS_PER_CARD));
+  return Math.round(splitters * SPLITTER_COST + cards * OLT_CARD_COST);
+}
+
+/** The splitters a forecast needs beyond another's, priced (splittersCost of each; at least 0). */
+function extraSplittersCost(state: GameState, more: CustomerForecast, base: CustomerForecast): number {
+  return Math.max(0, splittersCost(state, more.splitters) - splittersCost(state, base.splitters));
 }
 
 /**
@@ -1695,7 +2120,8 @@ function marginOf(price: number, perCustomer: number): number {
  * Pure. ok/reasons as setMarketing decides (and false once the game is
  * over). Figures: forecastCustomers at this budget and at $0 over
  * CUSTOMER_QUOTE_MONTHS: signups a month, the extra ones the budget brings,
- * and perMonth / extra.
+ * the splitters they need (splitterCost) and (the budget over the horizon
+ * plus splitterCost) per extra customer.
  */
 export function quoteMarketing(state: GameState, perMonth: number): MarketingQuote {
   const reasons: string[] = [];
@@ -1703,13 +2129,17 @@ export function quoteMarketing(state: GameState, perMonth: number): MarketingQuo
   if (typeof perMonth !== 'number' || !Number.isInteger(perMonth) || perMonth < 0 || perMonth > MARKETING_MAX_PER_MONTH) {
     reasons.push(`The marketing budget is a whole number of dollars from $0 to ${formatMoney(MARKETING_MAX_PER_MONTH)} a month`);
   }
-  const quote: MarketingQuote = { ok: reasons.length === 0, reasons, perMonth, months: CUSTOMER_QUOTE_MONTHS, signupsPerMonth: 0, extraPerMonth: 0, costPerCustomer: null };
+  const quote: MarketingQuote = { ok: reasons.length === 0, reasons, perMonth, months: CUSTOMER_QUOTE_MONTHS, signupsPerMonth: 0, extraPerMonth: 0, splitterCost: 0, costPerCustomer: null };
   if (!quote.ok) return quote;
-  const at = forecastCustomers(state, { marketingPerMonth: perMonth }).signups / CUSTOMER_QUOTE_MONTHS;
-  const none = perMonth === 0 ? at : forecastCustomers(state, { marketingPerMonth: 0 }).signups / CUSTOMER_QUOTE_MONTHS;
+  const withBudget = forecastCustomers(state, { marketingPerMonth: perMonth });
+  const without = perMonth === 0 ? withBudget : forecastCustomers(state, { marketingPerMonth: 0 });
+  const at = withBudget.signups / CUSTOMER_QUOTE_MONTHS;
+  const none = without.signups / CUSTOMER_QUOTE_MONTHS;
   quote.signupsPerMonth = Math.max(0, at);
   quote.extraPerMonth = Math.max(0, at - none);
-  quote.costPerCustomer = perMonth > 0 && quote.extraPerMonth >= 0.01 ? Math.round(perMonth / quote.extraPerMonth) : null;
+  quote.splitterCost = extraSplittersCost(state, withBudget, without);
+  quote.costPerCustomer =
+    perMonth > 0 && quote.extraPerMonth >= 0.01 ? Math.round((perMonth * CUSTOMER_QUOTE_MONTHS + quote.splitterCost) / (quote.extraPerMonth * CUSTOMER_QUOTE_MONTHS)) : null;
   return quote;
 }
 
@@ -1722,9 +2152,10 @@ export function quoteMarketing(state: GameState, perMonth: number): MarketingQuo
  * the cost. cost and unsignedUnits from unsignedUnitsIn / campaignCost,
  * unawareUnits from whyNotSwitched. Figures: forecastCustomers over that
  * area's streets with a campaign bought today and without:
- * extraSignups, cost / extra, valueGained = the extra subscriber-months x
- * (what a unit pays there less overhead.perCustomerCost), pays = valueGained
- * > cost.
+ * extraSignups, the splitters they need (splitterCost), (cost +
+ * splitterCost) / extra, valueGained = the extra subscriber-months x (what
+ * a unit pays there less overhead.perCustomerCost), pays = valueGained >
+ * cost + splitterCost.
  */
 export function quoteCampaign(state: GameState, cabinet: CabinetId): CampaignQuote {
   const reasons: string[] = [];
@@ -1736,6 +2167,7 @@ export function quoteCampaign(state: GameState, cabinet: CabinetId): CampaignQuo
     unsignedUnits: 0,
     unawareUnits: 0,
     extraSignups: 0,
+    splitterCost: 0,
     costPerCustomer: null,
     valueGained: 0,
     pays: false,
@@ -1770,9 +2202,10 @@ export function quoteCampaign(state: GameState, cabinet: CabinetId): CampaignQuo
     const extra = Math.max(0, withIt.signups - without.signups);
     const margin = marginOf(withIt.price, perCustomerCost(state));
     quote.extraSignups = extra;
-    quote.costPerCustomer = extra >= 0.01 ? Math.round(quote.cost / extra) : null;
+    quote.splitterCost = extraSplittersCost(state, withIt, without);
+    quote.costPerCustomer = extra >= 0.01 ? Math.round((quote.cost + quote.splitterCost) / extra) : null;
     quote.valueGained = Math.max(0, Math.round(((withIt.unitDays - without.unitDays) / DAYS_PER_MONTH) * margin));
-    quote.pays = quote.valueGained > quote.cost;
+    quote.pays = quote.valueGained > quote.cost + quote.splitterCost;
   }
   return quote;
 }
@@ -1782,11 +2215,14 @@ export function quoteCampaign(state: GameState, cabinet: CabinetId): CampaignQuo
  * Pure. ok/reasons as setSupport decides (and false once the game is over).
  * costPerMonth and costChange: SUPPORT_LEVELS cost x today's subscribed
  * units. Buckets: happinessReport at that level. Figures: forecastCustomers
- * at that level and at today's over CUSTOMER_QUOTE_MONTHS: cancellations
- * and signups a month at that level; netValue = its subscriber-months x
- * its margin (what a unit pays less overhead.perCustomerCost with that
- * level's support cost in place of today's) less today's level's; pays =
- * netValue > 0 (never for today's own level).
+ * at that level and at today's over SUPPORT_QUOTE_MONTHS with the outages
+ * each street's cable can expect (round 4c/4d fix: `outages`; Great support
+ * earns its keep by keeping storm-hit customers, which shows only over
+ * years): cancellations and signups a month at that level; netValue = its
+ * subscriber-months x its margin (what a unit pays less
+ * overhead.perCustomerCost with that level's support cost in place of
+ * today's) less today's level's and the splitters it needs more
+ * (splitterCost); pays = netValue > 0 (never for today's own level).
  */
 export function quoteSupport(state: GameState, level: SupportLevel): SupportQuote {
   const reasons: string[] = [];
@@ -1799,9 +2235,12 @@ export function quoteSupport(state: GameState, level: SupportLevel): SupportQuot
   const costPerMonth = Math.round(spec.costPerSub * units);
   const currentCost = Math.round(SUPPORT_LEVELS[current].costPerSub * units);
   const report = happinessReport(state, valid ? level : current);
-  const at = forecastCustomers(state, { supportLevel: valid ? level : current });
+  // Round 4c/4d fix: over years, with the outages the plant can expect (spec I.4/I.7: Great pays with high outage exposure or long horizons).
+  const horizon = { months: SUPPORT_QUOTE_MONTHS, outages: true };
+  const at = forecastCustomers(state, { ...horizon, supportLevel: valid ? level : current });
   const quote: SupportQuote = {
     level,
+    months: SUPPORT_QUOTE_MONTHS,
     ok: reasons.length === 0,
     reasons,
     costPerMonth,
@@ -1809,17 +2248,19 @@ export function quoteSupport(state: GameState, level: SupportLevel): SupportQuot
     happy: report.happy,
     okay: report.okay,
     unhappy: report.unhappy,
-    cancellationsPerMonth: at.days > 0 ? at.cancellations / CUSTOMER_QUOTE_MONTHS : 0,
-    signupsPerMonth: at.days > 0 ? at.signups / CUSTOMER_QUOTE_MONTHS : 0,
+    cancellationsPerMonth: at.days > 0 ? at.cancellations / SUPPORT_QUOTE_MONTHS : 0,
+    signupsPerMonth: at.days > 0 ? at.signups / SUPPORT_QUOTE_MONTHS : 0,
+    splitterCost: 0,
     netValue: 0,
     pays: false,
   };
   if (!valid || level === current) return quote;
-  const today = forecastCustomers(state, {});
+  const today = forecastCustomers(state, horizon);
   const perCustomer = perCustomerCost(state);
   const marginAt = marginOf(at.price, perCustomer - SUPPORT_LEVELS[current].costPerSub + spec.costPerSub);
   const marginNow = marginOf(today.price, perCustomer);
-  quote.netValue = Math.round(((at.unitDays * marginAt - today.unitDays * marginNow) / DAYS_PER_MONTH));
+  quote.splitterCost = extraSplittersCost(state, at, today);
+  quote.netValue = Math.round((at.unitDays * marginAt - today.unitDays * marginNow) / DAYS_PER_MONTH - quote.splitterCost);
   quote.pays = quote.netValue > 0;
   return quote;
 }
@@ -1830,26 +2271,30 @@ export function quoteSupport(state: GameState, level: SupportLevel): SupportQuot
  * Figures: forecastCustomers with credits on and off over
  * CUSTOMER_QUOTE_MONTHS. On: referrals a month (the credited share of
  * signups), their credits (2 x REFERRAL_CREDIT each), the extra signups a
- * month, credits / extra, and netValue = the extra subscriber-months x the
- * margin (what a unit pays less overhead.perCustomerCost) less the credits.
- * Off: no referrals or credits, netValue the negative of on's.
+ * month, the splitters they need (splitterCost), (credits + splitterCost)
+ * per extra customer, and netValue = the extra subscriber-months x the
+ * margin (what a unit pays less overhead.perCustomerCost) less the credits
+ * and splitterCost. Off: no referrals or credits, netValue the negative of
+ * on's.
  */
 export function quoteReferrals(state: GameState, on: boolean): ReferralQuote {
   const reasons: string[] = [];
   if (state.gameOver) reasons.push(`Game over: ${state.gameOver.message}`);
   if (typeof on !== 'boolean') reasons.push('Referral credits are on or off');
-  const quote: ReferralQuote = { on, ok: reasons.length === 0, reasons, referralsPerMonth: 0, costPerMonth: 0, extraPerMonth: 0, costPerCustomer: null, netValue: 0, pays: false };
+  const quote: ReferralQuote = { on, ok: reasons.length === 0, reasons, referralsPerMonth: 0, costPerMonth: 0, extraPerMonth: 0, splitterCost: 0, costPerCustomer: null, netValue: 0, pays: false };
   if (typeof on !== 'boolean') return quote;
   const withCredits = forecastCustomers(state, { referrals: true });
   const without = forecastCustomers(state, { referrals: false });
   const credits = withCredits.referrals * 2 * REFERRAL_CREDIT;
   const margin = marginOf(withCredits.price, perCustomerCost(state));
-  const value = ((withCredits.unitDays - without.unitDays) / DAYS_PER_MONTH) * margin - credits;
+  const splitters = extraSplittersCost(state, withCredits, without);
+  const value = ((withCredits.unitDays - without.unitDays) / DAYS_PER_MONTH) * margin - credits - splitters;
   if (on) {
     quote.referralsPerMonth = withCredits.referrals / CUSTOMER_QUOTE_MONTHS;
     quote.costPerMonth = quote.referralsPerMonth * 2 * REFERRAL_CREDIT;
     quote.extraPerMonth = Math.max(0, (withCredits.signups - without.signups) / CUSTOMER_QUOTE_MONTHS);
-    quote.costPerCustomer = quote.extraPerMonth >= 0.01 ? Math.round(quote.costPerMonth / quote.extraPerMonth) : null;
+    quote.splitterCost = splitters;
+    quote.costPerCustomer = quote.extraPerMonth >= 0.01 ? Math.round((quote.costPerMonth + splitters / CUSTOMER_QUOTE_MONTHS) / quote.extraPerMonth) : null;
     quote.netValue = Math.round(value);
   } else {
     quote.netValue = Math.round(-value);
