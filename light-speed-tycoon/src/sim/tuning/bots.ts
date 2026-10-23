@@ -53,6 +53,30 @@
 //     (LEAN_OPTIONS): cheap aerial plant, densest streets first, a short
 //     runway, the intro promo while it pays, and a bridge loan when cash runs
 //     under its floor with the line used up.
+//   Round 4c/4d:
+//   - its costs, reserves and margins come from overhead.ts (the scaled
+//     overhead: base, per customer with the support level, per cabinet and
+//     route-mile), its signup estimates from the switching model
+//     (customers.ts: awareness, the deal factor, word of mouth);
+//   - its loan and line buffers are judged with a year of its plant's expected
+//     storm repairs off the operating cash flow (opts.stormCovenantYears,
+//     stormStressed): the covenants count a storm at its trailing-year total,
+//     and a network borrowed to the edge of its buffer breached on the first
+//     bad storm on tree-lined aerial streets (spec D);
+//   - with a covenant at risk it repays the line down to its floor, a storm's
+//     repairs included, not to a month of fixed costs;
+//   - optional growth levers (SmartOptions campaigns, support, referrals):
+//     neighborhood campaigns where customers.quoteCampaign pays, the support
+//     level and referral credits by their quotes (SMART_LEVERS_OPTIONS);
+//     SMART itself keeps Good support, no campaigns and no credits.
+// - CASUAL (round 4c/4d, spec F): a first-time player: a few dense streets near
+//   the CO with one cabinet on its first look, default prices, default
+//   marketing, Good support, no campaigns, no loans, a splitter when its
+//   cabinet is full.
+// - DISCOUNT / OVERPRICED (round 4c/4d, spec I.7): SMART with every price
+//   DISCOUNT_PRICE_MULTIPLIER (about 17% below) or OVERPRICED_PRICE_MULTIPLIER
+//   of the defaults from day 0.
+// - ADVISOR_FOLLOWER and SMART-lite run at every difficulty level (round 4c/4d).
 // - TWO_GIG_ONLY / NO_CHEAP_TIER (round 4b): SMART offering only 2 Gig, or 1 Gig
 //   and 2 Gig, at their default prices from day 0 (lineupBot).
 // - AGGRESSIVE (round 4b): SMART with every price x0.8 from day 0.
@@ -78,8 +102,9 @@
 //   every offered tier by PRICE_HIKE_SHARE (grandfathered for the default
 //   months, or passed on at the next bill with priceHikerBot(0)).
 // - RURAL: SMART's borrowing rules on red rural cabinet areas only (round 3's
-//   cash rules, no storm reserve), so its lifetime cost per passing is red
-//   while it borrows: the bank's CPP spread.
+//   cash rules, no storm reserve or storm cushion; round 4c/4d: its lanes
+//   buried), so its lifetime cost per passing is red while it borrows: the
+//   bank's CPP spread.
 // - CARELESS: overbuilds underground toward random far corners whenever cash
 //   covers it (no reserve), cabinets at every 4th corner reached, marketing at
 //   the maximum, never adds splitters, never borrows.
@@ -88,15 +113,22 @@
 //   tiers retired and re-offered), intro promos, underground rebuilds, budget
 //   changes, extra splitters and OLT cards, credit-line draws and repayments,
 //   term loans and prepayments, round 4b's retention offers, snoozes and
-//   briefing notes (and junk of each): every command type, for the
-//   invariant sessions.
+//   briefing notes, round 4c/4d's campaigns, support levels and referral
+//   credits (and junk of each): every command type, for the invariant
+//   sessions.
 //
 // Bots read the game only through public sim functions and change it only
 // through `send` (applyCommand). Their randomness comes from their own Rng.
 // The round-4b experiments at the end of this file (incumbent promo answers,
 // the intro promo in a fresh area and in a mature town) start from a copy of
 // a bot's game, with an incumbent promo injected when none runs (a test-only
-// state edit, ensureIncumbentPromo).
+// state edit, ensureIncumbentPromo). Round 4c/4d adds the lever experiments
+// (campaigns, support levels, referral credits, switching by price, the
+// marketing forecast), and the noisy comparisons average over
+// EXPERIMENT_REPLICATES copies whose sales stream is re-seeded
+// (replicateState, also a test-only state edit): common random numbers, so a
+// lever's measured worth is its expected worth there, not one roll of the
+// signup and churn draws.
 
 import {
   AERIAL_FT_PER_DAY,
@@ -142,6 +174,7 @@ import {
   TIER_PRICE_MAX,
   TIER_PRICE_MIN,
   UNDERGROUND_FT_PER_DAY,
+  UNDERWRITING_MIN_MARGIN,
 } from '../balance';
 import { coveragePreview, segmentsWithinReach } from '../coverage';
 import {
@@ -196,6 +229,7 @@ import {
   installCost,
   installsPaused,
   monthlyRecurringRevenue,
+  promoQuoteMonths,
   quotePromo,
   subscriberUnits,
   targetTakeRate,
@@ -323,6 +357,10 @@ export interface SmartOptions {
    * Round 4b: with cash under its floor and the line used up, take a term
    * loan (within the loan buffers) that restores the floor plus this many
    * months of the last close's operating deficit (0: never; bridge).
+   * Round 4c/4d fix (spec A, the Seed round never defaults): on at every
+   * purse, not only the lean one; with it off a Seed-round SMART whose cash
+   * a severe storm took below zero (seed 91, month 21: $32,679 of repairs
+   * with the line drawn) missed its next payment instead of bridging it.
    */
   bridgeMonths: number;
   /** Loan amounts are rounded up to a multiple of this. */
@@ -354,6 +392,19 @@ export interface SmartOptions {
   /** Weight of the make-ready wait in the lifetime method choice (1: the margin lost while waiting, in full). */
   waitWeight: number;
   /**
+   * Round 4c/4d fix (spec D): the planner caps streets at opts.maxStreetCpp and orders them by the charges of the
+   * method it will build each street with (plannerBuildCosts: its policy's, or for the lifetime planner chooseMethod
+   * with the street's own subscribers, which also ranks its areas and feeders), not by the cheapest method's: an
+   * area priced aerial and then built half underground passes fewer homes per dollar than it was chosen for.
+   */
+  chosenCosts: boolean;
+  /**
+   * Round 4c/4d fix (spec D): plan every one of the opts.candidatesTried best-scored areas and build the acceptable
+   * plan with the lowest cost per passing (projectCpp), not the first acceptable one: an area's score is its whole
+   * reach, and a purse that buys only part of it may buy a sparse part.
+   */
+  bestOfPlans: boolean;
+  /**
    * Round 4b: the lifetime method choice buries a street only when what it
    * saves over the horizon is at least this multiple of what burying costs
    * more up front (0: whenever it is cheaper over the horizon). Money is what
@@ -369,6 +420,15 @@ export interface SmartOptions {
   stormWeight: number;
   /** Years of expected repairs on its plant (expectedRepairsPerYear) kept in the reserve: a bad storm is not a missed payment. */
   stormReserveYears: number;
+  /**
+   * Round 4c/4d: its loan and line buffers are judged with the annual
+   * operating cash flow less this many years of expected repairs on its plant
+   * (stormStressed): the covenants count a storm's repairs at their
+   * trailing-year total, so a network borrowed to the edge of its buffer
+   * breaches on the first bad storm (spec D made tree-lined aerial streets
+   * costly in storms).
+   */
+  stormCovenantYears: number;
   /** Rebuild storm-hit aerial spans underground when it pays back (round 4). */
   convert: boolean;
   /** Storm hits (in the weather log) that make an aerial span worth a look. */
@@ -459,7 +519,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   ownLifetimeCpp: 0.98 * CPP_TARGET,
   borrowWhenShort: false,
   minLoan: 25_000,
-  bridgeMonths: 0,
+  bridgeMonths: 3,
   loanStep: 5_000,
   floorMonths: 1,
   floorInstallDays: 60,
@@ -471,9 +531,12 @@ export const SMART_DEFAULTS: SmartOptions = {
   horizonYears: BUILD_METHOD_HORIZON_YEARS,
   upfrontWeight: METHOD_UPFRONT_WEIGHT,
   waitWeight: 1,
+  chosenCosts: false,
+  bestOfPlans: false,
   buryGain: 0,
   stormWeight: 1,
   stormReserveYears: 2,
+  stormCovenantYears: 1,
   convert: true,
   convertHits: 2,
   convertPaybackYears: 10,
@@ -853,11 +916,10 @@ function groupOrders(city: City, segments: Iterable<SegmentId>, method: CableMet
  * `policy` (policyBuildCost). Returns per node the cost and the source corner
  * it is cheapest from.
  */
-function feederCosts(state: GameState, policy: MethodPolicy): { cost: Float64Array; source: Int32Array } {
+function feederCosts(state: GameState, build: Float64Array): { cost: Float64Array; source: Int32Array } {
   const { city, network } = state;
   const planned = plannedService(state);
   const cabled = new Set<SegmentId>(network.spans.map((s) => s.segment));
-  const build = segmentBuildCosts(city, policy);
   const n = city.nodes.length;
   const cost = new Float64Array(n).fill(Infinity);
   const source = new Int32Array(n).fill(-1);
@@ -919,6 +981,8 @@ interface PlanContext {
   rates: Readonly<Record<ParcelKind, number>>;
   /** Subscriber economics for the method choice (subscriberEconomics). */
   econ: SubscriberEconomics;
+  /** Build charges per segment the planner ranks and caps streets by (plannerBuildCosts). */
+  buildCost?: Float64Array;
 }
 
 /**
@@ -979,13 +1043,14 @@ function planProject(
   }
 
   const tree = streetTree(city, node, CABINET_REACH_FT);
+  const streetCost = (seg: StreetSegment): number => (ctx.buildCost && opts.chosenCosts ? (ctx.buildCost[seg.id] as number) : cheapestMethod(seg).cost);
   const targets = preview.segments
     .filter((entry) => {
       if (entry.servedBy !== null || ctx.plannedLit.has(entry.segment)) return false;
       const units = ctx.units[entry.segment] as number;
       if (units === 0) return false;
       const seg = city.segments[entry.segment] as StreetSegment;
-      return ctx.cabled.has(entry.segment) || cheapestMethod(seg).cost <= opts.maxStreetCpp * units;
+      return ctx.cabled.has(entry.segment) || streetCost(seg) <= opts.maxStreetCpp * units;
     })
     .sort((x, y) => x.distanceFt - y.distanceFt || x.segment - y.segment)
     .map((entry) => {
@@ -1004,7 +1069,7 @@ function planProject(
     // Most units per dollar of the street and its path first (a small budget takes the best streets).
     const density = (t: { segment: SegmentId; path: SegmentId[] }) => {
       let cost = 0;
-      for (const id of t.path) cost += cheapestMethod(city.segments[id] as StreetSegment).cost;
+      for (const id of t.path) cost += streetCost(city.segments[id] as StreetSegment);
       return (ctx.units[t.segment] as number) / Math.max(1, cost);
     };
     const score = new Map(targets.map((t) => [t.segment, density(t)]));
@@ -1120,6 +1185,25 @@ function segmentBuildCosts(city: City, policy: MethodPolicy): Float64Array {
   return costs;
 }
 
+const chosenCostCache = new WeakMap<GameState, { day: number; version: number; opts: SmartOptions; costs: Float64Array }>();
+
+/**
+ * What each segment costs to build (before fees) for the planner's area scores, feeders and (with opts.chosenCosts)
+ * street caps and order: for a lifetime planner with opts.chosenCosts the charges of the method chooseMethod picks
+ * with the street's own expected subscribers (memoized per state, day and network version), else segmentBuildCosts
+ * for its policy (underground charges for 'underground', the cheapest method's otherwise).
+ */
+function plannerBuildCosts(state: GameState, opts: SmartOptions, econ: SubscriberEconomics, rates: Readonly<Record<ParcelKind, number>>): Float64Array {
+  if (opts.methods !== 'lifetime' || !opts.chosenCosts) return segmentBuildCosts(state.city, opts.methods);
+  const cached = chosenCostCache.get(state);
+  if (cached && cached.day === state.day && cached.version === state.network.version && cached.opts === opts) return cached.costs;
+  const costs = Float64Array.from(state.city.segments, (seg) =>
+    spanCharges(seg, chooseMethod(state, seg, streetSubscribers(state, seg.id, rates), 0, opts, econ)).total,
+  );
+  chosenCostCache.set(state, { day: state.day, version: state.network.version, opts, costs });
+  return costs;
+}
+
 /** Outside-plant cost per unit the project newly passes (its cabinet and cable; an OLT card is CO capex). */
 function projectCpp(project: Project): number {
   return (project.cost - (project.oltCard ? OLT_CARD_COST : 0)) / project.newUnits;
@@ -1144,7 +1228,6 @@ function chooseProject(
   accept: (project: Project) => boolean = () => true,
 ): Project | null {
   const { city, network } = state;
-  const { cost: feeder, source } = feederCosts(state, opts.methods);
   const ctx: PlanContext = {
     units: unitsBySegment(state),
     cabled: new Set<SegmentId>(network.spans.map((s) => s.segment)),
@@ -1155,8 +1238,10 @@ function chooseProject(
     rates: takeRates(state),
     econ: subscriberEconomics(state),
   };
+  ctx.buildCost = plannerBuildCosts(state, opts, ctx.econ, ctx.rates);
+  const { cost: feeder, source } = feederCosts(state, ctx.buildCost);
   const reach = streetReach(city);
-  const buildCost = segmentBuildCosts(city, opts.methods);
+  const buildCost = ctx.buildCost;
   const standing = new Set<NodeId>(network.cabinets.map((c) => c.node));
   const candidates: Array<{ node: NodeId; band: number; score: number }> = [];
   for (const { id: node } of city.nodes) {
@@ -1181,26 +1266,40 @@ function chooseProject(
     const band = BAND_RANK[cppBand(projectCpp(project))];
     return !(strict && band > maxBand) && !(opts.redOnly && band < BAND_RANK.red) && accept(project);
   };
+  let best: Project | null = null;
+  const consider = (project: Project): Project | null => {
+    if (!opts.bestOfPlans) return project;
+    if (best === null || projectCpp(project) < projectCpp(best)) best = project;
+    return null;
+  };
   for (const candidate of candidates.slice(0, opts.candidatesTried)) {
     const from = source[candidate.node] as number;
     const project = planProject(state, candidate.node, from, budget, ctx, opts);
-    if (acceptable(project)) return project;
+    if (acceptable(project)) {
+      if (consider(project)) return project;
+      continue;
+    }
     // Underground plant raises the cost per passing the bank prices on: when
     // the lifetime plan would breach the bot's cost-per-passing test, keep
     // only the burials that save the most for what they cost more up front,
     // and at last string the area aerial wherever it can be.
     if (opts.methods === 'lifetime') {
+      let found = false;
       for (const minGain of LIFETIME_FALLBACK_GAINS) {
         const cheaper = planProject(state, candidate.node, from, budget, ctx, opts, minGain);
-        if (acceptable(cheaper)) return cheaper;
+        if (acceptable(cheaper)) {
+          if (consider(cheaper)) return cheaper;
+          found = true;
+          break;
+        }
       }
-      if (opts.aerialFallback) {
+      if (!found && opts.aerialFallback) {
         const aerial = planProject(state, candidate.node, from, budget, ctx, { ...opts, methods: 'aerial' });
-        if (acceptable(aerial)) return aerial;
+        if (acceptable(aerial) && consider(aerial)) return aerial;
       }
     }
   }
-  return null;
+  return best;
 }
 
 /** The worst band a bot builds with its own cash: amber, or red with opts.allowRed. */
@@ -1277,6 +1376,27 @@ export function withinBuffer(m: CovenantMetrics, leverageShare: number, coverage
   return true;
 }
 
+/**
+ * Round 4c/4d: `m` with `cushion` a year less operating cash flow (a storm
+ * year on top of the trailing one): the lender's cash flow max(annual
+ * operating cash flow - cushion, ARR x UNDERWRITING_MIN_MARGIN), and leverage
+ * and coverage from it as covenantMetrics rounds them.
+ */
+export function stormStressed(m: CovenantMetrics, cushion: number): CovenantMetrics {
+  if (!(cushion > 0)) return m;
+  const ocf = m.annualOperatingCashFlow - cushion;
+  const cash = Math.max(ocf, m.arr * UNDERWRITING_MIN_MARGIN);
+  const hundredth = (x: number) => Math.round(x * 100) / 100;
+  const leverage = m.totalDebt === 0 ? 0 : cash > 0 ? hundredth(m.totalDebt / cash) : null;
+  const coverage = m.annualDebtService === 0 ? null : hundredth(cash / m.annualDebtService);
+  return { ...m, annualOperatingCashFlow: ocf, underwritingCashFlow: cash, leverage, coverage };
+}
+
+/** The storm cushion SMART's buffers count (SmartOptions.stormCovenantYears of expectedRepairsPerYear). */
+function stormCushion(state: GameState, opts: SmartOptions): number {
+  return opts.stormCovenantYears > 0 ? opts.stormCovenantYears * expectedRepairsPerYear(state) : 0;
+}
+
 /** Largest multiple of `step` in [0, max] for which `ok` holds (`ok` true at 0 and monotone: once false, false above). */
 function largestOk(max: number, step: number, ok: (amount: number) => boolean): number {
   let lo = 0;
@@ -1307,9 +1427,10 @@ export function lineRoom(state: GameState, opts: SmartOptions): number {
   const offer = creditOffer(state);
   if (offer.available <= 0) return 0;
   const bps = offer.rate.effectiveRateBps;
+  const cushion = stormCushion(state, opts);
   return largestOk(offer.available, LOAN_ROUNDING, (amount) =>
     withinBuffer(
-      covenantMetrics(state, { addDebt: amount, addAnnualDebtService: Math.round((amount * bps) / 10_000) }),
+      stormStressed(covenantMetrics(state, { addDebt: amount, addAnnualDebtService: Math.round((amount * bps) / 10_000) }), cushion),
       opts.lineLeverageShare,
       opts.lineCoverageMultiple,
     ),
@@ -1328,10 +1449,11 @@ export function safeTermLoan(state: GameState, opts: SmartOptions): number {
   if (state.debt.covenant.stage !== 'compliant') return 0;
   const safe = maxSafeTermLoan(state, opts.termYears);
   if (safe < min) return 0;
+  const cushion = stormCushion(state, opts);
   const amount = largestOk(safe, LOAN_ROUNDING, (a) => {
     if (a < TERM_LOAN_MIN) return true;
     const quote = quoteTermLoan(state, a, opts.termYears);
-    return quote.ok && !quote.breachesCovenant && withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple);
+    return quote.ok && !quote.breachesCovenant && withinBuffer(stormStressed(quote.after, cushion), opts.loanLeverageShare, opts.loanCoverageMultiple);
   });
   return amount >= min ? amount : 0;
 }
@@ -1379,7 +1501,8 @@ function manageCredit(state: GameState, send: Send, opts: SmartOptions): void {
     state.debt.covenant.stage !== 'compliant' ||
     !withinBuffer(covenantMetrics(state), opts.lineLeverageShare, opts.lineCoverageMultiple);
   if (balance > 0) {
-    const keep = atRisk ? fixedCosts(state) + nextService : smartReserve(state, opts, nextService) + nextService;
+    // Round 4c/4d: with a covenant at risk it still keeps a storm's repairs in hand (cashFloor's storm term).
+    const keep = atRisk ? fixedCosts(state) + nextService + opts.floorStormYears * expectedRepairsPerYear(state) : smartReserve(state, opts, nextService) + nextService;
     const repay = Math.min(balance, Math.floor(cash - keep));
     if (repay >= 1) {
       send({ type: 'repayCredit', amount: repay });
@@ -1455,7 +1578,7 @@ function borrowFor(state: GameState, send: Send, opts: SmartOptions, project: Pr
   const amount = Math.min(room, Math.max(opts.minLoan, TERM_LOAN_MIN, Math.ceil(need / opts.loanStep) * opts.loanStep));
   if (amount < need) return false;
   const quote = quoteTermLoan(state, amount, opts.termYears);
-  if (!quote.ok || quote.breachesCovenant || !withinBuffer(quote.after, opts.loanLeverageShare, opts.loanCoverageMultiple)) return false;
+  if (!quote.ok || quote.breachesCovenant || !withinBuffer(stormStressed(quote.after, stormCushion(state, opts)), opts.loanLeverageShare, opts.loanCoverageMultiple)) return false;
   return send({ type: 'takeTermLoan', amount, termYears: opts.termYears }).ok;
 }
 
@@ -1745,6 +1868,17 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
  * passing, the intro promo while sales.quotePromo says it pays, and a term
  * loan within its buffers whenever cash falls under its floor with the line
  * used up (bridgeMonths).
+ *
+ * Round 4c/4d fix (spec D at small purses): a small purse buys only part of
+ * an area, so it ranks areas and streets by the charges of the method it
+ * will build each one with (chosenCosts; ranked at aerial prices, the
+ * planner chose sparse areas and then buried half of them), plans each of
+ * its candidate areas and builds the one with the lowest cost per passing
+ * (bestOfPlans), and counts a street's make-ready wait three times its lost
+ * margin (waitWeight: a thin company's first months are its runway, and its
+ * borrowing grows with its trailing revenue). At the Seed round's purse,
+ * which builds whole areas, the first two measured slightly better over 25
+ * towns but lost tuning seed 1 to all-underground, so they stay lean settings.
  */
 export const LEAN_OPTIONS: Partial<SmartOptions> = {
   troughCheck: true,
@@ -1757,6 +1891,9 @@ export const LEAN_OPTIONS: Partial<SmartOptions> = {
   marketingPerPassing: 1,
   bridgeMonths: 3,
   promoWhenPays: SMART_INTRO_PROMO,
+  chosenCosts: true,
+  bestOfPlans: true,
+  waitWeight: 3,
 };
 
 /** The starting cash of `state`'s difficulty (company.difficultyLevel). */
@@ -1935,10 +2072,17 @@ export const RURAL_OPTIONS: Partial<SmartOptions> = {
   borrowWhenShort: true,
   minNewUnits: 10,
   maxStreetCpp: Infinity,
-  // Round 3's cash rules (no storm reserve): the bot is about the bank's CPP
-  // spread, so it keeps borrowing for red lanes rather than holding cash.
+  // Round 3's cash rules (no storm reserve or storm cushion on its buffers):
+  // the bot is about the bank's CPP spread, so it keeps borrowing for red
+  // lanes rather than holding cash.
   stormReserveYears: 0,
   floorStormYears: 0,
+  stormCovenantYears: 0,
+  // Round 4c/4d: rural lanes are wooded and near the map's edge (storm-exposed,
+  // spec D), so it buries them; its cost per passing then stays red while it
+  // owes, even as the town fills in along its lanes (strung aerial, the new
+  // homes on them pulled it into amber for half its loan months).
+  methods: 'underground',
   name: 'rural',
 };
 
@@ -2359,21 +2503,48 @@ function copyState(state: GameState): GameState {
 }
 
 /**
+ * Round 4c/4d: replicates a lever experiment averages over. Two runs that
+ * differ by one decision drift apart through the sales stream's draws (who
+ * signs up and who cancels when), by more than many levers are worth over a
+ * year or three; averaging over replicates that share their draws arm by arm
+ * (common random numbers) measures the decision's expected worth in that
+ * situation instead of one roll of the dice.
+ */
+export const EXPERIMENT_REPLICATES = 3;
+
+/**
+ * Test-only state edit: a copy of `state` for replicate `r` of an
+ * experiment: replicate 0 as it stands, replicate r > 0 with its sales stream
+ * (signups, tier choice, churn) re-seeded from r. The weather stream is kept,
+ * so every replicate meets the same storms (the situation under test).
+ */
+export function replicateState(state: GameState, r: number): GameState {
+  const copy = copyState(state);
+  if (r > 0) copy.rng.sales = (copy.rng.sales ^ Math.imul(r, 0x9e3779b9)) >>> 0;
+  return copy;
+}
+
+/**
  * Test-only state edit: an incumbent promo at the cabinet area with the most
  * passings among those with customers (round 4c/4d: the incumbent answers a
  * take rate, so a promo where nobody has signed up yet tests nothing; any
  * area when none has customers), starting today with the rule's length, price and quiet months
- * (incumbent.reviewIncumbent's record), unless one already runs (then the
- * running one with the most passings). Returns its cabinet and whether it
- * was injected.
+ * (incumbent.reviewIncumbent's record), unless one already runs that is
+ * not yet answered (then the running one with the most passings). Round
+ * 4c/4d review: a promo the game has already answered cannot be answered
+ * again, so every answer would play exactly like ignoring it; the injected
+ * promo then goes to an area where none runs. Returns its cabinet and
+ * whether it was injected.
  */
 export function ensureIncumbentPromo(state: GameState): { cabinet: number; injected: boolean } {
   const areas = areaTakeRates(state);
   const passingsOf = (cabinet: number) => areas.find((a) => a.cabinet === cabinet)?.passings ?? 0;
-  const running = activePromos(state).sort((a, b) => passingsOf(b.cabinet) - passingsOf(a.cabinet) || a.cabinet - b.cabinet);
+  const active = activePromos(state);
+  const running = active.filter((p) => !p.answered).sort((a, b) => passingsOf(b.cabinet) - passingsOf(a.cabinet) || a.cabinet - b.cabinet);
   if (running[0]) return { cabinet: running[0].cabinet, injected: false };
   const signed = (a: { takeRate: number }) => (a.takeRate > 0 ? 1 : 0);
-  const area = [...areas].sort((a, b) => signed(b) - signed(a) || b.passings - a.passings || a.cabinet - b.cabinet)[0];
+  const free = areas.filter((a) => !active.some((p) => p.cabinet === a.cabinet));
+  const area = [...(free.length > 0 ? free : areas)].sort((a, b) => signed(b) - signed(a) || b.passings - a.passings || a.cabinet - b.cabinet)[0];
   if (!area) throw new Error('ensureIncumbentPromo: no cabinet area');
   const endDay = closeDayAfter(state.day, INCUMBENT_PROMO_MONTHS);
   const promo: IncumbentPromo = {
@@ -2421,7 +2592,8 @@ export interface AnswerExperiment {
  * intro promo (SMART_INTRO_PROMO) for new signups while it runs; or what
  * incumbent.bestIncumbentAnswer chooses at its start (that intro promo while
  * it runs, the retention offer, or nothing). Any later promo is ignored in
- * every case.
+ * every case. Each figure is the mean over EXPERIMENT_REPLICATES
+ * (replicateState).
  */
 export function incumbentAnswerExperiment(seed: number, month = ANSWER_EXPERIMENT_MONTH, months = ANSWER_EXPERIMENT_MONTHS): AnswerExperiment {
   const start = runBot(seed, smartBot(), month).state;
@@ -2451,9 +2623,13 @@ export function incumbentAnswerExperiment(seed: number, month = ANSWER_EXPERIMEN
         },
       };
     };
-    const run = runBot(seed, answering, months, { state: copyState(start) });
-    ocf[policy] = cumulativeOperatingCashFlow(run);
-    incumbentChurn[policy] = run.reports.reduce((t, r) => t + (r.ops?.incumbentChurn ?? 0), 0);
+    ocf[policy] = 0;
+    incumbentChurn[policy] = 0;
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, answering, months, { state: replicateState(start, r) });
+      ocf[policy] += cumulativeOperatingCashFlow(run) / EXPERIMENT_REPLICATES;
+      incumbentChurn[policy] += run.reports.reduce((t, report) => t + (report.ops?.incumbentChurn ?? 0), 0) / EXPERIMENT_REPLICATES;
+    }
   }
   return { cabinet, injected, chosen: best.kind, netValue: best.netValue, ocf, incumbentChurn };
 }
@@ -2484,7 +2660,22 @@ export interface PromoExperiment {
   /** Cumulative operating cash flow with the intro promo and without, at each checked month. */
   withPromo: number[];
   without: number[];
+  /** Round 4c/4d fix: the same less installs (operatingLessInstalls: cash before financing, installs counted), at each checked month. */
+  withPromoCash: number[];
+  withoutCash: number[];
 }
+
+/**
+ * Round 4c/4d fix (spec C): the standing promos the mature-town experiment
+ * also tries besides SMART_INTRO_PROMO: a long one, a long shallow one, and a
+ * deep one-month one (a long promo raised every street's ceiling for good
+ * and paid in a mature town).
+ */
+export const MATURE_PROMO_CASES: readonly IntroPromo[] = [
+  { percentOff: 20, months: 12 },
+  { percentOff: 10, months: 12 },
+  { percentOff: 50, months: 1 },
+];
 
 /**
  * The intro promo in a fresh area: SMART's game at FRESH_PROMO_MONTH (areas
@@ -2492,7 +2683,8 @@ export interface PromoExperiment {
  * nothing is lit yet) with an
  * incumbent promo at its largest area (ensureIncumbentPromo), played on by
  * SMART (building as usual) with SMART_INTRO_PROMO for new signups while the
- * incumbent's promo runs, against SMART ignoring it.
+ * incumbent's promo runs, against SMART ignoring it (each the mean over
+ * EXPERIMENT_REPLICATES: replicateState).
  */
 export function freshPromoExperiment(seed: number): PromoExperiment {
   let start = runBot(seed, smartBot(), FRESH_PROMO_MONTH).state;
@@ -2503,10 +2695,20 @@ export function freshPromoExperiment(seed: number): PromoExperiment {
   ensureIncumbentPromo(start);
   const quote = quotePromo(start, SMART_INTRO_PROMO);
   const play = (incumbentAnswer: IncumbentAnswerPolicy) => {
-    const run = runBot(seed, smartBot({ incumbentAnswer, introPromo: SMART_INTRO_PROMO }), FRESH_PROMO_MONTHS, { state: copyState(start) });
-    return FRESH_PROMO_CHECK_MONTHS.map((m) => cumulativeOperatingCashFlow(run, m));
+    const flows = FRESH_PROMO_CHECK_MONTHS.map(() => 0);
+    const cash = FRESH_PROMO_CHECK_MONTHS.map(() => 0);
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, smartBot({ incumbentAnswer, introPromo: SMART_INTRO_PROMO }), FRESH_PROMO_MONTHS, { state: replicateState(start, r) });
+      FRESH_PROMO_CHECK_MONTHS.forEach((m, i) => {
+        flows[i] = (flows[i] ?? 0) + cumulativeOperatingCashFlow(run, m) / EXPERIMENT_REPLICATES;
+        cash[i] = (cash[i] ?? 0) + operatingLessInstalls(run, m) / EXPERIMENT_REPLICATES;
+      });
+    }
+    return { flows, cash };
   };
-  return { quote, withPromo: play('introPromo'), without: play('none') };
+  const withPromo = play('introPromo');
+  const without = play('none');
+  return { quote, withPromo: withPromo.flows, without: without.flows, withPromoCash: withPromo.cash, withoutCash: without.cash };
 }
 
 /**
@@ -2514,20 +2716,46 @@ export function freshPromoExperiment(seed: number): PromoExperiment {
  * SMART building nothing new until all its plant is live (at most
  * MATURE_SETTLE_MONTHS_MAX closes), played MATURE_PROMO_MONTHS on by SMART
  * building nothing new, with SMART_INTRO_PROMO set throughout against none
- * (any incumbent promo ignored).
+ * (any incumbent promo ignored), each the mean over EXPERIMENT_REPLICATES
+ * (replicateState).
  */
 export function maturePromoExperiment(seed: number): PromoExperiment {
+  return maturePromoExperiments(seed, [SMART_INTRO_PROMO])[0] as PromoExperiment;
+}
+
+/**
+ * Round 4c/4d fix (spec C): the mature-town experiment for each of `promos`
+ * from the one start (maturePromoExperiment's), each played and measured over
+ * the longer of MATURE_PROMO_MONTHS and its quote's horizon
+ * (sales.promoQuoteMonths: the step churn when its locks end inside it),
+ * against no promo over the same months; one checked month each, by
+ * operating cash flow and by it less installs.
+ */
+export function maturePromoExperiments(seed: number, promos: readonly IntroPromo[]): PromoExperiment[] {
   let start = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
   const building = (state: GameState) => state.network.spans.some((s) => s.stage !== 'live') || state.network.cabinets.some((c) => c.stage !== 'live');
   for (let month = 0; month < MATURE_SETTLE_MONTHS_MAX && building(start); month++) {
     start = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none' }), 1, { state: start }).state;
   }
-  const quote = quotePromo(start, SMART_INTRO_PROMO);
-  const play = (standingPromo: IntroPromo | null) => {
-    const run = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), MATURE_PROMO_MONTHS, { state: copyState(start) });
-    return [cumulativeOperatingCashFlow(run)];
-  };
-  return { quote, withPromo: play(SMART_INTRO_PROMO), without: play(null) };
+  const horizon = (promo: IntroPromo) => Math.max(MATURE_PROMO_MONTHS, promoQuoteMonths(promo));
+  const longest = Math.max(...promos.map(horizon));
+  const runs = (standingPromo: IntroPromo | null, months: number) =>
+    Array.from({ length: EXPERIMENT_REPLICATES }, (_, r) =>
+      runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), months, { state: replicateState(start, r) }),
+    );
+  const mean = (list: readonly RunResult[], pick: (run: RunResult) => number) => list.reduce((sum, run) => sum + pick(run), 0) / list.length;
+  const none = runs(null, longest);
+  return promos.map((promo) => {
+    const months = horizon(promo);
+    const played = runs(promo, months);
+    return {
+      quote: quotePromo(start, promo),
+      withPromo: [mean(played, (run) => cumulativeOperatingCashFlow(run, months))],
+      without: [mean(none, (run) => cumulativeOperatingCashFlow(run, months))],
+      withPromoCash: [mean(played, (run) => operatingLessInstalls(run, months))],
+      withoutCash: [mean(none, (run) => operatingLessInstalls(run, months))],
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2710,13 +2938,15 @@ export interface MarketingForecastCheck {
  * The marketing forecast against what the sim then does: SMART's game at the
  * close of `month`, quoteMarketing at its budget, then CUSTOMER_QUOTE_MONTHS
  * of SMART operating that network as it stands, under the forecast's own
- * assumptions (customers.forecastCustomers: no new streets and no new ports,
- * so no new areas or splitters; the same marketing per passing).
+ * assumptions (customers.forecastCustomers: no new streets, so no new
+ * areas; the same marketing per passing). Round 4c/4d fix: SMART adds
+ * splitters as its cabinets fill, as the forecast now assumes (it no longer
+ * stops at today's free ports).
  */
 export function marketingForecastCheck(seed: number, month: number): MarketingForecastCheck {
   const start = runBot(seed, smartBot(), month).state;
   const quote = quoteMarketing(start, start.sales.marketingPerMonth);
-  const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, capacity: false }), CUSTOMER_QUOTE_MONTHS, { state: copyState(start) });
+  const run = runBot(seed, smartBot(OPERATOR_OPTIONS), CUSTOMER_QUOTE_MONTHS, { state: copyState(start) });
   let realized = 0;
   for (const report of run.reports) realized += report.stats?.grossAdds ?? 0;
   return {
@@ -2829,18 +3059,25 @@ function areaUnitMonths(run: RunResult, cabinet: number): number {
  * The campaign experiment: a neighborhood campaign in a freshly lit area
  * (freshAreaStart) and in a well-signed one (signedAreaStart), each against
  * none, by realized operating cash flow over LEVER_EXPERIMENT_MONTHS
- * (the campaign's cost is in it) and by quoteCampaign at the start.
+ * (the campaign's cost is in it; each the mean over EXPERIMENT_REPLICATES)
+ * and by quoteCampaign at the start.
  */
 export function campaignExperiment(seed: number): CampaignExperiment {
   const arm = (start: { state: GameState; cabinet: number } | null): CampaignArm | null => {
     if (!start) return null;
     const quote = quoteCampaign(start.state, start.cabinet);
-    const { a, b } = leverRuns(seed, start.state, (_, send) => {
-      send({ type: 'runCampaign', cabinet: start.cabinet });
-    });
     const margin = subscriberEconomics(start.state).margin;
-    const areaValue = (areaUnitMonths(a, start.cabinet) - areaUnitMonths(b, start.cabinet)) * margin - quote.cost;
-    return { cabinet: start.cabinet, quote, areaValue, ...armOf(a, b) };
+    // Round 4c/4d review: the mean over EXPERIMENT_REPLICATES (replicateState), as the other noisy comparisons: one
+    // pair of runs drifted apart through the sales stream by more than a campaign is worth in a well-signed area.
+    const sum: LeverArm & { areaValue: number } = { areaValue: 0, withLever: 0, without: 0, subsWith: 0, subsWithout: 0 };
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const { a, b } = leverRuns(seed, replicateState(start.state, r), (_, send) => {
+        send({ type: 'runCampaign', cabinet: start.cabinet });
+      });
+      const one = { areaValue: (areaUnitMonths(a, start.cabinet) - areaUnitMonths(b, start.cabinet)) * margin - quote.cost, ...armOf(a, b) };
+      for (const key of Object.keys(sum) as (keyof typeof sum)[]) sum[key] += one[key] / EXPERIMENT_REPLICATES;
+    }
+    return { cabinet: start.cabinet, quote, ...sum };
   };
   return { fresh: arm(freshAreaStart(seed)), signed: arm(signedAreaStart(seed)) };
 }
@@ -2854,11 +3091,11 @@ export const SUPPORT_SHORT_MONTHS = CUSTOMER_QUOTE_MONTHS;
 export const SUPPORT_LONG_MONTHS = 36;
 
 export interface SupportCase {
-  /** Cumulative operating cash flow less installs over the horizon, by level. */
+  /** Cumulative operating cash flow less installs over the horizon, by level (mean over EXPERIMENT_REPLICATES). */
   value: Record<SupportLevel, number>;
-  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level. */
+  /** harness.runValue at the end (cash less debt plus VALUE_YEARS of its trailing operating cash flow), by level (mean over the replicates). */
   worth: Record<SupportLevel, number>;
-  /** Subscribers at the end, by level. */
+  /** Subscribers at the end, by level (mean over the replicates). */
   subscribers: Record<SupportLevel, number>;
   /** quoteSupport('great') at the start. */
   greatQuote: SupportQuote;
@@ -2874,10 +3111,15 @@ function supportCase(seed: number, start: GameState, months: number): SupportCas
   const worth = {} as Record<SupportLevel, number>;
   const subscribers = {} as Record<SupportLevel, number>;
   for (const level of SUPPORT_LEVEL_IDS) {
-    const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: copyState(start) });
-    value[level] = operatingLessInstalls(run);
-    worth[level] = runValue(run);
-    subscribers[level] = run.reports.at(-1)?.stats?.subscribers ?? 0;
+    value[level] = 0;
+    worth[level] = 0;
+    subscribers[level] = 0;
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, smartBot({ ...OPERATOR_OPTIONS, support: level }), months, { state: replicateState(start, r) });
+      value[level] += operatingLessInstalls(run) / EXPERIMENT_REPLICATES;
+      worth[level] += runValue(run) / EXPERIMENT_REPLICATES;
+      subscribers[level] += (run.reports.at(-1)?.stats?.subscribers ?? 0) / EXPERIMENT_REPLICATES;
+    }
   }
   return { value, worth, subscribers, greatQuote: quoteSupport(start, 'great') };
 }
@@ -2888,7 +3130,8 @@ function supportCase(seed: number, start: GameState, months: number): SupportCas
  * all-underground one (low), each over SUPPORT_SHORT_MONTHS and
  * SUPPORT_LONG_MONTHS, SMART operating its network (no new areas), valued by
  * operating cash flow less installs (operatingLessInstalls: a cancellation
- * refilled costs a new install).
+ * refilled costs a new install), each the mean over EXPERIMENT_REPLICATES
+ * (replicateState: the same storms, the sales stream re-seeded).
  */
 export function supportExperiment(seed: number): SupportExperiment {
   const high = runBot(seed, allAerialBot(), SUPPORT_EXPERIMENT_MONTH).state;
@@ -2966,13 +3209,17 @@ export function referralExperiment(seed: number): ReferralExperiment {
 export const SWITCHING_EXPERIMENT_MONTH = 12;
 /** ... and plays the network it has this long under each lineup. */
 export const SWITCHING_EXPERIMENT_MONTHS = 48;
-/** An area "reaches the ceiling" once its take rate is this share of its ceiling (AreaCurve.ceiling). */
+/** Areas "reach the ceiling" once their take rate is this share of the ceiling at the default prices (AreaCurve.ceiling of the standard arm). */
 export const CEILING_SHARE = 0.9;
 
 export interface SwitchingArm {
-  /** Pooled over the areas lit at the start: whole months until their take rate reached CEILING_SHARE of their ceiling (null: not within the run). */
+  /**
+   * Pooled over the areas lit at the start: whole months until their take
+   * rate reached CEILING_SHARE of the ceiling at the default prices (the
+   * standard arm's `ceiling`; null: not within the run).
+   */
   monthsToCeiling: number | null;
-  /** Their ceiling take rate and their take rate at the end. */
+  /** Their ceiling take rate under this arm's prices and their take rate at the end. */
   ceiling: number;
   take: number;
   /** Their take rate at each close of the run. */
@@ -2999,47 +3246,57 @@ export interface SwitchingExperiment {
  * DISCOUNT_PRICE_MULTIPLIER of them and at OVERPRICED_PRICE_MULTIPLIER (set
  * on the first day, the default grandfathering for a rise), measured on the
  * areas lit at the start (their pooled take rate against their pooled
- * ceiling: harness.areaCurves).
+ * ceiling: harness.areaCurves), each figure the mean over
+ * EXPERIMENT_REPLICATES (replicateState). "Reaching the ceiling" is reaching
+ * CEILING_SHARE of the ceiling at the default prices (spec I.1: the
+ * realistic ceiling, ~45-55% of homes at the default prices, which a better
+ * deal reaches sooner); each arm's own ceiling (its target take rate at its
+ * prices) is reported beside it. Churn keeps an area's take below its own
+ * target: a lineup's areas settle where switching into the gap balances the
+ * cancellations out of it.
  */
 export function switchingExperiment(seed: number): SwitchingExperiment {
   const start = runBot(seed, smartBot(), SWITCHING_EXPERIMENT_MONTH).state;
   const service = getService(start);
   const cabinets = start.network.cabinets.filter((c) => c.liveDay !== null && (service.cabinetCoverage.get(c.id)?.passings ?? 0) > 0).map((c) => c.id);
-  const arm = (multiplier: number): SwitchingArm => {
-    const inner = smartBot(OPERATOR_OPTIONS);
-    const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
-    const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: copyState(start) });
-    const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
-    let target = 0;
-    let passings = 0;
-    for (const c of curves) {
-      target += c.ceiling * c.passings;
-      passings += c.passings;
-    }
-    const ceiling = passings > 0 ? target / passings : 0;
-    const takes = run.reports.map((report) => {
-      let units = 0;
-      let homes = 0;
-      for (const area of report.customers?.areas ?? []) {
-        if (!cabinets.includes(area.cabinet)) continue;
-        units += area.units;
-        homes += area.passings;
+  const arm = (multiplier: number, reference: number | null): SwitchingArm => {
+    let ceiling = 0;
+    let arpu = 0;
+    let revenuePerHome = 0;
+    let ocf = 0;
+    const takes: number[] = new Array<number>(SWITCHING_EXPERIMENT_MONTHS).fill(0);
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const inner = smartBot(OPERATOR_OPTIONS);
+      const bot = multiplier === 1 ? inner : constantPriceBot(inner, multiplier);
+      const run = runBot(seed, bot, SWITCHING_EXPERIMENT_MONTHS, { state: replicateState(start, r) });
+      const curves = areaCurves(run).filter((c) => cabinets.includes(c.cabinet));
+      let target = 0;
+      let passings = 0;
+      for (const c of curves) {
+        target += c.ceiling * c.passings;
+        passings += c.passings;
       }
-      return homes > 0 ? units / homes : 0;
-    });
-    const reached = takes.findIndex((t) => t >= CEILING_SHARE * ceiling);
-    let revenue = 0;
-    for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
-    const lastPassings = run.reports.at(-1)?.passings ?? 0;
-    return {
-      monthsToCeiling: reached < 0 ? null : reached + 1,
-      ceiling,
-      take: takes.at(-1) ?? 0,
-      takes,
-      arpu: averageArpu(run) ?? 0,
-      revenuePerHome: lastPassings > 0 ? revenue / lastPassings : 0,
-      ocf: cumulativeOperatingCashFlow(run),
-    };
+      ceiling += (passings > 0 ? target / passings : 0) / EXPERIMENT_REPLICATES;
+      run.reports.forEach((report, i) => {
+        let units = 0;
+        let homes = 0;
+        for (const area of report.customers?.areas ?? []) {
+          if (!cabinets.includes(area.cabinet)) continue;
+          units += area.units;
+          homes += area.passings;
+        }
+        takes[i] = (takes[i] ?? 0) + (homes > 0 ? units / homes : 0) / EXPERIMENT_REPLICATES;
+      });
+      let revenue = 0;
+      for (const report of run.reports.slice(-12)) revenue += report.totals.revenue ?? 0;
+      const lastPassings = run.reports.at(-1)?.passings ?? 0;
+      arpu += (averageArpu(run) ?? 0) / EXPERIMENT_REPLICATES;
+      revenuePerHome += (lastPassings > 0 ? revenue / lastPassings : 0) / EXPERIMENT_REPLICATES;
+      ocf += cumulativeOperatingCashFlow(run) / EXPERIMENT_REPLICATES;
+    }
+    const reached = takes.findIndex((t) => t >= CEILING_SHARE * (reference ?? ceiling));
+    return { monthsToCeiling: reached < 0 ? null : reached + 1, ceiling, take: takes.at(-1) ?? 0, takes, arpu, revenuePerHome, ocf };
   };
-  return { cabinets, standard: arm(1), discount: arm(DISCOUNT_PRICE_MULTIPLIER), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER) };
+  const standard = arm(1, null);
+  return { cabinets, standard, discount: arm(DISCOUNT_PRICE_MULTIPLIER, standard.ceiling), overpriced: arm(OVERPRICED_PRICE_MULTIPLIER, standard.ceiling) };
 }

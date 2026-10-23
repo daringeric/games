@@ -90,6 +90,7 @@
 import {
   ADVICE_SNOOZE_MONTHS,
   ADVICE_SNOOZE_URGENT_MONTHS,
+  ARR_TRAILING_MONTHS,
   AWARENESS_ON_LIT,
   BANK_WATCH_HEADROOM,
   CABINET_COST,
@@ -141,6 +142,7 @@ import {
   dealFactor,
   dealFactors,
   forecastCustomers,
+  splittersCost,
   happinessReport,
   marketingAwarenessPerDay,
   quoteCampaign,
@@ -157,9 +159,11 @@ import {
   covenantsWithin,
   estimateNextDebtService,
   estimateSweep,
-  formatMultiple,
   formatRateBps,
   fundingHint,
+  LEVERAGE_LIMIT_WORDS,
+  perDollarWords,
+  yearsOfProfitWords,
   maxSafeTermLoan,
   pricingCpp,
   quoteDraw,
@@ -213,6 +217,7 @@ import type {
   Command,
   CommandResult,
   CovenantMetrics,
+  CureOption,
   FundingHint,
   GameState,
   GrowthOption,
@@ -1036,14 +1041,14 @@ function borrowedBy(funding: Funding): number {
  * inside the covenants; no financing once an earlier rule borrowed or said
  * not to borrow (Claims.holdBorrowing).
  * ", and cash covers it." / ": a $4,000 credit-line draw pays for it and
- * keeps a cushion, within the covenants." / null (nothing safe covers it).
+ * keeps a cushion, inside the bank's limits." / null (nothing safe covers it).
  */
 function purchaseFunding(state: GameState, r: Readings, cost: number): { text: string; commands: Command[]; cash: boolean; borrow: number } | null {
   const hint = fundingHint(state, cost + r.claims.spend, SUGGESTED_BORROWING_HEADROOM);
   if (hint.kind === 'cash') return { text: ', and cash covers it.', commands: [], cash: true, borrow: 0 };
   const funding = r.claims.borrowed || r.claims.holdBorrowing ? null : fundingOf(hint);
   if (!funding) return null;
-  return { text: `: ${funding.phrase} pays for it and keeps a cushion, within the covenants.`, commands: funding.commands, cash: false, borrow: borrowedBy(funding) };
+  return { text: `: ${funding.phrase} pays for it and keeps a cushion, inside the bank's limits.`, commands: funding.commands, cash: false, borrow: borrowedBy(funding) };
 }
 
 /** What a purchase waits on beyond its cost: "the next loan payment" while one is due or anything is owed, else "a cushion" (the fixed costs fundingHint keeps). */
@@ -1096,13 +1101,13 @@ function paymentShortRule(state: GameState, r: Readings): AdvicePlan | null {
   }
   const ends = state.debt.acceleration !== null || state.debt.covenant.stage === 'frozen';
   let next: string;
-  if (funding) next = `${capitalize(funding.phrase)} now covers it with a cushion and stays within the covenants.`;
+  if (funding) next = `${capitalize(funding.phrase)} now covers it with a cushion and stays inside the bank's limits.`;
   else if (state.debt.acceleration !== null) {
     next = `The bank has called your loans, so a close that cannot pay is a default that ends the game: ${cutSpending(state)} until it is paid.`;
   } else if (state.debt.covenant.stage === 'frozen') {
     next = `Your credit line is frozen, so a missed payment is a default that ends the game: ${cutSpending(state)} until it is paid.`;
   } else {
-    next = `No covenant-safe borrowing covers it: ${cutSpending(state)}, or a missed payment freezes the credit line and adds a late fee.`;
+    next = `No borrowing inside the bank's limits covers it: ${cutSpending(state)}, or a missed payment stops your borrowing and adds a late fee.`;
   }
   const why: Wording = funding
     ? [
@@ -1153,20 +1158,64 @@ function loansCalledRule(state: GameState, r: Readings): AdvicePlan | null {
   return plan(makeAdvice('loansCalled', ADVICE_PRIORITY.loansCalled, title, why, BANK, 'loansCalled', { detail: `${lead} ${next}` }));
 }
 
-/** "leverage 6.48× (limit 5.00×) and coverage 0.60× (minimum 1.20×)" */
-function covenantFigures(m: CovenantMetrics): string {
-  const leverage = m.leverage === null ? 'leverage unmeasurable (no cash flow to measure it against)' : `leverage ${formatMultiple(m.leverage)} (limit ${formatMultiple(COVENANT_MAX_LEVERAGE)})`;
-  const coverage = m.coverage === null ? 'nothing scheduled' : `coverage ${formatMultiple(m.coverage)} (minimum ${formatMultiple(COVENANT_MIN_COVERAGE)})`;
-  return `${leverage} and ${coverage}`;
+/**
+ * The bank's two checks in the Bank's own plain words (spec G/H: no
+ * leverage, covenant or × in the month summary, its disclosure included):
+ * "your debt is 14.3 years of profit (the bank's limit is 5), and you earn
+ * $1.04 for every $1 of loan payments (it wants at least $1.20)".
+ */
+function checksInWords(m: CovenantMetrics): string {
+  const debt =
+    m.totalDebt <= 0
+      ? 'you owe nothing'
+      : m.leverage === null
+        ? `you have no profit yet to measure your debt against (the bank's limit is ${LEVERAGE_LIMIT_WORDS} years of profit)`
+        : `your debt is ${yearsOfProfitWords(m.leverage)} (the bank's limit is ${LEVERAGE_LIMIT_WORDS})`;
+  const earn =
+    m.coverage === null
+      ? 'you have no loan payments yet'
+      : `you earn ${perDollarWords(m.coverage)} for every $1 of loan payments (it wants at least ${perDollarWords(COVENANT_MIN_COVERAGE)})`;
+  return `${debt}, and ${earn}`;
 }
 
-/** What the next breached close does at each stage. */
+/** The checks after a cure, in the same words: "your debt to 3.5 years of profit and $1.20 earned for every $1 of loan payments". */
+function checksAfterInWords(m: CovenantMetrics): string {
+  const debt =
+    m.totalDebt <= 0 ? 'no debt left' : m.leverage === null ? 'your debt still with no profit to measure it against' : `your debt to ${yearsOfProfitWords(m.leverage)}`;
+  const earn = m.coverage === null ? 'no loan payments' : `${perDollarWords(m.coverage)} earned for every $1 of loan payments`;
+  return `${debt} and ${earn}`;
+}
+
+/** What the next failed check does at each stage, in the Bank's slip-ladder words. */
 const NEXT_BREACH: Record<GameState['debt']['covenant']['stage'], string> = {
-  compliant: 'a breach there brings a warning',
-  warning: 'a second breach brings the penalty rate',
-  penalty: 'another breach freezes the credit line',
-  frozen: `the freeze lasts until ${COVENANT_CURE_CLOSES} compliant closes in a row`,
+  compliant: 'failing it there brings a warning from the bank',
+  warning: 'a second slip makes every loan cost more',
+  penalty: 'another slip stops your borrowing and the bank starts taking your spare cash',
+  frozen: `borrowing stays stopped until ${count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes')} in a row`,
 };
+
+/** A cure (debt.cureFor) in plain words: what to pay, and where it leaves the bank's checks and your cash. */
+function cureInWords(option: CureOption, state: GameState): string {
+  const leaves = `, leaving ${money(option.cashAfter)} in cash.`;
+  switch (option.kind) {
+    case 'repayCredit':
+      return `Pay back ${money(option.amount)} of emergency cash: at today's figures that brings ${checksAfterInWords(option.after)}${leaves}`;
+    case 'prepayLoan': {
+      const loan = state.debt.loans.find((l) => l.id === option.loan);
+      const what = loan && option.amount >= loan.balance ? `Pay off loan ${option.loan} (${money(option.amount)})` : `Pay ${money(option.amount)} off loan ${option.loan} early`;
+      return `${what}: at today's figures that brings ${checksAfterInWords(option.after)}${leaves}`;
+    }
+    case 'repayAll':
+      return `Pay back everything you owe (${money(option.amount)}): with no debt the bank clears everything at the next month close${leaves}`;
+    case 'grow': {
+      const from = option.after.annualOperatingCashFlow - option.amount;
+      return (
+        `No single repayment fixes it: about ${money(option.amount)} a year more profit (yearly bills less running costs) would, ` +
+        `from ${money(from)} to ${money(option.after.annualOperatingCashFlow)} a year, bringing ${checksAfterInWords(option.after)}.`
+      );
+    }
+  }
+}
 
 /**
  * covenantCure: a covenant breached at today's figures (urgent while the
@@ -1180,8 +1229,9 @@ const NEXT_BREACH: Record<GameState['debt']['covenant']['stage'], string> = {
  * happens). Or, compliant but within COVENANT_RISK_MARGIN of a limit,
  * important: hold off on borrowing (beyond what an earlier suggestion, the
  * payment the next close must make, borrows: Claims.newDebt). Never "borrow
- * more". Open Bank. Round 4c/4d: the card speaks of "the bank's checks";
- * the covenant figures are in its detail.
+ * more". Open Bank. Round 4c/4d: the card and its detail speak the Bank's
+ * words ("the bank's checks", "years of profit", "for every $1 of loan
+ * payments", "loan 1", "emergency cash"), never leverage, covenants or ×.
  */
 function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
   if (r.debt() === 0) return null;
@@ -1196,54 +1246,54 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
     if (!inTime && (!option || option.kind !== 'repayAll')) return null;
     const lead = !inTime
       ? state.debt.acceleration !== null
-        ? 'The bank has called your loans: a covenant cure does not end the call, only repaying everything does.'
-        : `At today's figures ${covenantFigures(m)} breach the covenants, and lifting the freeze takes ${COVENANT_CURE_CLOSES} compliant closes in a row, ` +
-          `more than remain before the bank calls the loans: only repaying everything stops it.`
-      : `At today's figures ${covenantFigures(m)} breach the covenants, and the ${close} close tests them again: ${NEXT_BREACH[stage]}.`;
+        ? 'The bank has asked for every loan back: passing its checks again does not stop that, only paying back everything does.'
+        : `At today's figures ${checksInWords(m)}, so you fail the bank's checks. Getting back to borrowing takes ` +
+          `${count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes')} in a row, more than remain before the bank asks for every loan back: only paying back everything stops it.`
+      : `At today's figures ${checksInWords(m)}, so you fail the bank's checks, and the ${close} close checks again: ${NEXT_BREACH[stage]}.`;
     const growWhy: Wording = [
       `You fail the bank's checks and can't repay enough: grow profit and don't borrow.`,
       `You fail the bank's checks: grow profit and don't borrow.`,
     ];
     if (!option) {
-      const detail = `${lead} No single repayment cures it: grow operating cash flow (more subscribers, lower costs) and do not borrow more.`;
-      return plan(makeAdvice('covenantCure', priority, "Grow cash flow to pass the bank's checks", growWhy, BANK, 'covenantCure', { detail }));
+      const detail = `${lead} No single repayment fixes it: grow your profit (more customers, lower costs) and do not borrow more.`;
+      return plan(makeAdvice('covenantCure', priority, "Grow profit to pass the bank's checks", growWhy, BANK, 'covenantCure', { detail }));
     }
     let title: Wording;
     let why: Wording;
     let commands: Command[] = [];
     if (option.kind === 'repayAll') {
-      title = [`Repay all ${money(option.amount)} you owe`, 'Repay everything you owe'];
+      title = [`Pay back all ${money(option.amount)} you owe`, 'Pay back everything you owe'];
       commands = repayAllCommands(state);
       why = !inTime
-        ? ['Only repaying everything you owe stops the bank calling your loans.']
-        : [`You fail the bank's checks, and repaying everything you owe clears them.`];
+        ? ['Only paying back everything you owe stops the bank asking for every loan back.', 'Only paying back everything stops the bank asking for it.']
+        : [`You fail the bank's checks, and paying back everything you owe clears them.`];
     } else if (option.kind === 'repayCredit') {
-      title = [`Repay ${money(option.amount)} of the credit line`, `Repay ${money(option.amount)} of the line`];
+      title = [`Pay back ${money(option.amount)} of emergency cash`, 'Pay back emergency cash'];
       commands = [{ type: 'repayCredit', amount: option.amount }];
-      why = [`At today's figures you fail the bank's checks; repaying ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
+      why = [`At today's figures you fail the bank's checks; paying back ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
     } else if (option.kind === 'prepayLoan' && option.loan !== null) {
       const loan = state.debt.loans.find((l) => l.id === option.loan);
-      title = loan && option.amount >= loan.balance ? `Pay off term loan #${option.loan}` : [`Prepay ${money(option.amount)} of term loan #${option.loan}`, `Prepay ${money(option.amount)} of a term loan`];
+      title = loan && option.amount >= loan.balance ? `Pay off loan ${option.loan}` : [`Pay ${money(option.amount)} off loan ${option.loan}`, 'Pay part of a loan off early'];
       commands = [{ type: 'prepayLoan', loan: option.loan, amount: option.amount }];
-      why = [`At today's figures you fail the bank's checks; repaying ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
+      why = [`At today's figures you fail the bank's checks; paying ${money(option.amount)} early fixes that.`, `You fail the bank's checks; this early payment fixes that.`];
     } else {
       // On the same basis as its text: today's operating cash flow raised to this.
       const to = Math.round(option.after.annualOperatingCashFlow / LOAN_ROUNDING) * LOAN_ROUNDING;
-      title = [`Raise cash flow to about ${money(to)} a year`, "Grow cash flow to pass the bank's checks"];
+      title = [`Raise profit to about ${money(to)} a year`, "Grow profit to pass the bank's checks"];
       why = growWhy;
     }
     const spend = commands.length > 0 ? state.finance.cash - option.cashAfter : 0;
-    return plan(makeAdvice('covenantCure', priority, title, why, BANK, 'covenantCure', { detail: `${lead} ${option.text}` }), commands, spend);
+    return plan(makeAdvice('covenantCure', priority, title, why, BANK, 'covenantCure', { detail: `${lead} ${cureInWords(option, state)}` }), commands, spend);
   }
   const leverageNear = m.totalDebt > 0 && m.leverage !== null && m.leverage > COVENANT_MAX_LEVERAGE * (1 - COVENANT_RISK_MARGIN);
   const coverageNear = m.coverage !== null && m.coverage < COVENANT_MIN_COVERAGE * (1 + COVENANT_RISK_MARGIN);
   if (!leverageNear && !coverageNear) return null;
   const hold = r.claims.newDebt
-    ? 'Beyond the borrowing suggested above (it covers the payment and stays within the covenants), hold off on new borrowing and keep cash flow growing'
-    : 'Hold off on new borrowing and keep cash flow growing';
+    ? "Beyond the borrowing suggested above (it covers the payment and stays inside the bank's limits), hold off on new borrowing and keep your profit growing"
+    : 'Hold off on new borrowing and keep your profit growing';
   const detail =
-    `At today's figures ${covenantFigures(m)} pass, but only just: a weak month or more borrowing would breach them at the ${close} close. ` +
-    `${hold}; repaying debt widens the margin.`;
+    `At today's figures ${checksInWords(m)}: you pass the bank's checks, but only just, and a weak month or more borrowing would fail them at the ${close} close. ` +
+    `${hold}; paying back debt widens the margin.`;
   const why: Wording = r.claims.newDebt
     ? [`You pass the bank's checks only just: borrow nothing beyond the payment above.`]
     : [`You pass the bank's checks only just: hold off on new borrowing.`];
@@ -1253,9 +1303,13 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
 /**
  * frozenSweep (important): frozen with debt and not yet called: the sweep
  * at the last close (report.debt.sweep) and the next (debt.estimateSweep),
- * the closes until the bank calls the loans (debt.closesUntilAcceleration),
- * and what lifts the freeze (COVENANT_CURE_CLOSES compliant closes in a
- * row), or that too few closes remain for that. Open Bank.
+ * the month closes until the bank asks for every loan back
+ * (debt.closesUntilAcceleration), and what gets borrowing back
+ * (COVENANT_CURE_CLOSES good closes in a row), or that too few remain for
+ * that. Round 4c/4d: in the words the HUD chip, the Bank and the summary's
+ * badge use ("no more borrowing", "asks for every loan back in N months");
+ * the bank's own terms (frozen, compliant closes) only in the detail, next
+ * to their plain meaning. Open Bank.
  */
 function frozenSweepRule(state: GameState, r: Readings): AdvicePlan | null {
   if (state.debt.covenant.stage !== 'frozen' || state.debt.acceleration !== null || r.debt() === 0) return null;
@@ -1266,29 +1320,31 @@ function frozenSweepRule(state: GameState, r: Readings): AdvicePlan | null {
   const compliantNow = r.metrics().compliant;
   const done = compliantNow ? state.debt.covenant.compliantCloses : 0;
   const needed = Math.max(1, COVENANT_CURE_CLOSES - done);
-  const swept = last > 0 ? `swept ${money(last)} at the last close and ` : '';
+  const swept = last > 0 ? `took ${money(last)} of your spare cash at the last close and ` : '';
   const takes =
     next > 0
       ? `will take about ${money(next)} at the ${close} close`
-      : `takes ${pct(FROZEN_SWEEP_SHARE)} of each month's positive operating cash flow (none expected at the ${close} close)`;
-  const call = left <= 0 ? 'calls the loans at the next frozen close' : `calls the loans after ${count(left, 'more frozen close', 'more frozen closes')}`;
-  const lead = `While your credit line is frozen the bank ${swept}${takes}, and it ${call}.`;
+      : `takes ${pct(FROZEN_SWEEP_SHARE)} of each month's spare cash (none expected at the ${close} close)`;
+  const months = (n: number) => count(n, 'month', 'months');
+  const call = left <= 0 ? 'asks for every loan back at the next month close' : `asks for every loan back after ${count(left, 'more month close', 'more month closes')} like this`;
+  const lead = `While your borrowing is stopped (the bank has frozen your credit line) the bank ${swept}${takes}, and it ${call}.`;
   const canCure = needed <= Math.max(1, left);
+  const goodCloses = count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes');
   const lift = canCure
-    ? `${COVENANT_CURE_CLOSES} compliant closes in a row lift the freeze (${compliantNow ? `today's figures pass; ${done} so far` : "today's figures still breach"}).`
-    : `Lifting the freeze takes ${COVENANT_CURE_CLOSES} compliant closes in a row, more than remain before the call: only repaying everything stops it.`;
+    ? `${goodCloses} in a row (passing both of the bank's checks, its covenants) get your borrowing back (${compliantNow ? `today's figures pass; ${done} so far` : "today's figures still fail them"}).`
+    : `Getting your borrowing back takes ${goodCloses} in a row, more than remain before the bank asks for every loan back: only paying back everything stops it.`;
   const title: Wording = !canCure
-    ? [`Repay ${money(r.debt())} before the loans are called`, 'Repay everything before the loans are called']
+    ? [`Pay back ${money(r.debt())} before the bank asks`, 'Pay back everything before the bank asks']
     : left <= 0
-      ? 'The bank calls the loans at the next close'
-      : `Lift the freeze within ${count(left, 'close', 'closes')}`;
+      ? 'The bank asks for every loan back next month'
+      : `Get back to borrowing within ${months(left)}`;
   const why: Wording = !canCure
-    ? ['Too few closes remain to lift the freeze: only repaying everything stops the call.']
+    ? ['Too little time is left to get borrowing back: only paying back everything stops the bank.', 'Only paying back everything stops the bank asking.']
     : left <= 0
-      ? ['The bank calls every loan at the next close unless you repay what you owe.']
+      ? ['The bank asks for every loan back at the next month close unless you pay back what you owe.']
       : [
-          `The bank takes your spare cash each month and calls every loan in ${count(left, 'close', 'closes')}.`,
-          `The bank takes spare cash and calls every loan in ${count(left, 'close', 'closes')}.`,
+          `The bank takes your spare cash each month and asks for every loan back in ${months(left)}.`,
+          `The bank takes spare cash and asks for every loan back in ${months(left)}.`,
         ];
   return plan(makeAdvice('frozenSweep', ADVICE_PRIORITY.frozenSweep, title, why, BANK, 'frozenSweep', { detail: `${lead} ${lift}` }));
 }
@@ -1403,11 +1459,11 @@ function cashRunwayRule(state: GameState, r: Readings): AdvicePlan | null {
   // repayment above (covenantCure's) is not borrowing, and its warning stands.
   const next = funding
     ? `${capitalize(funding.phrase)} adds about ${months === 1 ? 'a month' : `${months} months`} of ${paused ? 'costs' : 'runway'} ` +
-      `and leaves the covenants at least ${pct(SUGGESTED_BORROWING_HEADROOM)} inside their limits.`
+      `and leaves you at least ${pct(SUGGESTED_BORROWING_HEADROOM)} inside the bank's limits.`
     : r.claims.newDebt
       ? `Beyond the borrowing suggested above, ${cutSpending(state)} until revenue catches up.`
       : hold
-        ? `Until the covenants are clear of their limits (see above), don't borrow: ${cutSpending(state)} until revenue catches up.`
+        ? `Until you are clear of the bank's limits (see above), don't borrow: ${cutSpending(state)} until revenue catches up.`
         : borrowed
           ? `After the repayment suggested above, ${cutSpending(state)} until revenue catches up.`
           : overloaded
@@ -1416,7 +1472,7 @@ function cashRunwayRule(state: GameState, r: Readings): AdvicePlan | null {
             : cannotCarry
               ? `Even with every street you have lit signed up to its target, this network would bring in about ${money(mature)} a month after running costs, ` +
                 `not enough to carry another loan, so borrowing would only put off the shortfall: ${cutSpending(state)} and grow customers on the streets you have.`
-              : `No covenant-safe borrowing covers it: ${cutSpending(state)} until revenue catches up.`;
+              : `No borrowing inside the bank's limits covers it: ${cutSpending(state)} until revenue catches up.`;
   // Without financing, trim marketing (a command) while cash covers the next payment (paymentShort covers the rest).
   const marketing = state.sales.marketingPerMonth;
   const cut = !funding && marketing > 0 && cash >= r.nextService() ? trimmedMarketing(marketing) : null;
@@ -2086,6 +2142,12 @@ function lineupRule(state: GameState, r: Readings): AdvicePlan | null {
   return plan(makeAdvice('lineup', ADVICE_PRIORITY.lineup, title, why, PRICING, ADVICE_KEYS.lineup(first.id), { detail }), [command]);
 }
 
+/** A quote's horizon for a card's detail: "year", "three years", "18 months". */
+function horizonPhrase(months: number): string {
+  const years: Record<number, string> = { 12: 'year', 24: 'two years', 36: 'three years', 48: 'four years', 60: 'five years' };
+  return years[months] ?? `${months} months`;
+}
+
 /** Subscribed units whose biggest grievance is service (outages, install waits, Basic support), from a happiness report's top reasons. */
 function serviceUnhappy(report: ReturnType<typeof happinessReport>): number {
   let units = 0;
@@ -2102,7 +2164,8 @@ function serviceUnhappy(report: ReturnType<typeof happinessReport>): number {
  * - on Good: at least SUPPORT_SERVICE_SHARE of customers are unhappy mainly
  *   about service (outages, install waits: customers.happinessReport) and
  *   customers.quoteSupport('great') pays (the customers kept and won are
- *   worth more than its extra cost over CUSTOMER_QUOTE_MONTHS): suggest
+ *   worth more than its extra cost over SUPPORT_QUOTE_MONTHS, round 4c/4d
+ *   fix: with the outages the plant can expect): suggest
  *   Great (setSupport), its extra cost a month and EXPAND_RESERVE_MONTHS of
  *   it covered by cash with the cushion (extraSpend);
  * - on Basic: when a dearer level pays (the better netValue of Good and
@@ -2127,8 +2190,8 @@ function supportRule(state: GameState, r: Readings): AdvicePlan | null {
     if (!cashCovers(state, r, extra)) return null;
     const detail =
       `${count(service, 'customer is', 'customers are')} unhappy mainly about outages or waiting to be connected, and unhappy customers cancel more. ` +
-      `Great support costs ${money(quote.costChange)} a month more for your ${count(units, 'customer', 'customers')} and, over the next ${CUSTOMER_QUOTE_MONTHS} months, ` +
-      `keeps and wins customers worth about ${money(quote.netValue)} more than it costs (about ${quote.cancellationsPerMonth.toFixed(1)} cancellations a month at Great).`;
+      `Great support costs ${money(quote.costChange)} a month more for your ${count(units, 'customer', 'customers')} and, over the next ${horizonPhrase(quote.months)} ` +
+      `with the outages your cable can expect, keeps and wins customers worth about ${money(quote.netValue)} more than it costs (about ${quote.cancellationsPerMonth.toFixed(1)} cancellations a month at Great).`;
     const why: Wording = [
       `${count(service, 'customer is', 'customers are')} unhappy about outages or waits; Great support pays. ${costs(quote.costChange)}`,
       `Outages and waits make customers unhappy; Great support pays. ${costs(quote.costChange)}`,
@@ -2148,7 +2211,7 @@ function supportRule(state: GameState, r: Readings): AdvicePlan | null {
   const saving = Math.max(0, better.costChange);
   const detail =
     `Basic support saves ${money(saving)} a month against ${name}, but its customers are less happy, so more cancel and fewer neighbors sign up: ` +
-    `about ${count(lost, 'customer', 'customers')} fewer a year. Over the next ${CUSTOMER_QUOTE_MONTHS} months ${name} is worth about ${money(better.netValue)} more than it costs.`;
+    `about ${count(lost, 'customer', 'customers')} fewer a year. Over the next ${horizonPhrase(better.months)} ${name} is worth about ${money(better.netValue)} more than it costs.`;
   const why: Wording = [
     `Basic support saves ${money(saving)} a month but costs about ${count(lost, 'customer', 'customers')} a year.`,
     `Basic support costs you about ${count(lost, 'customer', 'customers')} a year.`,
@@ -2678,6 +2741,12 @@ interface BuildChoice {
   years: TermYears;
   /** The customers its streets should sign at your prices (planCustomers). */
   customers: number;
+  /**
+   * Round 4c/4d fix (spec B): a first build that may not pay its way whole (chooseBuild's thin pass: no build that
+   * does fits the cash): its own margin signed up still covers its own upkeep, so it shrinks the burn the office costs
+   * anyway, and the cash covers it and its ramp's trough.
+   */
+  thin: boolean;
 }
 
 /**
@@ -2735,6 +2804,18 @@ function firstBuildPays(state: GameState, r: Readings, plan: BuildOutPlan & { li
 }
 
 /**
+ * Round 4c/4d fix (spec B), a thin first build: its streets signed up to
+ * target at the households' signup price less overhead.perCustomerCost more
+ * than cover what the plan itself adds to the running costs
+ * (planRunningCost): it shrinks the burn the office's base costs bring
+ * whether the company builds or not, even where it does not cover them all
+ * (firstBuildPays).
+ */
+function shrinksBurn(state: GameState, r: Readings, plan: BuildOutPlan & { lit?: readonly SegmentId[] }, target: number): boolean {
+  return target * (r.forecast().signupPrice - perCustomerCost(state)) > planRunningCost(state, plan);
+}
+
+/**
  * The build expand (or, on a new company with no cabinet, firstBuild)
  * suggests, or null. Only when compliant (stage and today's figures, loans
  * not called) with both covenants at least COVENANT_RISK_MARGIN inside their
@@ -2761,9 +2842,14 @@ function firstBuildPays(state: GameState, r: Readings, plan: BuildOutPlan & { li
  * (coverage.smallerBuildPlan: the cabinet, its feeder and the densest of its
  * streets the money covers) at the first SMALLER_CANDIDATES_MAX corners. A
  * first build may be amber when nothing green fits, and must pay its way
- * (firstBuildPays).
+ * (firstBuildPays). With `thin` (firstBuild's second pass, when that finds
+ * nothing for a new company): the same corners and plans, each needing only
+ * to shrink the burn (shrinksBurn: its own margin signed up covers its own
+ * upkeep) and a reserve of its ramp's trough without the funding cushion on
+ * top (the cash never runs out on the advisor's projection); the choice is
+ * flagged thin.
  */
-function chooseBuild(state: GameState, r: Readings): BuildChoice | null {
+function chooseBuild(state: GameState, r: Readings, thin = false): BuildChoice | null {
   if (state.debt.covenant.stage !== 'compliant' || state.debt.acceleration !== null || state.sales.installsPaused) return null;
   const runway = r.runway();
   if (runway !== null && runway < EXPAND_MIN_RUNWAY_MONTHS) return null;
@@ -2771,6 +2857,7 @@ function chooseBuild(state: GameState, r: Readings): BuildChoice | null {
   const m = r.metrics();
   if (!m.compliant || !covenantsWithin(m, COVENANT_RISK_MARGIN)) return null;
   const first = state.network.cabinets.length === 0;
+  if (thin && !first) return null;
   const service = Math.max(r.nextService(), Math.ceil(m.annualDebtService / 12));
   const installs = Math.max(monthlyInstallPace(state), plannedInstallPace(state, r.subscribed()));
   const running = r.fixed() + monthlyPoleRent(state) + service + installs;
@@ -2785,17 +2872,19 @@ function chooseBuild(state: GameState, r: Readings): BuildChoice | null {
   const budget = cash - base + safeLoan;
 
   /** The plan at `node` with its reserve and funding, or null when it cannot be paid for (or, first, cannot pay its way). */
+  // A thin first build keeps the ramp's trough itself (the cash never runs out on the advisor's own projection) without
+  // the funding cushion on top: the office's base costs burn whether it builds or not.
   const reserveOf = (plan: BuildOutPlan & { lit?: readonly SegmentId[] }, area: ReturnType<typeof areaSignups>): number =>
-    Math.max(base + EXPAND_RESERVE_MONTHS * planRunningCost(state, plan) + area.installs, r.keep() + rampTrough(state, r, plan, area, passingsToday, installs));
+    Math.max(base + EXPAND_RESERVE_MONTHS * planRunningCost(state, plan) + area.installs, (thin ? 0 : r.keep()) + rampTrough(state, r, plan, area, passingsToday, installs));
   const price = (plan: BuildOutPlan & { lit?: readonly SegmentId[] }, node: NodeId, smaller: boolean): BuildChoice | null => {
     const area = areaSignups(state, plan, passingsToday, EXPAND_INSTALL_MONTHS, r.ramp(passingsToday + plan.passings));
-    if (first && !firstBuildPays(state, r, plan, area.target)) return null;
+    if (first && !(thin ? shrinksBurn(state, r, plan, area.target) : firstBuildPays(state, r, plan, area.target))) return null;
     const reserve = reserveOf(plan, area);
     // An amber build is paid from cash only (it raises what the bank charges on new loans: CPP_SPREAD_BPS).
     const amberBuild = plan.cpp !== null && cppBand(plan.cpp) !== 'green';
     const funding = expandFunding(state, r, plan.cost, reserve, amberBuild ? 0 : safeLoan, years, planRunningCost(state, plan));
     if (!funding) return null;
-    return { node, plan, cpp: plan.cpp ?? Number.POSITIVE_INFINITY, funding, installs: area.installs, smaller, first, years, customers: area.target };
+    return { node, plan, cpp: plan.cpp ?? Number.POSITIVE_INFINITY, funding, installs: area.installs, smaller, first, years, customers: area.target, thin };
   };
   // "Nothing burns" needs a closed month with lit homes behind it: before the first close (or while the first
   // cabinet is still being built) runway reads null only because there is nothing to measure yet.
@@ -2881,7 +2970,7 @@ function buildCard(state: GameState, choice: BuildChoice): { commands: Command[]
   const loanText =
     funding.loan === 0
       ? `Cash covers it and still keeps ${reserveText}.`
-      : `A ${money(funding.loan)} ${years}-year term loan covers it, leaves the covenants at least ${pct(EXPAND_COVENANT_HEADROOM)} inside their limits and keeps ${reserveText}.`;
+      : `A ${money(funding.loan)} ${years}-year term loan covers it, leaves you at least ${pct(EXPAND_COVENANT_HEADROOM)} inside the bank's limits and keeps ${reserveText}.`;
   const commands: Command[] = [];
   if (funding.loan > 0) commands.push({ type: 'takeTermLoan', amount: funding.loan, termYears: years });
   commands.push(...build.commands);
@@ -2897,12 +2986,18 @@ function buildCard(state: GameState, choice: BuildChoice): { commands: Command[]
  * amber paid from cash once nothing burns and no green build fits: an area
  * above the CPP target still pays for itself many times over the years. Not beside covenantCure
  * (snoozed or not: chooseBuild needs both covenants COVENANT_RISK_MARGIN
- * inside their limits) or an earlier suggestion about cash running short.
+ * inside their limits) or an earlier suggestion about cash running short,
+ * and never while the company's first cabinet is still being built (no lit
+ * homes yet: firstBuild's wait card).
  * Commands [takeTermLoan?, ...plan.commands], spend = plan.cost, extraSpend
  * 0, keep = the reserve (with the loan's payments). Show me: the corner.
  */
 function expandRule(state: GameState, r: Readings): AdvicePlan | null {
   if (state.network.cabinets.length === 0) return null;
+  // Round 4c/4d fix (spec B): no second area while the first is still being built (firstBuild's wait card says to
+  // hold off): nothing measures the first area's install pace yet, and two areas signing up at once outran the
+  // reserve each card promised (the Seed round's seed 13 follower defaulted in month 11).
+  if (r.service().passings === 0) return null;
   if (r.claims.holdBorrowing || r.claims.cashShort) return null;
   const choice = r.build();
   if (!choice) return null;
@@ -2934,9 +3029,13 @@ function expandRule(state: GameState, r: Readings): AdvicePlan | null {
  * ("Light Elm St & 4th first: 140 homes at $857 each. Costs $120,000."),
  * green when one fits, else amber (a first area must exist before anything
  * else does), never one that cannot pay its way, from cash keeping the
- * reserve (a new company has nothing to borrow against). When none fits
- * (too little cash for any build that pays its way) it says so, with no
- * command (Show me: the central office). Once a cabinet is placed but
+ * reserve (a new company has nothing to borrow against). Round 4c/4d fix:
+ * when none that pays its way fits (a Shoestring purse on some towns), the
+ * concrete build that shrinks the monthly loss the most while the cash
+ * covers it and its ramp's trough (chooseBuild's thin pass), saying plainly
+ * that it may not carry the office alone. Only when not even that fits (too
+ * little cash for any build) it says so, with no command (Show me: the
+ * central office). Once a cabinet is placed but
  * nothing is lit yet, a tip with no command: the first streets light up
  * when it and its cable are built. Show me: the corner (the Customers panel
  * while building).
@@ -2951,7 +3050,9 @@ function firstBuildRule(state: GameState, r: Readings): AdvicePlan | null {
     return plan(makeAdvice('firstBuild', ADVICE_PRIORITY.firstBuildWait, 'Your first streets light up soon', why, CUSTOMERS, 'firstBuild', { detail }));
   }
   if (r.claims.holdBorrowing || r.claims.cashShort) return null;
-  const choice = r.build();
+  // Round 4c/4d fix (spec B): when no build that pays its way fits the cash, the smallest concrete one that shrinks
+  // the burn (the office costs its base whether the company builds or not), never a card the follower cannot act on.
+  const choice = r.build() ?? chooseBuild(state, r, true);
   if (!choice) {
     // No build that pays its way fits the cash (or none can be built now): say so rather than nothing.
     if (state.debt.covenant.stage !== 'compliant' || state.sales.installsPaused) return null;
@@ -2972,14 +3073,21 @@ function firstBuildRule(state: GameState, r: Readings): AdvicePlan | null {
     band === 'green'
       ? ''
       : ` It costs more per home than the ${money(CPP_TARGET)} target, which the bank notices, but it is the best first area your cash covers; build greener areas next.`;
-  const why: Wording = [
-    `Your first cabinet here lights ${homes} at ${money(choice.cpp)} each. ${costs(build.cost)}`,
-    `It lights ${homes} at ${money(choice.cpp)} each. ${costs(build.cost)}`,
-  ];
+  // A thin build says plainly that it may not carry the office on its own.
+  const thin = choice.thin
+    ? ` No area your cash covers pays all the office's running costs once signed up, so this is the one that cuts the monthly loss the most ` +
+      `while the cash lasts through its first years; keep marketing modest and build out from it as cash allows.`
+    : '';
+  const why: Wording = choice.thin
+    ? [
+        `It lights ${homes} at ${money(choice.cpp)} each and cuts your monthly loss. ${costs(build.cost)}`,
+        `It lights ${homes} at ${money(choice.cpp)} each. ${costs(build.cost)}`,
+      ]
+    : [`Your first cabinet here lights ${homes} at ${money(choice.cpp)} each. ${costs(build.cost)}`, `It lights ${homes} at ${money(choice.cpp)} each. ${costs(build.cost)}`];
   const title: Wording = [`Light ${corner} first`, `Light ${firstStreet(corner)} first`, 'Light your first streets'];
   const action: AdviceAction = { kind: 'focusNode', node };
   const advice = makeAdvice('firstBuild', ADVICE_PRIORITY.firstBuild, title, why, action, ADVICE_KEYS.firstBuild(node), {
-    detail: `${card.lead} ${card.loanText}${amber}`,
+    detail: `${card.lead} ${card.loanText}${amber}${thin}`,
     cost: build.cost,
   });
   return plan(advice, card.commands, build.cost, 0, funding.keep);
@@ -3045,6 +3153,8 @@ function perCustomer(cost: number, customers: number): number | null {
  *   MARKETING_MAX_PER_MONTH) against today's (what customers.quoteMarketing
  *   at both budgets says: the signups it adds), costing the step x the
  *   months; setMarketing;
+ * (round 4c/4d fix: each of marketing, a campaign and referral credits also
+ * costs the splitters its extra signups need, customers.splittersCost)
  * - a campaign: customers.quoteCampaign at the CAMPAIGN_QUOTES_MAX cabinet
  *   areas with the most households not signed up (customers.customerAreas,
  *   none running or cooling down there), the one cheapest per customer;
@@ -3063,7 +3173,9 @@ function perCustomer(cost: number, customers: number): number | null {
  * covering its price (a campaign) or EXPAND_RESERVE_MONTHS of its running
  * cost (marketing, credits) with the cushion and, while the company burns
  * cash (monthlyFlowNow below 0), EXPAND_MIN_RUNWAY_MONTHS of that burn on
- * top. Levers are weighed only while the lit areas are under-signed
+ * top; with debt (round 4c/4d fix), the covenants EXPAND_COVENANT_HEADROOM
+ * inside their limits once its spend comes off the operating cash flow (a
+ * campaign's price x 12 / ARR_TRAILING_MONTHS, a running cost x 12). Levers are weighed only while the lit areas are under-signed
  * (underSigned), unless `all` (growthOptions). The build is affordable when
  * chooseBuild found it. Cheapest per customer first (ties: the lever order
  * campaign, marketing, referrals, build). Also, for growCustomers: `trim`,
@@ -3088,6 +3200,13 @@ function growthWith(state: GameState, r: Readings, all = false): Growth {
   const hold = EXPAND_MIN_RUNWAY_MONTHS * Math.max(0, -monthlyFlowNow(state, r));
   const covers = (cost: number) => cashCovers(state, r, cost + hold);
   const sensible = (cpc: number | null, customers: number) => cpc !== null && customers >= GROW_MIN_CUSTOMERS && cpc <= GROWTH_PAYBACK_MONTHS * margin;
+  // Round 4c/4d review fix (spec B: following the advice never breaches a covenant): a lever's spend comes off the
+  // operating cash flow the covenants measure (debt.annualOperatingCashFlow annualizes the trailing
+  // ARR_TRAILING_MONTHS closes, so a campaign's price counts 12 / ARR_TRAILING_MONTHS times for a quarter); with
+  // debt, a lever must leave the covenants EXPAND_COVENANT_HEADROOM inside their limits after it, as a loan must.
+  const now = r.metrics();
+  const keepsCovenants = (annualCut: number) =>
+    (now.totalDebt === 0 && now.annualDebtService === 0) || covenantsWithin(covenantMetrics(state, { addDebt: 0, addAnnualDebtService: 0, addAnnualOperatingCashFlow: -annualCut }), EXPAND_COVENANT_HEADROOM);
   const levers: GrowthOption[] = [];
   const lit = r.service().passings > 0;
   if (lit && roomy && (all || underSigned(r.signed()))) {
@@ -3099,21 +3218,23 @@ function growthWith(state: GameState, r: Readings, all = false): Growth {
     let campaign: GrowthOption | null = null;
     for (const area of areas) {
       const quote = quoteCampaign(state, area.cabinet);
-      if (!quote.ok || !covers(quote.cost)) continue;
-      const cpc = perCustomer(quote.cost, quote.extraSignups);
+      if (!quote.ok || !covers(quote.cost) || !keepsCovenants((quote.cost * 12) / ARR_TRAILING_MONTHS)) continue;
+      // Round 4c/4d fix: with the splitters its extra signups need (the forecast lets them take ports added as cabinets fill).
+      const cost = quote.cost + quote.splitterCost;
+      const cpc = perCustomer(cost, quote.extraSignups);
       if (!sensible(cpc, quote.extraSignups)) continue;
       if (campaign === null || (cpc as number) < (campaign.costPerCustomer as number)) {
-        campaign = { lever: 'campaign', customers: quote.extraSignups, cost: quote.cost, costPerCustomer: cpc, cabinet: area.cabinet, node: area.node, commands: [{ type: 'runCampaign', cabinet: area.cabinet }] };
+        campaign = { lever: 'campaign', customers: quote.extraSignups, cost, costPerCustomer: cpc, cabinet: area.cabinet, node: area.node, commands: [{ type: 'runCampaign', cabinet: area.cabinet }] };
       }
     }
     if (campaign) levers.push(campaign);
     // One marketing step more.
     const m = state.sales.marketingPerMonth;
     const next = Math.min(MARKETING_MAX_PER_MONTH, m + MARKETING_STEP);
-    if (next > m && covers(EXPAND_RESERVE_MONTHS * (next - m))) {
+    if (next > m && covers(EXPAND_RESERVE_MONTHS * (next - m)) && keepsCovenants(12 * (next - m))) {
       const up = forecastCustomers(state, { marketingPerMonth: next });
       const customers = Math.max(0, up.signups - forecast.signups);
-      const cost = (next - m) * months;
+      const cost = (next - m) * months + Math.max(0, splittersCost(state, up.splitters) - splittersCost(state, forecast.splitters));
       const cpc = perCustomer(cost, customers);
       if (sensible(cpc, customers)) levers.push({ lever: 'marketing', customers, cost, costPerCustomer: cpc, cabinet: null, node: null, commands: [{ type: 'setMarketing', perMonth: next }] });
     }
@@ -3121,9 +3242,9 @@ function growthWith(state: GameState, r: Readings, all = false): Growth {
     if (!state.customers.referrals) {
       const credited = forecastCustomers(state, { referrals: true });
       const customers = Math.max(0, credited.signups - forecast.signups);
-      const cost = credited.referrals * 2 * REFERRAL_CREDIT;
+      const cost = credited.referrals * 2 * REFERRAL_CREDIT + Math.max(0, splittersCost(state, credited.splitters) - splittersCost(state, forecast.splitters));
       const cpc = perCustomer(cost, customers);
-      if (sensible(cpc, customers) && covers((EXPAND_RESERVE_MONTHS * cost) / months)) {
+      if (sensible(cpc, customers) && covers((EXPAND_RESERVE_MONTHS * cost) / months) && keepsCovenants((12 * cost) / months)) {
         levers.push({ lever: 'referrals', customers, cost, costPerCustomer: cpc, cabinet: null, node: null, commands: [{ type: 'setReferrals', on: true }] });
       }
     }

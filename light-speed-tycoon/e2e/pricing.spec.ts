@@ -18,7 +18,6 @@ import {
   INCUMBENT_DOWN_MBPS,
   INCUMBENT_PRICE,
   INCUMBENT_PROMO_DISCOUNT,
-  PROMO_QUOTE_MONTHS,
   RETENTION_PERCENT_OFF,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
@@ -376,7 +375,7 @@ test('the cable company\'s promo is answered with a retention offer: its subscri
   await page.getByRole('button', { name: 'Pricing' }).click();
   const dialog = page.getByRole('dialog', { name: 'Pricing', exact: true });
   // With the area lit for months and households still waiting, the intro promo line quotes the typed offer.
-  await expect(dialog.locator('.promo-advice')).toHaveText(new RegExp(`over the next ${PROMO_QUOTE_MONTHS} months: (about \\d+ more signups?|less than one more signup), \\$[\\d,]+ of margin against \\$[\\d,]+ of discounts\\.$`));
+  await expect(dialog.locator('.promo-advice')).toHaveText(new RegExp(`over the next \\d+ months: (about \\d+ more signups?|less than one more signup), \\$[\\d,]+ of margin against \\$[\\d,]+ of discounts\\.$`));
   await expect(dialog.locator('.promo-advice')).toHaveText(/pays/i);
   const rivals = dialog.getByRole('region', { name: 'Incumbent promos' });
   await expect(rivals).toBeVisible();

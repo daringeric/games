@@ -9,7 +9,7 @@
 // dollar amounts.
 
 import { describe, expect, it } from 'vitest';
-import { CAMPAIGN_DAYS, CUSTOMER_QUOTE_MONTHS, MARKETING_MAX_PER_MONTH, REFERRAL_CREDIT, SUPPORT_LEVELS } from '../sim/balance';
+import { CAMPAIGN_DAYS, CUSTOMER_QUOTE_MONTHS, MARKETING_MAX_PER_MONTH, REFERRAL_CREDIT, SUPPORT_LEVELS, SUPPORT_QUOTE_MONTHS } from '../sim/balance';
 import { formatDate, formatMonth } from '../sim/calendar';
 import {
   AREA_TREND_MONTHS,
@@ -57,6 +57,7 @@ import {
   happinessView,
   horizonWords,
   LEVER_WHAT,
+  MARKETING_NOTHING_LIT,
   marketingForecast,
   marketingProblem,
   marketingStepLine,
@@ -106,8 +107,8 @@ function litTown(): { state: GameState; cabinet: CabinetId } {
 }
 
 function reasonsOf(overall: Partial<SwitchReasons['overall']>, areas: SwitchReasons['areas'] = []): SwitchReasons {
-  const o = { unaware: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0, notLit: 0, ...overall };
-  if (overall.unsigned === undefined) o.unsigned = o.unaware + o.notWorth + o.tooExpensive + o.waiting;
+  const o = { unaware: 0, deciding: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0, notLit: 0, ...overall };
+  if (overall.unsigned === undefined) o.unsigned = o.unaware + o.deciding + o.notWorth + o.tooExpensive + o.waiting;
   return { overall: o, areas };
 }
 
@@ -267,27 +268,32 @@ describe('why homes haven\'t switched', () => {
   it('lists each reason with its count and the lever that addresses it', () => {
     const { state, cabinet } = litTown();
     const corner = cornerName(state.city, state.network.cabinets[0]!.node);
-    const reasons = reasonsOf({ unaware: 40, notWorth: 30, tooExpensive: 20, waiting: 10, passings: 200, subscribed: 100 }, [
-      { cabinet, unaware: 40, notWorth: 30, tooExpensive: 20, waiting: 10, unsigned: 100, passings: 200, subscribed: 100, notLit: 0 },
+    const reasons = reasonsOf({ unaware: 40, deciding: 20, notWorth: 20, tooExpensive: 10, waiting: 10, passings: 200, subscribed: 100 }, [
+      { cabinet, unaware: 40, deciding: 20, notWorth: 20, tooExpensive: 10, waiting: 10, unsigned: 100, passings: 200, subscribed: 100, notLit: 0 },
     ]);
     const rows = switchRows(state, reasons);
-    expect(rows.map((r) => r.key)).toEqual(['unaware', 'notWorth', 'tooExpensive', 'waiting']);
+    expect(rows.map((r) => r.key)).toEqual(['unaware', 'deciding', 'notWorth', 'tooExpensive', 'waiting']);
     expect(rows.map((r) => [r.label, r.lever])).toEqual([
       ["Don't know you yet", 'Marketing or a neighborhood campaign'],
+      ["Know you, haven't switched yet", 'Time and word of mouth; referral credits, a campaign or lower prices speed it up'],
       ['Not worth switching at your price', 'Lower prices or an intro promo'],
       ['Too expensive for them', 'A cheaper plan'],
       ['Waiting for install', 'Add a splitter where a cabinet is full, or keep cash for installs'],
     ]);
-    expect(rows.map((r) => r.count)).toEqual([40, 30, 20, 10]);
+    expect(rows.map((r) => r.count)).toEqual([40, 20, 20, 10, 10]);
     expect(rows[0]!.countText).toBe('40 homes');
-    expect(rows.map((r) => r.share)).toEqual([0.4, 0.3, 0.2, 0.1]);
+    expect(rows.map((r) => r.share)).toEqual([0.4, 0.2, 0.2, 0.1, 0.1]);
     expect(rows[0]!.links).toEqual([
       { kind: 'section', section: 'marketing', label: 'Marketing' },
       { kind: 'section', section: 'areas', label: 'Campaigns' },
     ]);
-    expect(rows[1]!.links).toEqual([{ kind: 'pricing', label: 'Open Pricing' }]);
+    expect(rows[1]!.links).toEqual([
+      { kind: 'section', section: 'referrals', label: 'Referral credits' },
+      { kind: 'section', section: 'areas', label: 'Campaigns' },
+    ]);
     expect(rows[2]!.links).toEqual([{ kind: 'pricing', label: 'Open Pricing' }]);
-    expect(rows[3]!.links).toEqual([{ kind: 'showMe', cabinet, label: 'Show me', place: corner }]);
+    expect(rows[3]!.links).toEqual([{ kind: 'pricing', label: 'Open Pricing' }]);
+    expect(rows[4]!.links).toEqual([{ kind: 'showMe', cabinet, label: 'Show me', place: corner }]);
     expect(switchIntro(reasons)).toBe("100 homes you can sell to haven't signed up yet.");
   });
 
@@ -324,6 +330,7 @@ describe('areas and campaigns', () => {
     unsignedUnits: 120,
     unawareUnits: 60,
     extraSignups: 18.4,
+    splitterCost: 0,
     costPerCustomer: 78,
     valueGained: 2_000,
     pays: true,
@@ -420,6 +427,7 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
     months: CUSTOMER_QUOTE_MONTHS,
     signupsPerMonth: 12.3,
     extraPerMonth: 4.1,
+    splitterCost: 0,
     costPerCustomer: 366,
     ...over,
   });
@@ -430,10 +438,35 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
     expect(marketingForecast(mq({ extraPerMonth: 0, costPerCustomer: null }))).toBe(
       `At ${formatMoney(1_500)} a month: about 12 new customers a month, but marketing adds hardly any of them: most homes on your lit streets already know you.`,
     );
+    // Fewer extra customers than the count's floor: never a price per customer it says hardly come (round 4c/4d check:
+    // "about 3 new customers a month, about $23,360 per new customer it brings" at $500 with most homes aware).
+    for (const extraPerMonth of [0.011, 0.0214, 0.05]) {
+      const few = marketingForecast(mq({ perMonth: 500, signupsPerMonth: 3.2, extraPerMonth, costPerCustomer: Math.round(500 / extraPerMonth) }));
+      expect(few).toBe(`At ${formatMoney(500)} a month: about 3 new customers a month, but marketing adds hardly any of them: most homes on your lit streets already know you.`);
+    }
+    expect(marketingForecast(mq({ extraPerMonth: 0.06, costPerCustomer: 25_000 }))).toContain(`about ${formatMoney(25_000)} per new customer it brings`);
     expect(marketingForecast(mq({ signupsPerMonth: 1 }))).toContain('about 1 new customer a month');
     expect(marketingForecast(mq({ signupsPerMonth: 0.3 }))).toContain('less than one new customer a month');
     expect(marketingForecast(mq({ signupsPerMonth: 0 }))).toContain('no new customers a month');
     expect(marketingForecast(mq({ ok: false, reasons: ['Game over'] }))).toBe('');
+  });
+
+  it('with nothing lit, says marketing helps once a street is lit (never "no new customers, but hardly any of them")', () => {
+    const state = newGame(12345);
+    const header = customersHeader(state, whyNotSwitched(state));
+    expect(header.share).toBeNull();
+    for (const perMonth of [MARKETING_STEP, 2 * MARKETING_STEP, MARKETING_MAX_PER_MONTH]) {
+      const q = quoteMarketing(state, perMonth);
+      expect(q.ok).toBe(true);
+      expect(marketingForecast(q, header.share !== null)).toBe(MARKETING_NOTHING_LIT);
+      expect(marketingStepLine(q, quoteMarketing(state, perMonth + MARKETING_STEP), quoteMarketing(state, perMonth - MARKETING_STEP), header.share !== null)).toBe('');
+    }
+    expect(MARKETING_NOTHING_LIT).not.toMatch(/already know you|hardly any/);
+    // Once something is lit, the forecast speaks again.
+    const { state: lit } = litTown();
+    const litHeader = customersHeader(lit, whyNotSwitched(lit));
+    expect(litHeader.share).not.toBeNull();
+    expect(marketingForecast(quoteMarketing(lit, 1_000), litHeader.share !== null)).toMatch(/^At \$1,000 a month: /);
   });
 
   it('says what one step up or down would do', () => {
@@ -463,6 +496,7 @@ describe('the marketing budget (moved here from the pricing panel)', () => {
 describe('support level and referral credits', () => {
   const sq = (over: Partial<SupportQuote> = {}): SupportQuote => ({
     level: 'great',
+    months: SUPPORT_QUOTE_MONTHS,
     ok: true,
     reasons: [],
     costPerMonth: 700,
@@ -472,6 +506,7 @@ describe('support level and referral credits', () => {
     unhappy: 0,
     cancellationsPerMonth: 1.4,
     signupsPerMonth: 9,
+    splitterCost: 0,
     netValue: 1_234,
     pays: true,
     ...over,
@@ -484,15 +519,18 @@ describe('support level and referral credits', () => {
       current: false,
       price: `${formatMoney(SUPPORT_LEVELS.great.costPerSub)} a customer a month`,
       effect: `${formatMoney(700)} a month for your 100 customers. About 1 cancels a month; 90 happy.`,
-      verdict: `Better than now by about ${roughMoney(1_234)} over ${horizonWords()}.`,
+      verdict: `Better than now by about ${roughMoney(1_234)} over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.`,
     });
-    expect(supportOption('good', 100, sq({ level: 'basic', netValue: -420, pays: false })).verdict).toBe(`Worse than now by about ${roughMoney(420)} over ${horizonWords()}.`);
+    expect(supportOption('good', 100, sq({ level: 'basic', netValue: -420, pays: false })).verdict).toBe(`Worse than now by about ${roughMoney(420)} over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.`);
+    // Round 4c/4d fix: the support quote looks three years ahead, and the verdict says so.
+    expect(horizonWords(SUPPORT_QUOTE_MONTHS)).toBe('three years');
+    expect(horizonWords(CUSTOMER_QUOTE_MONTHS)).toBe('a year');
     expect(supportOption('great', 100, sq()).verdict).toBe('Your level now.');
     expect(supportOption('great', 100, sq()).current).toBe(true);
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 3.2 })).effect).toContain('About 3 cancel a month');
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 0.2 })).effect).toContain('Less than one cancel a month');
     expect(supportOption('good', 100, sq({ cancellationsPerMonth: 0 })).effect).toContain('Hardly anyone cancels');
-    expect(supportOption('good', 0, sq({ costPerMonth: 0, netValue: 0 }))).toMatchObject({ effect: 'No customers yet, so it costs nothing today.', verdict: `About the same as now over ${horizonWords()}.` });
+    expect(supportOption('good', 0, sq({ costPerMonth: 0, netValue: 0 }))).toMatchObject({ effect: 'No customers yet, so it costs nothing today.', verdict: `About the same as now over ${horizonWords(SUPPORT_QUOTE_MONTHS)}.` });
   });
 
   it('reads every level from the sim\'s quotes', () => {
@@ -514,6 +552,7 @@ describe('support level and referral credits', () => {
     referralsPerMonth: 3.2,
     costPerMonth: 3.2 * 2 * REFERRAL_CREDIT,
     extraPerMonth: 1.1,
+    splitterCost: 0,
     costPerCustomer: 145,
     netValue: 480,
     pays: true,
@@ -534,6 +573,16 @@ describe('support level and referral credits', () => {
       'Hardly any referrals expected now, so credits would cost little and bring few customers.',
     );
     expect(referralLines(true, rq()).state).toBe('On');
+    // Fewer extra customers than the count's floor: never "no more customers a month (about $987 each)".
+    for (const extraPerMonth of [0.011, 0.03, 0.05]) {
+      const few = referralLines(false, rq({ referralsPerMonth: 0.6, costPerMonth: 30, extraPerMonth, costPerCustomer: Math.round(30 / extraPerMonth) }));
+      expect(few.forecast).toBe(`About 1 referral a month, about ${roughMoney(30)} a month in credits: hardly any of them extra.`);
+      expect(few.forecast).not.toMatch(/no more customers|each\)/);
+    }
+    // A few dollars of credits never round to "about $0".
+    expect(referralLines(false, rq({ referralsPerMonth: 0.07, costPerMonth: 3.7, extraPerMonth: 0.01, costPerCustomer: 370 })).forecast).toBe(
+      'Less than one referral a month, a few dollars a month in credits: hardly any of them extra.',
+    );
     const { state } = litTown();
     const real = referralLines(state.customers.referrals, quoteReferrals(state, true));
     expect(real.state).toBe(state.customers.referrals ? 'On' : 'Off');
@@ -551,7 +600,7 @@ describe('plain words', () => {
     const texts: string[] = [];
     const h = customersHeader(state, reasons);
     texts.push(h.title, h.change, h.shareLine, growthSummary(growthSeries(state.finance.reports)), switchIntro(reasons));
-    for (const row of switchRows(state, reasonsOf({ unaware: 1, notWorth: 1, tooExpensive: 1, waiting: 1, notLit: 1, passings: 4 }, [{ cabinet, unaware: 1, notWorth: 1, tooExpensive: 1, waiting: 1, unsigned: 4, passings: 4, subscribed: 0, notLit: 0 }]))) {
+    for (const row of switchRows(state, reasonsOf({ unaware: 1, deciding: 1, notWorth: 1, tooExpensive: 1, waiting: 1, notLit: 1, passings: 5 }, [{ cabinet, unaware: 1, deciding: 1, notWorth: 1, tooExpensive: 1, waiting: 1, unsigned: 5, passings: 5, subscribed: 0, notLit: 0 }]))) {
       texts.push(row.label, row.countText, row.lever, ...row.links.map((l) => l.label));
     }
     const view = happinessView(state, happinessReport(state));

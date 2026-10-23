@@ -20,6 +20,7 @@ vi.mock('./incumbent', async (importOriginal) => {
 import {
   ADVICE_SNOOZE_MONTHS,
   ADVICE_SNOOZE_URGENT_MONTHS,
+  ARR_TRAILING_MONTHS,
   CABINET_REACH_FT,
   CABINET_START_SPLITTERS,
   CONVERT_PAYBACK_YEARS,
@@ -44,6 +45,7 @@ import {
   SPLITTER_COST,
   SPLIT_RATIO,
   STORM_LOG_DAYS,
+  SUPPORT_QUOTE_MONTHS,
   TERM_LOAN_MIN,
   TERM_LOAN_YEARS,
   TIER_DEFAULTS,
@@ -75,6 +77,7 @@ import {
   GROW_MIN_CUSTOMERS,
   LINEUP_MIN_GAIN,
   SUPPORT_MIN_UNITS,
+  SUPPORT_SERVICE_SHARE,
   growthOptions,
   isAdviceKey,
   isSnoozed,
@@ -107,7 +110,8 @@ import {
   cureOptions,
   estimateNextDebtService,
   estimateSweep,
-  formatMultiple,
+  perDollarWords,
+  yearsOfProfitWords,
   fundingHint,
   formatRateBps,
   maxSafeTermLoan,
@@ -120,15 +124,15 @@ import * as incumbent from './incumbent';
 import { incumbentPromoPrice } from './incumbent';
 import { cppBand, REPAIR_TRAILING_MONTHS } from './metrics';
 import { getService, outageImpact, outageService, ponPortsUsed, quoteConvert } from './network';
-import { churnProbability, closeDayAfter, segmentDemand, stateTakeRate, unitsByTier } from './sales';
-import { dealFactor, forecastCustomers, MARKETING_STEP, quoteCampaign, quoteSupport } from './customers';
+import { churnProbability, closeDayAfter, segmentDemand, stateTakeRate, subscriberUnits, unitsByTier } from './sales';
+import { dealFactor, forecastCustomers, happinessReport, MARKETING_STEP, quoteCampaign, quoteSupport } from './customers';
 import { deserialize, hashState, serialize } from './save';
 import { cornerName } from './streets';
 import { fixedCostsPerMonth, perCustomerCost } from './overhead';
 import { addLivePlant, makeGridCity, makeLoan, makeTestState, makeTradingState, noDebtStats } from './testing/fixtures';
-import { advisorFollowerBot, ensureIncumbentPromo, smartBot } from './tuning/bots';
-import { runBot, TUNING_SEEDS } from './tuning/harness';
-import type { Bot } from './tuning/harness';
+import { advisorFollowerBot, allAerialBot, ensureIncumbentPromo, smartBot } from './tuning/bots';
+import { runBot, TUNING_SEEDS, worstStage } from './tuning/harness';
+import type { Bot, BotFactory } from './tuning/harness';
 import type { Advice, AdviceId, CableSpan, City, Command, GameState, IncumbentAnswer, Notice, TermYears, TierId, Zone } from './types';
 import { exposureBand, outageChurnProbability, repairCost, segmentExposure } from './weather';
 
@@ -256,6 +260,11 @@ const KEY_PATTERN: Record<AdviceId, RegExp> = {
 /** Everything an advice says: the card's short reason and the longer reasoning behind it (round 4c/4d: the figures moved to the detail). */
 const text = (advice: Advice): string => `${advice.why} ${advice.detail}`;
 
+/** The bank's terms, which even a card's detail uses only next to their plain meaning (BANK_TERM_GLOSSED). */
+const BANK_JARGON = /covenant|leverage|DSCR|\bARR\b|\bOCF\b|\bbps\b|×/i;
+/** Where a detail names the bank's term beside its plain meaning ("passing both of the bank's checks, its covenants"). */
+const BANK_TERM_GLOSSED = /\(passing both of the bank's checks, its covenants\)/g;
+
 /** Words the card's first view never uses (spec G/B: plain words; they may appear in the detail, next to their meaning). */
 const JARGON = /covenant|leverage|DSCR|\bARR\b|\bOCF\b|operating cash flow|\bbps\b|×|\bCPP\b|cost per passing|PON\b/i;
 
@@ -278,6 +287,8 @@ function expectShort(advice: Advice): void {
   const body = advice.why.replace(/ Costs \$[\d,]+\.$/, '');
   expect(body.slice(0, -1), advice.why).not.toMatch(/[.!?]\s/);
   expect(`${advice.title} ${advice.why}`, advice.id).not.toMatch(JARGON);
+  // Behind "More about this" too, the bank's terms appear only next to their plain meaning (spec G/H; round 4c/4d check).
+  expect((advice.detail ?? '').replace(BANK_TERM_GLOSSED, ''), `${advice.id} detail`).not.toMatch(BANK_JARGON);
   expect(advice.title).not.toMatch(/\u2026$/);
   expect(advice.why).not.toMatch(/\u2026$/);
   expect(typeof advice.detail).toBe('string');
@@ -474,7 +485,7 @@ describe('paymentShort', () => {
     state.finance.cash = estimateNextDebtService(state) + state.finance.cash - estimateCashAtClose(state) - 1;
     const p = plan(state, 'paymentShort');
     expect(p.commands).toEqual([]);
-    expect(text(p.advice)).toContain('No covenant-safe borrowing covers it');
+    expect(text(p.advice)).toContain("No borrowing inside the bank's limits covers it");
     expect(text(p.advice)).toContain(formatMoney(state.sales.marketingPerMonth));
   });
 
@@ -537,9 +548,14 @@ describe('covenantCure', () => {
     const option = cureOptions(state)[0]!;
     const p = plan(state, 'covenantCure');
     expect(p.advice).toMatchObject({ severity: 'urgent', priority: ADVICE_PRIORITY.covenantCureUrgent, action: { kind: 'openPanel', panel: 'bank' } });
-    expect(text(p.advice)).toContain(option.text);
-    expect(text(p.advice)).toContain(formatMultiple(m.leverage!));
-    expect(text(p.advice)).toContain(formatMultiple(m.coverage!));
+    // The figures in the Bank's own words (spec G/H: no leverage, covenant or × in the summary, its disclosure included).
+    expect(text(p.advice)).toContain(`your debt is ${yearsOfProfitWords(m.leverage!)}`);
+    expect(text(p.advice)).toContain(`you earn ${perDollarWords(m.coverage!)} for every $1 of loan payments`);
+    expect(text(p.advice)).toContain(`your debt to ${yearsOfProfitWords(option.after.leverage!)}`);
+    expect(text(p.advice)).toContain(`leaving ${formatMoney(option.cashAfter)} in cash`);
+    expect(`${p.advice.title} ${text(p.advice)}`).not.toMatch(/×|leverage|covenant|term loan #|credit line/i);
+    const loan = state.debt.loans.find((l) => l.id === option.loan)!;
+    expect(p.advice.title).toBe(option.amount >= loan.balance ? `Pay off loan ${option.loan}` : `Pay ${formatMoney(option.amount)} off loan ${option.loan}`);
     expect(p.commands).toEqual([{ type: 'prepayLoan', loan: option.loan, amount: option.amount }]);
     const after = expectNoBackfire(state, p);
     expect(after.finance.cash).toBeGreaterThanOrEqual(estimateNextDebtService(after));
@@ -552,7 +568,9 @@ describe('covenantCure', () => {
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.covenantCureAtRisk });
     const option = cureOptions(far)[0]!;
     expect(option.kind).toBe('repayCredit');
-    expect(p.advice.title).toBe(`Repay ${formatMoney(option.amount)} of the credit line`);
+    expect(p.advice.title).toBe(`Pay back ${formatMoney(option.amount)} of emergency cash`);
+    expect(text(p.advice)).toContain(`Pay back ${formatMoney(option.amount)} of emergency cash`);
+    expect(text(p.advice)).toContain('a warning from the bank');
     expect(p.commands).toEqual([{ type: 'repayCredit', amount: option.amount }]);
     expectNoBackfire(far, p);
 
@@ -572,7 +590,7 @@ describe('covenantCure', () => {
     expect(text(p.advice)).toContain(formatMoney(option.amount));
     // The title on the same basis as the text: operating cash flow raised to (about) this.
     const to = Math.round(option.after.annualOperatingCashFlow / LOAN_ROUNDING) * LOAN_ROUNDING;
-    expect(p.advice.title).toBe(`Raise cash flow to about ${formatMoney(to)} a year`);
+    expect(p.advice.title).toBe(`Raise profit to about ${formatMoney(to)} a year`);
     expect(text(p.advice)).not.toMatch(/\bdraw\b|take a .*loan/i);
   });
 
@@ -585,7 +603,8 @@ describe('covenantCure', () => {
     expect(m.compliant).toBe(true);
     const p = plan(state, 'covenantCure');
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.covenantCureAtRisk });
-    expect(text(p.advice)).toContain(formatMultiple(m.leverage!));
+    expect(text(p.advice)).toContain(`your debt is ${yearsOfProfitWords(m.leverage!)}`);
+    expect(text(p.advice)).not.toMatch(/×|leverage|covenant/i);
     expect(text(p.advice)).toContain('Hold off on new borrowing');
     expect(p.commands).toEqual([]);
   });
@@ -602,20 +621,23 @@ describe('frozenSweep', () => {
     const left = closesUntilAcceleration(state)!;
     const p = plan(state, 'frozenSweep');
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.frozenSweep, action: { kind: 'openPanel', panel: 'bank' } });
-    expect(p.advice.title).toBe(`Lift the freeze within ${left} closes`);
-    expect(text(p.advice)).toContain(`${left} more frozen closes`);
-    expect(text(p.advice)).toContain(`${COVENANT_CURE_CLOSES} compliant closes in a row`);
-    expect(text(p.advice)).toContain("today's figures still breach");
+    // The words the HUD chip, the Bank and the summary's badge use for the same state and countdown.
+    expect(p.advice.title).toBe(`Get back to borrowing within ${left} months`);
+    expect(p.advice.why).toBe(`The bank takes your spare cash each month and asks for every loan back in ${left} months.`);
+    expect(`${p.advice.title} ${p.advice.why}`).not.toMatch(/freeze|frozen|\bcalls?\b|closes?\b/i);
+    expect(text(p.advice)).toContain(`${left} more month closes`);
+    expect(text(p.advice)).toContain(`${COVENANT_CURE_CLOSES} good month closes in a row`);
+    expect(text(p.advice)).toContain("today's figures still fail them");
   });
 
   it("quotes the last close's sweep, and says when too few closes remain to cure it", () => {
     const state = fixture('v3-grid');
     state.finance.reports.at(-1)!.debt!.sweep = 4_321;
-    expect(text(plan(state, 'frozenSweep').advice)).toContain(`swept ${formatMoney(4_321)}`);
+    expect(text(plan(state, 'frozenSweep').advice)).toContain(`took ${formatMoney(4_321)} of your spare cash`);
     state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES - 1;
     const late = plan(state, 'frozenSweep').advice;
-    expect(text(late)).toContain('only repaying everything stops it');
-    expect(late.title).toBe(`Repay ${formatMoney(totalDebt(state))} before the loans are called`);
+    expect(text(late)).toContain('only paying back everything stops it');
+    expect(late.title).toBe(`Pay back ${formatMoney(totalDebt(state))} before the bank asks`);
   });
 
   it('does not fire unless frozen and not yet called', () => {
@@ -653,7 +675,7 @@ describe('cashRunway', () => {
     frozen.debt.covenant.stage = 'frozen';
     const p = plan(frozen, 'cashRunway');
     expect(p.advice).toMatchObject({ severity: 'urgent', priority: ADVICE_PRIORITY.cashRunwayUrgent });
-    expect(text(p.advice)).toContain('No covenant-safe borrowing covers it');
+    expect(text(p.advice)).toContain("No borrowing inside the bank's limits covers it");
     expect(p.commands).toEqual(trimMarketing(frozen));
     expect(p.commands.length).toBe(1);
     // With safe financing the same runway is important, not urgent.
@@ -700,12 +722,12 @@ describe('cashRunway', () => {
     expect(['draw', 'term', 'drawAndTerm']).not.toContain(fundingHint(state, cost, SUGGESTED_BORROWING_HEADROOM).kind);
     const p = plan(state, 'cashRunway');
     expect(p.commands).toEqual(trimMarketing(state));
-    expect(text(p.advice)).toContain('No covenant-safe borrowing covers it');
+    expect(text(p.advice)).toContain("No borrowing inside the bank's limits covers it");
     // Where it does borrow, the covenants after it keep the headroom, and the card says so.
     const roomy = burning(35_000);
     const q = plan(roomy, 'cashRunway');
     expect(q.commands.length).toBeGreaterThan(0);
-    expect(text(q.advice)).toContain(`at least ${pct(SUGGESTED_BORROWING_HEADROOM)} inside their limits`);
+    expect(text(q.advice)).toContain(`at least ${pct(SUGGESTED_BORROWING_HEADROOM)} inside the bank's limits`);
     const copy = deserialize(serialize(roomy));
     for (const command of q.commands) expect(applyCommand(copy, command).ok).toBe(true);
     expect(covenantsWithin(covenantMetrics(copy), SUGGESTED_BORROWING_HEADROOM)).toBe(true);
@@ -1514,7 +1536,7 @@ describe('expand', () => {
     // The reserve counts the new loan's payments too.
     expect(p.keep).toBe(reserveOf(state, node) + EXPAND_RESERVE_MONTHS * quote.payment + quote.stubInterest);
     expect(text(p.advice)).toContain(`${formatMoney(loan.amount)} ${loan.termYears}-year term loan`);
-    expect(text(p.advice)).toContain(`${pct(EXPAND_COVENANT_HEADROOM)} inside their limits`);
+    expect(text(p.advice)).toContain(`${pct(EXPAND_COVENANT_HEADROOM)} inside the bank's limits`);
     const after = expectNoBackfire(state, p);
     expect(covenantsWithin(covenantMetrics(after), EXPAND_COVENANT_HEADROOM)).toBe(true);
   });
@@ -1705,6 +1727,76 @@ describe('firstBuild (round 4c/4d, spec B)', () => {
     while (getService(state).passings === 0) runDays(state, 7);
     expect(planFor(state, 'firstBuild')).toBeNull();
   });
+
+  it('suggests no second area while the first is still being built (the Seed round seed 13 follower built two in its first week)', () => {
+    const state = newGame(13, { difficulty: 'seed' });
+    for (const command of planFor(state, 'firstBuild')!.commands) expect(applyCommand(state, command).ok).toBe(true);
+    for (let week = 0; getService(state).passings === 0; week++) {
+      expect(week, 'the first area lights within a year').toBeLessThan(52);
+      runDays(state, 7);
+      if (getService(state).passings > 0) break;
+      expect(planFor(state, 'expand'), `day ${state.day}`).toBeNull();
+      expect(advicePlans(state)[0]?.advice.id, `day ${state.day}`).not.toBe('expand');
+    }
+  });
+
+  it('suggests no growth lever whose spend would take the covenants past the headroom (the Bootstrapped seed 1 follower ran a campaign right after its financed build and breached)', () => {
+    // A lever's spend comes off the operating cash flow the covenants measure: the trailing ARR_TRAILING_MONTHS
+    // closes, annualized, so a campaign's price counts 12 / ARR_TRAILING_MONTHS times for a quarter.
+    let offered = 0;
+    const checking: BotFactory = (seed) => {
+      const inner = advisorFollowerBot(seed);
+      return {
+        name: inner.name,
+        act(state, send) {
+          if (totalDebt(state) > 0) {
+            for (const option of growthOptions(state)) {
+              const command = option.commands[0];
+              let cut: number | null = null;
+              if (command?.type === 'runCampaign') cut = (quoteCampaign(state, command.cabinet).cost * 12) / ARR_TRAILING_MONTHS;
+              else if (command?.type === 'setMarketing') cut = 12 * (command.perMonth - state.sales.marketingPerMonth);
+              else if (command?.type === 'setReferrals') cut = (12 * option.cost) / CUSTOMER_QUOTE_MONTHS;
+              if (cut === null) continue;
+              offered++;
+              const after = covenantMetrics(state, { addDebt: 0, addAnnualDebtService: 0, addAnnualOperatingCashFlow: -cut });
+              expect(covenantsWithin(after, EXPAND_COVENANT_HEADROOM), `day ${state.day}: ${option.lever}`).toBe(true);
+            }
+          }
+          inner.act(state, send);
+        },
+      };
+    };
+    const run = runBot(1, checking, 48, { state: newGame(1, { difficulty: 'bootstrapped' }) });
+    expect(run.state.debt.loans.length, 'the follower borrowed for a build').toBeGreaterThan(0);
+    expect(worstStage(run)).toBe('compliant');
+    expect(offered, "levers weighed while in debt").toBeGreaterThan(0);
+  }, 120_000);
+
+  it('where no area the starting purse covers pays its way whole, still gives a concrete build that cuts the monthly loss (Shoestring seed 12345)', () => {
+    const state = newGame(12345, { difficulty: 'shoestring' });
+    const p = plan(state, 'firstBuild');
+    expect(advise(state)[0]?.key).toBe(p.advice.key);
+    const node = (p.advice.action as { node: number }).node;
+    expect(node).not.toBe(state.city.coNode);
+    expect(p.advice.key).toBe(ADVICE_KEYS.firstBuild(node));
+    expect(p.commands[0]).toEqual({ type: 'placeCabinet', node });
+    expect(p.commands.slice(1).length).toBeGreaterThan(0);
+    expect(p.commands.slice(1).every((c) => c.type === 'layCable')).toBe(true);
+    // Sized to the cash: the build and its ramp's trough fit, with at least the funding cushion kept.
+    expect(p.spend + p.keep).toBeLessThanOrEqual(state.finance.cash);
+    expect(p.keep).toBeGreaterThanOrEqual(fundingHint(state, 0).cushion);
+    // The card names the street, the homes, the cost per home and the cost, and says plainly it may not carry the office.
+    expect(p.advice.title).toBe(fit(ADVICE_TITLE_MAX, `Light ${cornerName(state.city, node)} first`, `Light ${cornerName(state.city, node).split(' & ')[0]} first`, 'Light your first streets'));
+    expect(p.advice.why).toMatch(/lights [\d,]+ homes? at \$[\d,]+ each.* Costs \$[\d,]+\.$/);
+    expect(p.advice.detail).toContain("No area your cash covers pays all the office's running costs");
+    expectShort(p.advice);
+    // Following it builds it, and the follower then lights homes instead of watching the office drain the cash.
+    const after = expectNoBackfire(state, p);
+    expect(after.network.cabinets.map((c) => c.node)).toEqual([node]);
+    runDays(after, DAYS_PER_YEAR);
+    expect(after.gameOver).toBeNull();
+    expect(getService(after).passings).toBeGreaterThan(0);
+  }, 60_000);
 
   it('with too little cash for any area that pays its way, says so instead of nothing (no command)', () => {
     const state = newGame(1, { difficulty: 'shoestring' });
@@ -1940,6 +2032,22 @@ describe('support (round 4c/4d, spec I.6)', () => {
     expect(p.advice.why).toContain(formatMoney(quote.costChange));
     expect(p.extraSpend).toBe(EXPAND_RESERVE_MONTHS * quote.costChange);
   });
+
+  it('suggests Great support in a real storm-hit game where outages make customers unhappy (all-aerial seed 1, month 34), over three years', () => {
+    // Round 4c/4d fix: over CUSTOMER_QUOTE_MONTHS with no outage foreseen the quote never paid there, so the card never showed.
+    const state = runBot(1, allAerialBot(), 34).state;
+    const units = subscriberUnits(state);
+    let service = 0;
+    for (const reason of happinessReport(state).reasons) if (reason.bucket === 'unhappy' && reason.reason === 'outages') service += reason.units;
+    expect(service).toBeGreaterThanOrEqual(SUPPORT_SERVICE_SHARE * units);
+    const quote = quoteSupport(state, 'great');
+    expect(quote.months).toBe(SUPPORT_QUOTE_MONTHS);
+    expect(quote.pays).toBe(true);
+    const p = plan(state, 'support');
+    expect(p.advice).toMatchObject({ key: ADVICE_KEYS.support('great'), title: 'Switch to Great support' });
+    expect(p.commands).toEqual([{ type: 'setSupport', level: 'great' }]);
+    expect(p.advice.detail).toContain('over the next three years with the outages your cable can expect');
+  }, 120_000);
 
   it('on Basic, says what it costs in customers and the level to go back to', () => {
     const state = supported();

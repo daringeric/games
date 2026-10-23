@@ -48,11 +48,13 @@
   font: 600 32px / 1.12 var(--font-display);
 }
 
-.briefing-headline.tone-warn {
+/* The tone rules repeat the base rule's selector so they outrank its plain
+   text color (a bare .briefing-headline.tone-warn lost to it). */
+.briefing .sheet-subtitle.briefing-headline.tone-warn {
   color: color-mix(in srgb, var(--cpp-amber) 72%, var(--text));
 }
 
-.briefing-headline.tone-danger {
+.briefing .sheet-subtitle.briefing-headline.tone-danger {
   color: var(--danger);
 }
 

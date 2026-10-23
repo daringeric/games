@@ -120,7 +120,10 @@ test('each lever changes the game: marketing budget, support level and referral 
   await expect(dialog.locator('.customers-chart-summary')).toHaveText(/ joined and \d+ left\.$/);
   const reasons = dialog.getByRole('region', { name: "Why homes haven't switched" });
   // One row per reason (and Not lit yet only when some homes are), each with the lever that addresses it.
-  expect(await reasons.locator('.customers-switch-row').count()).toBeGreaterThanOrEqual(4);
+  expect(await reasons.locator('.customers-switch-row').count()).toBeGreaterThanOrEqual(5);
+  // Homes that know you and would switch at your prices are "deciding", not "not worth it at your price".
+  await expect(reasons.locator('[data-reason="deciding"] .customers-switch-label')).toHaveText("Know you, haven't switched yet");
+  await expect(reasons.locator('[data-reason="deciding"] .customers-switch-lever')).toHaveText('Time and word of mouth; referral credits, a campaign or lower prices speed it up');
   await expect(reasons.locator('[data-reason="tooExpensive"] .customers-switch-lever')).toHaveText('A cheaper plan');
   await expect(reasons.locator('[data-reason="unaware"] .customers-switch-lever')).toHaveText('Marketing or a neighborhood campaign');
   await expect(reasons.locator('[data-reason="notWorth"] .customers-switch-lever')).toHaveText('Lower prices or an intro promo');
@@ -152,7 +155,8 @@ test('each lever changes the game: marketing budget, support level and referral 
   const support = dialog.getByRole('group', { name: 'Support level' });
   await expect(support.locator('[data-level="good"]')).toHaveAttribute('aria-pressed', 'true');
   await expect(support.locator('[data-level="great"] .customers-choice-price')).toHaveText(`${money(SUPPORT_LEVELS.great.costPerSub)} a customer a month`);
-  await expect(support.locator('[data-level="great"] .customers-choice-verdict')).toHaveText(/^(Better|Worse) than now by about \$[\d,]+ over a year\.$|^About the same as now over a year\.$/);
+  // Round 4c/4d fix: the support quote looks three years ahead, with the outages the plant can expect.
+  await expect(support.locator('[data-level="great"] .customers-choice-verdict')).toHaveText(/^(Better|Worse) than now by about \$[\d,]+ over three years\.$|^About the same as now over three years\.$/);
   await support.locator('[data-level="great"]').click();
   await expect.poll(toasts).toContainEqual(toast('ok', `Support set to ${SUPPORT_LEVELS.great.name}`));
   expect(await page.evaluate(() => window.__lst!.getState().customers.supportLevel)).toBe('great');

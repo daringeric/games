@@ -1202,6 +1202,47 @@ function liveReach(state: GameState): LiveReach {
   return { reach, ...cutOffBy(reach, computeReach(city, workingSegments, cabinets)) };
 }
 
+/**
+ * Round 4c/4d fix: the day each segment lit today first lit with the plant it
+ * has now, ascending by segment. Pure. The earliest day D on which the
+ * coverage rule over the spans and cabinets live today whose liveDay <= D
+ * (no liveDay: day 0) lights it; lit-ness only grows as plant goes live, so a
+ * binary search over the plant's live days finds it. Plant since removed,
+ * rebuilt or out of service is not remembered: it is what the plant says
+ * today, at most state.day. For saves from before round 4c/4d, whose
+ * customers state has no streets yet (customers.seedStreets).
+ */
+export function litSinceDays(state: GameState): Map<SegmentId, number> {
+  const { city, network } = state;
+  const spans = network.spans.filter((s) => s.stage === 'live').map((s) => ({ segment: s.segment, day: Math.min(state.day, Math.max(0, s.liveDay ?? 0)) }));
+  const cabinets = network.cabinets.filter((c) => c.stage === 'live').map((c) => ({ cabinet: c, day: Math.min(state.day, Math.max(0, c.liveDay ?? 0)) }));
+  const today = computeReach(city, new Set(spans.map((s) => s.segment)), cabinets.map((c) => c.cabinet));
+  const days = [...new Set([...spans.map((s) => s.day), ...cabinets.map((c) => c.day)])].sort((a, b) => a - b);
+  const litAt = new Map<number, ReadonlySet<SegmentId>>();
+  const lit = (i: number): ReadonlySet<SegmentId> => {
+    let found = litAt.get(i);
+    if (!found) {
+      const day = days[i] as number;
+      const live = new Set(spans.filter((s) => s.day <= day).map((s) => s.segment));
+      found = new Set(computeReach(city, live, cabinets.filter((c) => c.day <= day).map((c) => c.cabinet)).serving.keys());
+      litAt.set(i, found);
+    }
+    return found;
+  };
+  const out = new Map<SegmentId, number>();
+  for (const segment of today.serving.keys()) {
+    let lo = 0;
+    let hi = days.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (lit(mid).has(segment)) hi = mid;
+      else lo = mid + 1;
+    }
+    out.set(segment, days[lo] ?? state.day);
+  }
+  return out;
+}
+
 /** Whether an outage cuts a subscriber on `segment` wired to `cabinet` off (ServiceSnapshot.cutOffCabinets). */
 export function isCutOff(service: ServiceSnapshot, segment: SegmentId, cabinet: CabinetId): boolean {
   if (service.cutOffCabinets.size === 0) return false;

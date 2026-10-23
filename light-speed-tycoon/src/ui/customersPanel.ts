@@ -74,7 +74,7 @@ export interface CustomersPanelDeps {
 /** What the panel should open at: an area (scrolls to it, e.g. from an advisor card) or a lever section. */
 export interface CustomersFocus {
   cabinet?: CabinetId;
-  section?: 'growth' | 'happiness' | 'reasons' | 'areas' | 'levers' | 'marketing';
+  section?: 'growth' | 'happiness' | 'reasons' | 'areas' | 'levers' | 'marketing' | 'referrals';
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +87,10 @@ export const GROWTH_MONTHS = 24;
 /** Quotes refresh at most this often while the clock runs (a command or an edit refreshes at once). A UI pace, not balance. */
 export const QUOTE_REFRESH_MS = 1_000;
 
-/** "a year" for the quotes' horizon (CUSTOMER_QUOTE_MONTHS), else "12 months". */
+/** A quote's horizon in words: "a year" (CUSTOMER_QUOTE_MONTHS), "two years", "three years" (the support quote's), else "18 months". */
 export function horizonWords(months: number = CUSTOMER_QUOTE_MONTHS): string {
-  return months === 12 ? 'a year' : plural(months, 'month');
+  const years: Record<number, string> = { 12: 'a year', 24: 'two years', 36: 'three years', 48: 'four years', 60: 'five years' };
+  return years[months] ?? plural(months, 'month');
 }
 
 /** A forecast count in words: "about 12", "less than one", "none" (n not rounded). */
@@ -360,11 +361,11 @@ export function happinessView(state: GameState, report: HappinessReport): Happin
 // Why homes haven't switched
 // ---------------------------------------------------------------------------
 
-export type SwitchReasonKey = 'unaware' | 'notWorth' | 'tooExpensive' | 'waiting' | 'notLit';
+export type SwitchReasonKey = 'unaware' | 'deciding' | 'notWorth' | 'tooExpensive' | 'waiting' | 'notLit';
 
 /** What a reason row's lever button does. */
 export type LeverLink =
-  | { kind: 'section'; section: 'marketing' | 'areas'; label: string }
+  | { kind: 'section'; section: 'marketing' | 'areas' | 'referrals'; label: string }
   | { kind: 'pricing'; label: string }
   | { kind: 'showMe'; cabinet: CabinetId; label: string; place: string };
 
@@ -386,6 +387,7 @@ export interface SwitchRow {
 /** The reasons' words (spec I.5's pairs). */
 export const SWITCH_WORDS: Readonly<Record<SwitchReasonKey, { label: string; lever: string }>> = {
   unaware: { label: "Don't know you yet", lever: 'Marketing or a neighborhood campaign' },
+  deciding: { label: "Know you, haven't switched yet", lever: 'Time and word of mouth; referral credits, a campaign or lower prices speed it up' },
   notWorth: { label: 'Not worth switching at your price', lever: 'Lower prices or an intro promo' },
   tooExpensive: { label: 'Too expensive for them', lever: 'A cheaper plan' },
   waiting: { label: 'Waiting for install', lever: 'Add a splitter where a cabinet is full, or keep cash for installs' },
@@ -400,7 +402,7 @@ export const SWITCH_WORDS: Readonly<Record<SwitchReasonKey, { label: string; lev
  */
 export function switchRows(state: GameState, reasons: SwitchReasons): SwitchRow[] {
   const o = reasons.overall;
-  const keys: SwitchReasonKey[] = ['unaware', 'notWorth', 'tooExpensive', 'waiting'];
+  const keys: SwitchReasonKey[] = ['unaware', 'deciding', 'notWorth', 'tooExpensive', 'waiting'];
   if (o.notLit > 0) keys.push('notLit');
   const total = o.unsigned + o.notLit;
   let waitingArea: { cabinet: CabinetId; waiting: number } | null = null;
@@ -409,6 +411,7 @@ export function switchRows(state: GameState, reasons: SwitchReasons): SwitchRow[
     const count = o[key];
     const links: LeverLink[] = [];
     if (key === 'unaware') links.push({ kind: 'section', section: 'marketing', label: 'Marketing' }, { kind: 'section', section: 'areas', label: 'Campaigns' });
+    if (key === 'deciding') links.push({ kind: 'section', section: 'referrals', label: 'Referral credits' }, { kind: 'section', section: 'areas', label: 'Campaigns' });
     if (key === 'notWorth' || key === 'tooExpensive') links.push({ kind: 'pricing', label: 'Open Pricing' });
     if (key === 'waiting' && waitingArea) {
       const place = placeOf(state, waitingArea.cabinet);
@@ -543,17 +546,27 @@ export function marketingProblem(perMonth: number): string | null {
   return null;
 }
 
+/** The marketing lines with nothing lit to sell to (the header's "light a street first"). */
+export const MARKETING_NOTHING_LIT = 'No lit streets yet: marketing starts helping once a street is lit.';
+
 /**
  * The marketing forecast line (spec I.4): "At $1,500 a month: about 12 new
  * customers a month, about $95 per new customer it brings." With no budget,
- * where new customers come from; with a budget that adds hardly any, says so.
- * Empty for a quote that is not ok. Pure.
+ * where new customers come from; with a budget that adds hardly any (fewer
+ * extra customers than aboutCount names), says so;
+ * with no homes to sell to yet (`canSell` false: nothing lit), says that
+ * instead. Empty for a quote that is not ok. Pure.
  */
-export function marketingForecast(q: MarketingQuote): string {
+export function marketingForecast(q: MarketingQuote, canSell = true): string {
   if (!q.ok) return '';
+  if (!canSell) return MARKETING_NOTHING_LIT;
   const at = `At ${formatMoney(q.perMonth)} a month: ${aboutCustomers(q.signupsPerMonth, 'new')} a month`;
   if (q.perMonth === 0) return `${at}, from neighbors and time alone.`;
-  if (q.costPerCustomer === null) return `${at}, but marketing adds hardly any of them: most homes on your lit streets already know you.`;
+  // Under the count's own floor ("no new customers"), a price per extra customer would price customers it says don't
+  // come ("about 3 new customers a month, about $23,360 per new customer it brings"): say it adds hardly any.
+  if (q.costPerCustomer === null || aboutCount(q.extraPerMonth) === 'none') {
+    return `${at}, but marketing adds hardly any of them: most homes on your lit streets already know you.`;
+  }
   return `${at}, about ${formatMoney(q.costPerCustomer)} per new customer it brings.`;
 }
 
@@ -568,8 +581,8 @@ function stepWords(diff: number, word: 'more' | 'fewer'): string {
  * more a month. $500 less: about 1 fewer a month." `up` / `down`
  * null when the budget is at its maximum / minimum. Pure.
  */
-export function marketingStepLine(base: MarketingQuote, up: MarketingQuote | null, down: MarketingQuote | null): string {
-  if (!base.ok) return '';
+export function marketingStepLine(base: MarketingQuote, up: MarketingQuote | null, down: MarketingQuote | null, canSell = true): string {
+  if (!base.ok || !canSell) return '';
   const parts: string[] = [];
   if (up?.ok) parts.push(`${formatMoney(MARKETING_STEP)} more a month: ${stepWords(up.signupsPerMonth - base.signupsPerMonth, 'more')}.`);
   if (down?.ok) parts.push(`${formatMoney(MARKETING_STEP)} less: ${stepWords(base.signupsPerMonth - down.signupsPerMonth, 'fewer')}.`);
@@ -586,7 +599,7 @@ export interface SupportOption {
   price: string;
   /** "$2,058 a month for your 294 customers. About 3 cancel a month; 294 happy." */
   effect: string;
-  /** "Your level now." / "Better than now by about $6,300 over a year." / "Worse than now by about $300 over a year." */
+  /** "Your level now." / "Better than now by about $6,300 over three years." / "Worse than now by about $300 over three years." (the quote's horizon, SupportQuote.months) */
   verdict: string;
 }
 
@@ -602,9 +615,9 @@ export function supportOption(current: SupportLevel, customers: number, q: Suppo
       : 'No customers yet, so it costs nothing today.';
   let verdict: string;
   if (isCurrent) verdict = 'Your level now.';
-  else if (customers === 0 || Math.abs(q.netValue) < 50) verdict = `About the same as now over ${horizonWords()}.`;
-  else if (q.netValue > 0) verdict = `Better than now by about ${roughMoney(q.netValue)} over ${horizonWords()}.`;
-  else verdict = `Worse than now by about ${roughMoney(-q.netValue)} over ${horizonWords()}.`;
+  else if (customers === 0 || Math.abs(q.netValue) < 50) verdict = `About the same as now over ${horizonWords(q.months)}.`;
+  else if (q.netValue > 0) verdict = `Better than now by about ${roughMoney(q.netValue)} over ${horizonWords(q.months)}.`;
+  else verdict = `Worse than now by about ${roughMoney(-q.netValue)} over ${horizonWords(q.months)}.`;
   return { level: q.level, name: spec.name, current: isCurrent, price: `${formatMoney(spec.costPerSub)} a customer a month`, effect, verdict };
 }
 
@@ -626,8 +639,14 @@ export function referralLines(on: boolean, q: ReferralQuote): ReferralLines {
   else if (!(q.referralsPerMonth >= 0.05)) forecast = 'Hardly any referrals expected now, so credits would cost little and bring few customers.';
   else {
     const refs = q.referralsPerMonth < 0.5 ? 'Less than one referral' : `About ${plural(Math.round(q.referralsPerMonth), 'referral')}`;
-    const extra = q.costPerCustomer === null ? 'hardly any of them extra' : `${aboutCustomers(q.extraPerMonth, 'more')} a month (about ${formatMoney(q.costPerCustomer)} each)`;
-    forecast = `${refs} a month, about ${roughMoney(q.costPerMonth)} a month in credits: ${extra}.`;
+    // "no more customers a month (about $987 each)" would price customers it says don't come: under the count's own floor, say hardly any.
+    const extra =
+      q.costPerCustomer === null || aboutCount(q.extraPerMonth) === 'none'
+        ? 'hardly any of them extra'
+        : `${aboutCustomers(q.extraPerMonth, 'more')} a month (about ${formatMoney(q.costPerCustomer)} each)`;
+    // roughMoney rounds to $10: a few dollars of credits would read "about $0".
+    const credits = q.costPerMonth < 5 ? 'a few dollars a month in credits' : `about ${roughMoney(q.costPerMonth)} a month in credits`;
+    forecast = `${refs} a month, ${credits}: ${extra}.`;
   }
   const value = q.netValue;
   const lead = on ? 'Keeping them on' : 'Turning them on';
@@ -718,6 +737,8 @@ export class CustomersPanel {
   private dom: PanelDom | null = null;
   /** What the figures were last drawn from: the game, its revision, and when the quotes last ran. */
   private seen = { state: null as GameState | null, revision: -1, quotesAt: -Infinity, quotesRevision: -1 };
+  /** There are lit homes to sell to (the header's share): the marketing lines say so when there are none. */
+  private canSell = true;
 
   constructor(
     private readonly session: GameSession,
@@ -1030,6 +1051,7 @@ export class CustomersPanel {
     this.seen.revision = this.session.revision;
     const reasons = whyNotSwitched(state);
     const header = customersHeader(state, reasons);
+    this.canSell = header.share !== null;
     setText(dom.headline, header.title);
     setText(dom.change, header.change);
     setText(dom.share, header.shareLine);
@@ -1201,7 +1223,8 @@ export class CustomersPanel {
   private leverButton(link: LeverLink): HTMLButtonElement {
     const button = el('button', { class: 'btn customers-link', text: link.label, attrs: { type: 'button' } });
     if (link.kind === 'section') {
-      button.setAttribute('aria-label', link.section === 'marketing' ? 'Go to the marketing budget' : 'Go to the areas and their campaigns');
+      const goes = { marketing: 'Go to the marketing budget', areas: 'Go to the areas and their campaigns', referrals: 'Go to referral credits' } as const;
+      button.setAttribute('aria-label', goes[link.section]);
       button.addEventListener('click', () => this.goTo({ section: link.section }));
     } else if (link.kind === 'pricing') {
       button.addEventListener('click', () => this.show({ kind: 'openPanel', panel: 'pricing' }));
@@ -1303,8 +1326,8 @@ export class CustomersPanel {
     const base = quoteMarketing(state, value);
     const up = value + MARKETING_STEP <= MARKETING_MAX_PER_MONTH ? quoteMarketing(state, value + MARKETING_STEP) : null;
     const down = value - MARKETING_STEP >= 0 ? quoteMarketing(state, value - MARKETING_STEP) : null;
-    setText(dom.marketingForecast, marketingForecast(base));
-    setText(dom.marketingStep, marketingStepLine(base, up, down));
+    setText(dom.marketingForecast, marketingForecast(base, this.canSell));
+    setText(dom.marketingStep, marketingStepLine(base, up, down, this.canSell));
   }
 
   private refreshSupport(state: GameState): void {

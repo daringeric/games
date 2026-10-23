@@ -12,6 +12,7 @@ import {
   GRANDFATHER_MONTHS_MAX,
   GRANDFATHER_STEP_SHARE,
   HAPPINESS_GOOD_DEAL_MAX,
+  HAPPINESS_MARKET_PREMIUM_TOLERATED,
   HAPPINESS_PER_PRICE_OVER_MARKET,
   HAPPINESS_PER_PRICE_UNDER_MARKET,
   HAPPY_CHURN_FLOOR,
@@ -30,6 +31,7 @@ import {
   NOTICE_LOG_MAX,
   PRICE_STEP_CHURN_MAX,
   PRICE_STEP_CHURN_PER_RISE,
+  PROMO_BOOST_YOUNG_MONTHS,
   PROMO_HORIZON_MONTHS,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
@@ -65,7 +67,7 @@ import {
 import type { DemandSegment } from './balance';
 import { dateOf, dayOf, MONTH_LENGTHS } from './calendar';
 import { formatMoney } from './finance';
-import { AWARENESS_PPM, churnFromScore, dealFactor, marketingAwarenessPerDay, priceScores, PROMO_BOOST_YOUNG_DAYS, stepCustomers } from './customers';
+import { AWARENESS_PPM, churnFromScore, dealFactor, forecastCustomers, marketingAwarenessPerDay, priceScores, PROMO_BOOST_YOUNG_DAYS, stepCustomers, whyNotSwitched } from './customers';
 import { incumbentChurnFor } from './incumbent';
 import { applyCommand, newGame, runDays } from './game';
 import { getService, quoteRemoveCabinet, quoteRemoveSpan } from './network';
@@ -97,6 +99,7 @@ import {
   reservationPrice,
   reservationSuit,
   promoAdvice,
+  promoQuoteMonths,
   promoSignupFactor,
   retentionPrice,
   SUGGESTED_PROMO,
@@ -1183,8 +1186,15 @@ describe('churn', () => {
       expect(churnProbability({ ...tier, price: lower })).toBeLessThan(CHURN_MONTHLY_BASE);
       const higher = { ...tier, price: Math.round(d.price * 1.5) };
       const over = (higher.price - d.price) / d.price;
-      // The price-over-market factor replaces round 4's price sensitivity: the same churn at the same weight.
-      expect(churnProbability(higher)).toBeCloseTo(Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * over)), 12);
+      // The price-over-market factor replaces round 4's price sensitivity, past the premium customers accept (round 4c/4d fix).
+      expect(churnProbability(higher)).toBeCloseTo(
+        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * Math.max(0, over - HAPPINESS_MARKET_PREMIUM_TOLERATED))),
+        12,
+      );
+      // A modest premium, within what customers accept, churns like the market price.
+      const modest = { ...tier, price: Math.floor(d.price * (1 + HAPPINESS_MARKET_PREMIUM_TOLERATED)) };
+      expect(modest.price).toBeGreaterThan(d.price);
+      expect(churnProbability(modest)).toBeCloseTo(CHURN_MONTHLY_BASE, 12);
       expect(churnProbability({ ...tier, price: 1_000_000 })).toBe(CHURN_MONTHLY_MAX);
     }
   });
@@ -1195,7 +1205,7 @@ describe('churn', () => {
       expect(churnProbability(tier, 'home', SMB_MULTIPLIER_MAX)).toBe(churnProbability(tier));
       const over = SMB_MULTIPLIER_MAX / SMB_MULTIPLIER_DEFAULT - 1;
       expect(churnProbability(tier, 'smb', SMB_MULTIPLIER_MAX)).toBeCloseTo(
-        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * over)),
+        Math.min(CHURN_MONTHLY_MAX, CHURN_MONTHLY_BASE * (1 + HAPPINESS_PER_PRICE_OVER_MARKET * Math.max(0, over - HAPPINESS_MARKET_PREMIUM_TOLERATED))),
         12,
       );
       const under = 1 - SMB_MULTIPLIER_MIN / SMB_MULTIPLIER_DEFAULT;
@@ -2129,7 +2139,12 @@ describe('quotePromo', () => {
     expect(q.pays).toBe(true);
     expect(q.valueGained).toBeGreaterThan(q.discountCost);
     expect(q.advice).toMatch(/^Pays now: about \d+ households on newly lit streets are waiting to sign up/);
-    expect(q.advice).toContain('in a mature town it would mostly discount people who would sign up anyway');
+    // Round 4c/4d fix: when to stop, never a self-contradicting "pays now ... in a mature town it would mostly discount".
+    expect(q.advice).toContain('once they have signed up it only discounts people who would sign up anyway, so take it off then');
+    expect(q.advice).not.toMatch(/mature town/);
+    // The quote looks past the promo's own months, so the step churn when its locks end is inside it.
+    expect(q.months).toBe(promoQuoteMonths(q.promo));
+    expect(q.months).toBeGreaterThan(SUGGESTED_PROMO.months);
     // A deep, long offer costs more in discounts than bringing them in sooner is worth.
     const deep = quotePromo(state, { percentOff: PROMO_MAX_PERCENT_OFF, months: PROMO_MAX_MONTHS });
     expect(deep.discountCost).toBeGreaterThan(q.discountCost);
@@ -2150,7 +2165,7 @@ describe('quotePromo', () => {
     expect(quotePromo(litTown().state, { ...SUGGESTED_PROMO }).pays).toBe(true);
     const settled = quotePromo(state, { ...SUGGESTED_PROMO });
     expect(settled.pays).toBe(false);
-    expect(settled.advice).toMatch(/^Doesn't pay now: your streets were lit over a year ago/);
+    expect(settled.advice.startsWith(`Doesn't pay now: your streets were lit over ${PROMO_BOOST_YOUNG_MONTHS === 12 ? 'a year' : `${PROMO_BOOST_YOUNG_MONTHS} months`} ago`), settled.advice).toBe(true);
     // Everyone who wants fiber signed up: nobody waits, nothing to gain.
     state.sales.accounts = state.city.parcels.map((p) => account(p.id, state.network.cabinets[0]!.id, { fiber1g: 1 }));
     expect(quotePromo(state, { ...SUGGESTED_PROMO })).toMatchObject({ waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
@@ -2163,6 +2178,7 @@ describe('quotePromo', () => {
       reasons: [],
       promo: { ...SUGGESTED_PROMO },
       waitingUnits: 40,
+      months: promoQuoteMonths({ ...SUGGESTED_PROMO }),
       extraSignups: 8,
       discountCost: 1_000,
       valueGained: 2_000,
@@ -2173,20 +2189,57 @@ describe('quotePromo', () => {
     expect(promoAdvice(quote({}), 30, 0)).toMatch(/^Pays now: about 40 households on newly lit streets are waiting/);
     expect(promoAdvice(quote({}), 0, 30)).toMatch(/^Pays now: about 40 households where the cable company's promo runs are waiting/);
     expect(promoAdvice(quote({}), 0, 0)).toMatch(/^Pays now: about 40 households are waiting/);
+    // Round 4c/4d fix: "pays now" never says in the same breath that it would mostly discount people who would sign up anyway there.
+    for (const [young, contested] of [[30, 0], [0, 30], [0, 0]] as const) expect(promoAdvice(quote({}), young, contested)).not.toMatch(/mature town/);
+    expect(promoAdvice(quote({}), 30, 0)).toMatch(/take it off then\.$/);
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 30, 0)).toMatch(/^Doesn't pay at this discount/);
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 30)).toMatch(/^Doesn't pay at this discount/);
+    // Balance symbolic: the young-street window is PROMO_BOOST_YOUNG_MONTHS ("a year" at 12).
+    const ago = PROMO_BOOST_YOUNG_MONTHS === 12 ? 'a year' : `${PROMO_BOOST_YOUNG_MONTHS} months`;
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 0)).toBe(
-      "Doesn't pay now: your streets were lit over a year ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.",
+      `Doesn't pay now: your streets were lit over ${ago} ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.`,
     );
     expect(promoAdvice(quote({ waitingUnits: 0 }), 0, 0)).toMatch(/^Nobody is waiting/);
     expect(promoAdvice(quote({ waitingUnits: 1 }), 1, 0)).toMatch(/^Pays now: about 1 household on newly lit streets is waiting/);
+  });
+
+  it('lifts nothing on streets lit long ago where cable runs no promo: there it only discounts its signups (round 4c/4d fix)', () => {
+    const offer: IntroPromo = { percentOff: 20, months: 12 };
+    // Old streets: the same households wait, with the promo or without, and none is "not worth it" only for want of it.
+    const old = mature();
+    const without = whyNotSwitched(old).overall;
+    old.sales.promo = offer;
+    expect(whyNotSwitched(old).overall).toEqual(without);
+    expect(forecastCustomers(old, { promo: offer }).gap).toBe(forecastCustomers(old, { promo: null }).gap);
+    // The sim agrees: within the month (no close, so no churn draws) the same signups as without it (same draws), each discounted.
+    const a = mature();
+    const b = mature();
+    b.sales.promo = offer;
+    const days = closeDayAfter(a.day, 1) - a.day - 1;
+    expect(days).toBeGreaterThan(10);
+    runDays(a, days);
+    runDays(b, days);
+    expect(b.sales.connectsTotal).toBe(a.sales.connectsTotal);
+    expect(subscriberUnits(b)).toBe(subscriberUnits(a));
+    expect(subscriberUnits(b)).toBeGreaterThan(subscriberUnits(mature()));
+    expect(b.sales.accounts.some((acc) => acc.locks.some((l) => l.reason === 'promo'))).toBe(true);
+    // Young streets: it lifts their target and the households waiting (where it pays).
+    const { state: fresh } = litTown();
+    const before = whyNotSwitched(fresh).overall;
+    fresh.sales.promo = offer;
+    const after = whyNotSwitched(fresh).overall;
+    expect(after.unaware + after.deciding).toBeGreaterThan(before.unaware + before.deciding);
   });
 
   it('quotes nothing for no promo, but says when one pays', () => {
     const q = quotePromo(litTown().state, null);
     expect(q).toMatchObject({ ok: true, promo: null, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
     expect(q.waitingUnits).toBeGreaterThan(0);
-    expect(q.advice).toMatch(/speeds up signups on streets lit in the last year and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway\.$/);
+    const span = PROMO_BOOST_YOUNG_MONTHS === 12 ? 'the last year' : `the last ${PROMO_BOOST_YOUNG_MONTHS} months`;
+    expect(
+      q.advice.endsWith(`speeds up signups on streets lit in ${span} and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway.`),
+      q.advice,
+    ).toBe(true);
   });
 
   it('counts only one cabinet\'s streets when asked', () => {

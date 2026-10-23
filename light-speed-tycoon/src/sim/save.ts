@@ -38,7 +38,7 @@ import {
 import { isAdviceKey, newAdvisorState } from './advisor';
 import { dateOf, formatMonth } from './calendar';
 import { COMPANY_NAME_MAX, defaultCompanyName, normalizeCompanyName } from './company';
-import { AWARENESS_PPM, newCustomers } from './customers';
+import { AWARENESS_PPM, newCustomers, seedStreets } from './customers';
 import { formatMoney, groupThousands } from './finance';
 import { getService } from './network';
 import { postNotice } from './notices';
@@ -171,9 +171,13 @@ export function deserialize(json: string): GameState {
       `Unsupported save version ${describe(raw.schemaVersion)} (this build reads version ${SCHEMA_VERSION})`,
     );
   }
+  const withoutCustomers = !('customers' in raw);
   upgradeEarlyV4(raw);
   checkState(raw, 4);
-  return raw as unknown as GameState;
+  const state = raw as unknown as GameState;
+  // Round 4c/4d fix: a v4 save from before round 4c/4d gets its lit streets seeded from its plant (customers.seedStreets).
+  if (withoutCustomers) seedStreets(state);
+  return state;
 }
 
 /**
@@ -194,8 +198,10 @@ export function deserialize(json: string): GameState {
  *   (round(INCUMBENT_PROMO_TAKE_RATE x 100)), answered = false and
  *   answeredWithPromo = false.
  * - Before round 4c/4d: customers = customers.newCustomers() right after
- *   `sales`; every report's ops.overhead = null (right after outageCredits).
- *   Reports keep no `customers` (it is optional).
+ *   `sales`, its lit streets seeded from the plant once the save checks out
+ *   (customers.seedStreets, in deserialize); every report's ops.overhead =
+ *   null (right after outageCredits). Reports keep no `customers` (it is
+ *   optional).
  */
 function upgradeEarlyV4(save: Json): void {
   const weather = save.weather;
@@ -260,6 +266,8 @@ function toCurrent(v3: V3State): GameState {
   checkState(state as unknown as Json, 4);
   noteRetiredTiers(state);
   noteFrozenRules(state);
+  // Round 4c/4d fix: the lit streets' awareness and lit days from the plant, not as if lit today.
+  seedStreets(state);
   return state;
 }
 
@@ -387,7 +395,8 @@ function trailingFrozenCloses(reports: readonly MonthlyReport[]): number {
  * - round 4b: company { name: company.defaultCompanyName(the town's name),
  *   difficulty: DEFAULT_DIFFICULTY }, advisor = advisor.newAdvisorState(),
  *   sales.month.outageCreditDollarDays = 0.
- * - round 4c/4d: customers = customers.newCustomers().
+ * - round 4c/4d: customers = customers.newCustomers() (toCurrent then seeds
+ *   its lit streets from the plant: customers.seedStreets).
  * Keys are written in newGame's order so migrated and fresh saves hash alike.
  */
 export function migrateV3toV4(v3: V3State): GameState {

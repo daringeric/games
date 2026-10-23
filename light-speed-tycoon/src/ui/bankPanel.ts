@@ -49,6 +49,8 @@ import { dateOf, dayOf, formatDate, formatMonth } from '../sim/calendar';
 import {
   acceleratedSchedule,
   bankHealth,
+  perDollarWords,
+  yearsOfProfitWords,
   closesUntilAcceleration,
   covenantsWithin,
   creditOffer,
@@ -143,23 +145,19 @@ export function plainRate(bps: number): string {
   return `${trimNumber(Math.round(bps) / 100)}%`;
 }
 
-/** Dollars earned per $1 of loan payments: 1.54 -> "$1.54", -0.3 -> "-$0.30". */
+/** Dollars earned per $1 of loan payments: 1.54 -> "$1.54", -0.3 -> "-$0.30" (debt.perDollarWords: the advisor words it alike). */
 export function perDollar(x: number): string {
-  const cents = Math.round(x * 100);
-  const abs = Math.abs(cents);
-  return `${cents < 0 ? '-' : ''}$${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+  return perDollarWords(x);
 }
 
 /**
  * The bank's first check in plain words: "3.4 years of profit". One decimal,
  * two where one would hide which side of the limit it is on (5.04 is over a
- * limit of 5: "5.04 years", never "5 years"); "under 0.1 years" for a sliver.
+ * limit of 5: "5.04 years", never "5 years"); "under 0.1 years" for a sliver
+ * (debt.yearsOfProfitWords: the advisor words it alike).
  */
 export function yearsOfProfit(leverage: number): string {
-  let value = Math.round(leverage * 10) / 10;
-  if (leverage > COVENANT_MAX_LEVERAGE !== value > COVENANT_MAX_LEVERAGE) value = Math.round(leverage * 100) / 100;
-  if (value === 0 && leverage > 0) return 'under 0.1 years of profit';
-  return `${trimNumber(value)} ${value === 1 ? 'year' : 'years'} of profit`;
+  return yearsOfProfitWords(leverage);
 }
 
 /** Leverage as the bank sees it, for the disclosures: "not measurable" when there is debt and no cash flow to measure it against. */

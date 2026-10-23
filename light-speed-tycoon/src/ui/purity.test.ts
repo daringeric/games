@@ -40,9 +40,10 @@ function midGame(): GameState {
   applyCommand(state, { type: 'placeCabinet', node: co });
   applyCommand(state, { type: 'layCable', segments: shortestPath(city, co, far(10)) ?? [], method: 'underground' });
   // Round 4c/4d: a lit street switches over years (customers.ts); a campaign
-  // the day the first streets light signs the first subscribers in time.
+  // the day the area's streets are all lit signs the first subscribers in
+  // time (a campaign boosts only the streets lit when it starts).
   let day = 0;
-  for (; day < 120 && getService(state).passings === 0; day++) runDays(state, 1);
+  for (; day < 120 && !(getService(state).passings > 0 && state.network.spans.every((s) => s.stage === 'live')); day++) runDays(state, 1);
   applyCommand(state, { type: 'runCampaign', cabinet: state.network.cabinets[0]!.id });
   runDays(state, 120 - day);
   applyCommand(state, { type: 'addSplitter', cabinet: state.network.cabinets[0]!.id });

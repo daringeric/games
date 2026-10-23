@@ -20,7 +20,7 @@ The town is generated from a seed and the whole simulation is deterministic, so 
 
 ### Run it
 
-Needs Node 22.
+Needs Node 22.23.4 or a newer 22.x (pinned in `light-speed-tycoon/.nvmrc`).
 
 ```sh
 cd light-speed-tycoon

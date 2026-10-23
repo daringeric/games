@@ -151,6 +151,7 @@ import {
   notePriceSteps,
   priceScores,
   regularChurnReader,
+  splittersCost,
   switchingDay,
   waitedOn,
 } from './customers';
@@ -256,6 +257,8 @@ const POPULARITY: Readonly<Record<TierId, number>> = Object.fromEntries(
  * The share of the list price a new signup weighs off for an intro promo:
  * percentOff / 100 x min(months, PROMO_HORIZON_MONTHS) / PROMO_HORIZON_MONTHS
  * (0 without a promo). A tier's price term then uses list - list x this.
+ * Round 4c/4d fix: the sim values it only on the streets where the promo's
+ * boost applies (young or contested: customers.promoApplies).
  */
 export function promoDiscountShare(promo: IntroPromo | null): number {
   if (promo === null) return 0;
@@ -1105,8 +1108,12 @@ function pickTier(mix: Record<TierId, number>, rng: Rng): TierId | null {
  * - While Sales.promo is set, the ramp (expect above) is also multiplied by
  *   promoSignupFactor(promo) = 1 + PROMO_SIGNUP_BOOST x percentOff / 100.
  *   Round 4c (spec C): only on young streets (lit within
- *   PROMO_BOOST_YOUNG_MONTHS) and where the incumbent runs a promo; its
- *   discount also raises the deal factor everywhere.
+ *   PROMO_BOOST_YOUNG_MONTHS) and where the incumbent runs a promo. Round
+ *   4c/4d fix: on those streets only its discount is also valued in the
+ *   target, the signup tier mix and the deal factor (customers.StreetSwitching
+ *   promoApplies); on the others a standing promo discounts every signup for
+ *   its months and lifts nothing (a long promo raised every street's
+ *   ceiling for good and paid in a mature town).
  *
  * Round 4c/4d (sim-customers):
  * - Each connected unit adds round(its street's referral share x 1000) to
@@ -1136,12 +1143,17 @@ export function stepSales(state: GameState, rng: Rng): void {
   // but the cabinet areas where it runs a promo today.
   const localPrice = new Map<CabinetId, number>();
   for (const running of activePromos(state)) localPrice.set(running.cabinet, running.price);
+  // Round 4c/4d fix (spec C): the intro promo is valued (in the target, the
+  // signup mix and the deal factor) only on the streets where its boost
+  // applies, young or contested (customers.promoApplies); elsewhere its
+  // signups are discounted for their months for nothing more.
   const models = new Map<number, Demand>();
-  const demandAt = (incumbentPrice: number): Demand => {
-    let model = models.get(incumbentPrice);
+  const demandAt = (incumbentPrice: number, valued: boolean): Demand => {
+    const key = incumbentPrice * 2 + (valued ? 1 : 0);
+    let model = models.get(key);
     if (!model) {
-      model = demandModel(pricing, incumbentPrice, promo);
-      models.set(incumbentPrice, model);
+      model = demandModel(pricing, incumbentPrice, valued ? promo : null);
+      models.set(key, model);
     }
     return model;
   };
@@ -1149,11 +1161,12 @@ export function stepSales(state: GameState, rng: Rng): void {
   // incumbent price, each kind's deal factor; per street, awareness, word of
   // mouth, the area's campaign and the intro promo's boost (young or contested).
   const deals = new Map<number, Record<ParcelKind, number>>();
-  const dealAt = (incumbentPrice: number): Record<ParcelKind, number> => {
-    let deal = deals.get(incumbentPrice);
+  const dealAt = (incumbentPrice: number, valued: boolean): Record<ParcelKind, number> => {
+    const key = incumbentPrice * 2 + (valued ? 1 : 0);
+    let deal = deals.get(key);
     if (!deal) {
-      deal = dealFactors(pricing, incumbentPrice, promo);
-      deals.set(incumbentPrice, deal);
+      deal = dealFactors(pricing, incumbentPrice, valued ? promo : null);
+      deals.set(key, deal);
     }
     return deal;
   };
@@ -1211,8 +1224,9 @@ export function stepSales(state: GameState, rng: Rng): void {
       rerouted = true;
     }
     const incumbentPrice = localPrice.get(nearest) ?? INCUMBENT_PRICE;
-    const { take, mixes } = demandAt(incumbentPrice);
-    const deal = dealAt(incumbentPrice);
+    const street = switching(seg, nearest, localPrice.has(nearest));
+    const { take, mixes } = demandAt(incumbentPrice, street.promoApplies);
+    const deal = dealAt(incumbentPrice, street.promoApplies);
     const from = index.segStart[seg] as number;
     const to = index.segStart[seg + 1] as number;
 
@@ -1248,7 +1262,6 @@ export function stepSales(state: GameState, rng: Rng): void {
     let connectedHere = 0;
     let portsTakenHere = 0;
 
-    const street = switching(seg, nearest, localPrice.has(nearest));
     const ramp = Math.min(1, street.rate * streetDeal);
     const referralMilliPerUnit = Math.round(street.referral * 1000);
     const expect = gap * ramp;
@@ -2087,29 +2100,39 @@ export function roughMoney(amount: number): string {
 }
 
 /**
- * What setting `promo` (null: none) would do over the next
- * PROMO_QUOTE_MONTHS (see PromoQuote), against no intro promo at all. Pure,
- * no rng. ok/reasons as setPromo would decide (and false once the game is
- * over); with `cabinet`, only the streets that cabinet serves count (the
+ * Round 4c/4d fix: the months sales.quotePromo looks ahead for `promo`: its
+ * own months plus PROMO_QUOTE_MONTHS (PROMO_QUOTE_MONTHS without one), so the
+ * step churn when its first locks end is inside the quote.
+ */
+export function promoQuoteMonths(promo: IntroPromo | null): number {
+  return PROMO_QUOTE_MONTHS + (promo && Number.isInteger(promo.months) && promo.months > 0 ? Math.min(promo.months, PROMO_MAX_MONTHS) : 0);
+}
+
+/**
+ * What setting `promo` (null: none) and keeping it set would do over
+ * promoQuoteMonths(promo) (see PromoQuote), against no intro promo at all.
+ * Pure, no rng. ok/reasons as setPromo would decide (and false once the game
+ * is over); with `cabinet`, only the streets that cabinet serves count (the
  * incumbent's contested area: bestIncumbentAnswer).
- * Round 4c (spec C): customers.forecastCustomers plays both cases out day by
- * day under the round-4c rules: the promo raises each street's target and
- * its deal factor by its discount share over PROMO_HORIZON_MONTHS (longer
- * and deeper offers do more, with diminishing returns through the deal
- * clamp), and its signup boost (promoSignupFactor) applies only on young
- * streets (lit within PROMO_BOOST_YOUNG_MONTHS) and where the cable company
- * runs a promo; every new signup is discounted for its promo months (inside
- * the horizon) and a share of them cancels at the step when it ends
- * (PROMO_STEP_SHARE).
+ * customers.forecastCustomers plays both cases out under the sim's rules
+ * (round 4c/4d fix): on young streets (lit within PROMO_BOOST_YOUNG_MONTHS)
+ * and where the cable company runs a promo, and only while they are, the
+ * promo raises the street's target and its deal factor by its discount share
+ * over PROMO_HORIZON_MONTHS and boosts its signups (promoSignupFactor);
+ * every new signup is discounted for its promo months, scored at the
+ * discounted price meanwhile, and a share of them cancels at the step when
+ * it ends (PROMO_STEP_SHARE), reopening the gap.
  * - waitingUnits: the lit streets' gap today (target less subscribed) with
- *   the promo valued (without one for null).
+ *   the promo valued where it applies (without one for null).
  * - extraSignups = signups with the promo less without; discountCost = the
  *   discounted subscriber-months x percentOff of the new signups' average
  *   list price; valueGained = the extra subscriber-months x that price less
- *   overhead.perCustomerCost (installs left out: they only come sooner);
- *   pays = valueGained > discountCost. So it pays where many households
- *   wait on young or contested streets, and not in a mature town, where it
- *   mostly discounts people who would sign up anyway.
+ *   overhead.perCustomerCost, less the extra signups' installs and the
+ *   splitters they need (round 4c/4d fix: cash it spends), save the installs
+ *   that only come sooner (extra customers at the horizon's end, up to the
+ *   gap left then without it); pays = valueGained > discountCost. So it pays where
+ *   many households wait on young or contested streets, and never in a
+ *   mature town, where it only discounts people who would sign up anyway.
  * - advice: one sentence on when it pays (promoAdvice).
  */
 export function quotePromo(state: GameState, promo: IntroPromo | null, cabinet?: CabinetId): PromoQuote {
@@ -2125,19 +2148,28 @@ export function quotePromo(state: GameState, promo: IntroPromo | null, cabinet?:
   const reasons: string[] = [];
   if (state.gameOver) reasons.push(`Game over: ${state.gameOver.message}`);
   if (!inRange) reasons.push(`An intro promo is 1-${PROMO_MAX_PERCENT_OFF}% off for 1-${PROMO_MAX_MONTHS} months`);
-  const quote: PromoQuote = { ok: reasons.length === 0, reasons, promo, waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false, advice: '' };
+  const months = promoQuoteMonths(promo);
+  const quote: PromoQuote = { ok: reasons.length === 0, reasons, promo, waitingUnits: 0, months, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false, advice: '' };
   if (!quote.ok) return quote;
 
   const area = cabinet === undefined ? {} : { cabinet };
-  const base = forecastCustomers(state, { ...area, promo: null, months: PROMO_QUOTE_MONTHS });
-  const offered = promo === null ? base : forecastCustomers(state, { ...area, promo, months: PROMO_QUOTE_MONTHS });
+  const base = forecastCustomers(state, { ...area, promo: null, months });
+  const offered = promo === null ? base : forecastCustomers(state, { ...area, promo, months });
   const waiting = offered.gap;
   quote.waitingUnits = Math.round(waiting);
   if (promo !== null && waiting > 0) {
     const price = offered.signupPrice;
     const margin = Math.max(0, price - perCustomerCost(state));
     const discount = ((offered.promoUnitDays / DAYS_PER_MONTH) * price * promo.percentOff) / 100;
-    const value = ((offered.unitDays - base.unitDays) / DAYS_PER_MONTH) * margin;
+    // Round 4c/4d fix: the installs and splitters its extra signups need are cash it spends, save those that only come
+    // sooner (extra customers at the horizon's end the gap left without it would have signed later); those the lifted
+    // ceiling and the step churn's refills add are not.
+    const equipment = Math.max(0, splittersCost(state, offered.splitters) - splittersCost(state, base.splitters));
+    const installs = offered.installs - base.installs;
+    const sooner = Math.min(Math.max(0, offered.unitsEnd - base.unitsEnd), base.gapEnd);
+    const perInstall = offered.signups > 0 ? offered.installs / offered.signups : 0;
+    const extraInstalls = Math.max(Math.min(0, installs), installs - sooner * perInstall);
+    const value = ((offered.unitDays - base.unitDays) / DAYS_PER_MONTH) * margin - extraInstalls - equipment;
     quote.extraSignups = Math.max(0, Math.round(offered.signups - base.signups));
     quote.discountCost = Math.round(discount);
     quote.valueGained = Math.max(0, Math.round(value));
@@ -2168,11 +2200,14 @@ export function promoAdvice(quote: PromoQuote, young: number, contested: number)
   const fresh = young * 2 >= waiting;
   const fought = contested * 2 >= waiting;
   if (quote.pays) {
+    // Round 4c/4d fix: say when to stop, never "in a mature town" beside "pays now" (it contradicted itself).
     const where = fresh ? ' on newly lit streets' : fought ? " where the cable company's promo runs" : '';
-    return (
-      `Pays now: about ${households}${where} ${waiting === 1 ? 'is' : 'are'} waiting to sign up and it brings them in sooner ` +
-      '(in a mature town it would mostly discount people who would sign up anyway).'
-    );
+    const until = fresh
+      ? '; once they have signed up it only discounts people who would sign up anyway, so take it off then.'
+      : fought
+        ? "; once the cable company's promo ends it only discounts people who would sign up anyway."
+        : '.';
+    return `Pays now: about ${households}${where} ${waiting === 1 ? 'is' : 'are'} waiting to sign up and it brings them in sooner${until}`;
   }
   if (fresh || fought || young + contested > 0) {
     return (

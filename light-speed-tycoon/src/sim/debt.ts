@@ -255,6 +255,35 @@ export function formatMultiple(x: number): string {
   return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}${TIMES}`;
 }
 
+/** Up to two decimals, trailing zeros dropped: 5 -> "5", 4.5 -> "4.5", 3.456 -> "3.46". */
+function trimDecimals(x: number): string {
+  return String(round(x * 100) / 100);
+}
+
+/**
+ * The bank's first check (leverage) in the Bank's plain words: "3.4 years
+ * of profit". One decimal, two where one would hide which side of the limit
+ * it is on (5.04 is over a limit of 5: "5.04 years", never "5 years");
+ * "under 0.1 years" for a sliver. The Bank (ui/bankPanel.yearsOfProfit) and
+ * the advisor's bank cards word it alike.
+ */
+export function yearsOfProfitWords(leverage: number): string {
+  let value = round(leverage * 10) / 10;
+  if (leverage > COVENANT_MAX_LEVERAGE !== value > COVENANT_MAX_LEVERAGE) value = round(leverage * 100) / 100;
+  if (value === 0 && leverage > 0) return 'under 0.1 years of profit';
+  return `${trimDecimals(value)} ${value === 1 ? 'year' : 'years'} of profit`;
+}
+
+/** The bank's second check (coverage) in plain words: dollars earned per $1 of loan payments, 1.54 -> "$1.54", -0.3 -> "-$0.30". */
+export function perDollarWords(x: number): string {
+  const cents = round(x * 100);
+  const abs = Math.abs(cents);
+  return `${cents < 0 ? '-' : ''}$${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+}
+
+/** The leverage limit as the Bank says it: "5". */
+export const LEVERAGE_LIMIT_WORDS = trimDecimals(COVENANT_MAX_LEVERAGE);
+
 /** A capacity multiple for prose: 0.5 -> "0.5×", 3 -> "3×", 1.25 -> "1.25×". */
 function shortMultiple(x: number): string {
   const v = round(x * 100);

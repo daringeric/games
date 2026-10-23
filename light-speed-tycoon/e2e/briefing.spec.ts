@@ -69,6 +69,19 @@ async function revealCard(sheet: Locator, key: string): Promise<Locator> {
   return card;
 }
 
+/** The headline's computed text color. */
+const headlineColor = (sheet: Locator) => sheet.locator('.briefing-headline').evaluate((el) => getComputedStyle(el).color);
+/** What a CSS color value computes to inside the sheet (a throwaway probe element, removed at once). */
+const probeColor = (sheet: Locator, value: string) =>
+  sheet.locator('.sheet-body').evaluate((body, v) => {
+    const probe = document.createElement('span');
+    probe.style.color = v;
+    body.appendChild(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  }, value);
+
 async function dismissHint(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Got it' }).click();
 }
@@ -395,11 +408,34 @@ test('the bank leads the headline when it is worried, in its own plain words', a
   await reopenFromMenu(page);
   await expect(sheet.locator('.briefing-headline')).toHaveText('The bank is worried about your loans');
   await expect(sheet.locator('.briefing-health')).toHaveText('Bank health: Warning');
+  // The headline really draws in the bank's amber (its tone class must win over the base rule's text color).
+  await expect(sheet.locator('.briefing-headline')).toHaveClass(/tone-warn/);
+  // The bank's next step speaks the Bank's words, behind its "More about this" too: no leverage, covenant, × or "term loan #".
+  const cure = await revealCard(sheet, 'covenantCure');
+  const more = cure.locator('.briefing-card-detail');
+  if (await more.count()) {
+    await more.locator('summary').click();
+    await expect(more.locator('p')).toBeVisible();
+  }
+  expect(await cure.innerText()).toMatch(/the bank's checks/);
+  expect(await cure.innerText()).not.toMatch(/leverage|covenant|DSCR|×|term loan #|credit line/i);
+  expect(await headlineColor(sheet)).toEqual(await probeColor(sheet, 'color-mix(in srgb, var(--cpp-amber) 72%, var(--text))'));
+  expect(await headlineColor(sheet)).not.toEqual(await probeColor(sheet, 'var(--text)'));
   // Debt is never success green.
   await booksButton(sheet).click();
   const debt = sheet.locator('.briefing-tile-debt');
   await expect(debt.locator('.briefing-tile-detail')).toHaveText('Bank health: Warning');
   await expect(debt.locator('.briefing-tile-value')).toHaveClass(/tone-warn/);
+  // Higher interest: the headline turns the bank's red.
+  await page.keyboard.press('Escape');
+  await expect(sheet).toBeHidden();
+  await page.evaluate(() => {
+    window.__lst!.getState().debt.covenant.stage = 'penalty';
+  });
+  await reopenFromMenu(page);
+  await expect(sheet.locator('.briefing-health')).toHaveText('Bank health: Higher interest');
+  await expect(sheet.locator('.briefing-headline')).toHaveClass(/tone-danger/);
+  expect(await headlineColor(sheet)).toEqual(await probeColor(sheet, 'var(--danger)'));
   expect(errors).toEqual([]);
 });
 
@@ -484,6 +520,51 @@ test.describe('on a phone', () => {
     await expect(booksButton(sheet)).toBeFocused();
     await go.tap();
     await expect(sheet).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+
+  test('the money-in label is never cut short: a segment too narrow for it hands its name to the legend', async ({ page }) => {
+    const errors = watchErrors(page);
+    await openWithBriefings(page, SEED);
+    await cabinetAtCo(page);
+    await tick(page, 31);
+    await page.keyboard.press('Escape');
+    await expect(briefingSheet(page)).toBeHidden();
+    // Bills as the only source at 30% of the month's money out (test-only report edit, as other specs set the
+    // covenant): wide enough for the view to label it inside (BAR_LABEL_MIN_SHARE), too narrow on a phone's bar.
+    await page.evaluate(() => {
+      const s = window.__lst!.getState();
+      const report = s.finance.reports[s.finance.reports.length - 1]!;
+      const totals = report.totals as Record<string, number>;
+      let out = 0;
+      for (const [category, amount] of Object.entries(totals)) if (category !== 'revenue' && category !== 'loanProceeds' && amount < 0) out -= amount;
+      totals.loanProceeds = 0;
+      totals.revenue = Math.round(out * 0.3);
+    });
+    await page.getByRole('button', { name: 'Menu' }).tap();
+    await page.getByRole('menuitem', { name: /Latest briefing/ }).tap();
+    const sheet = briefingSheet(page);
+    await expect(sheet).toBeVisible();
+    const seg = sheet.locator('.briefing-bar-in .briefing-seg[data-key="bills"]');
+    await expect(seg).toHaveCount(1);
+    const share = await seg.evaluate((el) => el.getBoundingClientRect().width / el.parentElement!.getBoundingClientRect().width);
+    expect(share).toBeGreaterThan(0.25);
+    expect(share).toBeLessThan(0.35);
+    // Hidden inside the segment, named (with its amount) in the legend instead.
+    await expect(sheet.locator('.briefing-seg-label')).toBeHidden();
+    const legend = sheet.locator('.briefing-in-legend');
+    await expect(legend).toBeVisible();
+    await expect(legend.locator('li[data-key="bills"]')).toContainText('Customer bills');
+    // No visible label anywhere is clipped.
+    const clipped = await sheet.locator('.briefing-seg-label').evaluateAll((els) =>
+      els.filter((el) => (el as HTMLElement).offsetParent !== null && el.scrollWidth > el.clientWidth).length,
+    );
+    expect(clipped).toBe(0);
+    // Turned sideways the bar is wide enough again: the label comes back inside and the legend goes.
+    await page.setViewportSize({ width: 844, height: 390 });
+    await expect(sheet.locator('.briefing-seg-label')).toBeVisible();
+    await expect(legend).toBeHidden();
+    expect(await sheet.locator('.briefing-seg-label').evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
     expect(errors).toEqual([]);
   });
 });

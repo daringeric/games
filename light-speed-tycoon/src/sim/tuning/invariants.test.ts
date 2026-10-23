@@ -298,12 +298,12 @@ function brokenCustomersInvariant(state: GameState, synced: boolean): string | n
 /** Why homes haven't switched adds up, and the happiness buckets cover every subscribed unit (run once a week: whyNotSwitched walks every lit street). */
 function brokenCustomerCounts(state: GameState): string | null {
   const reasons = whyNotSwitched(state);
-  const sum = { unaware: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0 };
+  const sum = { unaware: 0, deciding: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0 };
   for (const row of [reasons.overall, ...reasons.areas]) {
     const label = 'cabinet' in row ? `area ${row.cabinet}` : 'overall';
-    if (row.unaware + row.notWorth + row.tooExpensive + row.waiting !== row.unsigned) return `${label}: reasons sum to ${row.unaware + row.notWorth + row.tooExpensive + row.waiting}, not ${row.unsigned} unsigned`;
+    if (row.unaware + row.deciding + row.notWorth + row.tooExpensive + row.waiting !== row.unsigned) return `${label}: reasons sum to ${row.unaware + row.deciding + row.notWorth + row.tooExpensive + row.waiting}, not ${row.unsigned} unsigned`;
     if (row.unsigned !== row.passings - row.subscribed) return `${label}: ${row.unsigned} unsigned of ${row.passings} passed with ${row.subscribed} subscribed`;
-    if (row.unaware < 0 || row.notWorth < 0 || row.tooExpensive < 0 || row.waiting < 0) return `${label}: a negative reason`;
+    if (row.unaware < 0 || row.deciding < 0 || row.notWorth < 0 || row.tooExpensive < 0 || row.waiting < 0) return `${label}: a negative reason`;
   }
   for (const area of reasons.areas) for (const key of Object.keys(sum) as (keyof typeof sum)[]) sum[key] += area[key];
   for (const key of Object.keys(sum) as (keyof typeof sum)[]) if (sum[key] !== reasons.overall[key]) return `areas' ${key} ${sum[key]} vs overall ${reasons.overall[key]}`;
