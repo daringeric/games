@@ -2368,19 +2368,23 @@ export interface AttentionItem {
 /**
  * Why a lit household has not signed up (one main reason each):
  *   unaware      - doesn't know you yet (awareness);
- *   notWorth     - knows you, but your deal is not worth switching for yet (value vs cable for its segment);
+ *   deciding     - knows you and would switch at your prices (inside its street's target), but hasn't yet:
+ *                  switching takes time (awareness x the daily pace), which word of mouth, referral credits,
+ *                  a campaign or a better deal speed up;
+ *   notWorth     - knows you, but your deal is not worth switching for (beyond the street's target: value vs cable for its segment);
  *   tooExpensive - no offered plan within its segment's reservation price;
  *   waiting      - wants to switch but waits for an install or a free port (cabinet full, installs paused, its street cut off).
  */
-export type SwitchReason = 'unaware' | 'notWorth' | 'tooExpensive' | 'waiting';
+export type SwitchReason = 'unaware' | 'deciding' | 'notWorth' | 'tooExpensive' | 'waiting';
 
 /** Counts by reason, in units (customers.whyNotSwitched). */
 export interface SwitchReasonCounts {
   unaware: number;
+  deciding: number;
   notWorth: number;
   tooExpensive: number;
   waiting: number;
-  /** Lit units not signed up: exactly unaware + notWorth + tooExpensive + waiting. */
+  /** Lit units not signed up: exactly unaware + deciding + notWorth + tooExpensive + waiting. */
   unsigned: number;
   /** Units passed (on lit streets) and subscribed units there. */
   passings: number;

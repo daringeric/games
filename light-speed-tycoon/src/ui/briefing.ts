@@ -1299,6 +1299,8 @@ export class BriefingSheet {
   /** Reports whose close-time briefing recorded its suggestions (noteAdviceShown): never twice. */
   private readonly noted = new WeakSet<MonthlyReport>();
   private nextSection: HTMLElement | null = null;
+  /** Watches the money-in bar's inside label: when it no longer fits its segment, the legend names the segment instead. */
+  private labelFit: ResizeObserver | null = null;
 
   constructor(private readonly deps: BriefingSheetDeps) {}
 
@@ -1530,10 +1532,12 @@ export class BriefingSheet {
   private moneyIn(view: SummaryView): HTMLElement {
     const id = this.id('in');
     const bar = view.bars.in;
-    return el('section', { class: 'briefing-money briefing-money-in', attrs: { 'aria-labelledby': id } }, [
-      this.moneyHead(id, 'Money in', bar.value, 'in', bar.segments.some((seg) => seg.key === 'borrowed')),
-      bar.empty ? el('p', { class: 'briefing-empty', text: bar.empty }) : this.bar(bar, 'in'),
-      view.bars.inLegend
+    const track = bar.empty ? null : this.bar(bar, 'in');
+    const label = track?.querySelector<HTMLElement>('.briefing-seg-label') ?? null;
+    // The legend, or (when the view puts the label inside its segment) a hidden
+    // fallback legend that takes over whenever that label would be cut short.
+    const legend =
+      view.bars.inLegend || label
         ? el(
             'ul',
             { class: 'briefing-in-legend' },
@@ -1545,8 +1549,41 @@ export class BriefingSheet {
               ]),
             ),
           )
-        : null,
+        : null;
+    this.labelFit?.disconnect();
+    this.labelFit = null;
+    if (label && legend && !view.bars.inLegend) {
+      legend.hidden = true;
+      this.fitLabel(label, legend);
+    }
+    return el('section', { class: 'briefing-money briefing-money-in', attrs: { 'aria-labelledby': id } }, [
+      this.moneyHead(id, 'Money in', bar.value, 'in', bar.segments.some((seg) => seg.key === 'borrowed')),
+      bar.empty ? el('p', { class: 'briefing-empty', text: bar.empty }) : track,
+      legend,
     ]);
+  }
+
+  /**
+   * Text is never clipped: the inside label shows only while its segment is
+   * wide enough for it (a phone's 25-39% segment is not); otherwise it hides
+   * and the legend under the bar names the segment. Measured on layout and on
+   * every resize (a phone turning), from the label's own width.
+   */
+  private fitLabel(label: HTMLElement, legend: HTMLElement): void {
+    const fit = () => {
+      if (!label.isConnected) return;
+      label.hidden = false;
+      const clipped = label.scrollWidth > label.clientWidth + 0.5;
+      label.hidden = clipped;
+      legend.hidden = !clipped;
+    };
+    if (typeof ResizeObserver === 'undefined') {
+      requestAnimationFrame(fit);
+      return;
+    }
+    const segment = label.parentElement;
+    this.labelFit = new ResizeObserver(fit);
+    this.labelFit.observe(segment ?? label);
   }
 
   private moneyOut(view: SummaryView): HTMLElement {

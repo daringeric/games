@@ -53,6 +53,30 @@
 //     (LEAN_OPTIONS): cheap aerial plant, densest streets first, a short
 //     runway, the intro promo while it pays, and a bridge loan when cash runs
 //     under its floor with the line used up.
+//   Round 4c/4d:
+//   - its costs, reserves and margins come from overhead.ts (the scaled
+//     overhead: base, per customer with the support level, per cabinet and
+//     route-mile), its signup estimates from the switching model
+//     (customers.ts: awareness, the deal factor, word of mouth);
+//   - its loan and line buffers are judged with a year of its plant's expected
+//     storm repairs off the operating cash flow (opts.stormCovenantYears,
+//     stormStressed): the covenants count a storm at its trailing-year total,
+//     and a network borrowed to the edge of its buffer breached on the first
+//     bad storm on tree-lined aerial streets (spec D);
+//   - with a covenant at risk it repays the line down to its floor, a storm's
+//     repairs included, not to a month of fixed costs;
+//   - optional growth levers (SmartOptions campaigns, support, referrals):
+//     neighborhood campaigns where customers.quoteCampaign pays, the support
+//     level and referral credits by their quotes (SMART_LEVERS_OPTIONS);
+//     SMART itself keeps Good support, no campaigns and no credits.
+// - CASUAL (round 4c/4d, spec F): a first-time player: a few dense streets near
+//   the CO with one cabinet on its first look, default prices, default
+//   marketing, Good support, no campaigns, no loans, a splitter when its
+//   cabinet is full.
+// - DISCOUNT / OVERPRICED (round 4c/4d, spec I.7): SMART with every price
+//   DISCOUNT_PRICE_MULTIPLIER (about 17% below) or OVERPRICED_PRICE_MULTIPLIER
+//   of the defaults from day 0.
+// - ADVISOR_FOLLOWER and SMART-lite run at every difficulty level (round 4c/4d).
 // - TWO_GIG_ONLY / NO_CHEAP_TIER (round 4b): SMART offering only 2 Gig, or 1 Gig
 //   and 2 Gig, at their default prices from day 0 (lineupBot).
 // - AGGRESSIVE (round 4b): SMART with every price x0.8 from day 0.
@@ -78,8 +102,9 @@
 //   every offered tier by PRICE_HIKE_SHARE (grandfathered for the default
 //   months, or passed on at the next bill with priceHikerBot(0)).
 // - RURAL: SMART's borrowing rules on red rural cabinet areas only (round 3's
-//   cash rules, no storm reserve), so its lifetime cost per passing is red
-//   while it borrows: the bank's CPP spread.
+//   cash rules, no storm reserve or storm cushion; round 4c/4d: its lanes
+//   buried), so its lifetime cost per passing is red while it borrows: the
+//   bank's CPP spread.
 // - CARELESS: overbuilds underground toward random far corners whenever cash
 //   covers it (no reserve), cabinets at every 4th corner reached, marketing at
 //   the maximum, never adds splitters, never borrows.
@@ -88,15 +113,22 @@
 //   tiers retired and re-offered), intro promos, underground rebuilds, budget
 //   changes, extra splitters and OLT cards, credit-line draws and repayments,
 //   term loans and prepayments, round 4b's retention offers, snoozes and
-//   briefing notes (and junk of each): every command type, for the
-//   invariant sessions.
+//   briefing notes, round 4c/4d's campaigns, support levels and referral
+//   credits (and junk of each): every command type, for the invariant
+//   sessions.
 //
 // Bots read the game only through public sim functions and change it only
 // through `send` (applyCommand). Their randomness comes from their own Rng.
 // The round-4b experiments at the end of this file (incumbent promo answers,
 // the intro promo in a fresh area and in a mature town) start from a copy of
 // a bot's game, with an incumbent promo injected when none runs (a test-only
-// state edit, ensureIncumbentPromo).
+// state edit, ensureIncumbentPromo). Round 4c/4d adds the lever experiments
+// (campaigns, support levels, referral credits, switching by price, the
+// marketing forecast), and the noisy comparisons average over
+// EXPERIMENT_REPLICATES copies whose sales stream is re-seeded
+// (replicateState, also a test-only state edit): common random numbers, so a
+// lever's measured worth is its expected worth there, not one roll of the
+// signup and churn draws.
 
 import {
   AERIAL_FT_PER_DAY,
@@ -484,7 +516,7 @@ export const SMART_DEFAULTS: SmartOptions = {
   buryGain: 0,
   stormWeight: 1,
   stormReserveYears: 2,
-  stormCovenantYears: 0,
+  stormCovenantYears: 1,
   convert: true,
   convertHits: 2,
   convertPaybackYears: 10,
@@ -1783,7 +1815,6 @@ function smartAct(state: GameState, send: Send, opts: SmartOptions, memo: SmartM
  */
 export const LEAN_OPTIONS: Partial<SmartOptions> = {
   troughCheck: true,
-  stormCovenantYears: 1,
   burnMonths: 2,
   installDays: 180,
   stormWeight: 1,
@@ -1971,10 +2002,17 @@ export const RURAL_OPTIONS: Partial<SmartOptions> = {
   borrowWhenShort: true,
   minNewUnits: 10,
   maxStreetCpp: Infinity,
-  // Round 3's cash rules (no storm reserve): the bot is about the bank's CPP
-  // spread, so it keeps borrowing for red lanes rather than holding cash.
+  // Round 3's cash rules (no storm reserve or storm cushion on its buffers):
+  // the bot is about the bank's CPP spread, so it keeps borrowing for red
+  // lanes rather than holding cash.
   stormReserveYears: 0,
   floorStormYears: 0,
+  stormCovenantYears: 0,
+  // Round 4c/4d: rural lanes are wooded and near the map's edge (storm-exposed,
+  // spec D), so it buries them; its cost per passing then stays red while it
+  // owes, even as the town fills in along its lanes (strung aerial, the new
+  // homes on them pulled it into amber for half its loan months).
+  methods: 'underground',
   name: 'rural',
 };
 
@@ -2479,7 +2517,8 @@ export interface AnswerExperiment {
  * intro promo (SMART_INTRO_PROMO) for new signups while it runs; or what
  * incumbent.bestIncumbentAnswer chooses at its start (that intro promo while
  * it runs, the retention offer, or nothing). Any later promo is ignored in
- * every case.
+ * every case. Each figure is the mean over EXPERIMENT_REPLICATES
+ * (replicateState).
  */
 export function incumbentAnswerExperiment(seed: number, month = ANSWER_EXPERIMENT_MONTH, months = ANSWER_EXPERIMENT_MONTHS): AnswerExperiment {
   const start = runBot(seed, smartBot(), month).state;
@@ -2509,9 +2548,13 @@ export function incumbentAnswerExperiment(seed: number, month = ANSWER_EXPERIMEN
         },
       };
     };
-    const run = runBot(seed, answering, months, { state: copyState(start) });
-    ocf[policy] = cumulativeOperatingCashFlow(run);
-    incumbentChurn[policy] = run.reports.reduce((t, r) => t + (r.ops?.incumbentChurn ?? 0), 0);
+    ocf[policy] = 0;
+    incumbentChurn[policy] = 0;
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, answering, months, { state: replicateState(start, r) });
+      ocf[policy] += cumulativeOperatingCashFlow(run) / EXPERIMENT_REPLICATES;
+      incumbentChurn[policy] += run.reports.reduce((t, report) => t + (report.ops?.incumbentChurn ?? 0), 0) / EXPERIMENT_REPLICATES;
+    }
   }
   return { cabinet, injected, chosen: best.kind, netValue: best.netValue, ocf, incumbentChurn };
 }
@@ -2550,7 +2593,8 @@ export interface PromoExperiment {
  * nothing is lit yet) with an
  * incumbent promo at its largest area (ensureIncumbentPromo), played on by
  * SMART (building as usual) with SMART_INTRO_PROMO for new signups while the
- * incumbent's promo runs, against SMART ignoring it.
+ * incumbent's promo runs, against SMART ignoring it (each the mean over
+ * EXPERIMENT_REPLICATES: replicateState).
  */
 export function freshPromoExperiment(seed: number): PromoExperiment {
   let start = runBot(seed, smartBot(), FRESH_PROMO_MONTH).state;
@@ -2561,8 +2605,12 @@ export function freshPromoExperiment(seed: number): PromoExperiment {
   ensureIncumbentPromo(start);
   const quote = quotePromo(start, SMART_INTRO_PROMO);
   const play = (incumbentAnswer: IncumbentAnswerPolicy) => {
-    const run = runBot(seed, smartBot({ incumbentAnswer, introPromo: SMART_INTRO_PROMO }), FRESH_PROMO_MONTHS, { state: copyState(start) });
-    return FRESH_PROMO_CHECK_MONTHS.map((m) => cumulativeOperatingCashFlow(run, m));
+    const flows = FRESH_PROMO_CHECK_MONTHS.map(() => 0);
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, smartBot({ incumbentAnswer, introPromo: SMART_INTRO_PROMO }), FRESH_PROMO_MONTHS, { state: replicateState(start, r) });
+      FRESH_PROMO_CHECK_MONTHS.forEach((m, i) => (flows[i] = (flows[i] ?? 0) + cumulativeOperatingCashFlow(run, m) / EXPERIMENT_REPLICATES));
+    }
+    return flows;
   };
   return { quote, withPromo: play('introPromo'), without: play('none') };
 }
@@ -2572,7 +2620,8 @@ export function freshPromoExperiment(seed: number): PromoExperiment {
  * SMART building nothing new until all its plant is live (at most
  * MATURE_SETTLE_MONTHS_MAX closes), played MATURE_PROMO_MONTHS on by SMART
  * building nothing new, with SMART_INTRO_PROMO set throughout against none
- * (any incumbent promo ignored).
+ * (any incumbent promo ignored), each the mean over EXPERIMENT_REPLICATES
+ * (replicateState).
  */
 export function maturePromoExperiment(seed: number): PromoExperiment {
   let start = runBot(seed, smartBot(), MATURE_PROMO_MONTH).state;
@@ -2582,8 +2631,12 @@ export function maturePromoExperiment(seed: number): PromoExperiment {
   }
   const quote = quotePromo(start, SMART_INTRO_PROMO);
   const play = (standingPromo: IntroPromo | null) => {
-    const run = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), MATURE_PROMO_MONTHS, { state: copyState(start) });
-    return [cumulativeOperatingCashFlow(run)];
+    let flow = 0;
+    for (let r = 0; r < EXPERIMENT_REPLICATES; r++) {
+      const run = runBot(seed, smartBot({ maxProjectsPerLook: 0, incumbentAnswer: 'none', standingPromo }), MATURE_PROMO_MONTHS, { state: replicateState(start, r) });
+      flow += cumulativeOperatingCashFlow(run) / EXPERIMENT_REPLICATES;
+    }
+    return [flow];
   };
   return { quote, withPromo: play(SMART_INTRO_PROMO), without: play(null) };
 }

@@ -107,7 +107,8 @@ import {
   cureOptions,
   estimateNextDebtService,
   estimateSweep,
-  formatMultiple,
+  perDollarWords,
+  yearsOfProfitWords,
   fundingHint,
   formatRateBps,
   maxSafeTermLoan,
@@ -537,9 +538,14 @@ describe('covenantCure', () => {
     const option = cureOptions(state)[0]!;
     const p = plan(state, 'covenantCure');
     expect(p.advice).toMatchObject({ severity: 'urgent', priority: ADVICE_PRIORITY.covenantCureUrgent, action: { kind: 'openPanel', panel: 'bank' } });
-    expect(text(p.advice)).toContain(option.text);
-    expect(text(p.advice)).toContain(formatMultiple(m.leverage!));
-    expect(text(p.advice)).toContain(formatMultiple(m.coverage!));
+    // The figures in the Bank's own words (spec G/H: no leverage, covenant or × in the summary, its disclosure included).
+    expect(text(p.advice)).toContain(`your debt is ${yearsOfProfitWords(m.leverage!)}`);
+    expect(text(p.advice)).toContain(`you earn ${perDollarWords(m.coverage!)} for every $1 of loan payments`);
+    expect(text(p.advice)).toContain(`your debt to ${yearsOfProfitWords(option.after.leverage!)}`);
+    expect(text(p.advice)).toContain(`leaving ${formatMoney(option.cashAfter)} in cash`);
+    expect(`${p.advice.title} ${text(p.advice)}`).not.toMatch(/×|leverage|covenant|term loan #|credit line/i);
+    const loan = state.debt.loans.find((l) => l.id === option.loan)!;
+    expect(p.advice.title).toBe(option.amount >= loan.balance ? `Pay off loan ${option.loan}` : `Pay ${formatMoney(option.amount)} off loan ${option.loan}`);
     expect(p.commands).toEqual([{ type: 'prepayLoan', loan: option.loan, amount: option.amount }]);
     const after = expectNoBackfire(state, p);
     expect(after.finance.cash).toBeGreaterThanOrEqual(estimateNextDebtService(after));
@@ -552,7 +558,9 @@ describe('covenantCure', () => {
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.covenantCureAtRisk });
     const option = cureOptions(far)[0]!;
     expect(option.kind).toBe('repayCredit');
-    expect(p.advice.title).toBe(`Repay ${formatMoney(option.amount)} of the credit line`);
+    expect(p.advice.title).toBe(`Pay back ${formatMoney(option.amount)} of emergency cash`);
+    expect(text(p.advice)).toContain(`Pay back ${formatMoney(option.amount)} of emergency cash`);
+    expect(text(p.advice)).toContain('a warning from the bank');
     expect(p.commands).toEqual([{ type: 'repayCredit', amount: option.amount }]);
     expectNoBackfire(far, p);
 
@@ -585,7 +593,8 @@ describe('covenantCure', () => {
     expect(m.compliant).toBe(true);
     const p = plan(state, 'covenantCure');
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.covenantCureAtRisk });
-    expect(text(p.advice)).toContain(formatMultiple(m.leverage!));
+    expect(text(p.advice)).toContain(`your debt is ${yearsOfProfitWords(m.leverage!)}`);
+    expect(text(p.advice)).not.toMatch(/×|leverage|covenant/i);
     expect(text(p.advice)).toContain('Hold off on new borrowing');
     expect(p.commands).toEqual([]);
   });
@@ -602,20 +611,23 @@ describe('frozenSweep', () => {
     const left = closesUntilAcceleration(state)!;
     const p = plan(state, 'frozenSweep');
     expect(p.advice).toMatchObject({ severity: 'important', priority: ADVICE_PRIORITY.frozenSweep, action: { kind: 'openPanel', panel: 'bank' } });
-    expect(p.advice.title).toBe(`Lift the freeze within ${left} closes`);
-    expect(text(p.advice)).toContain(`${left} more frozen closes`);
-    expect(text(p.advice)).toContain(`${COVENANT_CURE_CLOSES} compliant closes in a row`);
-    expect(text(p.advice)).toContain("today's figures still breach");
+    // The words the HUD chip, the Bank and the summary's badge use for the same state and countdown.
+    expect(p.advice.title).toBe(`Get back to borrowing within ${left} months`);
+    expect(p.advice.why).toBe(`The bank takes your spare cash each month and asks for every loan back in ${left} months.`);
+    expect(`${p.advice.title} ${p.advice.why}`).not.toMatch(/freeze|frozen|\bcalls?\b|closes?\b/i);
+    expect(text(p.advice)).toContain(`${left} more month closes`);
+    expect(text(p.advice)).toContain(`${COVENANT_CURE_CLOSES} good month closes in a row`);
+    expect(text(p.advice)).toContain("today's figures still fail them");
   });
 
   it("quotes the last close's sweep, and says when too few closes remain to cure it", () => {
     const state = fixture('v3-grid');
     state.finance.reports.at(-1)!.debt!.sweep = 4_321;
-    expect(text(plan(state, 'frozenSweep').advice)).toContain(`swept ${formatMoney(4_321)}`);
+    expect(text(plan(state, 'frozenSweep').advice)).toContain(`took ${formatMoney(4_321)} of your spare cash`);
     state.debt.frozenCloses = FROZEN_ACCELERATION_CLOSES - 1;
     const late = plan(state, 'frozenSweep').advice;
-    expect(text(late)).toContain('only repaying everything stops it');
-    expect(late.title).toBe(`Repay ${formatMoney(totalDebt(state))} before the loans are called`);
+    expect(text(late)).toContain('only paying back everything stops it');
+    expect(late.title).toBe(`Pay back ${formatMoney(totalDebt(state))} before the bank asks`);
   });
 
   it('does not fire unless frozen and not yet called', () => {

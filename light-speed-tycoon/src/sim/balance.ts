@@ -476,11 +476,19 @@ export const GRANDFATHER_MONTHS_MAX = 24;
  * share by the lock's reason: 1 for 'notice' (a rise passed on at the next
  * bill, grandfatherMonths 0), GRANDFATHER_STEP_SHARE for 'grandfather',
  * PROMO_STEP_SHARE for 'promo' (an intro promo ending).
+ * Round 4c/4d tuning: PRICE_STEP_CHURN_PER_RISE 0.4 -> 0.8 (a 15% rise passed
+ * on at the next bill now loses 12% of those customers at once) and
+ * GRANDFATHER_STEP_SHARE 0.5 -> 0.75, with PROMO_STEP_SHARE 0.5 -> 0.25 and
+ * RETENTION_STEP_SHARE 1 -> 0.5 so an intro promo's or a retention offer's
+ * end churns exactly as before. Happiness (customers.ts) now makes a price
+ * hiker's customers leave month by month for paying over the market, so its
+ * network was gone before many of them met a price step; the steps
+ * themselves had become the gentlest part of a hike (targets4 PRICE_HIKER).
  */
-export const PRICE_STEP_CHURN_PER_RISE = 0.4;
+export const PRICE_STEP_CHURN_PER_RISE = 0.8;
 export const PRICE_STEP_CHURN_MAX = 0.5;
-export const GRANDFATHER_STEP_SHARE = 0.5;
-export const PROMO_STEP_SHARE = 0.5;
+export const GRANDFATHER_STEP_SHARE = 0.75;
+export const PROMO_STEP_SHARE = 0.25;
 /**
  * A tier no longer offered: at the next close each of its units moves to the
  * offered tier nearest in price (ties: the cheaper) or cancels, with
@@ -521,9 +529,14 @@ export const INCUMBENT_PROMO_QUIET_MONTHS = 6;
  * incumbent's promo runs there. Round 4b: 0.01 -> 0.03: ignoring a promo now
  * costs about a sixth of the area's subscribers over its six months, so
  * answering it matters (at 1% no answer beat ignoring it by more than the
- * game's own noise).
+ * game's own noise). Round 4c/4d tuning: 0.03 -> 0.05 (spec C: answering
+ * must matter in the areas a promo targets). With happiness the promo's pull
+ * is the price-vs-cable factor (HAPPINESS_PER_PRICE_OVER_CABLE follows this
+ * value), and at 3% the best answer beat ignoring it on only two of five
+ * tuning towns; at 5% ignoring it costs about a quarter of the area's
+ * customers over its six months.
  */
-export const INCUMBENT_PROMO_CHURN = 0.03;
+export const INCUMBENT_PROMO_CHURN = 0.05;
 /**
  * The most a unit's total churn probability at a close may be (regular +
  * price step + outage + incumbent), so a bad month never empties a network
@@ -616,8 +629,15 @@ export const ADVICE_SNOOZE_URGENT_MONTHS = 1;
  * limits pro forma (leverage at most COVENANT_MAX_LEVERAGE x (1 - this),
  * coverage at least COVENANT_MIN_COVERAGE x (1 + this); debt.covenantsWithin),
  * so following the advice never brings the advisor's own covenant-risk warning.
+ * Round 4c/4d tuning: 0.15 -> 0.25 (also SUGGESTED_BORROWING_HEADROOM). With
+ * the scaled overhead a thin network's cash flow falls as new plant comes
+ * on (its per-cabinet and per-mile costs) before the new area pays, and a
+ * second financed build two months after the first was priced on a trailing
+ * year that did not show the first's costs yet: at 15% an advisor-follower at
+ * Bootstrapped breached its coverage covenant and defaulted (spec B: never
+ * bust from the advice).
  */
-export const EXPAND_COVENANT_HEADROOM = 0.15;
+export const EXPAND_COVENANT_HEADROOM = 0.25;
 /** expand: months of the new area's expected installs (connect capex) kept in reserve on top of EXPAND_RESERVE_MONTHS of running costs. */
 export const EXPAND_INSTALL_MONTHS = 6;
 /** Bank: the term-loan builder starts at the largest loan this far inside the covenant limits (debt.maxSafeTermLoan headroom), not exactly on them. */
@@ -688,9 +708,11 @@ export const DEMAND_RESERVATION_SOFTNESS = 0.15;
  * Round 4c/4d tuning: 0.05 -> 0.07. Happy customers' word of mouth keeps an
  * area growing past where round 4b's settled, so a mature area needs a
  * larger step before the next promo (the target: at most two per area in
- * five years).
+ * five years). Round 4c/4d tuning: 0.07 -> 0.1 with INCUMBENT_PROMO_CHURN
+ * 0.05: a promo now knocks an area's take further down, and an aggressive
+ * operator's area climbed back past the old step to a third promo.
  */
-export const INCUMBENT_PROMO_RETRIGGER_POINTS = 0.07;
+export const INCUMBENT_PROMO_RETRIGGER_POINTS = 0.1;
 /**
  * answerIncumbent: whole percent off the list price for the area's
  * subscribers until the promo ends. Round 4b tuning: 15 -> 12, with
@@ -704,8 +726,10 @@ export const RETENTION_PERCENT_OFF = 12;
  * GRANDFATHER_STEP_SHARE / PROMO_STEP_SHARE). Round 4b tuning: 0.25 -> 1 (the
  * discount ends like a rise passed on at the next bill), so a retention offer
  * made with a close or two left costs more at its end than it saves.
+ * Round 4c/4d tuning: 1 -> 0.5 with PRICE_STEP_CHURN_PER_RISE 0.4 -> 0.8:
+ * the same churn at the offer's end as before.
  */
-export const RETENTION_STEP_SHARE = 1;
+export const RETENTION_STEP_SHARE = 0.5;
 /**
  * While an intro promo is set, the signup ramp is multiplied by
  * 1 + PROMO_SIGNUP_BOOST x percentOff / 100 (households switch sooner for a
@@ -812,13 +836,20 @@ export const OVERHEAD_BASE_PER_MONTH = 2_500;
  * $4) a lineup 17% below the defaults earned nearly as much per customer and
  * signed many more, so it dominated on 5-year value; at $8 neither
  * dominates (spec I.7). It also slows the Seed round's break-even toward
- * spec A's band now that the base is small.
+ * spec A's band now that the base is small. Round 4c/4d tuning (second
+ * pass): 8 -> 9, with the per-plant costs below.
  */
-export const OVERHEAD_PER_CUSTOMER_PER_MONTH = 8;
-/** Per live cabinet per month (power, cooling, inspections, truck rolls): part of the per-plant line. */
-export const OVERHEAD_PER_CABINET_PER_MONTH = 200;
+export const OVERHEAD_PER_CUSTOMER_PER_MONTH = 9;
+/**
+ * Per live cabinet per month (power, cooling, inspections, truck rolls): part of the per-plant line.
+ * Round 4c/4d tuning: 200 -> 250, and OVERHEAD_PER_MILE_PER_MONTH 100 -> 125 (with the per-customer
+ * cost 8 -> 9): a network costs more to run as it grows, so the Seed round's careful operator, which
+ * borrows against its cash flow, passes about 60% of the town at month 60 (spec A: 55-65%; it passed
+ * 67%) while Bootstrapped and Shoestring, whose networks are small, are barely touched.
+ */
+export const OVERHEAD_PER_CABINET_PER_MONTH = 250;
 /** Per route-mile (5,280 ft) of live cable per month (locates, patrols, plant records): the rest of the per-plant line. */
-export const OVERHEAD_PER_MILE_PER_MONTH = 100;
+export const OVERHEAD_PER_MILE_PER_MONTH = 125;
 
 // Support level (customers.ts, overhead.ts) -------------------------------------
 
@@ -838,10 +869,14 @@ export interface SupportLevelSpec {
  * $7 / +0.3 -> $6 / +0.6, so Great pays where outages keep customers
  * unhappy (high exposure, long horizons) and not where they are rare (spec
  * I.7); at +0.3 it never lifted a customer out of an outage's unhappiness
- * and never paid.
+ * and never paid. Basic -0.4 -> -0.6: at -0.4 its customers were merely
+ * okay, and the $2 it saved a customer was worth more than the few extra
+ * cancellations over three years on a storm-hit network (spec I.7: Basic
+ * saves money but costs customers); at -0.6 they are unhappy (no word of
+ * mouth, churn x1.6).
  */
 export const SUPPORT_LEVELS: Readonly<Record<SupportLevel, SupportLevelSpec>> = {
-  basic: { id: 'basic', name: 'Basic', costPerSub: 2, happiness: -0.4 },
+  basic: { id: 'basic', name: 'Basic', costPerSub: 2, happiness: -0.6 },
   good: { id: 'good', name: 'Good', costPerSub: 4, happiness: 0 },
   great: { id: 'great', name: 'Great', costPerSub: 6, happiness: 0.6 },
 };
@@ -934,8 +969,14 @@ export const REFERRAL_WOM_MULTIPLIER = 2;
  */
 export const HAPPY_SCORE_MIN = -0.2;
 export const UNHAPPY_SCORE_MAX = -0.5;
-/** The happiest customers still churn at this share of CHURN_MONTHLY_BASE. Round 4c/4d tuning: 0.5 -> 0.7, so Great support and a cheap lineup cannot halve churn (a cheaper lineup dominated). */
-export const HAPPY_CHURN_FLOOR = 0.7;
+/**
+ * The happiest customers still churn at this share of CHURN_MONTHLY_BASE. Round 4c/4d tuning: 0.5 -> 0.7, so
+ * Great support and a cheap lineup cannot halve churn (a cheaper lineup dominated); 0.7 -> 0.8 (second pass), so
+ * Great support earns its keep by lifting customers out of an outage's unhappiness, not by trimming the churn of
+ * customers with nothing to complain about: on networks with few outages it paid over a single year (spec I.7:
+ * Great pays only with high outage exposure or long horizons).
+ */
+export const HAPPY_CHURN_FLOOR = 0.8;
 /** Score lost per day without service in the recent past (outages within HAPPINESS_OUTAGE_MEMORY_DAYS of the last). */
 export const HAPPINESS_PER_OUTAGE_DAY = 0.1;
 /** Round 4c/4d tuning: 90 -> 180, so outages weigh on happiness long enough for support to matter where storms are frequent. */
@@ -1002,8 +1043,13 @@ export const CUSTOMER_QUOTE_MONTHS = 12;
  * Round 4c (spec C): the intro promo's signup boost (PROMO_SIGNUP_BOOST)
  * applies only on streets lit within this many months (a freshly lit area),
  * so a standing promo in a mature town discounts every signup for little.
+ * Round 4c/4d tuning: 12 -> 6. A careful operator keeps lighting streets
+ * until its last year, so at a year a "mature" town still held enough young
+ * streets for a standing promo to pay its way there (spec C: it must pay only
+ * in freshly lit or contested areas); half a year is still the whole ramp of
+ * a newly lit street's first signups.
  */
-export const PROMO_BOOST_YOUNG_MONTHS = 12;
+export const PROMO_BOOST_YOUNG_MONTHS: number = 6;
 
 // Storm economics (weather.ts, terrain.ts; spec D) ------------------------------------
 

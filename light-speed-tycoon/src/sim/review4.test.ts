@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { ADVICE_PRIORITY, advicePlans, advise, buildBriefing, growthOptions, noticeNeedsAttention, planFor } from './advisor';
-import { COVENANT_CURE_CLOSES, CPP_AMBER_MULTIPLIER, CPP_SPREAD_BPS, CPP_TARGET, MARKETING_MAX_PER_MONTH, MAX_SPLITTERS_PER_CABINET } from './balance';
+import { COVENANT_CURE_CLOSES, CPP_AMBER_MULTIPLIER, CPP_SPREAD_BPS, CPP_TARGET, LOAN_ROUNDING, MARKETING_MAX_PER_MONTH, MAX_SPLITTERS_PER_CABINET } from './balance';
 import { formatMonth, dateOf } from './calendar';
 import {
   closesUntilAcceleration,
@@ -517,7 +517,13 @@ describe('#9 covenant cures and the bank\'s call', () => {
   });
 
   it('once the loans are called, suggests repaying everything when cash covers it, never a growth target', () => {
-    const state = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.finance.cash >= totalDebt(s));
+    // Round 4c/4d: the hoarder's first called close may hold barely more cash than it owes (not the accrued interest and
+    // the cushion repaying everything also needs: debt.repayAllCure), so the case is that close with the cash a better
+    // year would have left.
+    const called = firstClose(hoarder(), 1, (s) => s.debt.acceleration !== null && s.gameOver === null);
+    const state = structuredClone(called);
+    for (let i = 0; i < 100 && cureFor(state)?.kind !== 'repayAll'; i++) state.finance.cash += LOAN_ROUNDING;
+    expect(state.finance.cash).toBeGreaterThanOrEqual(totalDebt(state));
     expect(state.debt.acceleration).not.toBeNull();
     expect(cureOptions(state)[0]?.kind).toBe('grow');
     const plans = advicePlans(state);

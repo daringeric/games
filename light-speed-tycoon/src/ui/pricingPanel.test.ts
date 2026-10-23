@@ -435,7 +435,8 @@ describe('when an intro promo pays (round 4b)', () => {
         (quote.extraSignups < 1 ? 'less than one more signup' : `about ${quote.extraSignups} more signup`),
     );
     expect(line).toContain(`${roughMoney(quote.valueGained)} of margin against ${roughMoney(quote.discountCost)} of discounts.`);
-    expect(line).toMatch(/[Pp]ays/);
+    // The verdict either way (whether this offer pays here is the balance's call: PROMO_BOOST_YOUNG_MONTHS).
+    expect(line).toMatch(quote.pays ? /^Pays now/ : /^Doesn't pay/);
     // An offer that is not valid: the general advice.
     d.promo.percentOff = Number.NaN;
     expect(promoAdviceLine(state, d)).toBe(quotePromo(state, null).advice);

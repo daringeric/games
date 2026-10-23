@@ -30,6 +30,7 @@ import {
   NOTICE_LOG_MAX,
   PRICE_STEP_CHURN_MAX,
   PRICE_STEP_CHURN_PER_RISE,
+  PROMO_BOOST_YOUNG_MONTHS,
   PROMO_HORIZON_MONTHS,
   PROMO_MAX_MONTHS,
   PROMO_MAX_PERCENT_OFF,
@@ -2150,7 +2151,7 @@ describe('quotePromo', () => {
     expect(quotePromo(litTown().state, { ...SUGGESTED_PROMO }).pays).toBe(true);
     const settled = quotePromo(state, { ...SUGGESTED_PROMO });
     expect(settled.pays).toBe(false);
-    expect(settled.advice).toMatch(/^Doesn't pay now: your streets were lit over a year ago/);
+    expect(settled.advice.startsWith(`Doesn't pay now: your streets were lit over ${PROMO_BOOST_YOUNG_MONTHS === 12 ? 'a year' : `${PROMO_BOOST_YOUNG_MONTHS} months`} ago`), settled.advice).toBe(true);
     // Everyone who wants fiber signed up: nobody waits, nothing to gain.
     state.sales.accounts = state.city.parcels.map((p) => account(p.id, state.network.cabinets[0]!.id, { fiber1g: 1 }));
     expect(quotePromo(state, { ...SUGGESTED_PROMO })).toMatchObject({ waitingUnits: 0, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
@@ -2175,8 +2176,10 @@ describe('quotePromo', () => {
     expect(promoAdvice(quote({}), 0, 0)).toMatch(/^Pays now: about 40 households are waiting/);
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 30, 0)).toMatch(/^Doesn't pay at this discount/);
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 30)).toMatch(/^Doesn't pay at this discount/);
+    // Balance symbolic: the young-street window is PROMO_BOOST_YOUNG_MONTHS ("a year" at 12).
+    const ago = PROMO_BOOST_YOUNG_MONTHS === 12 ? 'a year' : `${PROMO_BOOST_YOUNG_MONTHS} months`;
     expect(promoAdvice(quote({ pays: false, valueGained: 500 }), 0, 0)).toBe(
-      "Doesn't pay now: your streets were lit over a year ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.",
+      `Doesn't pay now: your streets were lit over ${ago} ago, so it would mostly discount people who would sign up anyway; it pays when you light new areas.`,
     );
     expect(promoAdvice(quote({ waitingUnits: 0 }), 0, 0)).toMatch(/^Nobody is waiting/);
     expect(promoAdvice(quote({ waitingUnits: 1 }), 1, 0)).toMatch(/^Pays now: about 1 household on newly lit streets is waiting/);
@@ -2186,7 +2189,11 @@ describe('quotePromo', () => {
     const q = quotePromo(litTown().state, null);
     expect(q).toMatchObject({ ok: true, promo: null, extraSignups: 0, discountCost: 0, valueGained: 0, pays: false });
     expect(q.waitingUnits).toBeGreaterThan(0);
-    expect(q.advice).toMatch(/speeds up signups on streets lit in the last year and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway\.$/);
+    const span = PROMO_BOOST_YOUNG_MONTHS === 12 ? 'the last year' : `the last ${PROMO_BOOST_YOUNG_MONTHS} months`;
+    expect(
+      q.advice.endsWith(`speeds up signups on streets lit in ${span} and where the cable company runs a promo; in a mature town it mostly discounts people who would sign up anyway.`),
+      q.advice,
+    ).toBe(true);
   });
 
   it('counts only one cabinet\'s streets when asked', () => {

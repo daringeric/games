@@ -429,9 +429,9 @@ describe('awareness', () => {
 
 describe('why homes have not switched', () => {
   function checkSums(r: ReturnType<typeof whyNotSwitched>['overall']): void {
-    expect(r.unaware + r.notWorth + r.tooExpensive + r.waiting).toBe(r.unsigned);
+    expect(r.unaware + r.deciding + r.notWorth + r.tooExpensive + r.waiting).toBe(r.unsigned);
     expect(r.unsigned).toBe(r.passings - r.subscribed);
-    for (const n of [r.unaware, r.notWorth, r.tooExpensive, r.waiting, r.notLit]) expect(Number.isInteger(n) && n >= 0).toBe(true);
+    for (const n of [r.unaware, r.deciding, r.notWorth, r.tooExpensive, r.waiting, r.notLit]) expect(Number.isInteger(n) && n >= 0).toBe(true);
   }
 
   it('gives every lit unsigned household exactly one reason, per street, area and overall', () => {
@@ -458,18 +458,44 @@ describe('why homes have not switched', () => {
     checkSums(r);
   });
 
-  it('splits the gap by awareness: the unaware share, and the aware share not worth switching yet', () => {
+  it('splits the gap by awareness: the unaware share, and the aware share deciding (they switch at your prices, in time)', () => {
     const fresh = litTown({ aware: 0 });
     const known = litTown({ aware: 1 });
     const a = whyNotSwitched(fresh.state).overall;
     const b = whyNotSwitched(known.state).overall;
     expect(a.unaware).toBeGreaterThan(0);
     expect(b.unaware).toBe(0);
-    expect(a.unaware + a.notWorth).toBe(b.notWorth);
+    expect(a.deciding).toBe(0);
+    expect(a.unaware).toBe(b.deciding);
+    // Not worth switching at your price is only the households beyond the ceiling: awareness never moves them.
+    expect(a.notWorth).toBe(b.notWorth);
     expect(a.waiting + b.waiting + a.tooExpensive + b.tooExpensive).toBe(0);
     // Halfway: about half the gap is unaware.
     const half = whyNotSwitched(litTown({ aware: 0.5 }).state).overall;
     expect(Math.abs(half.unaware - a.unaware / 2)).toBeLessThanOrEqual(whyNotSwitched(fresh.state).areas.length + 8);
+  });
+
+  it('a campaign moves homes from "don\'t know you" to deciding, never to "not worth switching at your price" (no price changed)', () => {
+    const { state, cabinet } = litTown();
+    runDays(state, 10);
+    const withCampaign = deserialize(serialize(state));
+    expect(applyCommand(withCampaign, { type: 'runCampaign', cabinet }).ok).toBe(true);
+    runDays(state, 60);
+    runDays(withCampaign, 60);
+    const without = whyNotSwitched(state).overall;
+    const campaign = whyNotSwitched(withCampaign).overall;
+    expect(campaign.unaware).toBeLessThan(without.unaware);
+    expect(campaign.deciding).toBeGreaterThan(without.deciding);
+    // The ceiling at today's prices sets who is not worth it: the same on both copies (both inside their targets).
+    expect(campaign.notWorth).toBe(without.notWorth);
+    // Those deciding are inside the target: with no price change they keep switching.
+    let deciding = campaign.deciding;
+    const later = deserialize(serialize(withCampaign));
+    const before = subscriberUnits(later);
+    runDays(later, 240);
+    expect(subscriberUnits(later) - before).toBeGreaterThan(0);
+    deciding = whyNotSwitched(later).overall.deciding;
+    expect(deciding).toBeLessThan(campaign.deciding);
   });
 
   it('counts households no offered plan suits as too expensive', () => {
@@ -497,7 +523,8 @@ describe('why homes have not switched', () => {
     state.sales.installsPaused = true;
     const paused = whyNotSwitched(state).overall;
     expect(paused.waiting).toBe(gap);
-    expect(paused.notWorth).toBe(normal.notWorth - gap);
+    expect(paused.deciding).toBe(normal.deciding - gap);
+    expect(paused.notWorth).toBe(normal.notWorth);
     state.sales.installsPaused = false;
     state.sales.fullCabinets = [cabinet];
     expect(whyNotSwitched(state).overall).toEqual(paused);

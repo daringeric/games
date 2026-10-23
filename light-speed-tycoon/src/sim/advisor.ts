@@ -157,9 +157,11 @@ import {
   covenantsWithin,
   estimateNextDebtService,
   estimateSweep,
-  formatMultiple,
   formatRateBps,
   fundingHint,
+  LEVERAGE_LIMIT_WORDS,
+  perDollarWords,
+  yearsOfProfitWords,
   maxSafeTermLoan,
   pricingCpp,
   quoteDraw,
@@ -213,6 +215,7 @@ import type {
   Command,
   CommandResult,
   CovenantMetrics,
+  CureOption,
   FundingHint,
   GameState,
   GrowthOption,
@@ -1153,20 +1156,64 @@ function loansCalledRule(state: GameState, r: Readings): AdvicePlan | null {
   return plan(makeAdvice('loansCalled', ADVICE_PRIORITY.loansCalled, title, why, BANK, 'loansCalled', { detail: `${lead} ${next}` }));
 }
 
-/** "leverage 6.48× (limit 5.00×) and coverage 0.60× (minimum 1.20×)" */
-function covenantFigures(m: CovenantMetrics): string {
-  const leverage = m.leverage === null ? 'leverage unmeasurable (no cash flow to measure it against)' : `leverage ${formatMultiple(m.leverage)} (limit ${formatMultiple(COVENANT_MAX_LEVERAGE)})`;
-  const coverage = m.coverage === null ? 'nothing scheduled' : `coverage ${formatMultiple(m.coverage)} (minimum ${formatMultiple(COVENANT_MIN_COVERAGE)})`;
-  return `${leverage} and ${coverage}`;
+/**
+ * The bank's two checks in the Bank's own plain words (spec G/H: no
+ * leverage, covenant or × in the month summary, its disclosure included):
+ * "your debt is 14.3 years of profit (the bank's limit is 5), and you earn
+ * $1.04 for every $1 of loan payments (it wants at least $1.20)".
+ */
+function checksInWords(m: CovenantMetrics): string {
+  const debt =
+    m.totalDebt <= 0
+      ? 'you owe nothing'
+      : m.leverage === null
+        ? `you have no profit yet to measure your debt against (the bank's limit is ${LEVERAGE_LIMIT_WORDS} years of profit)`
+        : `your debt is ${yearsOfProfitWords(m.leverage)} (the bank's limit is ${LEVERAGE_LIMIT_WORDS})`;
+  const earn =
+    m.coverage === null
+      ? 'you have no loan payments yet'
+      : `you earn ${perDollarWords(m.coverage)} for every $1 of loan payments (it wants at least ${perDollarWords(COVENANT_MIN_COVERAGE)})`;
+  return `${debt}, and ${earn}`;
 }
 
-/** What the next breached close does at each stage. */
+/** The checks after a cure, in the same words: "your debt to 3.5 years of profit and $1.20 earned for every $1 of loan payments". */
+function checksAfterInWords(m: CovenantMetrics): string {
+  const debt =
+    m.totalDebt <= 0 ? 'no debt left' : m.leverage === null ? 'your debt still with no profit to measure it against' : `your debt to ${yearsOfProfitWords(m.leverage)}`;
+  const earn = m.coverage === null ? 'no loan payments' : `${perDollarWords(m.coverage)} earned for every $1 of loan payments`;
+  return `${debt} and ${earn}`;
+}
+
+/** What the next failed check does at each stage, in the Bank's slip-ladder words. */
 const NEXT_BREACH: Record<GameState['debt']['covenant']['stage'], string> = {
-  compliant: 'a breach there brings a warning',
-  warning: 'a second breach brings the penalty rate',
-  penalty: 'another breach freezes the credit line',
-  frozen: `the freeze lasts until ${COVENANT_CURE_CLOSES} compliant closes in a row`,
+  compliant: 'failing it there brings a warning from the bank',
+  warning: 'a second slip makes every loan cost more',
+  penalty: 'another slip stops your borrowing and the bank starts taking your spare cash',
+  frozen: `borrowing stays stopped until ${count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes')} in a row`,
 };
+
+/** A cure (debt.cureFor) in plain words: what to pay, and where it leaves the bank's checks and your cash. */
+function cureInWords(option: CureOption, state: GameState): string {
+  const leaves = `, leaving ${money(option.cashAfter)} in cash.`;
+  switch (option.kind) {
+    case 'repayCredit':
+      return `Pay back ${money(option.amount)} of emergency cash: at today's figures that brings ${checksAfterInWords(option.after)}${leaves}`;
+    case 'prepayLoan': {
+      const loan = state.debt.loans.find((l) => l.id === option.loan);
+      const what = loan && option.amount >= loan.balance ? `Pay off loan ${option.loan} (${money(option.amount)})` : `Pay ${money(option.amount)} off loan ${option.loan} early`;
+      return `${what}: at today's figures that brings ${checksAfterInWords(option.after)}${leaves}`;
+    }
+    case 'repayAll':
+      return `Pay back everything you owe (${money(option.amount)}): with no debt the bank clears everything at the next month close${leaves}`;
+    case 'grow': {
+      const from = option.after.annualOperatingCashFlow - option.amount;
+      return (
+        `No single repayment fixes it: about ${money(option.amount)} a year more profit (yearly bills less running costs) would, ` +
+        `from ${money(from)} to ${money(option.after.annualOperatingCashFlow)} a year, bringing ${checksAfterInWords(option.after)}.`
+      );
+    }
+  }
+}
 
 /**
  * covenantCure: a covenant breached at today's figures (urgent while the
@@ -1180,8 +1227,9 @@ const NEXT_BREACH: Record<GameState['debt']['covenant']['stage'], string> = {
  * happens). Or, compliant but within COVENANT_RISK_MARGIN of a limit,
  * important: hold off on borrowing (beyond what an earlier suggestion, the
  * payment the next close must make, borrows: Claims.newDebt). Never "borrow
- * more". Open Bank. Round 4c/4d: the card speaks of "the bank's checks";
- * the covenant figures are in its detail.
+ * more". Open Bank. Round 4c/4d: the card and its detail speak the Bank's
+ * words ("the bank's checks", "years of profit", "for every $1 of loan
+ * payments", "loan 1", "emergency cash"), never leverage, covenants or ×.
  */
 function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
   if (r.debt() === 0) return null;
@@ -1196,36 +1244,36 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
     if (!inTime && (!option || option.kind !== 'repayAll')) return null;
     const lead = !inTime
       ? state.debt.acceleration !== null
-        ? 'The bank has called your loans: a covenant cure does not end the call, only repaying everything does.'
-        : `At today's figures ${covenantFigures(m)} breach the covenants, and lifting the freeze takes ${COVENANT_CURE_CLOSES} compliant closes in a row, ` +
-          `more than remain before the bank calls the loans: only repaying everything stops it.`
-      : `At today's figures ${covenantFigures(m)} breach the covenants, and the ${close} close tests them again: ${NEXT_BREACH[stage]}.`;
+        ? 'The bank has asked for every loan back: passing its checks again does not stop that, only paying back everything does.'
+        : `At today's figures ${checksInWords(m)}, so you fail the bank's checks. Getting back to borrowing takes ` +
+          `${count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes')} in a row, more than remain before the bank asks for every loan back: only paying back everything stops it.`
+      : `At today's figures ${checksInWords(m)}, so you fail the bank's checks, and the ${close} close checks again: ${NEXT_BREACH[stage]}.`;
     const growWhy: Wording = [
       `You fail the bank's checks and can't repay enough: grow profit and don't borrow.`,
       `You fail the bank's checks: grow profit and don't borrow.`,
     ];
     if (!option) {
-      const detail = `${lead} No single repayment cures it: grow operating cash flow (more subscribers, lower costs) and do not borrow more.`;
+      const detail = `${lead} No single repayment fixes it: grow your profit (more customers, lower costs) and do not borrow more.`;
       return plan(makeAdvice('covenantCure', priority, "Grow cash flow to pass the bank's checks", growWhy, BANK, 'covenantCure', { detail }));
     }
     let title: Wording;
     let why: Wording;
     let commands: Command[] = [];
     if (option.kind === 'repayAll') {
-      title = [`Repay all ${money(option.amount)} you owe`, 'Repay everything you owe'];
+      title = [`Pay back all ${money(option.amount)} you owe`, 'Pay back everything you owe'];
       commands = repayAllCommands(state);
       why = !inTime
-        ? ['Only repaying everything you owe stops the bank calling your loans.']
-        : [`You fail the bank's checks, and repaying everything you owe clears them.`];
+        ? ['Only paying back everything you owe stops the bank asking for every loan back.', 'Only paying back everything stops the bank asking for it.']
+        : [`You fail the bank's checks, and paying back everything you owe clears them.`];
     } else if (option.kind === 'repayCredit') {
-      title = [`Repay ${money(option.amount)} of the credit line`, `Repay ${money(option.amount)} of the line`];
+      title = [`Pay back ${money(option.amount)} of emergency cash`, 'Pay back emergency cash'];
       commands = [{ type: 'repayCredit', amount: option.amount }];
-      why = [`At today's figures you fail the bank's checks; repaying ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
+      why = [`At today's figures you fail the bank's checks; paying back ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
     } else if (option.kind === 'prepayLoan' && option.loan !== null) {
       const loan = state.debt.loans.find((l) => l.id === option.loan);
-      title = loan && option.amount >= loan.balance ? `Pay off term loan #${option.loan}` : [`Prepay ${money(option.amount)} of term loan #${option.loan}`, `Prepay ${money(option.amount)} of a term loan`];
+      title = loan && option.amount >= loan.balance ? `Pay off loan ${option.loan}` : [`Pay ${money(option.amount)} off loan ${option.loan}`, 'Pay part of a loan off early'];
       commands = [{ type: 'prepayLoan', loan: option.loan, amount: option.amount }];
-      why = [`At today's figures you fail the bank's checks; repaying ${money(option.amount)} fixes that.`, `You fail the bank's checks; this repayment fixes that.`];
+      why = [`At today's figures you fail the bank's checks; paying ${money(option.amount)} early fixes that.`, `You fail the bank's checks; this early payment fixes that.`];
     } else {
       // On the same basis as its text: today's operating cash flow raised to this.
       const to = Math.round(option.after.annualOperatingCashFlow / LOAN_ROUNDING) * LOAN_ROUNDING;
@@ -1233,17 +1281,17 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
       why = growWhy;
     }
     const spend = commands.length > 0 ? state.finance.cash - option.cashAfter : 0;
-    return plan(makeAdvice('covenantCure', priority, title, why, BANK, 'covenantCure', { detail: `${lead} ${option.text}` }), commands, spend);
+    return plan(makeAdvice('covenantCure', priority, title, why, BANK, 'covenantCure', { detail: `${lead} ${cureInWords(option, state)}` }), commands, spend);
   }
   const leverageNear = m.totalDebt > 0 && m.leverage !== null && m.leverage > COVENANT_MAX_LEVERAGE * (1 - COVENANT_RISK_MARGIN);
   const coverageNear = m.coverage !== null && m.coverage < COVENANT_MIN_COVERAGE * (1 + COVENANT_RISK_MARGIN);
   if (!leverageNear && !coverageNear) return null;
   const hold = r.claims.newDebt
-    ? 'Beyond the borrowing suggested above (it covers the payment and stays within the covenants), hold off on new borrowing and keep cash flow growing'
-    : 'Hold off on new borrowing and keep cash flow growing';
+    ? "Beyond the borrowing suggested above (it covers the payment and stays inside the bank's limits), hold off on new borrowing and keep your profit growing"
+    : 'Hold off on new borrowing and keep your profit growing';
   const detail =
-    `At today's figures ${covenantFigures(m)} pass, but only just: a weak month or more borrowing would breach them at the ${close} close. ` +
-    `${hold}; repaying debt widens the margin.`;
+    `At today's figures ${checksInWords(m)}: you pass the bank's checks, but only just, and a weak month or more borrowing would fail them at the ${close} close. ` +
+    `${hold}; paying back debt widens the margin.`;
   const why: Wording = r.claims.newDebt
     ? [`You pass the bank's checks only just: borrow nothing beyond the payment above.`]
     : [`You pass the bank's checks only just: hold off on new borrowing.`];
@@ -1253,9 +1301,13 @@ function covenantCureRule(state: GameState, r: Readings): AdvicePlan | null {
 /**
  * frozenSweep (important): frozen with debt and not yet called: the sweep
  * at the last close (report.debt.sweep) and the next (debt.estimateSweep),
- * the closes until the bank calls the loans (debt.closesUntilAcceleration),
- * and what lifts the freeze (COVENANT_CURE_CLOSES compliant closes in a
- * row), or that too few closes remain for that. Open Bank.
+ * the month closes until the bank asks for every loan back
+ * (debt.closesUntilAcceleration), and what gets borrowing back
+ * (COVENANT_CURE_CLOSES good closes in a row), or that too few remain for
+ * that. Round 4c/4d: in the words the HUD chip, the Bank and the summary's
+ * badge use ("no more borrowing", "asks for every loan back in N months");
+ * the bank's own terms (frozen, compliant closes) only in the detail, next
+ * to their plain meaning. Open Bank.
  */
 function frozenSweepRule(state: GameState, r: Readings): AdvicePlan | null {
   if (state.debt.covenant.stage !== 'frozen' || state.debt.acceleration !== null || r.debt() === 0) return null;
@@ -1266,29 +1318,31 @@ function frozenSweepRule(state: GameState, r: Readings): AdvicePlan | null {
   const compliantNow = r.metrics().compliant;
   const done = compliantNow ? state.debt.covenant.compliantCloses : 0;
   const needed = Math.max(1, COVENANT_CURE_CLOSES - done);
-  const swept = last > 0 ? `swept ${money(last)} at the last close and ` : '';
+  const swept = last > 0 ? `took ${money(last)} of your spare cash at the last close and ` : '';
   const takes =
     next > 0
       ? `will take about ${money(next)} at the ${close} close`
-      : `takes ${pct(FROZEN_SWEEP_SHARE)} of each month's positive operating cash flow (none expected at the ${close} close)`;
-  const call = left <= 0 ? 'calls the loans at the next frozen close' : `calls the loans after ${count(left, 'more frozen close', 'more frozen closes')}`;
-  const lead = `While your credit line is frozen the bank ${swept}${takes}, and it ${call}.`;
+      : `takes ${pct(FROZEN_SWEEP_SHARE)} of each month's spare cash (none expected at the ${close} close)`;
+  const months = (n: number) => count(n, 'month', 'months');
+  const call = left <= 0 ? 'asks for every loan back at the next month close' : `asks for every loan back after ${count(left, 'more month close', 'more month closes')} like this`;
+  const lead = `While your borrowing is stopped (the bank has frozen your credit line) the bank ${swept}${takes}, and it ${call}.`;
   const canCure = needed <= Math.max(1, left);
+  const goodCloses = count(COVENANT_CURE_CLOSES, 'good month close', 'good month closes');
   const lift = canCure
-    ? `${COVENANT_CURE_CLOSES} compliant closes in a row lift the freeze (${compliantNow ? `today's figures pass; ${done} so far` : "today's figures still breach"}).`
-    : `Lifting the freeze takes ${COVENANT_CURE_CLOSES} compliant closes in a row, more than remain before the call: only repaying everything stops it.`;
+    ? `${goodCloses} in a row (passing both of the bank's checks, its covenants) get your borrowing back (${compliantNow ? `today's figures pass; ${done} so far` : "today's figures still fail them"}).`
+    : `Getting your borrowing back takes ${goodCloses} in a row, more than remain before the bank asks for every loan back: only paying back everything stops it.`;
   const title: Wording = !canCure
-    ? [`Repay ${money(r.debt())} before the loans are called`, 'Repay everything before the loans are called']
+    ? [`Pay back ${money(r.debt())} before the bank asks`, 'Pay back everything before the bank asks']
     : left <= 0
-      ? 'The bank calls the loans at the next close'
-      : `Lift the freeze within ${count(left, 'close', 'closes')}`;
+      ? 'The bank asks for every loan back next month'
+      : `Get back to borrowing within ${months(left)}`;
   const why: Wording = !canCure
-    ? ['Too few closes remain to lift the freeze: only repaying everything stops the call.']
+    ? ['Too little time is left to get borrowing back: only paying back everything stops the bank.', 'Only paying back everything stops the bank asking.']
     : left <= 0
-      ? ['The bank calls every loan at the next close unless you repay what you owe.']
+      ? ['The bank asks for every loan back at the next month close unless you pay back what you owe.']
       : [
-          `The bank takes your spare cash each month and calls every loan in ${count(left, 'close', 'closes')}.`,
-          `The bank takes spare cash and calls every loan in ${count(left, 'close', 'closes')}.`,
+          `The bank takes your spare cash each month and asks for every loan back in ${months(left)}.`,
+          `The bank takes spare cash and asks for every loan back in ${months(left)}.`,
         ];
   return plan(makeAdvice('frozenSweep', ADVICE_PRIORITY.frozenSweep, title, why, BANK, 'frozenSweep', { detail: `${lead} ${lift}` }));
 }

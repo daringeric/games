@@ -8,7 +8,8 @@
 // TUNE_SWEEP=0 to skip the constant-price sweep (the slowest part),
 // TUNE_PART=4cd for the round-4c/4d section only (difficulty levels, the
 // advisor follower, CASUAL, switching, the growth levers and the marketing
-// forecast: what the 100-seed confirmation runs).
+// forecast: what the 100-seed confirmation runs), TUNE_PART=kept for the
+// round-2..4b section only (the kept targets).
 
 import { describe, expect, it } from 'vitest';
 import { CPP_TARGET, DIFFICULTY_LEVELS, INCUMBENT_PROMO_MIN_PASSINGS, START_CASH } from '../balance';
@@ -210,7 +211,7 @@ describe('balance report', () => {
     expect(ENABLED).toBe(false);
   });
 
-  it.runIf(ENABLED && PART === 'all')(
+  it.runIf(ENABLED && (PART === 'all' || PART === 'kept'))(
     'prints the per-seed numbers behind every balance target',
     () => {
       const summary: Array<Record<string, string>> = [];

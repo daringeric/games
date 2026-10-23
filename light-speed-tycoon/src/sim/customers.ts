@@ -57,11 +57,14 @@
 //    unsigned units split into exactly one reason each: tooExpensive (the
 //    households of each demand segment that no offered tier suits, by
 //    sales' reservation suit: share x (1 - best suit), within the households
-//    beyond the ceiling), notWorth (the rest beyond the ceiling, and the
-//    aware part of the gap that has not switched yet), unaware (gap x (1 -
-//    awareness)), waiting (the aware part of the gap while its cabinet is
-//    full, installs are paused or an outage cuts the street off from its
-//    cabinet). Whole units, largest-remainder rounding per street so a
+//    beyond the ceiling), notWorth (the rest beyond the ceiling: at today's
+//    prices the deal is not worth switching for), unaware (gap x (1 -
+//    awareness)), deciding (the aware part of the gap: inside the ceiling,
+//    so they switch at today's prices, at awareness x SWITCH_BASE_PER_DAY x
+//    the deal and word of mouth; they just haven't yet), waiting (that aware
+//    part instead while its cabinet is full, installs are paused or an
+//    outage cuts the street off from its cabinet). A campaign moves homes
+//    from unaware to deciding, never to notWorth. Whole units, largest-remainder rounding per street so a
 //    street's reasons sum exactly to its unsigned units; areas and the total
 //    are sums of streets. notLit counts cabled streets not lit.
 // 4. Happiness (accountHappiness): a score summed from factors (balance
@@ -1113,11 +1116,12 @@ function unitsByCabinet(state: GameState): Map<CabinetId, number> {
 // ---------------------------------------------------------------------------
 
 function emptyCounts(): SwitchReasonCounts {
-  return { unaware: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0, notLit: 0 };
+  return { unaware: 0, deciding: 0, notWorth: 0, tooExpensive: 0, waiting: 0, unsigned: 0, passings: 0, subscribed: 0, notLit: 0 };
 }
 
 function addCounts(into: SwitchReasonCounts, row: SwitchReasonCounts): void {
   into.unaware += row.unaware;
+  into.deciding += row.deciding;
   into.notWorth += row.notWorth;
   into.tooExpensive += row.tooExpensive;
   into.waiting += row.waiting;
@@ -1158,10 +1162,10 @@ function tooExpensiveShare(pricing: Pricing, kind: ParcelKind, incumbentPrice: n
  * passed units - subscribed; target = its whole-unit target as stepSales
  * rounds it; gap = min(unsigned, target - subscribed); beyond = unsigned -
  * gap; tooExpensive = min(beyond, its households no offered tier suits);
- * unaware = gap x (1 - awareness); the aware part of the gap is waiting
- * while the serving cabinet is in Sales.fullCabinets, installs are paused
- * or an outage cuts the street off from it, else notWorth with the rest of
- * beyond; largest-remainder whole units per street. notLit: units on
+ * notWorth = the rest of beyond; unaware = gap x (1 - awareness); the aware
+ * part of the gap is waiting while the serving cabinet is in
+ * Sales.fullCabinets, installs are paused or an outage cuts the street off
+ * from it, else deciding; largest-remainder whole units per street. notLit: units on
  * existing parcels of streets with cable in any stage that are not lit.
  */
 export function whyNotSwitched(state: GameState): SwitchReasons {
@@ -1223,8 +1227,11 @@ function reasonsIn(state: GameState, only?: CabinetId): SwitchReasons {
     const blocked = full.has(row.cabinet) || paused || cut;
     const expensive = Math.min(beyond, row.expensive);
     const aware = gap * awareness;
-    const [unaware, notWorth, tooExpensive, waiting] = largestRemainder([gap - aware, beyond - expensive + (blocked ? 0 : aware), expensive, blocked ? aware : 0], unsigned) as [number, number, number, number];
-    const counts: SwitchReasonCounts = { ...emptyCounts(), unaware, notWorth, tooExpensive, waiting, unsigned, passings: row.units, subscribed: row.subscribed };
+    const [unaware, deciding, notWorth, tooExpensive, waiting] = largestRemainder(
+      [gap - aware, blocked ? 0 : aware, beyond - expensive, expensive, blocked ? aware : 0],
+      unsigned,
+    ) as [number, number, number, number, number];
+    const counts: SwitchReasonCounts = { ...emptyCounts(), unaware, deciding, notWorth, tooExpensive, waiting, unsigned, passings: row.units, subscribed: row.subscribed };
     addCounts(overall, counts);
     let area = areas.get(row.cabinet);
     if (!area) {

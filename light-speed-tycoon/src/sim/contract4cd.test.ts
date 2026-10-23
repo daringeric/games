@@ -575,9 +575,9 @@ describe('customers queries', () => {
     const state = litTown(120);
     const reasons = whyNotSwitched(state);
     const check = (r: typeof reasons.overall) => {
-      expect(r.unaware + r.notWorth + r.tooExpensive + r.waiting).toBe(r.unsigned);
+      expect(r.unaware + r.deciding + r.notWorth + r.tooExpensive + r.waiting).toBe(r.unsigned);
       expect(r.unsigned).toBe(r.passings - r.subscribed);
-      for (const n of [r.unaware, r.notWorth, r.tooExpensive, r.waiting, r.notLit]) expect(Number.isInteger(n) && n >= 0).toBe(true);
+      for (const n of [r.unaware, r.deciding, r.notWorth, r.tooExpensive, r.waiting, r.notLit]) expect(Number.isInteger(n) && n >= 0).toBe(true);
     };
     check(reasons.overall);
     expect(reasons.overall.passings).toBe(getService(state).passings);

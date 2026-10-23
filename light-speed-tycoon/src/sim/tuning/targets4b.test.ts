@@ -72,8 +72,9 @@ const MOST_SEEDS = 4;
 
 /**
  * Shoestring is winnable on at least this many seeds: no game over in 60
- * months and operating cash flow positive at month 60 (unreachable today: the
- * test is skipped, see DESIGN.md).
+ * months and operating cash flow positive at month 60 (round 4b could not
+ * reach it with a flat overhead; round 4c/4d's scaled overhead does: DESIGN.md
+ * "Round 4c/4d").
  */
 const SHOESTRING_WINS_MIN = 3;
 

@@ -125,3 +125,16 @@ button.hud-company:focus-visible {
     display: none;
   }
 }
+
+/* Laptop widths (over 1100px): the chip row may not push the HUD past the
+   screen. It still takes one line when there is room, but wraps once the HUD
+   reaches its max-width, instead of spilling the speed buttons and Menu off
+   both edges (with a bank chip such as "Bank: No more borrowing: 5 months to
+   call" and the Customers button, the row was wider than 1180-1440px
+   screens). */
+@media (min-width: 1101px) {
+  .hud-stats {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+}

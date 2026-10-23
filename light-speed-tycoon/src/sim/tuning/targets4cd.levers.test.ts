@@ -2,7 +2,8 @@
 // TUNING_SEEDS through the real sim:
 // - realistic switching: SMART at default prices reaches 40-55% take on
 //   areas lit 3-5 years; a lineup about 17% cheaper (DISCOUNT) reaches the
-//   ceiling a year or more sooner at a lower revenue per customer, an
+//   ceiling (the realistic one at the default prices, spec I.1) a year or
+//   more sooner at a lower revenue per customer, an
 //   overpriced one (OVERPRICED) grows clearly slower, and neither the cheaper
 //   lineup nor the default dominates over five years;
 // - the growth levers each pay only in their situation: a neighborhood

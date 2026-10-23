@@ -549,7 +549,8 @@ describe('the best answer to a promo (round 4b)', () => {
   });
 
   it('is an intro promo when one pays town-wide and brings signups where the promo runs', () => {
-    const { state, cabinet } = area({ subscribed: 10 });
+    // One subscriber: a retention offer has next to nothing to keep there, so the town-wide intro promo is the larger remedy.
+    const { state, cabinet } = area({ subscribed: 1 });
     state.sales.incumbentPromos = [{ cabinet, startDay: JUN1, endDay: closeDayAfter(JUN1, INCUMBENT_PROMO_MONTHS), price: incumbentPromoPrice(), quietUntil: closeDayAfter(JUN1, 12), triggerTakePct: 45, answered: false, answeredWithPromo: false }];
     const town = quotePromo(state, { ...SUGGESTED_PROMO });
     expect(town.pays).toBe(true);

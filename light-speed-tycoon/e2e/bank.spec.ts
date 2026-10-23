@@ -431,6 +431,80 @@ test.describe('on a phone', () => {
   });
 });
 
+test('at laptop widths the HUD stays on screen with every bank chip: Pause, Menu and the whole chip in view', async ({ page }) => {
+  test.setTimeout(120_000);
+  const errors = watchErrors(page);
+  await page.setViewportSize({ width: 1366, height: 900 });
+  await open(page, '/?seed=12345');
+  // Every chip the HUD can show at once: lit homes (so cost per home), building in progress, debt and the bank's word.
+  const route = await routeFromCo(page, 2);
+  expect(route, 'a cable route out of the CO').not.toBeNull();
+  await page.evaluate((segments) => {
+    const lst = window.__lst!;
+    lst.dispatch({ type: 'layCable', segments, method: 'underground' });
+    lst.dispatch({ type: 'placeCabinet', node: lst.getState().city.coNode });
+    lst.tick(120);
+    // More cable in progress (the building chip): the first unbuilt street out of the CO's neighbors that takes an order.
+    const s = lst.getState();
+    const built = new Set(s.network.spans.map((sp) => sp.segment));
+    for (const seg of s.city.segments) {
+      if (built.has(seg.id)) continue;
+      if (lst.dispatch({ type: 'layCable', segments: [seg.id], method: 'underground' }).ok) break;
+    }
+  }, route!.segments);
+  await giveRevenue(page, 40_000, 20_000);
+  const chip = page.getByTestId('hud-covenant');
+  const cases: { stage: 'penalty' | 'frozen'; text: RegExp }[] = [
+    { stage: 'penalty', text: /^Bank: Higher interest$/ },
+    { stage: 'frozen', text: /^Bank: No more borrowing: \d+ months to call$/ },
+  ];
+  for (const c of cases) {
+    await page.evaluate((stage) => {
+      const s = window.__lst!.getState();
+      s.debt.covenant = { stage, compliantCloses: 0 };
+      s.debt.credit.balance = 150_000;
+      s.debt.frozenCloses = stage === 'frozen' ? 1 : 0;
+      window.__lst!.tick(1);
+    }, c.stage);
+    await expect(page.getByTestId('hud-debt')).toBeVisible();
+    await expect(page.locator('.chip-building')).toBeVisible();
+    for (const width of [1180, 1280, 1366]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(chip).toBeVisible();
+      if (width > 1100) await expect(chip).toHaveText(c.text);
+      const box = await page.evaluate(() => {
+        const rect = (el: Element | null) => el!.getBoundingClientRect();
+        const pause = rect(document.querySelector('.speed[data-speed="0"]'));
+        const menu = rect(document.querySelector('.menu-button'));
+        const covenant = document.querySelector<HTMLElement>('[data-testid="hud-covenant"]')!;
+        const chipBox = rect(covenant);
+        const stats = rect(document.querySelector('.hud-stats'));
+        return {
+          width: window.innerWidth,
+          pauseLeft: pause.left,
+          menuRight: menu.right,
+          chipLeft: chipBox.left,
+          chipRight: chipBox.right,
+          chipClipped: covenant.scrollWidth > covenant.clientWidth + 1,
+          statsLeft: stats.left,
+          statsRight: stats.right,
+        };
+      });
+      const where = `${c.stage} at ${width}px`;
+      expect(box.pauseLeft, where).toBeGreaterThanOrEqual(0);
+      expect(box.menuRight, where).toBeLessThanOrEqual(box.width);
+      expect(box.chipLeft, where).toBeGreaterThanOrEqual(0);
+      expect(box.chipRight, where).toBeLessThanOrEqual(box.width);
+      expect(box.chipClipped, where).toBe(false);
+      expect(box.statsLeft, where).toBeGreaterThanOrEqual(0);
+      expect(box.statsRight, where).toBeLessThanOrEqual(box.width);
+      // Pause still takes a click.
+      await page.locator('.speed[data-speed="0"]').click();
+    }
+  }
+  expect(errors).toEqual([]);
+});
+
 test('the verified cure leads when a check fails, and its button cures it', async ({ page }) => {
   const errors = watchErrors(page);
   await open(page, '/?seed=12345');
