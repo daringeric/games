@@ -4,6 +4,10 @@ Small browser games, built in TypeScript.
 
 ## Light Speed Tycoon
 
+<p align="center">
+  <img src="docs/light-speed-tycoon/logo.webp" alt="Light Speed Tycoon logo: the title in glossy white and gold letters over a glowing toy city wired with blue fiber lines" width="640" />
+</p>
+
 ![A town in Light Speed Tycoon: fiber routes, subscriber homes in coral, the HUD and a monthly report](docs/light-speed-tycoon/screenshot.png)
 
 A city-builder where you're the fiber company. The town grows on its own; you build the network, sell service and try not to go broke doing it.

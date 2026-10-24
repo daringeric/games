@@ -47,9 +47,14 @@ src/
     tuning/       headless bots + balance targets (TUNE_REPORT=1 prints per-seed numbers)
   render/       PixiJS scene drawing and themes
   ui/           HTML/CSS HUD, tools, input, storage
+  assets/       the logo banner (start screen, menu), imported so it gets a hashed /assets URL
   main.ts       bootstrap
+public/         favicon, app icons, web manifest and the link-preview image (served as is)
+scripts/        logo-assets.py: makes src/assets and the public images from docs/light-speed-tycoon/logo.webp
 e2e/            Playwright tests
 ```
+
+The logo files are generated, never edited by hand: `python3 scripts/logo-assets.py [source.webp]` (Pillow and NumPy) rewrites them all and prints the backdrop gradient that `theme.ts` `ui.logoBackdrop` must match.
 
 ## Architecture rules
 
