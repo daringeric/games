@@ -518,6 +518,31 @@ body {
   display: none;
 }
 
+/* The game's logo heading the menu, on a strip of its own navy (the image's
+   sides are eased into the same gradient, so no seam shows). Not an item:
+   it sits outside the role="menu" list and never takes focus. */
+.menu-brand {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 4px;
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--logo-backdrop);
+}
+
+.menu-logo {
+  display: block;
+  width: auto;
+  height: 52px;
+}
+
+.menu-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .menu-item {
   flex: none;
   flex-direction: column;
@@ -1187,6 +1212,10 @@ body {
 
   .menu-detail {
     display: none;
+  }
+
+  .menu-logo {
+    height: 40px;
   }
 }
 

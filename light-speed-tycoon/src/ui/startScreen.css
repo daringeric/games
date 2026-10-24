@@ -1,13 +1,19 @@
-/* Round 4b: the start screen (startScreen.ts): company name, difficulty cards,
-   the town, Start. Imported by main.ts after style.css. Toy Town look: the
-   pill-card, the theme variables themeCss.ts publishes (--card, --text,
-   --active, --radius, --touch, ...) and the display/UI fonts, never literal
-   colors. Fits a 390x844 phone with no sideways scroll, and a short landscape
-   phone by scrolling its body while Start stays in view.
+/* Round 4b: the start screen (startScreen.ts): the logo banner, company name,
+   difficulty cards, the town, Start. Imported by main.ts after style.css. Toy
+   Town look: the pill-card, the theme variables themeCss.ts publishes (--card,
+   --text, --active, --radius, --touch, --logo-backdrop, ...) and the
+   display/UI fonts, never literal colors. Fits a 390x844 phone with no
+   sideways scroll, and a short landscape phone by scrolling its body while
+   Start stays in view.
 
    Owner: start-screen workstream. */
 
 .start-screen {
+  /* The logo banner's height: as tall as the screen leaves room for, up to
+     210 px, so the whole card fits (from 851 px tall here; laptops and phones
+     have their own rules below). startScreen.ts BANNER_SIZES gives the width
+     this draws the logo at. */
+  --banner-h: clamp(160px, calc(100dvh - 642px), 210px);
   width: min(600px, calc(100vw - 24px));
   max-width: none;
   max-height: calc(100vh - 24px);
@@ -34,7 +40,7 @@
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 18px 16px 6px 22px;
+  padding: 14px 16px 6px 22px;
 }
 
 .start-heading {
@@ -42,23 +48,21 @@
   min-width: 0;
 }
 
-.start-kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0 0 4px;
-  color: var(--accent);
-  font: 700 13px / 1.2 var(--font-display);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+/* The title banner: the logo on its own navy, edge to edge across the top of
+   the card (the dialog's rounded corners clip it). The image's sides are eased
+   into exactly this gradient (scripts/logo-assets.py), so no seam shows; its
+   width and height attributes hold its place while it loads. */
+.start-banner {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  background: var(--logo-backdrop);
 }
 
-.start-kicker::before {
-  content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
+.start-logo {
+  display: block;
+  width: min(100%, calc(var(--banner-h) * 1280 / 682));
+  height: auto;
 }
 
 .start-title {
@@ -318,13 +322,14 @@
 /* Phones: tighter padding, the cards stay two across (one across on the narrowest). */
 @media (max-width: 600px) {
   .start-screen {
+    --banner-h: clamp(110px, calc(100dvh - 714px), 150px);
     width: calc(100vw - 16px);
     max-height: calc(100vh - 16px);
     max-height: calc(100dvh - 16px);
   }
 
   .start-head {
-    padding: 14px 12px 4px 16px;
+    padding: 10px 12px 4px 16px;
   }
 
   .start-title {
@@ -373,10 +378,76 @@
   }
 }
 
-/* Short landscape screens: a smaller heading so more of the form shows. */
-@media (max-height: 500px) {
+/* Laptop screens, wider than a phone and 501-850 px tall (a 1366x768 or
+   1536x864 screen less the browser's bars, Playwright's 1280x720): the card at
+   its full banner needs about 850 px, so here the form's spacing tightens and
+   the banner gives up the rest of the height, down to 140 px. The whole card
+   fits from about 720 px tall up; shorter, its body scrolls under the banner
+   while Start stays in view. */
+@media (min-width: 601px) and (min-height: 501px) and (max-height: 850px) {
+  .start-screen {
+    --banner-h: clamp(140px, calc(100dvh - 580px), 210px);
+  }
+
   .start-head {
     padding-top: 10px;
+    padding-bottom: 4px;
+  }
+
+  .start-body {
+    gap: 12px;
+    padding-top: 4px;
+    padding-bottom: 10px;
+  }
+
+  .start-section {
+    gap: 6px;
+  }
+
+  .start-cards {
+    gap: 8px;
+  }
+
+  .start-card {
+    padding-top: 9px;
+    padding-bottom: 9px;
+  }
+
+  .start-card-feel {
+    margin-top: 3px;
+  }
+
+  .start-town {
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  .start-actions {
+    padding-top: 10px;
+    padding-bottom: 12px;
+  }
+}
+
+/* Short landscape screens: a smaller heading so more of the form shows, and
+   the logo a small badge beside it rather than a banner above it. */
+@media (max-height: 500px) {
+  .start-screen {
+    --banner-h: 44px;
+  }
+
+  .start-banner {
+    position: absolute;
+    top: 10px;
+    left: 16px;
+    overflow: hidden;
+    border-radius: 10px;
+  }
+
+  .start-head {
+    align-items: center;
+    min-height: 60px;
+    padding-top: 10px;
+    padding-left: calc(16px + var(--banner-h) * 1280 / 682 + 12px);
   }
 
   .start-title {

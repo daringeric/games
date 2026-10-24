@@ -8,16 +8,49 @@
 // Owner: start-screen workstream; ui-bank (round 4c/4d).
 
 import { expect, test } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { DIFFICULTY_LEVELS } from '../src/sim/balance';
 import { COMPANY_NAME_MAX, defaultCompanyName } from '../src/sim/company';
 import { formatMoney } from '../src/ui/format';
-import { currentGame, open, openWithStart, startCompany, startScreen, watchErrors } from './helpers';
+import { currentGame, open, openWithStart, startCompany, startScreen, watchErrors, withDebug, withStart } from './helpers';
 
 const levelCash = (id: string) => DIFFICULTY_LEVELS.find((l) => l.id === id)!.startCash;
 const speedOf = (page: Page) => page.locator('.speed[aria-pressed="true"]').getAttribute('data-speed');
 const company = (page: Page) => page.evaluate(() => window.__lst!.getState().company);
 const screenOpen = (page: Page) => page.evaluate(() => window.__lst!.startScreenOpen());
+
+/** The start screen's logo banner image: shown, and its file loaded. */
+async function bannerLogo(page: Page): Promise<Locator> {
+  const logo = startScreen(page).getByRole('img', { name: 'Light Speed Tycoon' });
+  await expect(logo).toBeVisible();
+  await expect(logo).toHaveAttribute('decoding', 'async');
+  await expect.poll(() => logo.evaluate((img: HTMLImageElement) => (img.complete ? img.naturalWidth : 0))).toBeGreaterThan(0);
+  return logo;
+}
+
+/** Where the banner sits: its image and strip, the card, and the heading below it. */
+async function bannerLayout(page: Page) {
+  return page.evaluate(() => {
+    const box = (el: Element) => {
+      const r = el.getBoundingClientRect();
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+    };
+    const dialog = document.querySelector('.start-screen')!;
+    const img = dialog.querySelector('img')!;
+    const body = dialog.querySelector<HTMLElement>('.start-body')!;
+    return {
+      dialog: box(dialog),
+      card: { left: dialog.clientLeft, width: dialog.clientWidth },
+      strip: box(dialog.querySelector('.start-banner')!),
+      img: box(img),
+      title: box(dialog.querySelector('.start-title')!),
+      body: box(body),
+      town: box(dialog.querySelector('.start-town')!),
+      bodyOverflow: body.scrollHeight - body.clientHeight,
+      sideways: document.documentElement.scrollWidth - window.innerWidth,
+    };
+  });
+}
 
 /** Set the name field the way a paste past its maxlength would (typing stops at COMPANY_NAME_MAX). */
 async function forceName(page: Page, value: string): Promise<void> {
@@ -36,6 +69,8 @@ test('a first launch opens on the start screen and starts the company chosen the
   const screen = startScreen(page);
   await expect(screen).toBeVisible();
   expect(await screenOpen(page)).toBe(true);
+  // The game's logo heads the screen (it replaced the small "Light Speed Tycoon" eyebrow line).
+  await bannerLogo(page);
   const name = screen.getByLabel('Company name');
   await expect(name).toBeFocused();
   await expect(name).toHaveAttribute('maxlength', String(COMPANY_NAME_MAX));
@@ -320,6 +355,14 @@ test.describe('on a phone', () => {
     await page.evaluate(() => document.fonts.ready);
     const screen = startScreen(page);
     await expect(screen).toBeVisible();
+    // The logo banner: loaded, 110-150 px tall, across the card above the heading.
+    await bannerLogo(page);
+    const banner = await bannerLayout(page);
+    expect(banner.img.height).toBeGreaterThanOrEqual(110);
+    expect(banner.img.height).toBeLessThanOrEqual(150);
+    expect(banner.strip.width).toBeCloseTo(banner.card.width, 0);
+    expect(banner.img.width).toBeLessThanOrEqual(banner.card.width);
+    expect(banner.img.bottom).toBeLessThanOrEqual(banner.title.top);
     const fit = await page.evaluate(() => {
       const dialog = document.querySelector<HTMLElement>('.start-screen')!;
       const body = dialog.querySelector<HTMLElement>('.start-body')!;
@@ -354,6 +397,136 @@ test.describe('on a phone', () => {
     await expect(screen).toBeHidden();
     expect(await company(page)).toMatchObject({ difficulty: 'seed' });
     expect(errors).toEqual([]);
+  });
+});
+
+test.describe('the logo banner', () => {
+  test('heads the card on a desktop: 160-220 px tall, edge to edge, centred, nothing moving as it loads', async ({ page }) => {
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 1440, height: 900 });
+    // Hold the logo files back, to see the space they will fill already held.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route(/logo-(640|1280).*\.webp$/, async (route) => {
+      await held;
+      await route.continue();
+    });
+    // Not waiting for the load event: the held logo would hold it back.
+    await page.goto(withDebug(withStart('/')), { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window.__lst !== undefined);
+    await page.evaluate(() => document.fonts.ready);
+    const screen = startScreen(page);
+    await expect(screen).toBeVisible();
+    expect(await screen.locator('img').evaluate((img: HTMLImageElement) => img.complete)).toBe(false);
+    const before = await bannerLayout(page);
+    release();
+    await bannerLogo(page);
+    const after = await bannerLayout(page);
+    expect(after.img).toEqual(before.img);
+    expect(after.title).toEqual(before.title);
+
+    expect(after.img.height).toBeGreaterThanOrEqual(160);
+    expect(after.img.height).toBeLessThanOrEqual(220);
+    // At the top of the card, across its full width, the logo in the middle of it.
+    expect(after.strip.top).toBeCloseTo(after.dialog.top + 1, 0);
+    expect(after.strip.left).toBeCloseTo(after.dialog.left + after.card.left, 0);
+    expect(after.strip.width).toBeCloseTo(after.card.width, 0);
+    expect(after.strip.height).toBeCloseTo(after.img.height, 0);
+    expect(Math.abs(after.img.left - after.strip.left - (after.strip.right - after.img.right))).toBeLessThanOrEqual(1);
+    expect(after.img.bottom).toBeLessThanOrEqual(after.title.top);
+    // The heading still names the dialog, and the whole card fits.
+    await expect(screen.getByRole('heading', { name: 'Start your fiber company' })).toBeVisible();
+    expect(after.bodyOverflow).toBeLessThanOrEqual(0);
+    expect(after.sideways).toBeLessThanOrEqual(0);
+    await expect(screen.getByRole('button', { name: 'Start', exact: true })).toBeInViewport({ ratio: 1 });
+    expect(errors).toEqual([]);
+  });
+
+  // Laptop screens: 1280x800, a 1366x768 screen's or a 1024x768 one's full
+  // height, and 1280x720 (about what a 1536x864 screen leaves under the browser's
+  // bars, and Playwright's own desktop size). The form's spacing tightens and the
+  // banner gives up height as the screen does, so the whole card still fits, the
+  // town row included, with the banner never under 140 px.
+  for (const { width, height, min, max } of [
+    { width: 1280, height: 800, min: 160, max: 210 },
+    { width: 1366, height: 768, min: 160, max: 210 },
+    { width: 1024, height: 768, min: 160, max: 210 },
+    { width: 1280, height: 720, min: 140, max: 209 },
+  ]) {
+    test(`fits the whole card on a ${width}x${height} laptop screen, the banner ${min}-${max} px tall`, async ({ page }) => {
+      const errors = watchErrors(page);
+      await page.setViewportSize({ width, height });
+      await openWithStart(page, '/');
+      await page.evaluate(() => document.fonts.ready);
+      await bannerLogo(page);
+      const banner = await bannerLayout(page);
+      // Within half a pixel: the image's height comes out of its width at the logo's ratio.
+      expect(banner.img.height).toBeGreaterThanOrEqual(min - 0.5);
+      expect(banner.img.height).toBeLessThanOrEqual(max + 0.5);
+      expect(banner.bodyOverflow).toBeLessThanOrEqual(0);
+      // The last row, the town and its New town button, in full above the footer.
+      expect(banner.town.bottom).toBeLessThanOrEqual(banner.body.bottom);
+      expect(banner.dialog.top).toBeGreaterThanOrEqual(0);
+      expect(banner.dialog.bottom).toBeLessThanOrEqual(height);
+      expect(banner.sideways).toBeLessThanOrEqual(0);
+      const screen = startScreen(page);
+      await expect(screen.getByRole('button', { name: 'New town' })).toBeInViewport({ ratio: 1 });
+      await expect(screen.getByRole('button', { name: 'Start', exact: true })).toBeInViewport({ ratio: 1 });
+      expect(errors).toEqual([]);
+    });
+  }
+
+  test('on a shorter laptop screen keeps a 140 px banner and scrolls the form under it, Start in view', async ({ page }) => {
+    // 1366x657: a 1366x768 screen less the browser's bars. Too short for the whole card.
+    const errors = watchErrors(page);
+    await page.setViewportSize({ width: 1366, height: 657 });
+    await openWithStart(page, '/');
+    await page.evaluate(() => document.fonts.ready);
+    await bannerLogo(page);
+    const banner = await bannerLayout(page);
+    expect(banner.img.height).toBeGreaterThanOrEqual(139.5);
+    expect(banner.img.height).toBeLessThanOrEqual(141);
+    expect(banner.dialog.top).toBeGreaterThanOrEqual(0);
+    expect(banner.dialog.bottom).toBeLessThanOrEqual(657);
+    expect(banner.sideways).toBeLessThanOrEqual(0);
+    const screen = startScreen(page);
+    const start = screen.getByRole('button', { name: 'Start', exact: true });
+    await expect(start).toBeInViewport({ ratio: 1 });
+    // The town row is a scroll away, and Start stays put while the form scrolls.
+    expect(banner.bodyOverflow).toBeGreaterThan(0);
+    await screen.locator('.start-body').evaluate((body) => (body.scrollTop = body.scrollHeight));
+    const newTown = screen.getByRole('button', { name: 'New town' });
+    await expect(newTown).toBeInViewport({ ratio: 1 });
+    await expect(start).toBeInViewport({ ratio: 1 });
+    expect(errors).toEqual([]);
+  });
+
+  test.describe('on a landscape phone', () => {
+    test.use({ viewport: { width: 844, height: 390 }, hasTouch: true });
+
+    test('becomes a small badge beside the heading, and Start stays in view and reachable by keyboard', async ({ page }) => {
+      const errors = watchErrors(page);
+      await openWithStart(page, '/');
+      await page.evaluate(() => document.fonts.ready);
+      const screen = startScreen(page);
+      await bannerLogo(page);
+      const banner = await bannerLayout(page);
+      expect(banner.img.height).toBeLessThanOrEqual(56);
+      // Beside the heading, not above it.
+      expect(banner.img.right).toBeLessThanOrEqual(banner.title.left);
+      expect(banner.img.bottom).toBeGreaterThan(banner.title.top);
+      expect(banner.dialog.top).toBeGreaterThanOrEqual(0);
+      expect(banner.dialog.bottom).toBeLessThanOrEqual(390);
+      expect(banner.sideways).toBeLessThanOrEqual(0);
+      const start = screen.getByRole('button', { name: 'Start', exact: true });
+      await expect(start).toBeInViewport({ ratio: 1 });
+      await expect(screen.getByLabel('Company name')).toBeFocused();
+      for (let i = 0; i < 8 && !(await start.evaluate((el) => el === document.activeElement)); i++) await page.keyboard.press('Tab');
+      await expect(start).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(screen).toBeHidden();
+      expect(errors).toEqual([]);
+    });
   });
 });
 

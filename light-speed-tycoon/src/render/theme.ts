@@ -254,6 +254,13 @@ export interface Theme {
     touch: number;
     fontSize: number;
     numberSize: number;
+    /**
+     * The logo's own navy, top to bottom: the strip behind the logo banner
+     * (start screen, menu), so the image's edges blend into it. The stops are
+     * sampled from the banner's edges by scripts/logo-assets.py (which eases
+     * the image's sides into exactly this gradient); regenerate both together.
+     */
+    logoBackdrop: string;
   };
 }
 
@@ -454,5 +461,6 @@ export const toyTown: Theme = {
     touch: 44,
     fontSize: 15,
     numberSize: 17,
+    logoBackdrop: 'linear-gradient(#000a1b 0%, #000918 50%, #000817 80%, #000513 90%, #000310 100%)',
   },
 };

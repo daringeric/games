@@ -29,6 +29,7 @@ export function applyThemeCss(theme: Theme, root: HTMLElement = document.documen
     '--touch': `${ui.touch}px`,
     '--fs': `${ui.fontSize}px`,
     '--fs-num': `${ui.numberSize}px`,
+    '--logo-backdrop': ui.logoBackdrop,
     '--font-ui': `'${theme.fonts.ui}', system-ui, sans-serif`,
     '--font-display': `'${theme.fonts.display}', '${theme.fonts.ui}', system-ui, sans-serif`,
     '--tone-aerial': cable.aerial.tube,

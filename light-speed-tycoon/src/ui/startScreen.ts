@@ -2,7 +2,9 @@
 // starting investment), see the town that will be generated (and reroll it),
 // then Start. Shown for a new game only: a first launch with no saved
 // company, a fresh ?seed link, the menu's New game (after the replace
-// confirm) and the game-over dialog's "Start a new town".
+// confirm) and the game-over dialog's "Start a new town". The game's logo
+// heads it as a title banner (logo.ts), a badge beside the heading on short
+// screens.
 //
 // The logic is a small pure view-model (StartModel and the functions above
 // it), unit-tested in startScreen.test.ts without a DOM; StartScreen only
@@ -19,6 +21,7 @@ import { COMPANY_NAME_MAX, checkCompanyName, isDifficultyId, suggestCompanyName 
 import type { DifficultyId } from '../sim/types';
 import { el, icon } from './dom';
 import { formatMoney } from './format';
+import { logoImage } from './logo';
 
 /** Per-browser memory of the last difficulty picked (a convenience: never game state). */
 export const DIFFICULTY_STORAGE_KEY = 'lst:difficulty';
@@ -262,6 +265,13 @@ const DICE_ICON = svg('<rect x="4" y="4" width="16" height="16" rx="4"/><circle 
 const SPARKLE_ICON = svg('<path d="M10 4l1.6 4.4L16 10l-4.4 1.6L10 16l-1.6-4.4L4 10l4.4-1.6z"/><path d="M18 15v5M15.5 17.5h5"/>');
 const TOWN_ICON = svg('<path d="M3 20h18"/><path d="M5 20v-8l4-3 4 3v8"/><path d="M13 20v-11l3-2 3 2v11"/>');
 
+/**
+ * The width the title banner's logo is drawn at (startScreen.css: its height
+ * times the logo's aspect ratio): a badge beside the heading on short
+ * screens, then phones, then the rest. The browser picks the file from it.
+ */
+const BANNER_SIZES = '(max-height: 500px) 84px, (max-width: 600px) 282px, 394px';
+
 let screenCount = 0;
 
 /** The start screen: a modal dialog (the map and its shortcuts stand aside while it is open). */
@@ -344,9 +354,10 @@ export class StartScreen {
     const titleId = `${id}-title`;
     const ledeId = `${id}-lede`;
     const dialog = el('dialog', { class: 'start-screen pill-card', attrs: { 'aria-labelledby': titleId, 'aria-describedby': ledeId } }, [
+      // The game's logo as the title banner, on its own navy.
+      el('div', { class: 'start-banner' }, [logoImage('start-logo', BANNER_SIZES)]),
       el('header', { class: 'start-head' }, [
         el('div', { class: 'start-heading' }, [
-          el('p', { class: 'start-kicker', text: 'Light Speed Tycoon' }),
           el('h2', { class: 'start-title', text: 'Start your fiber company', attrs: { id: titleId } }),
           el('p', { class: 'start-lede', text: 'Name it, pick your backing, and wire up a town that grows on its own.', attrs: { id: ledeId } }),
         ]),
